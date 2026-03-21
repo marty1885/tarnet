@@ -1,0 +1,13 @@
+[package]
+name = "tarnet-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tarnet-api = { path = "../tarnet-api" }
+tokio = { version = "1", features = ["sync", "net", "io-util", "time", "rt"] }
+async-trait = "0.1"
+log = "0.4"
+serde = "1"
+rmp-serde = "1"
+serde_bytes = "0.11"

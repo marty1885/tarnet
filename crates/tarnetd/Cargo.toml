@@ -1,0 +1,28 @@
+[package]
+name = "tarnetd"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tarnetd"
+path = "src/main.rs"
+
+[dependencies]
+tarnet = { path = "../.." }
+tarnet-api = { path = "../tarnet-api" }
+tarnet-socks = { path = "../tarnet-socks" }
+tarnet-expose = { path = "../tarnet-expose" }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.11"
+serde = "1"
+rmp-serde = "1"
+serde_bytes = "0.11"
+toml = "0.8"
+mdns-sd = "0.11"
+rand = "0.8"
+
+[features]
+default = ["mainline-bootstrap"]
+mainline-bootstrap = ["tarnet/mainline-bootstrap"]

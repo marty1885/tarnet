@@ -1,0 +1,42 @@
+[workspace]
+members = [".", "crates/tarnet-api", "crates/tarnetd", "crates/tarnet-client", "crates/tarnet-cli", "crates/tarnet-stream", "crates/tarnet-socks", "crates/tarnet-expose"]
+default-members = ["crates/tarnetd", "crates/tarnet-cli", "crates/tarnet-socks", "crates/tarnet-expose"]
+
+[package]
+name = "tarnet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tarnet-api = { path = "crates/tarnet-api" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+curve25519-dalek = "4"
+chacha20poly1305 = "0.10"
+blake3 = "1"
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+rusqlite = { version = "0.31", features = ["bundled"] }
+webrtc = "0.17"
+serde_json = "1"
+bytes = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+pqcrypto-falcon = "0.3"
+pqcrypto-kyber = "0.8"
+pqcrypto-traits = "0.3"
+lru = "0.12"
+dashmap = "6"
+libc = "0.2"
+mainline = { version = "6", optional = true }
+sha1_smol = { version = "1", optional = true }
+
+[features]
+default = ["mainline-bootstrap"]
+mainline-bootstrap = ["mainline", "sha1_smol"]

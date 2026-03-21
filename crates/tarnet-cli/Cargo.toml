@@ -1,0 +1,16 @@
+[package]
+name = "tarnet-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tarnet"
+path = "src/main.rs"
+
+[dependencies]
+tarnet-api = { path = "../tarnet-api" }
+tarnet-client = { path = "../tarnet-client" }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
