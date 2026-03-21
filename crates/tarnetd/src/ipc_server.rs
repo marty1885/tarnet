@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Mutex;
 
 use tarnet_api::error::ApiResult;
 use tarnet_api::ipc::*;
@@ -19,11 +19,12 @@ type ConnTable = Arc<Mutex<HashMap<u32, Arc<Connection>>>>;
 
 /// Run the IPC server on the given Unix socket path.
 /// Accepts client connections and dispatches requests to the service API.
-/// The `reload_notify` is triggered when a client sends METHOD_RELOAD.
+/// `expose_reload_tx` sends reload requests to the expose service with error feedback.
 pub async fn run_ipc_server(
     socket_path: std::path::PathBuf,
     api: Arc<dyn ServiceApi>,
-    reload_notify: Arc<Notify>,
+    reload_notify: Arc<tokio::sync::Notify>,
+    expose_reload_tx: Option<tarnet_expose::expose::ReloadSender>,
 ) -> ApiResult<()> {
     // Ensure parent directory exists
     if let Some(parent) = socket_path.parent() {
@@ -41,8 +42,9 @@ pub async fn run_ipc_server(
             Ok((stream, _addr)) => {
                 let client_api = api.clone();
                 let client_reload = reload_notify.clone();
+                let client_expose_reload = expose_reload_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, client_api, client_reload).await {
+                    if let Err(e) = handle_client(stream, client_api, client_reload, client_expose_reload).await {
                         log::debug!("IPC client disconnected: {}", e);
                     }
                 });
@@ -56,7 +58,12 @@ pub async fn run_ipc_server(
 
 /// Handle a single IPC client connection.
 /// Auto-subscribes to all events and starts relaying them immediately.
-async fn handle_client(mut stream: UnixStream, api: Arc<dyn ServiceApi>, reload_notify: Arc<Notify>) -> ApiResult<()> {
+async fn handle_client(
+    mut stream: UnixStream,
+    api: Arc<dyn ServiceApi>,
+    reload_notify: Arc<tokio::sync::Notify>,
+    expose_reload_tx: Option<tarnet_expose::expose::ReloadSender>,
+) -> ApiResult<()> {
     // Version handshake before splitting the stream
     let _negotiated_version = tarnet_api::ipc::handshake_server(&mut stream).await?;
 
@@ -129,9 +136,29 @@ async fn handle_client(mut stream: UnixStream, api: Arc<dyn ServiceApi>, reload_
                     }
                     METHOD_RELOAD => {
                         log::info!("Reload requested via IPC");
+                        // Always notify generic reload listeners (bandwidth, etc.)
                         reload_notify.notify_waiters();
+                        // Send reload request to expose with error feedback.
+                        let response = if let Some(ref tx) = expose_reload_tx {
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            if tx.send(reply_tx).await.is_ok() {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    reply_rx,
+                                ).await {
+                                    Ok(Ok(Ok(()))) => ok_response(request_id, &[]),
+                                    Ok(Ok(Err(e))) => err_response(request_id, &e),
+                                    Ok(Err(_)) => err_response(request_id, "expose reload cancelled"),
+                                    Err(_) => err_response(request_id, "expose reload timed out"),
+                                }
+                            } else {
+                                err_response(request_id, "expose service not running")
+                            }
+                        } else {
+                            ok_response(request_id, &[])
+                        };
                         let mut w = writer.lock().await;
-                        let _ = send_frame(&mut *w, &ok_response(request_id, &[])).await;
+                        let _ = send_frame(&mut *w, &response).await;
                     }
                     METHOD_CONN_CLOSE => {
                         let conn_id: u32 = match decode_payload(&payload) {

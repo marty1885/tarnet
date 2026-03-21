@@ -170,12 +170,16 @@ async fn main() {
         });
     }
 
+    // Create expose reload channel (IPC → expose with error feedback).
+    let (expose_reload_tx, expose_reload_rx) = tokio::sync::mpsc::channel(4);
+
     // Start the IPC server
     let ipc_api = api.clone() as Arc<dyn tarnet_api::service::ServiceApi>;
     let socket_path = opts.socket_path.clone();
     let ipc_reload = reload_notify.clone();
+    let ipc_expose_tx = if opts.expose_enabled { Some(expose_reload_tx.clone()) } else { None };
     tokio::spawn(async move {
-        if let Err(e) = ipc_server::run_ipc_server(socket_path, ipc_api, ipc_reload).await {
+        if let Err(e) = ipc_server::run_ipc_server(socket_path, ipc_api, ipc_reload, ipc_expose_tx).await {
             log::error!("IPC server error: {}", e);
         }
     });
@@ -209,9 +213,8 @@ async fn main() {
     if opts.expose_enabled {
         let expose_api = api.clone();
         let expose_dir = opts.expose_dir.clone();
-        let expose_reload = reload_notify.clone();
         tokio::spawn(async move {
-            tarnet_expose::expose::run_expose(expose_api, expose_dir, expose_reload).await;
+            tarnet_expose::expose::run_expose(expose_api, expose_dir, expose_reload_rx).await;
         });
     }
 
