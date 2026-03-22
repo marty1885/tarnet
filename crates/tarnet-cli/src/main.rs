@@ -172,6 +172,29 @@ enum TnsCommand {
         /// Name to resolve
         name: String,
     },
+    /// Export all zone records to a JSON file
+    Export {
+        /// Output file (defaults to stdout)
+        file: Option<String>,
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Import zone records from a JSON file
+    #[command(arg_required_else_help = true)]
+    Import {
+        /// JSON file to import
+        file: String,
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Remove all records from the zone
+    Clear {
+        /// Skip confirmation prompt
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -586,7 +609,133 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
+        TnsCommand::Export { file, yes } => {
+            let entries = match client.tns_list_labels().await {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if entries.is_empty() {
+                eprintln!("No records to export.");
+                std::process::exit(0);
+            }
+
+            let dest = file.as_deref().unwrap_or("stdout");
+            if !yes {
+                eprint!("Export {} record(s) to {}? [N/y] ", entries.len(), dest);
+                if !confirm_stdin() {
+                    eprintln!("Aborted.");
+                    std::process::exit(1);
+                }
+            }
+
+            let export: Vec<ZoneEntry> = entries
+                .into_iter()
+                .map(|(label, records, publish)| ZoneEntry { label, records, publish })
+                .collect();
+
+            let json = serde_json::to_string_pretty(&export).unwrap();
+
+            if let Some(path) = file {
+                if let Err(e) = std::fs::write(path, &json) {
+                    eprintln!("Failed to write file: {}", e);
+                    std::process::exit(1);
+                }
+                eprintln!("Exported {} record(s) to {}", export.len(), path);
+            } else {
+                println!("{}", json);
+            }
+        }
+        TnsCommand::Import { file, yes } => {
+            let data = match std::fs::read_to_string(file) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("Failed to read '{}': {}", file, e);
+                    std::process::exit(1);
+                }
+            };
+
+            let entries: Vec<ZoneEntry> = match serde_json::from_str(&data) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Invalid JSON: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if entries.is_empty() {
+                eprintln!("No records in file.");
+                std::process::exit(0);
+            }
+
+            if !yes {
+                eprint!("Import {} record(s) from '{}'? [N/y] ", entries.len(), file);
+                if !confirm_stdin() {
+                    eprintln!("Aborted.");
+                    std::process::exit(1);
+                }
+            }
+
+            let mut ok = 0usize;
+            for entry in &entries {
+                match client.tns_set_label(&entry.label, entry.records.clone(), entry.publish).await {
+                    Ok(()) => ok += 1,
+                    Err(e) => eprintln!("Failed to import '{}': {}", entry.label, e),
+                }
+            }
+            eprintln!("Imported {}/{} record(s).", ok, entries.len());
+        }
+        TnsCommand::Clear { yes } => {
+            let entries = match client.tns_list_labels().await {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            if entries.is_empty() {
+                eprintln!("No records to clear.");
+                std::process::exit(0);
+            }
+
+            if !yes {
+                eprint!("Remove all {} record(s) from the zone? [N/y] ", entries.len());
+                if !confirm_stdin() {
+                    eprintln!("Aborted.");
+                    std::process::exit(1);
+                }
+            }
+
+            let mut ok = 0usize;
+            for (label, _, _) in &entries {
+                match client.tns_remove_label(label).await {
+                    Ok(()) => ok += 1,
+                    Err(e) => eprintln!("Failed to remove '{}': {}", label, e),
+                }
+            }
+            eprintln!("Removed {}/{} record(s).", ok, entries.len());
+        }
     }
+}
+
+/// A single zone label entry for export/import.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ZoneEntry {
+    label: String,
+    records: Vec<TnsRecord>,
+    publish: bool,
+}
+
+/// Read a y/N confirmation from stdin. Returns true only for "y" or "yes".
+fn confirm_stdin() -> bool {
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).unwrap_or(0);
+    let answer = answer.trim().to_lowercase();
+    answer == "y" || answer == "yes"
 }
 
 fn parse_tns_record(type_str: &str, value: &str) -> TnsRecord {

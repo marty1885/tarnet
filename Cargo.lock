@@ -2610,6 +2610,8 @@ dependencies = [
  "async-trait",
  "clap",
  "libc",
+ "serde",
+ "serde_json",
  "tarnet-api",
  "tarnet-client",
  "tokio",
