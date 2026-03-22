@@ -5,13 +5,10 @@ const TAG_OFFER: u8 = 0x01;
 const TAG_ANSWER: u8 = 0x02;
 const TAG_ICE_CANDIDATE: u8 = 0x03;
 
-/// Port name prefix for WebRTC signaling channels.
-const WEBRTC_PORT_PREFIX: &str = "_tarnet_webrtc_transport_";
-
-/// Derive the signaling channel port name from a hello record's secret.
-fn signaling_port_name(secret: &[u8; 16]) -> String {
-    let hex: String = secret.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}{}", WEBRTC_PORT_PREFIX, hex)
+/// Derive the 32-byte signaling channel port hash from a hello record's secret
+/// using blake3 KDF with domain separation. No string intermediary.
+fn signaling_port_hash(secret: &[u8; 16]) -> [u8; 32] {
+    blake3::derive_key("tarnet webrtc signaling port", secret)
 }
 
 impl Node {
@@ -69,12 +66,11 @@ impl Node {
             None => return,
         };
 
-        let port_name = signaling_port_name(&self.signaling_secret);
-        self.register_webrtc_port_listener(port_name, connector).await;
+        let port_hash = signaling_port_hash(&self.signaling_secret);
+        self.register_webrtc_port_listener(port_hash, connector).await;
     }
 
-    async fn register_webrtc_port_listener(&self, port_name: String, connector: Arc<WebRtcConnector>) {
-        let port_hash = crate::wire::hash_port_name(&port_name);
+    async fn register_webrtc_port_listener(&self, port_hash: [u8; 32], connector: Arc<WebRtcConnector>) {
 
         let (listener_tx, mut listener_rx) = mpsc::unbounded_channel::<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>();
         self.channel_port_listeners.lock().await.insert(port_hash, listener_tx);
@@ -88,7 +84,7 @@ impl Node {
         let routing_table = self.routing_table.clone();
         let peer_id = self.peer_id();
 
-        log::info!("WebRTC signaling listener on port {:?}", port_name);
+        log::info!("WebRTC signaling listener registered");
 
         tokio::spawn(async move {
             while let Some((remote_peer, channel_id, mut data_rx)) = listener_rx.recv().await {
@@ -210,9 +206,9 @@ impl Node {
         });
     }
 
-    /// Compute the WebRTC signaling port name for a peer based on their hello record.
-    fn webrtc_port_name_for_peer(hello: &HelloRecord) -> String {
-        signaling_port_name(&hello.signaling_secret)
+    /// Compute the WebRTC signaling port hash for a peer based on their hello record.
+    fn webrtc_port_hash_for_peer(hello: &HelloRecord) -> [u8; 32] {
+        signaling_port_hash(&hello.signaling_secret)
     }
 
     /// Initiate a WebRTC connection to a remote peer via channel-based signaling.
@@ -223,18 +219,18 @@ impl Node {
             .as_ref()
             .ok_or_else(|| Error::Protocol("WebRTC not enabled".into()))?;
 
-        // Look up peer's hello record to get the port name
+        // Look up peer's hello record to derive the signaling port
         let hello = self.lookup_hello(&peer_id).await
             .ok_or_else(|| Error::Protocol("no hello record for WebRTC target".into()))?;
-        let port_name = Self::webrtc_port_name_for_peer(&hello);
+        let port_hash = Self::webrtc_port_hash_for_peer(&hello);
 
         // Ensure we have a tunnel to the peer
         let tunnel_rx = self.create_tunnel(peer_id).await?;
         let _ = tunnel_rx.await.map_err(|_| Error::Protocol("tunnel setup cancelled".into()))?;
 
         // Open a signaling channel
-        let (channel_id, mut data_rx) = self.channel_open_with_handler(
-            &peer_id, &port_name, true, true,
+        let (channel_id, mut data_rx) = self.channel_open_with_handler_port(
+            &peer_id, port_hash, true, true,
         ).await?;
 
         let (sdp_offer, transport_rx, mut ice_rx) = connector.initiate(peer_id).await?;

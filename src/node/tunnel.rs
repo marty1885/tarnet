@@ -487,6 +487,34 @@ impl Node {
         Ok(channel_id)
     }
 
+    /// Open a channel using a pre-computed 32-byte port hash.
+    pub async fn channel_open_port(
+        &self,
+        dest: &PeerId,
+        port: [u8; 32],
+        reliable: bool,
+        ordered: bool,
+    ) -> Result<u32> {
+        use rand::Rng;
+        let channel_id: u32 = rand::thread_rng().gen();
+        let ch = Channel::new(channel_id, port, reliable, ordered);
+
+        self.channels
+            .lock()
+            .await
+            .insert(channel_id, (*dest, ch));
+
+        let open = ChannelOpenMsg {
+            channel_id,
+            port,
+            reliable,
+            ordered,
+        };
+        let inner = open.to_wire().encode();
+        self.send_tunnel_data(dest, &inner).await?;
+        Ok(channel_id)
+    }
+
     /// Open a reliable channel and return a receiver for incoming data on it.
     /// Used for internal protocols (e.g., WebRTC signaling) that need bidirectional
     /// communication on a channel without going through app_tx.
@@ -498,6 +526,20 @@ impl Node {
         ordered: bool,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
         let channel_id = self.channel_open(dest, port_name, reliable, ordered).await?;
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        self.channel_data_handlers.lock().await.insert(channel_id, data_tx);
+        Ok((channel_id, data_rx))
+    }
+
+    /// Like `channel_open_with_handler` but takes a pre-computed port hash.
+    pub async fn channel_open_with_handler_port(
+        &self,
+        dest: &PeerId,
+        port: [u8; 32],
+        reliable: bool,
+        ordered: bool,
+    ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
+        let channel_id = self.channel_open_port(dest, port, reliable, ordered).await?;
         let (data_tx, data_rx) = mpsc::unbounded_channel();
         self.channel_data_handlers.lock().await.insert(channel_id, data_tx);
         Ok((channel_id, data_rx))
