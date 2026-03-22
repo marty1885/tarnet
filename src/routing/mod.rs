@@ -69,6 +69,7 @@ impl RoutingTable {
     }
 
     /// Number of distinct destinations in the table.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.routes.len()
     }
