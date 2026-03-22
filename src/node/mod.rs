@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use std::collections::HashSet;
 
 use crate::firewall::{self as firewall, Firewall};
+use crate::governor::{Governor, GovernorConfig, Verdict};
 
 use crate::channel::Channel;
 use crate::circuit::{
@@ -295,6 +296,9 @@ pub struct Node {
     mainline_enabled: bool,
     /// Optional stateful firewall for inbound message filtering.
     firewall: Mutex<Option<Firewall>>,
+    /// Resource governor: per-link-peer budgeting, strike system, circuit rate limiting.
+    /// Always-on core infrastructure (unlike the optional firewall).
+    governor: Mutex<Governor>,
     /// Per-circuit relay cell queues: ensures cells on the same circuit are
     /// processed in FIFO order rather than racing in spawned tasks.
     /// Key: (circuit_id, from_peer) → sender into that circuit's processing task.
@@ -485,6 +489,7 @@ impl Node {
             #[cfg(feature = "mainline-bootstrap")]
             mainline_enabled: false,
             firewall: Mutex::new(None),
+            governor: Mutex::new(Governor::new(GovernorConfig::default())),
             circuit_relay_queues: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(crate::stats::StatsRegistry::new()),
             bandwidth: Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0)),
@@ -1034,6 +1039,17 @@ impl Node {
             }
         });
 
+        // Periodic governor tick: decay strikes, update pressure, drain reports.
+        let gov_ref = node_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(crate::governor::GOVERNOR_TICK_INTERVAL);
+            loop {
+                interval.tick().await;
+                let ct_len = gov_ref.circuit_table.lock().await.len();
+                gov_ref.governor.lock().await.tick(ct_len);
+            }
+        });
+
         // Periodic DHT expiry
         let dht_ref = self.dht_store.clone();
         let watches_ref = self.dht_watches.clone();
@@ -1357,6 +1373,18 @@ impl Node {
                             }
                         }
                     }
+                    // Resource governor: per-link-peer budgeting.
+                    {
+                        let circuits_for_peer = self.circuit_table.lock().await
+                            .circuits_per_peer()
+                            .get(&from)
+                            .copied()
+                            .unwrap_or(0);
+                        let mut gov = self.governor.lock().await;
+                        if gov.evaluate(&from, msg.msg_type, circuits_for_peer) == Verdict::Shed {
+                            continue;
+                        }
+                    }
                     // Update link activity timestamp for keepalive tracking
                     self.links.lock().await.touch_recv(&from, msg_link_id);
 
@@ -1452,6 +1480,7 @@ impl Node {
         }
 
         if is_first {
+            self.governor.lock().await.peer_connected(peer_id);
             self.routing_table.lock().await.add_neighbor(peer_id);
             let dht_id = dht_id_from_peer_id(&peer_id);
             self.kbucket.lock().await.insert(peer_id, dht_id);
@@ -1634,6 +1663,7 @@ impl Node {
         // are unaffected. If this was the last link, full peer cleanup runs.
         let peer_gone = self.links.lock().await.remove_link(&peer_id, link_id);
         if peer_gone {
+            self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
             self.circuit_table.lock().await.remove_peer(&peer_id);
@@ -1649,6 +1679,7 @@ impl Node {
         log::info!("Link down: {:?} (link_id={})", peer_id, link_id);
         let peer_gone = self.links.lock().await.remove_link(&peer_id, link_id);
         if peer_gone {
+            self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
             // Clean up all circuits involving this peer

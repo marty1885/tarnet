@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod channel;
 pub mod circuit;
 pub mod firewall;
+pub mod governor;
 pub(crate) mod crypto;
 pub mod dht;
 pub mod identity;
