@@ -34,7 +34,7 @@ use crate::pubkey_cache::PubkeyCache;
 use crate::routing::dv;
 use tarnet_api::types::SigningAlgo;
 use crate::routing::RoutingTable;
-use crate::state::{PersistedIdentity, PersistedRecord, PersistedRepublishEntry, StateDb, StorageLimits};
+use crate::state::{PersistedIdentity, PersistedRecord, StateDb, StorageLimits};
 use crate::bootstrap;
 use crate::transport::Discovery;
 use crate::transport::webrtc::WebRtcConnector;
@@ -232,9 +232,6 @@ pub struct Node {
     query_tokens: Arc<Mutex<HashMap<[u8; 32], (PeerId, Instant)>>>,
     /// Monotonically increasing sequence number for signed content records.
     signed_content_sequence: Arc<Mutex<u64>>,
-    /// Records registered for periodic republishing: (plaintext, ttl_secs).
-    /// The node re-signs and re-publishes these on each republish cycle.
-    republish_registry: Arc<Mutex<Vec<(Vec<u8>, u32)>>>,
     /// Circuit forwarding table.
     circuit_table: Arc<Mutex<CircuitTable>>,
     /// Outbound circuits we initiated (keyed by first_hop_circuit_id).
@@ -354,11 +351,11 @@ fn restore_keypair_from_persisted(entry: &crate::state::PersistedIdentity) -> Ke
 
 impl Node {
     pub fn new(identity: Keypair) -> Self {
-        Self::build(identity, Vec::new(), Vec::new(), Vec::new(), 0, 0, StorageLimits::default(), None)
+        Self::build(identity, Vec::new(), Vec::new(), 0, 0, StorageLimits::default(), None)
     }
 
     /// Create a node backed by a persistent `StateDb`.
-    /// Loads identities, DHT records, republish registry, and metadata from the database.
+    /// Loads identities, DHT records, and metadata from the database.
     pub fn with_db(
         identity: Keypair,
         db: Arc<StateDb>,
@@ -366,18 +363,16 @@ impl Node {
     ) -> Self {
         let identities = db.load_identities().unwrap_or_default();
         let dht_records = db.load_dht_records().unwrap_or_default();
-        let republish = db.load_republish_registry().unwrap_or_default();
         let hello_seq = db.get_metadata("hello_sequence").unwrap_or(None).unwrap_or(0);
         let sc_seq = db.get_metadata("signed_content_sequence").unwrap_or(None).unwrap_or(0);
 
-        Self::build(identity, identities, dht_records, republish, hello_seq, sc_seq, storage_limits, Some(db))
+        Self::build(identity, identities, dht_records, hello_seq, sc_seq, storage_limits, Some(db))
     }
 
     fn build(
         identity: Keypair,
         identities: Vec<PersistedIdentity>,
         dht_records: Vec<PersistedRecord>,
-        republish: Vec<PersistedRepublishEntry>,
         hello_seq: u64,
         sc_seq: u64,
         storage_limits: StorageLimits,
@@ -434,10 +429,6 @@ impl Node {
         let (circuit_drop_tx, circuit_drop_rx) = mpsc::unbounded_channel();
         let mut dht_store = DhtStore::with_limits(&peer_id, storage_limits);
         dht_store.import_records(dht_records);
-        let republish_registry = republish
-            .into_iter()
-            .map(|entry| (entry.value, entry.ttl_secs))
-            .collect();
         Self {
             identity: Arc::new(identity),
             max_inbound: 128,
@@ -467,7 +458,6 @@ impl Node {
             kbucket: Arc::new(Mutex::new(KBucketTable::new(&peer_id))),
             query_tokens: Arc::new(Mutex::new(HashMap::new())),
             signed_content_sequence: Arc::new(Mutex::new(sc_seq)),
-            republish_registry: Arc::new(Mutex::new(republish_registry)),
             circuit_table: Arc::new(Mutex::new(CircuitTable::new())),
             circuit_drop_tx,
             circuit_drop_rx: Mutex::new(Some(circuit_drop_rx)),
@@ -1345,100 +1335,6 @@ impl Node {
                 }
                 drop(kb);
                 log::debug!("Replication maintenance complete");
-            }
-        });
-
-        // Periodic signed content republishing
-        let repub_registry = self.republish_registry.clone();
-        let repub_identity = self.identity.clone();
-        let repub_dht = self.dht_store.clone();
-        let repub_links = self.links.clone();
-        let repub_kbucket = self.kbucket.clone();
-        let repub_seq = self.signed_content_sequence.clone();
-        let repub_db = self.db.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(HELLO_PUBLISH_INTERVAL);
-            loop {
-                interval.tick().await;
-                let entries = repub_registry.lock().await.clone();
-                for (value, ttl_secs) in &entries {
-                    let (key, blob) = crate::dht::content_address_put(value);
-                    let mut seq = repub_seq.lock().await;
-                    *seq += 1;
-                    let sequence = *seq;
-                    if let Some(ref db) = repub_db {
-                        let _ = db.set_metadata("signed_content_sequence", sequence);
-                    }
-                    drop(seq);
-
-                    let signer = *repub_identity.peer_id().as_bytes();
-                    let mut bloom = BloomFilter::new();
-                    bloom.insert(&repub_identity.peer_id());
-                    let mut put = DhtPutMsg {
-                        key: *key.as_bytes(),
-                        record_type: RecordType::SignedContent,
-                        sequence,
-                        signer,
-                        ttl: *ttl_secs,
-                        value: blob.clone(),
-                        signature: Vec::new(),
-                        signer_algo: repub_identity.identity.signing.algo() as u8,
-                        signer_pubkey: repub_identity.identity.signing.signing_pubkey_bytes(),
-                        hop_count: 0,
-                        hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-                        bloom: bloom.to_bytes(),
-                    };
-                    put.signature = repub_identity.sign(&put.signable_bytes());
-
-                    let record = crate::dht::DhtRecord {
-                        key,
-                        record_type: RecordType::SignedContent,
-                        sequence,
-                        signer,
-                        signer_algo: put.signer_algo,
-                        signer_pubkey: put.signer_pubkey.clone(),
-                        value: blob,
-                        ttl: Duration::from_secs(*ttl_secs as u64),
-                        stored_at: std::time::Instant::now(),
-                        signature: put.signature.clone(),
-                    };
-                    if let Some(ref db) = repub_db {
-                        if let Some(pr) = PersistedRecord::from_live(&record) {
-                            let _ = db.upsert_dht_record(&pr);
-                        }
-                    }
-                    repub_dht.lock().await.put(record);
-
-                    let kb = repub_kbucket.lock().await;
-                    let all_peers = kb.all_peers();
-                    let l2nse = kb.estimate_l2nse();
-                    drop(kb);
-                    let repub_params = DhtQueryParams::from_l2nse(l2nse);
-                    put.hop_limit = repub_params.hop_limit;
-                    let targets = probabilistic_select(&key, &all_peers, repub_params.fan_out);
-
-                    let encoded = put.to_wire().encode();
-                    let links = repub_links.lock().await;
-                    if targets.is_empty() {
-                        for (_, link) in links.iter() {
-                            let _ = link.send_message(&encoded).await;
-                        }
-                    } else {
-                        for (pid, _) in &targets {
-                            if let Some(link) = links.get(pid) {
-                                let _ = link.send_message(&encoded).await;
-                            }
-                        }
-                        for (pid, link) in links.iter() {
-                            if !targets.iter().any(|(p, _)| p == pid) {
-                                let _ = link.send_message(&encoded).await;
-                            }
-                        }
-                    }
-                }
-                if !entries.is_empty() {
-                    log::debug!("Republished {} signed content records", entries.len());
-                }
             }
         });
 

@@ -345,30 +345,6 @@ impl Node {
         Ok(())
     }
 
-    /// Register a value for periodic republishing as signed content.
-    /// The node will re-sign and re-publish this value on each republish cycle,
-    /// keeping it alive in the DHT as long as this node is running.
-    pub async fn register_signed_content_republish(&self, value: Vec<u8>, ttl_secs: u32) {
-        if let Some(db) = &self.db {
-            let _ = db.save_republish_entry(&PersistedRepublishEntry {
-                value: value.clone(),
-                ttl_secs,
-            });
-        }
-        self.republish_registry.lock().await.push((value, ttl_secs));
-    }
-
-    /// Unregister a value from periodic republishing.
-    pub async fn unregister_signed_content_republish(&self, value: &[u8]) {
-        if let Some(db) = &self.db {
-            let _ = db.remove_republish_entry(value);
-        }
-        self.republish_registry
-            .lock()
-            .await
-            .retain(|(v, _)| v != value);
-    }
-
     // ── TNS support: arbitrary-key DHT operations ──
 
     /// Store signed content at an arbitrary DHT key (not content-addressed).

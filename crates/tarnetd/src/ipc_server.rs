@@ -284,8 +284,8 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            let hash = api.dht_put_content(&value).await;
-            ok_response(request_id, &encode_payload(&DhtId(hash)))
+            let hash = api.dht_put(&value).await;
+            ok_response(request_id, &encode_payload(&hash))
         }
 
         METHOD_DHT_GET_CONTENT => {
@@ -293,7 +293,7 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.dht_get_content(hash.as_bytes(), timeout_secs).await {
+            match api.dht_get(&hash, timeout_secs).await {
                 Some(data) => ok_response(request_id, &encode_payload(&serde_bytes::ByteBuf::from(data))),
                 None => not_found_response(request_id),
             }
@@ -304,8 +304,8 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            let hash = api.dht_put_signed_content(&req.value, req.ttl_secs, req.republish).await;
-            ok_response(request_id, &encode_payload(&DhtId(hash)))
+            let hash = api.dht_put_signed(&req.value, req.ttl_secs).await;
+            ok_response(request_id, &encode_payload(&hash))
         }
 
         METHOD_DHT_GET_SIGNED => {
@@ -313,21 +313,12 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            let results = api.dht_get_signed_content(hash.as_bytes(), timeout_secs).await;
+            let results = api.dht_get_signed(&hash, timeout_secs).await;
             let entries: Vec<SignedContentEntry> = results
                 .into_iter()
-                .map(|(signer, data)| SignedContentEntry { signer, data })
+                .map(|e| SignedContentEntry { signer: e.signer, data: e.data })
                 .collect();
             ok_response(request_id, &encode_payload(&entries))
-        }
-
-        METHOD_UNREGISTER_REPUBLISH => {
-            let value: serde_bytes::ByteBuf = match decode_payload(payload) {
-                Ok(v) => v,
-                Err(e) => return err_response(request_id, &e.to_string()),
-            };
-            api.unregister_republish(&value).await;
-            ok_response(request_id, &[])
         }
 
         METHOD_LOOKUP_HELLO => {

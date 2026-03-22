@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::ipc::*;
 use tarnet_api::service::{
-    Connection, HelloInfo, NodeEvent, ServiceApi, TnsRecord, TnsResolution,
+    Connection, DhtEntry, HelloInfo, NodeEvent, ServiceApi, TnsRecord, TnsResolution,
 };
 use tarnet_api::types::{DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo};
 
@@ -362,22 +362,21 @@ impl ServiceApi for IpcServiceApi {
 
     // ── DHT: content-addressed ──
 
-    async fn dht_put_content(&self, value: &[u8]) -> [u8; 64] {
+    async fn dht_put(&self, value: &[u8]) -> DhtId {
         let payload = encode_payload(&serde_bytes::ByteBuf::from(value.to_vec()));
         let (_, resp) = self
             .request(METHOD_DHT_PUT_CONTENT, &payload)
             .await
             .unwrap();
-        let hash: DhtId = decode_payload(&resp).unwrap();
-        *hash.as_bytes()
+        decode_payload(&resp).unwrap()
     }
 
-    async fn dht_get_content(
+    async fn dht_get(
         &self,
-        inner_hash: &[u8; 64],
+        key: &DhtId,
         timeout_secs: u32,
     ) -> Option<Vec<u8>> {
-        let payload = encode_payload(&(DhtId(*inner_hash), timeout_secs));
+        let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
         let (status, resp) = self
             .request_with_timeout(METHOD_DHT_GET_CONTENT, &payload, timeout)
@@ -392,15 +391,13 @@ impl ServiceApi for IpcServiceApi {
 
     // ── DHT: signed content ──
 
-    async fn dht_put_signed_content(
+    async fn dht_put_signed(
         &self,
         value: &[u8],
         ttl_secs: u32,
-        republish: bool,
-    ) -> [u8; 64] {
+    ) -> DhtId {
         let req = DhtPutSignedReq {
             ttl_secs,
-            republish,
             value: value.to_vec(),
         };
         let payload = encode_payload(&req);
@@ -408,16 +405,15 @@ impl ServiceApi for IpcServiceApi {
             .request(METHOD_DHT_PUT_SIGNED, &payload)
             .await
             .unwrap();
-        let hash: DhtId = decode_payload(&resp).unwrap();
-        *hash.as_bytes()
+        decode_payload(&resp).unwrap()
     }
 
-    async fn dht_get_signed_content(
+    async fn dht_get_signed(
         &self,
-        inner_hash: &[u8; 64],
+        key: &DhtId,
         timeout_secs: u32,
-    ) -> Vec<(PeerId, Vec<u8>)> {
-        let payload = encode_payload(&(DhtId(*inner_hash), timeout_secs));
+    ) -> Vec<DhtEntry> {
+        let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
         let (status, resp) = match self
             .request_with_timeout(METHOD_DHT_GET_SIGNED, &payload, timeout)
@@ -435,13 +431,8 @@ impl ServiceApi for IpcServiceApi {
         };
         entries
             .into_iter()
-            .map(|e| (e.signer, e.data))
+            .map(|e| DhtEntry { signer: e.signer, data: e.data })
             .collect()
-    }
-
-    async fn unregister_republish(&self, value: &[u8]) {
-        let payload = encode_payload(&serde_bytes::ByteBuf::from(value.to_vec()));
-        let _ = self.request(METHOD_UNREGISTER_REPUBLISH, &payload).await;
     }
 
     // ── DHT: hello records ──

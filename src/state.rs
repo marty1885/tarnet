@@ -76,12 +76,6 @@ impl PersistedRecord {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PersistedRepublishEntry {
-    pub value: Vec<u8>,
-    pub ttl_secs: u32,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistedIdentity {
     pub label: String,
@@ -153,11 +147,6 @@ impl StateDb {
                  signer_algo INTEGER NOT NULL DEFAULT 1,
                  signer_pubkey BLOB NOT NULL DEFAULT X'',
                  PRIMARY KEY (key, signer)
-             );
-             CREATE TABLE IF NOT EXISTS republish_registry (
-                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                 value BLOB NOT NULL,
-                 ttl_secs INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS tns_labels (
                  label TEXT PRIMARY KEY,
@@ -408,55 +397,6 @@ impl StateDb {
         Ok(())
     }
 
-    // ── Republish Registry ──
-
-    pub fn load_republish_registry(&self) -> Result<Vec<PersistedRepublishEntry>> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare("SELECT value, ttl_secs FROM republish_registry ORDER BY id ASC")
-            .map_err(sqlite_err)?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(PersistedRepublishEntry {
-                    value: row.get(0)?,
-                    ttl_secs: row.get(1)?,
-                })
-            })
-            .map_err(sqlite_err)?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row.map_err(sqlite_err)?);
-        }
-        Ok(result)
-    }
-
-    pub fn save_republish_entry(&self, entry: &PersistedRepublishEntry) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO republish_registry(value, ttl_secs) VALUES(?1, ?2)",
-            params![entry.value, entry.ttl_secs],
-        )
-        .map_err(sqlite_err)?;
-        Ok(())
-    }
-
-    pub fn clear_republish_registry(&self) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute("DELETE FROM republish_registry", [])
-            .map_err(sqlite_err)?;
-        Ok(())
-    }
-
-    pub fn remove_republish_entry(&self, value: &[u8]) -> Result<()> {
-        let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM republish_registry WHERE value = ?1",
-            params![value],
-        )
-        .map_err(sqlite_err)?;
-        Ok(())
-    }
-
     // ── Labels (TNS local store) ──
 
     pub fn label_set(&self, label: &str, records: &[Vec<u8>], publish: bool) -> Result<()> {
@@ -634,16 +574,6 @@ mod tests {
         let loaded_records = db.load_dht_records().unwrap();
         assert_eq!(loaded_records.len(), 1);
         assert_eq!(loaded_records[0], record);
-
-        // Republish
-        let entry = PersistedRepublishEntry {
-            value: b"topic".to_vec(),
-            ttl_secs: 600,
-        };
-        db.save_republish_entry(&entry).unwrap();
-        let loaded_repub = db.load_republish_registry().unwrap();
-        assert_eq!(loaded_repub.len(), 1);
-        assert_eq!(loaded_repub[0], entry);
 
         // Labels
         let zone_rec = vec![1u8, 0x42, 0x42, 0x42]; // dummy record blob

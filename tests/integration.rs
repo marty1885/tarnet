@@ -898,9 +898,6 @@ async fn node_db_restores_sequences_and_records() {
         StorageLimits::default(),
     );
 
-    original
-        .register_signed_content_republish(b"topic".to_vec(), 300)
-        .await;
     original.publish_hello().await;
     let signed_hash = original.dht_put_signed_content(b"payload", 300).await;
 
@@ -922,7 +919,6 @@ async fn node_db_restores_sequences_and_records() {
         Some(1)
     );
     assert!(db.get_metadata("signed_content_sequence").unwrap().unwrap() >= 1);
-    assert_eq!(db.load_republish_registry().unwrap().len(), 1);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{}-wal", path.display()));

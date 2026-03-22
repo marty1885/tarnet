@@ -101,9 +101,6 @@ enum DhtCommand {
         /// Time-to-live in seconds
         #[arg(long, default_value_t = 3600)]
         ttl: u32,
-        /// Daemon periodically re-publishes the content
-        #[arg(long)]
-        republish: bool,
     },
     /// Retrieve signed content from the DHT
     #[command(arg_required_else_help = true)]
@@ -418,13 +415,14 @@ async fn cmd_dht(cli: &Cli, cmd: &DhtCommand) {
 
     match cmd {
         DhtCommand::Put { value } => {
-            let inner_hash = client.dht_put_content(value.as_bytes()).await;
-            println!("{}", hex_encode(&inner_hash));
+            let hash = client.dht_put(value.as_bytes()).await;
+            println!("{}", hex_encode(hash.as_bytes()));
         }
         DhtCommand::Get { hash } => {
             let inner_hash = parse_dht_hash(hash);
+            let key = tarnet_api::types::DhtId(inner_hash);
 
-            match client.dht_get_content(&inner_hash, 30).await {
+            match client.dht_get(&key, 30).await {
                 Some(data) => match String::from_utf8(data.clone()) {
                     Ok(s) => println!("{}", s),
                     Err(_) => {
@@ -438,28 +436,26 @@ async fn cmd_dht(cli: &Cli, cmd: &DhtCommand) {
                 }
             }
         }
-        DhtCommand::PutSigned { value, ttl, republish } => {
-            let inner_hash = client.dht_put_signed_content(value.as_bytes(), *ttl, *republish).await;
-            println!("{}", hex_encode(&inner_hash));
-            if *republish {
-                eprintln!("Daemon will republish every {}s", ttl);
-            }
+        DhtCommand::PutSigned { value, ttl } => {
+            let hash = client.dht_put_signed(value.as_bytes(), *ttl).await;
+            println!("{}", hex_encode(hash.as_bytes()));
         }
         DhtCommand::GetSigned { hash } => {
             let inner_hash = parse_dht_hash(hash);
+            let key = tarnet_api::types::DhtId(inner_hash);
 
-            let results = client.dht_get_signed_content(&inner_hash, 30).await;
+            let results = client.dht_get_signed(&key, 30).await;
             if results.is_empty() {
                 eprintln!("Timeout: signed content not found");
                 std::process::exit(1);
             }
-            for (signer, data) in &results {
-                print!("[{}] ", signer);
-                match String::from_utf8(data.clone()) {
+            for entry in &results {
+                print!("[{}] ", entry.signer);
+                match String::from_utf8(entry.data.clone()) {
                     Ok(s) => println!("{}", s),
                     Err(_) => {
                         use std::io::Write;
-                        std::io::stdout().write_all(data).unwrap();
+                        std::io::stdout().write_all(&entry.data).unwrap();
                         println!();
                     }
                 }

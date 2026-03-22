@@ -5,6 +5,14 @@ use tokio::sync::mpsc;
 use crate::error::{ApiError, ApiResult};
 use crate::types::{DhtId, PeerId, ServiceId};
 
+/// A single entry returned from a signed DHT get.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DhtEntry {
+    pub signer: PeerId,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+}
+
 /// Simplified hello record for the API surface.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloInfo {
@@ -230,25 +238,21 @@ pub trait ServiceApi: Send + Sync {
 
     // ── DHT: content-addressed (anonymous, self-authenticating) ──
 
-    /// Store content in the DHT. Returns the inner hash (BLAKE2b of value).
-    async fn dht_put_content(&self, value: &[u8]) -> [u8; 64];
+    /// Store content in the DHT. Returns the inner hash (BLAKE3 of value).
+    async fn dht_put(&self, value: &[u8]) -> DhtId;
 
     /// Retrieve content by inner hash. Checks local store first, then queries
     /// the network if `timeout_secs > 0`. Returns None if not found.
-    async fn dht_get_content(&self, inner_hash: &[u8; 64], timeout_secs: u32) -> Option<Vec<u8>>;
+    async fn dht_get(&self, key: &DhtId, timeout_secs: u32) -> Option<Vec<u8>>;
 
     // ── DHT: signed content (publisher-authenticated) ──
 
-    /// Store signed content. Returns inner hash. If `republish` is true,
-    /// the daemon will periodically re-sign and re-publish the content.
-    async fn dht_put_signed_content(&self, value: &[u8], ttl_secs: u32, republish: bool) -> [u8; 64];
+    /// Store signed content. Returns inner hash.
+    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> DhtId;
 
-    /// Retrieve signed content by inner hash. Returns (signer, plaintext) pairs.
+    /// Retrieve signed content by inner hash. Returns entries with signer and plaintext.
     /// Checks local store first, queries network if `timeout_secs > 0`.
-    async fn dht_get_signed_content(&self, inner_hash: &[u8; 64], timeout_secs: u32) -> Vec<(PeerId, Vec<u8>)>;
-
-    /// Stop republishing content.
-    async fn unregister_republish(&self, value: &[u8]);
+    async fn dht_get_signed(&self, key: &DhtId, timeout_secs: u32) -> Vec<DhtEntry>;
 
     // ── DHT: hello records (peer discovery) ──
 

@@ -14,7 +14,7 @@ use tarnet::state::StateDb;
 use tarnet::tns;
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::service::{
-    Connection, HelloInfo, NodeEvent, ServiceApi, TnsRecord, TnsResolution, WatchEvent,
+    Connection, DhtEntry, HelloInfo, NodeEvent, ServiceApi, TnsRecord, TnsResolution, WatchEvent,
 };
 use tarnet_api::types::{DhtId, PeerId, ServiceId};
 
@@ -289,11 +289,13 @@ impl ServiceApi for LocalServiceApi {
             .map_err(map_err)
     }
 
-    async fn dht_put_content(&self, value: &[u8]) -> [u8; 64] {
-        self.node.dht_put_content(value).await
+    async fn dht_put(&self, value: &[u8]) -> DhtId {
+        DhtId(self.node.dht_put_content(value).await)
     }
 
-    async fn dht_get_content(&self, inner_hash: &[u8; 64], timeout_secs: u32) -> Option<Vec<u8>> {
+    async fn dht_get(&self, key: &DhtId, timeout_secs: u32) -> Option<Vec<u8>> {
+        let inner_hash = key.as_bytes();
+
         // Check local store first.
         if let Some(data) = self.node.dht_get_content(inner_hash).await {
             return Some(data);
@@ -321,30 +323,21 @@ impl ServiceApi for LocalServiceApi {
         }
     }
 
-    async fn dht_put_signed_content(
-        &self,
-        value: &[u8],
-        ttl_secs: u32,
-        republish: bool,
-    ) -> [u8; 64] {
-        let hash = self.node.dht_put_signed_content(value, ttl_secs).await;
-        if republish {
-            self.node
-                .register_signed_content_republish(value.to_vec(), ttl_secs)
-                .await;
-        }
-        hash
+    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> DhtId {
+        DhtId(self.node.dht_put_signed_content(value, ttl_secs).await)
     }
 
-    async fn dht_get_signed_content(
+    async fn dht_get_signed(
         &self,
-        inner_hash: &[u8; 64],
+        key: &DhtId,
         timeout_secs: u32,
-    ) -> Vec<(PeerId, Vec<u8>)> {
+    ) -> Vec<DhtEntry> {
+        let inner_hash = key.as_bytes();
+
         // Check local store first.
         let results = self.node.dht_get_signed_content(inner_hash).await;
         if !results.is_empty() {
-            return results;
+            return results.into_iter().map(|(signer, data)| DhtEntry { signer, data }).collect();
         }
 
         if timeout_secs == 0 {
@@ -362,16 +355,12 @@ impl ServiceApi for LocalServiceApi {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let results = self.node.dht_get_signed_content(inner_hash).await;
             if !results.is_empty() {
-                return results;
+                return results.into_iter().map(|(signer, data)| DhtEntry { signer, data }).collect();
             }
             if tokio::time::Instant::now() >= deadline {
                 return Vec::new();
             }
         }
-    }
-
-    async fn unregister_republish(&self, value: &[u8]) {
-        self.node.unregister_signed_content_republish(value).await
     }
 
     async fn lookup_hello(&self, peer_id: &PeerId, timeout_secs: u32) -> Option<HelloInfo> {

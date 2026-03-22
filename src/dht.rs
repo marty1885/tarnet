@@ -121,8 +121,13 @@ impl DhtStore {
                 upsert_by_signer(entries, record, true);
             }
             RecordType::Content => {
-                // First write wins
-                if entries.is_empty() {
+                // Keep up to N candidates to resist poisoning attacks.
+                // The authentic record is identified at retrieval time via
+                // content-address decryption; storage nodes cannot verify.
+                const MAX_CONTENT_CANDIDATES: usize = 5;
+                if entries.len() < MAX_CONTENT_CANDIDATES
+                    && !entries.iter().any(|r| r.value == record.value)
+                {
                     entries.push(record);
                 }
             }
@@ -1228,7 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn content_first_write_wins() {
+    fn content_keeps_multiple_candidates() {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xEE; 64]);
@@ -1257,8 +1262,23 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
-        assert_eq!(store.get(&key).len(), 1);
-        assert_eq!(store.get(&key)[0].value, b"first");
+        // Both candidates kept (anti-poisoning)
+        assert_eq!(store.get(&key).len(), 2);
+
+        // Duplicate values are deduplicated
+        store.put(DhtRecord {
+            key,
+            record_type: RecordType::Content,
+            sequence: 0,
+            signer: [0u8; 32],
+            value: b"first".to_vec(),
+            ttl: Duration::from_secs(3600),
+            stored_at: Instant::now(),
+            signer_algo: 1,
+            signer_pubkey: vec![],
+            signature: vec![0u8; 64],
+        });
+        assert_eq!(store.get(&key).len(), 2);
     }
 
     #[test]

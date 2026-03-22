@@ -36,8 +36,6 @@ pub const METHOD_REQUEST_CONTENT: u16 = 0x0012;
 pub const METHOD_DHT_PUT_SIGNED: u16 = 0x0013;
 pub const METHOD_DHT_GET_SIGNED: u16 = 0x0014;
 pub const METHOD_REQUEST_SIGNED: u16 = 0x0015;
-pub const METHOD_REGISTER_REPUBLISH: u16 = 0x0016;
-pub const METHOD_UNREGISTER_REPUBLISH: u16 = 0x0017;
 pub const METHOD_LOOKUP_HELLO: u16 = 0x0020;
 pub const METHOD_REQUEST_HELLO: u16 = 0x0021;
 pub const METHOD_DHT_WATCH: u16 = 0x0030;
@@ -265,9 +263,9 @@ pub async fn recv_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> ApiResult<Ip
 // ── Version handshake ──
 
 /// IPC protocol version. Increment when making breaking changes.
-pub const IPC_VERSION: u16 = 3;
+pub const IPC_VERSION: u16 = 4;
 /// Minimum IPC version we can talk to.
-pub const IPC_MIN_VERSION: u16 = 3;
+pub const IPC_MIN_VERSION: u16 = 4;
 /// Magic bytes for version handshake.
 pub const IPC_MAGIC: &[u8; 4] = b"TNET";
 
@@ -368,7 +366,6 @@ pub struct SendDataReq {
 #[derive(Serialize, Deserialize)]
 pub struct DhtPutSignedReq {
     pub ttl_secs: u32,
-    pub republish: bool,
     #[serde(with = "serde_bytes")]
     pub value: Vec<u8>,
 }

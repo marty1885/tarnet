@@ -567,7 +567,7 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tarnet_api::error::{ApiError, ApiResult};
-    use tarnet_api::service::{Connection, HelloInfo, NodeEvent, TnsResolution};
+    use tarnet_api::service::{Connection, DhtEntry, HelloInfo, NodeEvent, TnsResolution};
     use tarnet_api::types::{DhtId, IdentityScheme, KemAlgo, PeerId, SigningAlgo};
     use tokio::sync::mpsc;
 
@@ -617,11 +617,10 @@ mod tests {
             Ok(())
         }
 
-        async fn dht_put_content(&self, _: &[u8]) -> [u8; 64] { [0; 64] }
-        async fn dht_get_content(&self, _: &[u8; 64], _: u32) -> Option<Vec<u8>> { None }
-        async fn dht_put_signed_content(&self, _: &[u8], _: u32, _: bool) -> [u8; 64] { [0; 64] }
-        async fn dht_get_signed_content(&self, _: &[u8; 64], _: u32) -> Vec<(PeerId, Vec<u8>)> { vec![] }
-        async fn unregister_republish(&self, _: &[u8]) {}
+        async fn dht_put(&self, _: &[u8]) -> DhtId { DhtId([0; 64]) }
+        async fn dht_get(&self, _: &DhtId, _: u32) -> Option<Vec<u8>> { None }
+        async fn dht_put_signed(&self, _: &[u8], _: u32) -> DhtId { DhtId([0; 64]) }
+        async fn dht_get_signed(&self, _: &DhtId, _: u32) -> Vec<DhtEntry> { vec![] }
         async fn lookup_hello(&self, _: &PeerId, _: u32) -> Option<HelloInfo> { None }
         async fn dht_watch(&self, _: &DhtId, _: u32) {}
         async fn dht_unwatch(&self, _: &DhtId) {}
