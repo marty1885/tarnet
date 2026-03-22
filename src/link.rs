@@ -11,7 +11,10 @@ use crate::crypto::kdf;
 use crate::identity::{self, peer_id_from_signing_pubkey, KemKeypair, Keypair};
 use crate::transport::Transport;
 use crate::types::{Error, PeerId, Result};
-use crate::wire::{HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage};
+use crate::wire::{
+    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage,
+    WIRE_VERSION_MAX, WIRE_VERSION_MIN,
+};
 use tarnet_api::types::{KemAlgo, SigningAlgo};
 
 /// Outbound cells buffered per link before dropping.
@@ -162,6 +165,19 @@ fn compute_confirm_hash(shared_secret: &[u8; 32], is_initiator: bool) -> [u8; 32
     blake3::derive_key(context, shared_secret)
 }
 
+/// Negotiate the wire protocol version from both sides' supported ranges.
+/// Returns the highest mutually supported version, or an error if incompatible.
+fn negotiate_version(my_min: u8, my_max: u8, peer_min: u8, peer_max: u8) -> Result<u8> {
+    let negotiated = my_max.min(peer_max);
+    if negotiated < my_min || negotiated < peer_min {
+        return Err(Error::Wire(format!(
+            "version negotiation failed: my [{}-{}] vs peer [{}-{}]",
+            my_min, my_max, peer_min, peer_max,
+        )));
+    }
+    Ok(negotiated)
+}
+
 /// Get current unix timestamp in seconds.
 fn unix_timestamp() -> u64 {
     SystemTime::now()
@@ -188,6 +204,8 @@ pub struct PeerLink {
     identity: std::sync::Arc<Keypair>,
     /// Negotiated KEM algorithm for rekey exchanges.
     rekey_kem_algo: KemAlgo,
+    /// Negotiated wire protocol version for this link.
+    negotiated_version: u8,
     _drain_task: tokio::task::JoinHandle<()>,
     /// Transport name captured at construction for status display.
     transport_name: &'static str,
@@ -226,6 +244,8 @@ impl PeerLink {
             timestamp,
             challenge,
             eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
+            min_version: WIRE_VERSION_MIN,
+            max_version: WIRE_VERSION_MAX,
         };
         let msg = my_hello.to_wire().encode();
         transport.send(&msg).await?;
@@ -235,6 +255,12 @@ impl PeerLink {
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
+
+        // Negotiate wire protocol version
+        let negotiated_version = negotiate_version(
+            WIRE_VERSION_MIN, WIRE_VERSION_MAX,
+            peer_hello.min_version, peer_hello.max_version,
+        )?;
 
         // Validate timestamp
         let now = unix_timestamp();
@@ -276,7 +302,9 @@ impl PeerLink {
         // Derive session keys
         let crypto = LinkCrypto::derive(&shared_bytes, true);
 
-        // Sign transcript (includes both KEM ciphertexts to bind PQ exchanges)
+        // Sign transcript (includes both KEM ciphertexts and version ranges)
+        let my_ver = (WIRE_VERSION_MIN, WIRE_VERSION_MAX);
+        let peer_ver = (peer_hello.min_version, peer_hello.max_version);
         let transcript = Self::compute_transcript(
             &my_hello.ephemeral_pubkey,
             &peer_hello.ephemeral_pubkey,
@@ -288,6 +316,8 @@ impl PeerLink {
             &peer_hello.challenge,
             &static_kem_ct,
             &eph_kem_ct,
+            my_ver,
+            peer_ver,
         );
         let sig = identity.sign(&transcript);
         let auth = HandshakeAuth {
@@ -313,6 +343,8 @@ impl PeerLink {
             &my_hello.challenge,
             &[], // responder's auth has no KEM ciphertext
             &[], // responder's auth has no ephemeral KEM ciphertext
+            peer_ver,
+            my_ver,
         );
         let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
             .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
@@ -345,7 +377,7 @@ impl PeerLink {
             return Err(Error::Crypto("key confirmation failed".into()));
         }
 
-        log::info!("Link established (initiator) with {:?}", remote_peer);
+        log::info!("Link established (initiator) with {:?}, wire v{}", remote_peer, negotiated_version);
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
         let (outbound_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
@@ -358,6 +390,7 @@ impl PeerLink {
             remote_signing_pubkey: peer_hello.signing_pubkey,
             is_initiator: true,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
+            negotiated_version,
             identity: std::sync::Arc::new(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap()),
             _drain_task,
             transport_name,
@@ -379,6 +412,12 @@ impl PeerLink {
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
+
+        // Negotiate wire protocol version
+        let negotiated_version = negotiate_version(
+            WIRE_VERSION_MIN, WIRE_VERSION_MAX,
+            peer_hello.min_version, peer_hello.max_version,
+        )?;
 
         // Validate timestamp
         let now = unix_timestamp();
@@ -408,6 +447,8 @@ impl PeerLink {
             timestamp,
             challenge,
             eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
+            min_version: WIRE_VERSION_MIN,
+            max_version: WIRE_VERSION_MAX,
         };
         transport.send(&my_hello.to_wire().encode()).await?;
 
@@ -440,7 +481,9 @@ impl PeerLink {
         // Derive session keys
         let crypto = LinkCrypto::derive(&shared_bytes, false);
 
-        // Verify peer auth signature (transcript includes both KEM ciphertexts)
+        // Verify peer auth signature (transcript includes KEM ciphertexts + version ranges)
+        let peer_ver = (peer_hello.min_version, peer_hello.max_version);
+        let my_ver = (WIRE_VERSION_MIN, WIRE_VERSION_MAX);
         let peer_transcript = Self::compute_transcript(
             &peer_hello.ephemeral_pubkey,
             &my_hello.ephemeral_pubkey,
@@ -452,6 +495,8 @@ impl PeerLink {
             &my_hello.challenge,
             &peer_auth.kem_ciphertext,
             &peer_auth.eph_kem_ciphertext,
+            peer_ver,
+            my_ver,
         );
         let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
             .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
@@ -474,6 +519,8 @@ impl PeerLink {
             &peer_hello.challenge,
             &[], // responder's auth has no KEM ciphertext
             &[], // responder's auth has no ephemeral KEM ciphertext
+            my_ver,
+            peer_ver,
         );
         let sig = identity.sign(&transcript);
         let auth = HandshakeAuth {
@@ -498,7 +545,7 @@ impl PeerLink {
         let confirm = HandshakeConfirmMsg { confirm_hash };
         transport.send(&confirm.to_wire().encode()).await?;
 
-        log::info!("Link established (responder) with {:?}", remote_peer);
+        log::info!("Link established (responder) with {:?}, wire v{}", remote_peer, negotiated_version);
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
         let (outbound_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
@@ -511,6 +558,7 @@ impl PeerLink {
             remote_signing_pubkey: peer_hello.signing_pubkey,
             is_initiator: false,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
+            negotiated_version,
             identity: std::sync::Arc::new(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap()),
             _drain_task,
             transport_name,
@@ -532,6 +580,8 @@ impl PeerLink {
         peer_challenge: &[u8; 32],
         kem_ciphertext: &[u8],
         eph_kem_ciphertext: &[u8],
+        my_ver_range: (u8, u8),
+        peer_ver_range: (u8, u8),
     ) -> Vec<u8> {
         let label = if is_initiator {
             b"tarnet-handshake-initiator"
@@ -549,6 +599,8 @@ impl PeerLink {
             .update(peer_challenge)
             .update(kem_ciphertext)
             .update(eph_kem_ciphertext)
+            .update(&[my_ver_range.0, my_ver_range.1])
+            .update(&[peer_ver_range.0, peer_ver_range.1])
             .finalize();
         hash.as_bytes().to_vec()
     }
@@ -618,6 +670,11 @@ impl PeerLink {
     /// Transport name (e.g. "tcp", "ws", "webrtc").
     pub fn transport_name(&self) -> &'static str {
         self.transport_name
+    }
+
+    /// Negotiated wire protocol version for this link.
+    pub fn negotiated_version(&self) -> u8 {
+        self.negotiated_version
     }
 
     /// Check if a re-key is needed based on messages sent.

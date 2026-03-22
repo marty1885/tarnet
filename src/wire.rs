@@ -1,6 +1,11 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
-pub const WIRE_VERSION: u8 = 2;
+/// Minimum wire protocol version this node supports.
+pub const WIRE_VERSION_MIN: u8 = 2;
+/// Maximum (current) wire protocol version this node supports.
+pub const WIRE_VERSION_MAX: u8 = 2;
+/// Current wire version used in outgoing messages.
+pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
 pub const MAX_PAYLOAD: usize = 65535;
 
@@ -175,8 +180,11 @@ impl WireMessage {
             return Err(Error::Wire("message too short for header".into()));
         }
         let ver = data[0];
-        if ver != WIRE_VERSION {
-            return Err(Error::Wire(format!("unsupported version: {}", ver)));
+        if ver < WIRE_VERSION_MIN || ver > WIRE_VERSION_MAX {
+            return Err(Error::Wire(format!(
+                "unsupported version: {} (supported {}-{})",
+                ver, WIRE_VERSION_MIN, WIRE_VERSION_MAX,
+            )));
         }
         let msg_type_raw = u16::from_be_bytes([data[1], data[2]]);
         let len = u16::from_be_bytes([data[3], data[4]]) as usize;
@@ -196,7 +204,7 @@ impl WireMessage {
 
 // ── Specific message payload structs ──
 
-/// HandshakeHello: ephemeral(32) || signing_algo(u8) || signing_pk_len(u16 BE) || signing_pk || kem_algo(u8) || kem_pk_len(u16 BE) || kem_pk || timestamp(u64 BE) || challenge(32) || eph_kem_pk_len(u16 BE) || eph_kem_pk
+/// HandshakeHello: ephemeral(32) || signing_algo(u8) || signing_pk_len(u16 BE) || signing_pk || kem_algo(u8) || kem_pk_len(u16 BE) || kem_pk || timestamp(u64 BE) || challenge(32) || eph_kem_pk_len(u16 BE) || eph_kem_pk || min_version(u8) || max_version(u8)
 #[derive(Debug, Clone)]
 pub struct HandshakeHello {
     pub ephemeral_pubkey: [u8; 32],
@@ -208,11 +216,15 @@ pub struct HandshakeHello {
     pub challenge: [u8; 32],
     /// Ephemeral KEM public key for per-session PQ forward secrecy.
     pub eph_kem_pubkey: Vec<u8>,
+    /// Minimum wire protocol version this node supports.
+    pub min_version: u8,
+    /// Maximum wire protocol version this node supports.
+    pub max_version: u8,
 }
 
 impl HandshakeHello {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let len = 32 + 1 + 2 + self.signing_pubkey.len() + 1 + 2 + self.kem_pubkey.len() + 8 + 32 + 2 + self.eph_kem_pubkey.len();
+        let len = 32 + 1 + 2 + self.signing_pubkey.len() + 1 + 2 + self.kem_pubkey.len() + 8 + 32 + 2 + self.eph_kem_pubkey.len() + 2;
         let mut buf = Vec::with_capacity(len);
         buf.extend_from_slice(&self.ephemeral_pubkey);
         buf.push(self.signing_algo);
@@ -225,6 +237,8 @@ impl HandshakeHello {
         buf.extend_from_slice(&self.challenge);
         buf.extend_from_slice(&(self.eph_kem_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.eph_kem_pubkey);
+        buf.push(self.min_version);
+        buf.push(self.max_version);
         buf
     }
 
@@ -245,6 +259,12 @@ impl HandshakeHello {
         let challenge = r.read_array::<32>()?;
         let eph_kem_pk_len = r.read_u16()? as usize;
         let eph_kem_pubkey = r.read_bytes(eph_kem_pk_len)?;
+        // Backward compat: old peers don't send version fields
+        let (min_version, max_version) = if r.remaining() >= 2 {
+            (r.read_u8()?, r.read_u8()?)
+        } else {
+            (2u8, 2u8)
+        };
         Ok(Self {
             ephemeral_pubkey,
             signing_algo,
@@ -254,6 +274,8 @@ impl HandshakeHello {
             timestamp,
             challenge,
             eph_kem_pubkey,
+            min_version,
+            max_version,
         })
     }
 
@@ -1625,6 +1647,8 @@ mod tests {
             timestamp: 1234567890,
             challenge: [0xAB; 32],
             eph_kem_pubkey: vec![77u8; 1216],
+            min_version: 2,
+            max_version: 3,
         };
         let bytes = hello.to_bytes();
         let decoded = HandshakeHello::from_bytes(&bytes).unwrap();
@@ -1636,6 +1660,31 @@ mod tests {
         assert_eq!(decoded.timestamp, 1234567890);
         assert_eq!(decoded.challenge, [0xAB; 32]);
         assert_eq!(decoded.eph_kem_pubkey, vec![77u8; 1216]);
+        assert_eq!(decoded.min_version, 2);
+        assert_eq!(decoded.max_version, 3);
+    }
+
+    #[test]
+    fn handshake_hello_backward_compat() {
+        // Simulate old-format hello without version fields
+        let hello = HandshakeHello {
+            ephemeral_pubkey: [42u8; 32],
+            signing_algo: 1,
+            signing_pubkey: vec![99u8; 32],
+            kem_algo: 2,
+            kem_pubkey: vec![88u8; 32],
+            timestamp: 1234567890,
+            challenge: [0xAB; 32],
+            eph_kem_pubkey: vec![77u8; 32],
+            min_version: 2,
+            max_version: 2,
+        };
+        let mut bytes = hello.to_bytes();
+        // Strip the trailing version bytes to simulate old format
+        bytes.truncate(bytes.len() - 2);
+        let decoded = HandshakeHello::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.min_version, 2);
+        assert_eq!(decoded.max_version, 2);
     }
 
     #[test]
