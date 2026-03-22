@@ -128,15 +128,9 @@ enum TnsCommand {
         record_type: String,
         /// Record value (ServiceId, text, alias target, etc.)
         value: String,
-        /// Identity (zone) to store under
-        #[arg(long)]
-        identity: Option<String>,
         /// Publish to the DHT (default: private/local-only)
         #[arg(long)]
         public: bool,
-        /// TTL in seconds (for public records)
-        #[arg(long, default_value_t = 3600)]
-        ttl: u32,
     },
     /// Show records for a name
     #[command(arg_required_else_help = true)]
@@ -152,22 +146,14 @@ enum TnsCommand {
     },
     /// List all records in your zone
     List,
-    /// Resolve a name (from your zone / local records)
+    /// Resolve a name (from your zone by default)
     #[command(arg_required_else_help = true)]
     Resolve {
         /// Name to resolve (e.g. "server", "www.blog", "www.alice")
         name: String,
-        /// Resolve from this identity's zone (default: default identity)
+        /// Resolve from a specific zone (ServiceId or identity label)
         #[arg(long)]
-        identity: Option<String>,
-    },
-    /// Resolve a name from a specific zone
-    #[command(arg_required_else_help = true)]
-    ResolveZone {
-        /// Zone (ServiceId)
-        zone: String,
-        /// Name to resolve
-        name: String,
+        zone: Option<String>,
     },
     /// Export all zone records to a JSON file
     Export {
@@ -499,30 +485,19 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
     let client = connect_daemon(cli).await;
 
     match cmd {
-        TnsCommand::Set { name, record_type, value, identity, public, ttl } => {
+        TnsCommand::Set { name, record_type, value, public } => {
             let record = parse_tns_record(record_type, value);
             let records = vec![record];
 
-            // Store locally.
-            match client.tns_set_label(name, records.clone(), *public).await {
-                Ok(()) => {}
+            match client.tns_set_label(name, records, *public).await {
+                Ok(()) => {
+                    let status = if *public { "[public]" } else { "[private]" };
+                    println!("{} {}", name, status);
+                }
                 Err(e) => {
                     eprintln!("Failed: {}", e);
                     std::process::exit(1);
                 }
-            }
-
-            // If public, also publish to DHT.
-            if *public {
-                match client.tns_publish(identity.as_deref(), name, records, *ttl).await {
-                    Ok(()) => println!("{} [public]", name),
-                    Err(e) => {
-                        eprintln!("Stored locally but publish failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                println!("{} [private]", name);
             }
         }
         TnsCommand::Get { name } => {
@@ -574,13 +549,18 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::Resolve { name, identity } => {
-            let result = if let Some(id) = identity {
-                let sid = match client.resolve_identity(id).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("Unknown identity '{}': {}", id, e);
-                        std::process::exit(1);
+        TnsCommand::Resolve { name, zone } => {
+            let result = if let Some(z) = zone {
+                // Try as ServiceId first, then as identity label
+                let sid = if let Ok(sid) = tarnet_api::types::ServiceId::parse(z) {
+                    sid
+                } else {
+                    match client.resolve_identity(z).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Unknown zone '{}': {}", z, e);
+                            std::process::exit(1);
+                        }
                     }
                 };
                 client.tns_resolve(sid, name).await
@@ -588,16 +568,6 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 client.tns_resolve_name(name).await
             };
             match result {
-                Ok(resolution) => print_resolution(name, &resolution),
-                Err(e) => {
-                    eprintln!("Resolve failed: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        TnsCommand::ResolveZone { zone, name } => {
-            let zone = parse_service_id(zone);
-            match client.tns_resolve(zone, name).await {
                 Ok(resolution) => print_resolution(name, &resolution),
                 Err(e) => {
                     eprintln!("Resolve failed: {}", e);

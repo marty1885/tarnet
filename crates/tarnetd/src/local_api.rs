@@ -501,6 +501,20 @@ impl ServiceApi for LocalServiceApi {
         }
         let record_blobs: Vec<Vec<u8>> = records.iter().map(|r| tns::tns_record_to_bytes(r)).collect();
         self.db.label_set(label, &record_blobs, publish).map_err(map_err)?;
+
+        // Auto-publish to DHT when marked public.
+        if publish {
+            let zone_keypair = {
+                let sid = self.node.default_service_id().await;
+                self.node.keypair_for_service(&sid).await.unwrap_or_else(|| {
+                    tarnet::identity::Keypair::from_full_bytes(&self.node.identity.to_full_bytes()).unwrap()
+                })
+            };
+            tns::publish(&self.node, &zone_keypair, label, &records, 3600)
+                .await
+                .map_err(map_err)?;
+        }
+
         self.tns_cache_clear().await;
         Ok(())
     }
