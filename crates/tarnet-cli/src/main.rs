@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use tarnet_api::service::{DataStream, NodeEvent, ServiceApi, TnsRecord, TnsResolution};
+use tarnet_api::service::{DataStream, ServiceApi, TnsRecord, TnsResolution};
 use tarnet_api::types::{PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -53,10 +53,9 @@ enum Command {
     },
     /// Listen for incoming connections (netcat-like I/O)
     Listen {
-        /// Identity to listen on (omit for PeerId tunnel mode)
-        #[arg(long)]
+        /// Identity to listen on (label or ServiceId; defaults to default identity)
         identity: Option<String>,
-        /// Port to listen on (circuit mode only)
+        /// Port to listen on
         #[arg(long, default_value_t = 80)]
         port: u16,
     },
@@ -833,47 +832,32 @@ async fn cmd_connect(cli: &Cli, target: &str, port: u16) {
 async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
     let client = connect_daemon(cli).await;
 
-    let identity = match identity {
-        Some(id) => id,
-        None => return cmd_listen_tunnel(client).await,
-    };
-
-    let service_id = match client.resolve_identity(identity).await {
+    let id_str = identity.as_deref().unwrap_or("default");
+    let service_id = match client.resolve_identity(id_str).await {
         Ok(sid) => sid,
         Err(e) => {
-            eprintln!("Failed to resolve identity '{}': {}", identity, e);
+            eprintln!("Failed to resolve identity '{}': {}", id_str, e);
             std::process::exit(1);
         }
     };
-
-    eprintln!("=== tarnet listen ===");
-    eprintln!("  Peer ID:    {}", client.peer_id());
-    eprintln!("  Identity:   {}", identity);
-    eprintln!("  ServiceId:  {}", service_id);
-    eprintln!("  Port:       {}", port);
-    eprintln!();
 
     if let Err(e) = client.listen(service_id, port).await {
         eprintln!("Listen failed: {}", e);
         std::process::exit(1);
     }
     eprintln!("Listening on {} port {}.", service_id, port);
-    eprintln!("Waiting for incoming connections... (Ctrl-C to quit)");
+    eprintln!("Waiting for connections... (Ctrl-C to quit)");
 
     let connections: Arc<tokio::sync::Mutex<Vec<Arc<tarnet_api::service::Connection>>>> =
         Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let conn_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     let accept_client = client.clone();
     let accept_conns = connections.clone();
-    let accept_count = conn_count.clone();
     tokio::spawn(async move {
         loop {
             match accept_client.accept().await {
                 Ok(conn) => {
-                    let n = accept_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    eprintln!("[+] Connection #{} from {:?}", n, conn.remote_service_id);
-
+                    eprintln!("[+] Connection from {}", conn.remote_service_id);
                     let conn = Arc::new(conn);
                     accept_conns.lock().await.push(conn.clone());
 
@@ -885,8 +869,7 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
                                 Ok(data) => {
                                     let tag = format!("{}", conn.remote_service_id);
                                     let short = &tag[..tag.len().min(16)];
-                                    let header = format!("[{}] ", short);
-                                    let _ = stdout.write_all(header.as_bytes()).await;
+                                    let _ = stdout.write_all(format!("[{}] ", short).as_bytes()).await;
                                     let _ = stdout.write_all(&data).await;
                                     let _ = stdout.flush().await;
                                 }
@@ -913,7 +896,7 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin);
     let mut line = String::new();
-    let mut daemon_disconnect_rx = client.subscribe_disconnect();
+    let mut disconnect_rx = client.subscribe_disconnect();
 
     loop {
         tokio::select! {
@@ -926,9 +909,7 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
                             eprintln!("[!] No connections yet.");
                         } else {
                             for conn in conns.iter() {
-                                if let Err(e) = conn.send(line.as_bytes()).await {
-                                    eprintln!("[!] Send failed: {}", e);
-                                }
+                                let _ = conn.send(line.as_bytes()).await;
                             }
                         }
                         line.clear();
@@ -939,93 +920,7 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
                     }
                 }
             }
-            _ = daemon_disconnect_rx.recv() => {
-                eprintln!("Daemon connection lost.");
-                std::process::exit(1);
-            }
-        }
-    }
-}
-
-async fn cmd_listen_tunnel(client: Arc<IpcServiceApi>) {
-    eprintln!("=== tarnet listen (tunnel) ===");
-    eprintln!("  Peer ID:  {}", client.peer_id());
-    eprintln!();
-    eprintln!("Waiting for incoming tunnels... (Ctrl-C to quit)");
-
-    let mut event_rx = client.subscribe_events().await.unwrap();
-    let mut daemon_disconnect_rx = client.subscribe_disconnect();
-
-    let stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut line = String::new();
-
-    let mut peers: Vec<PeerId> = Vec::new();
-    let mut active_peer: Option<PeerId> = None;
-
-    loop {
-        tokio::select! {
-            result = reader.read_line(&mut line) => {
-                match result {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if let Some(peer) = active_peer {
-                            if let Err(e) = client.send_tunnel_data(&peer, line.as_bytes()).await {
-                                eprintln!("[!] Send to {} failed: {}", peer, e);
-                                peers.retain(|p| *p != peer);
-                                active_peer = peers.last().copied();
-                            }
-                        } else {
-                            eprintln!("[!] No active peer.");
-                        }
-                        line.clear();
-                    }
-                    Err(e) => {
-                        eprintln!("stdin error: {}", e);
-                        break;
-                    }
-                }
-            }
-            msg = event_rx.recv() => {
-                match msg {
-                    Some(NodeEvent::Tunnel { peer: peer_id }) => {
-                        eprintln!("[+] Tunnel from {}", peer_id);
-                        if !peers.contains(&peer_id) {
-                            peers.push(peer_id);
-                        }
-                        active_peer = Some(peer_id);
-                        eprintln!("    Active peer: {} ({} connected)", peer_id, peers.len());
-                    }
-                    Some(NodeEvent::Data { peer, payload }) => {
-                        let tag = &format!("{}", peer)[..16];
-                        let header = format!("[{}] ", tag);
-                        let _ = stdout.write_all(header.as_bytes()).await;
-                        let _ = stdout.write_all(&payload).await;
-                        let _ = stdout.flush().await;
-                    }
-                    Some(NodeEvent::PeerDisconnected(peer_id)) => {
-                        if peers.contains(&peer_id) {
-                            eprintln!("[-] Peer disconnected: {}", peer_id);
-                            peers.retain(|p| *p != peer_id);
-                            if active_peer == Some(peer_id) {
-                                active_peer = peers.last().copied();
-                                if let Some(p) = active_peer {
-                                    eprintln!("    Active peer: {}", p);
-                                } else {
-                                    eprintln!("    No active peers.");
-                                }
-                            }
-                        }
-                    }
-                    Some(_) => {}
-                    None => {
-                        eprintln!("Daemon connection lost.");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            _ = daemon_disconnect_rx.recv() => {
+            _ = disconnect_rx.recv() => {
                 eprintln!("Daemon connection lost.");
                 std::process::exit(1);
             }
