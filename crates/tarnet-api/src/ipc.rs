@@ -26,65 +26,62 @@ const FRAME_EVENT: u8 = 0x03;
 
 // ── Method IDs (request/response) ──
 
+// Basic messaging
 pub const METHOD_GET_PEER_ID: u16 = 0x0001;
 pub const METHOD_SEND_DATA: u16 = 0x0002;
 pub const METHOD_CREATE_TUNNEL: u16 = 0x0003;
 pub const METHOD_SEND_TUNNEL_DATA: u16 = 0x0004;
-pub const METHOD_DHT_PUT_CONTENT: u16 = 0x0010;
-pub const METHOD_DHT_GET_CONTENT: u16 = 0x0011;
-pub const METHOD_REQUEST_CONTENT: u16 = 0x0012;
-pub const METHOD_DHT_PUT_SIGNED: u16 = 0x0013;
-pub const METHOD_DHT_GET_SIGNED: u16 = 0x0014;
-pub const METHOD_REQUEST_SIGNED: u16 = 0x0015;
-pub const METHOD_LOOKUP_HELLO: u16 = 0x0020;
-pub const METHOD_REQUEST_HELLO: u16 = 0x0021;
-pub const METHOD_DHT_WATCH: u16 = 0x0030;
-pub const METHOD_DHT_UNWATCH: u16 = 0x0031;
-pub const METHOD_CONNECTED_PEERS: u16 = 0x0040;
-pub const METHOD_ROUTING_ENTRIES: u16 = 0x0041;
-pub const METHOD_NODE_STATUS: u16 = 0x0042;
-pub const METHOD_SUBSCRIBE_DATA: u16 = 0x0050;
-pub const METHOD_SUBSCRIBE_TUNNELS: u16 = 0x0051;
-pub const METHOD_SUBSCRIBE_WATCHES: u16 = 0x0052;
 
-// TNS methods
-pub const METHOD_TNS_PUBLISH: u16 = 0x0060;
-pub const METHOD_TNS_RESOLVE: u16 = 0x0061;
-pub const METHOD_TNS_SET_LABEL: u16 = 0x0062;
-pub const METHOD_TNS_GET_LABEL: u16 = 0x0063;
-pub const METHOD_TNS_REMOVE_LABEL: u16 = 0x0064;
-pub const METHOD_TNS_LIST_LABELS: u16 = 0x0065;
-pub const METHOD_TNS_RESOLVE_NAME: u16 = 0x0066;
+// DHT
+pub const METHOD_DHT_PUT_CONTENT: u16 = 0x0005;
+pub const METHOD_DHT_GET_CONTENT: u16 = 0x0006;
+pub const METHOD_DHT_PUT_SIGNED: u16 = 0x0007;
+pub const METHOD_DHT_GET_SIGNED: u16 = 0x0008;
+pub const METHOD_LOOKUP_HELLO: u16 = 0x0009;
+pub const METHOD_DHT_WATCH: u16 = 0x000A;
+pub const METHOD_DHT_UNWATCH: u16 = 0x000B;
 
-// Circuit connection methods (Phase 5)
-pub const METHOD_DEFAULT_SERVICE_ID: u16 = 0x0070;
-pub const METHOD_CONNECT: u16 = 0x0071;
-pub const METHOD_LISTEN: u16 = 0x0072;
-pub const METHOD_ACCEPT: u16 = 0x0073;
-pub const METHOD_PUBLISH_HIDDEN_SERVICE: u16 = 0x0074;
-pub const METHOD_DEFAULT_SERVICE_ADDRESS: u16 = 0x0075; // deprecated
-pub const METHOD_CREATE_IDENTITY: u16 = 0x0076;
-pub const METHOD_LIST_IDENTITIES: u16 = 0x0077;
-pub const METHOD_UPDATE_IDENTITY: u16 = 0x0078;
-pub const METHOD_LISTEN_HIDDEN: u16 = 0x0079;
-pub const METHOD_DELETE_IDENTITY: u16 = 0x007B;
-pub const METHOD_RESOLVE_IDENTITY: u16 = 0x007A;
+// Node info
+pub const METHOD_CONNECTED_PEERS: u16 = 0x000C;
+pub const METHOD_ROUTING_ENTRIES: u16 = 0x000D;
+pub const METHOD_NODE_STATUS: u16 = 0x000E;
+
+// TNS
+pub const METHOD_TNS_PUBLISH: u16 = 0x000F;
+pub const METHOD_TNS_RESOLVE: u16 = 0x0010;
+pub const METHOD_TNS_SET_LABEL: u16 = 0x0011;
+pub const METHOD_TNS_GET_LABEL: u16 = 0x0012;
+pub const METHOD_TNS_REMOVE_LABEL: u16 = 0x0013;
+pub const METHOD_TNS_LIST_LABELS: u16 = 0x0014;
+pub const METHOD_TNS_RESOLVE_NAME: u16 = 0x0015;
+
+// Circuit connections
+pub const METHOD_DEFAULT_SERVICE_ID: u16 = 0x0016;
+pub const METHOD_CONNECT: u16 = 0x0017;
+pub const METHOD_LISTEN: u16 = 0x0018;
+pub const METHOD_ACCEPT: u16 = 0x0019;
+pub const METHOD_PUBLISH_HIDDEN_SERVICE: u16 = 0x001A;
+pub const METHOD_LISTEN_HIDDEN: u16 = 0x001B;
+pub const METHOD_CONNECT_TO: u16 = 0x001C;
+
+// Identity
+pub const METHOD_CREATE_IDENTITY: u16 = 0x001D;
+pub const METHOD_LIST_IDENTITIES: u16 = 0x001E;
+pub const METHOD_UPDATE_IDENTITY: u16 = 0x001F;
+pub const METHOD_RESOLVE_IDENTITY: u16 = 0x0020;
+pub const METHOD_DELETE_IDENTITY: u16 = 0x0021;
+
+// Connection data
 /// Send data on an established connection: conn_id(u32) || data
-pub const METHOD_CONN_SEND: u16 = 0x0080;
+pub const METHOD_CONN_SEND: u16 = 0x0022;
 /// Close a connection: conn_id(u32)
-pub const METHOD_CONN_CLOSE: u16 = 0x0081;
+pub const METHOD_CONN_CLOSE: u16 = 0x0023;
 
 // Daemon control
 /// Reload daemon configuration (equivalent to SIGHUP).
-pub const METHOD_RELOAD: u16 = 0x0090;
-
-// Daemon info
+pub const METHOD_RELOAD: u16 = 0x0024;
 /// Get the daemon's SOCKS proxy bind addresses.
-pub const METHOD_SOCKS_ADDR: u16 = 0x00A0;
-
-// Unified connect/listen (string-based resolution)
-/// Connect to a target by name/address string: (target: String, port: u16)
-pub const METHOD_CONNECT_TO: u16 = 0x00A1;
+pub const METHOD_SOCKS_ADDR: u16 = 0x0025;
 
 // ── Response status codes ──
 
