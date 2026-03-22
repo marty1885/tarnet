@@ -90,26 +90,19 @@ impl Transport for WebRtcTransport {
     }
 }
 
-/// Callback type for trickled ICE candidates that need to be sent to the remote peer.
-pub type IceCandidateCallback =
-    Arc<dyn Fn(PeerId, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
-
 /// Manages pending WebRTC connection establishments.
 pub struct WebRtcConnector {
     api: API,
     config: RTCConfiguration,
     /// Pending connections: peer_id → (RTCPeerConnection, completion sender)
     pending: Arc<Mutex<HashMap<PeerId, (Arc<RTCPeerConnection>, oneshot::Sender<WebRtcTransport>)>>>,
-    /// Callback to send trickled ICE candidates via the overlay
-    ice_callback: IceCandidateCallback,
 }
 
 impl WebRtcConnector {
     /// Create a new connector.
     ///
     /// `stun_servers` — list of STUN server URLs (e.g. `"stun:stun.l.google.com:19302"`).
-    /// `ice_callback` — called when a local ICE candidate needs to be sent to the remote peer.
-    pub fn new(stun_servers: Vec<String>, ice_callback: IceCandidateCallback) -> Result<Self> {
+    pub fn new(stun_servers: Vec<String>) -> Result<Self> {
         // Data-channel-only usage: no media codecs or interceptors needed.
         let media_engine = MediaEngine::default();
 
@@ -141,16 +134,16 @@ impl WebRtcConnector {
             api,
             config,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            ice_callback,
         })
     }
 
     /// Initiate a WebRTC connection to a remote peer.
-    /// Returns the SDP offer string and a receiver that yields the transport once the data channel opens.
+    /// Returns the SDP offer string, a receiver that yields the transport once the
+    /// data channel opens, and a receiver for trickled ICE candidates.
     pub async fn initiate(
         &self,
         peer_id: PeerId,
-    ) -> Result<(String, oneshot::Receiver<WebRtcTransport>)> {
+    ) -> Result<(String, oneshot::Receiver<WebRtcTransport>, mpsc::UnboundedReceiver<String>)> {
         let pc = Arc::new(
             self.api
                 .new_peer_connection(self.config.clone())
@@ -172,11 +165,10 @@ impl WebRtcConnector {
 
         let (tx, rx) = oneshot::channel();
 
-        // Set up ICE candidate trickle
-        let cb = self.ice_callback.clone();
-        let pid = peer_id;
+        // Set up ICE candidate trickle — send candidates to a channel
+        let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         pc.on_ice_candidate(Box::new(move |candidate| {
-            let cb = cb.clone();
+            let ice_tx = ice_tx.clone();
             Box::pin(async move {
                 if let Some(c) = candidate {
                     let json = match c.to_json() {
@@ -184,7 +176,7 @@ impl WebRtcConnector {
                         Err(_) => return,
                     };
                     let candidate_str = serde_json::to_string(&json).unwrap_or_default();
-                    cb(pid, candidate_str).await;
+                    let _ = ice_tx.send(candidate_str);
                 }
             })
         }));
@@ -228,16 +220,17 @@ impl WebRtcConnector {
         let sdp = offer.sdp;
         self.pending.lock().await.insert(peer_id, (pc, tx));
 
-        Ok((sdp, rx))
+        Ok((sdp, rx, ice_rx))
     }
 
     /// Handle an incoming SDP offer from a remote peer.
-    /// Returns the SDP answer string and a receiver that yields the transport once the data channel opens.
+    /// Returns the SDP answer string, a receiver that yields the transport once the
+    /// data channel opens, and a receiver for trickled ICE candidates.
     pub async fn handle_offer(
         &self,
         peer_id: PeerId,
         sdp_offer: &str,
-    ) -> Result<(String, oneshot::Receiver<WebRtcTransport>)> {
+    ) -> Result<(String, oneshot::Receiver<WebRtcTransport>, mpsc::UnboundedReceiver<String>)> {
         let pc = Arc::new(
             self.api
                 .new_peer_connection(self.config.clone())
@@ -247,11 +240,10 @@ impl WebRtcConnector {
 
         let (tx, rx) = oneshot::channel();
 
-        // Set up ICE candidate trickle
-        let cb = self.ice_callback.clone();
-        let pid = peer_id;
+        // Set up ICE candidate trickle — send candidates to a channel
+        let (ice_tx, ice_rx) = mpsc::unbounded_channel();
         pc.on_ice_candidate(Box::new(move |candidate| {
-            let cb = cb.clone();
+            let ice_tx = ice_tx.clone();
             Box::pin(async move {
                 if let Some(c) = candidate {
                     let json = match c.to_json() {
@@ -259,7 +251,7 @@ impl WebRtcConnector {
                         Err(_) => return,
                     };
                     let candidate_str = serde_json::to_string(&json).unwrap_or_default();
-                    cb(pid, candidate_str).await;
+                    let _ = ice_tx.send(candidate_str);
                 }
             })
         }));
@@ -318,7 +310,7 @@ impl WebRtcConnector {
         let sdp = answer.sdp;
         self.pending.lock().await.insert(peer_id, (pc, tx));
 
-        Ok((sdp, rx))
+        Ok((sdp, rx, ice_rx))
     }
 
     /// Handle an incoming SDP answer for a pending outbound connection.

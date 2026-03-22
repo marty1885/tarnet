@@ -1,5 +1,13 @@
 use super::*;
 
+/// WebRTC signaling channel message tags.
+const TAG_OFFER: u8 = 0x01;
+const TAG_ANSWER: u8 = 0x02;
+const TAG_ICE_CANDIDATE: u8 = 0x03;
+
+/// Port name prefix for WebRTC signaling channels.
+const WEBRTC_PORT_PREFIX: &str = "_tarnet_webrtc_transport_";
+
 impl Node {
     // ── WebRTC ──────────────────────────────────────────────────
 
@@ -41,99 +49,283 @@ impl Node {
     }
 
     pub fn enable_webrtc(&mut self, stun_servers: Vec<String>) -> Result<()> {
-        let identity = self.identity.clone();
-        let links = self.links.clone();
-        let routing_table = self.routing_table.clone();
-
-        let ice_callback: crate::transport::webrtc::IceCandidateCallback =
-            Arc::new(move |peer_id, candidate_str| {
-                let identity = identity.clone();
-                let links = links.clone();
-                let routing_table = routing_table.clone();
-                Box::pin(async move {
-                    let msg = WebRtcIceCandidateMsg {
-                        sender: identity.peer_id(),
-                        payload: candidate_str,
-                    };
-                    let inner = msg.to_wire_ice_candidate().encode();
-                    let data_msg = DataMsg {
-                        origin: identity.peer_id(),
-                        destination: peer_id,
-                        ttl: 64,
-                        data: inner,
-                    };
-                    let encoded = data_msg.to_wire().encode();
-
-                    // Try direct link first, then routing table
-                    let sent = {
-                        let links = links.lock().await;
-                        if let Some(link) = links.get(&peer_id) {
-                            let _ = link.send_message(&encoded).await;
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if !sent {
-                        let next_hop = {
-                            let table = routing_table.lock().await;
-                            table.lookup(&peer_id).map(|r| r.next_hop)
-                        };
-                        if let Some(hop) = next_hop {
-                            let links = links.lock().await;
-                            if let Some(link) = links.get(&hop) {
-                                let _ = link.send_message(&encoded).await;
-                            }
-                        }
-                    }
-                })
-            });
-
-        let connector = WebRtcConnector::new(stun_servers, ice_callback)?;
+        let connector = WebRtcConnector::new(stun_servers)?;
         self.webrtc_connector = Some(Arc::new(connector));
         Ok(())
     }
 
-    /// Initiate a WebRTC connection to a remote peer via overlay signaling.
-    /// The peer must be reachable via overlay routing for SDP exchange.
+    /// Start the WebRTC signaling listener on channel port(s) derived from
+    /// our global addresses. Must be called after addresses are known (during run).
+    pub(super) async fn start_webrtc_signaling_listener(&self) {
+        let connector = match self.webrtc_connector.as_ref() {
+            Some(c) => c.clone(),
+            None => return,
+        };
+
+        let addrs = self.global_addrs.lock().await.clone();
+        if addrs.is_empty() {
+            // No global addresses yet — register a single listener without IP suffix
+            self.register_webrtc_port_listener(WEBRTC_PORT_PREFIX.to_string(), connector).await;
+            return;
+        }
+
+        for addr in &addrs {
+            if let Some(connect_str) = addr.to_connect_string() {
+                // Extract IP (strip port if present)
+                let ip = connect_str.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&connect_str);
+                let port_name = format!("{}{}", WEBRTC_PORT_PREFIX, ip);
+                self.register_webrtc_port_listener(port_name, connector.clone()).await;
+            }
+        }
+    }
+
+    async fn register_webrtc_port_listener(&self, port_name: String, connector: Arc<WebRtcConnector>) {
+        let port_hash = crate::wire::hash_port_name(&port_name);
+
+        let (listener_tx, mut listener_rx) = mpsc::unbounded_channel::<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>();
+        self.channel_port_listeners.lock().await.insert(port_hash, listener_tx);
+
+        let event_tx = self.event_tx.clone();
+        let identity = self.identity.clone();
+        let channel_data_handlers = self.channel_data_handlers.clone();
+        let channels = self.channels.clone();
+        let tunnel_table = self.tunnel_table.clone();
+        let links = self.links.clone();
+        let routing_table = self.routing_table.clone();
+        let peer_id = self.peer_id();
+
+        log::info!("WebRTC signaling listener on port {:?}", port_name);
+
+        tokio::spawn(async move {
+            while let Some((remote_peer, channel_id, mut data_rx)) = listener_rx.recv().await {
+                let connector = connector.clone();
+                let event_tx = event_tx.clone();
+                let identity = identity.clone();
+                let channel_data_handlers = channel_data_handlers.clone();
+                let channels = channels.clone();
+                let tunnel_table = tunnel_table.clone();
+                let links = links.clone();
+                let routing_table = routing_table.clone();
+
+                log::debug!("WebRTC signaling session from {:?} on channel {}", remote_peer, channel_id);
+
+                tokio::spawn(async move {
+                    // Read messages from the channel
+                    while let Some(msg) = data_rx.recv().await {
+                        if msg.is_empty() {
+                            continue;
+                        }
+                        let tag = msg[0];
+                        let payload = &msg[1..];
+                        let payload_str = match std::str::from_utf8(payload) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                log::warn!("WebRTC signaling: invalid UTF-8 from {:?}", remote_peer);
+                                continue;
+                            }
+                        };
+
+                        match tag {
+                            TAG_OFFER => {
+                                log::debug!("WebRTC: received offer from {:?}", remote_peer);
+                                let (sdp_answer, transport_rx, mut ice_rx) = match connector.handle_offer(remote_peer, payload_str).await {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        log::warn!("WebRTC handle_offer failed: {}", e);
+                                        break;
+                                    }
+                                };
+
+                                // Send answer back on the same channel
+                                let mut answer_msg = Vec::with_capacity(1 + sdp_answer.len());
+                                answer_msg.push(TAG_ANSWER);
+                                answer_msg.extend_from_slice(sdp_answer.as_bytes());
+                                if let Err(e) = send_on_channel(
+                                    &channels, &tunnel_table, &links, &routing_table,
+                                    peer_id, channel_id, &answer_msg,
+                                ).await {
+                                    log::warn!("WebRTC: failed to send answer: {}", e);
+                                    break;
+                                }
+
+                                // Spawn ICE trickle sender
+                                let channels2 = channels.clone();
+                                let tunnel_table2 = tunnel_table.clone();
+                                let links2 = links.clone();
+                                let routing_table2 = routing_table.clone();
+                                tokio::spawn(async move {
+                                    while let Some(candidate) = ice_rx.recv().await {
+                                        let mut ice_msg = Vec::with_capacity(1 + candidate.len());
+                                        ice_msg.push(TAG_ICE_CANDIDATE);
+                                        ice_msg.extend_from_slice(candidate.as_bytes());
+                                        if send_on_channel(
+                                            &channels2, &tunnel_table2, &links2, &routing_table2,
+                                            peer_id, channel_id, &ice_msg,
+                                        ).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                // Wait for transport and do PeerLink handshake
+                                let event_tx = event_tx.clone();
+                                let identity = identity.clone();
+                                let channel_data_handlers = channel_data_handlers.clone();
+                                let channels3 = channels.clone();
+                                tokio::spawn(async move {
+                                    match transport_rx.await {
+                                        Ok(transport) => {
+                                            let transport: Box<dyn crate::transport::Transport> = Box::new(transport);
+                                            match crate::link::PeerLink::responder(transport, &identity).await {
+                                                Ok(link) => {
+                                                    let link = Arc::new(link);
+                                                    log::info!(
+                                                        "WebRTC link established (responder) to {:?}",
+                                                        link.remote_peer()
+                                                    );
+                                                    let _ = event_tx
+                                                        .send(NodeEvent::LinkUp(link.remote_peer(), link))
+                                                        .await;
+                                                }
+                                                Err(e) => {
+                                                    log::warn!("WebRTC PeerLink handshake failed (responder): {}", e);
+                                                }
+                                            }
+                                        }
+                                        Err(_) => {
+                                            log::warn!("WebRTC connection from {:?} was cancelled", remote_peer);
+                                        }
+                                    }
+                                    // Clean up channel handler
+                                    channel_data_handlers.lock().await.remove(&channel_id);
+                                    channels3.lock().await.remove(&channel_id);
+                                });
+                            }
+                            TAG_ICE_CANDIDATE => {
+                                if let Err(e) = connector.handle_ice_candidate(remote_peer, payload_str).await {
+                                    log::debug!("WebRTC ICE candidate error: {}", e);
+                                }
+                            }
+                            _ => {
+                                log::debug!("WebRTC signaling: unknown tag {} from {:?}", tag, remote_peer);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Compute the WebRTC signaling port name for a peer based on their hello record.
+    fn webrtc_port_name_for_peer(hello: &HelloRecord) -> String {
+        if let Some(addr) = hello.global_addresses.first() {
+            if let Some(connect_str) = addr.to_connect_string() {
+                let ip = connect_str.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&connect_str);
+                return format!("{}{}", WEBRTC_PORT_PREFIX, ip);
+            }
+        }
+        WEBRTC_PORT_PREFIX.to_string()
+    }
+
+    /// Initiate a WebRTC connection to a remote peer via channel-based signaling.
+    /// The peer must be reachable via overlay routing (tunnel) for SDP exchange.
     pub async fn connect_webrtc(&self, peer_id: PeerId) -> Result<()> {
         let connector = self
             .webrtc_connector
             .as_ref()
             .ok_or_else(|| Error::Protocol("WebRTC not enabled".into()))?;
 
-        let (sdp_offer, transport_rx) = connector.initiate(peer_id).await?;
+        // Look up peer's hello record to get the port name
+        let hello = self.lookup_hello(&peer_id).await
+            .ok_or_else(|| Error::Protocol("no hello record for WebRTC target".into()))?;
+        let port_name = Self::webrtc_port_name_for_peer(&hello);
 
-        // Send offer via overlay routing
-        let offer_msg = WebRtcOfferMsg {
-            sender: self.peer_id(),
-            payload: sdp_offer,
-        };
-        let inner = offer_msg.to_wire_offer().encode();
-        let data_msg = DataMsg {
-            origin: self.peer_id(),
-            destination: peer_id,
-            ttl: 64,
-            data: inner,
-        };
-        self.route_message(&peer_id, &data_msg.to_wire().encode())
-            .await?;
+        // Ensure we have a tunnel to the peer
+        let tunnel_rx = self.create_tunnel(peer_id).await?;
+        let _ = tunnel_rx.await.map_err(|_| Error::Protocol("tunnel setup cancelled".into()))?;
 
-        // Wait for the data channel to open (answer will arrive via handle_webrtc_answer)
-        let event_tx = self.event_tx.clone();
-        let identity = self.identity.clone();
+        // Open a signaling channel
+        let (channel_id, mut data_rx) = self.channel_open_with_handler(
+            &peer_id, &port_name, true, true,
+        ).await?;
+
+        let (sdp_offer, transport_rx, mut ice_rx) = connector.initiate(peer_id).await?;
+
+        // Send offer on the channel
+        let mut offer_msg = Vec::with_capacity(1 + sdp_offer.len());
+        offer_msg.push(TAG_OFFER);
+        offer_msg.extend_from_slice(sdp_offer.as_bytes());
+        self.channel_send(channel_id, &offer_msg).await?;
+
+        // Spawn ICE trickle sender (our candidates → channel)
+        let channels = self.channels.clone();
+        let tunnel_table = self.tunnel_table.clone();
+        let links = self.links.clone();
+        let routing_table = self.routing_table.clone();
+        let my_peer_id = self.peer_id();
+        tokio::spawn(async move {
+            while let Some(candidate) = ice_rx.recv().await {
+                let mut ice_msg = Vec::with_capacity(1 + candidate.len());
+                ice_msg.push(TAG_ICE_CANDIDATE);
+                ice_msg.extend_from_slice(candidate.as_bytes());
+                if send_on_channel(
+                    &channels, &tunnel_table, &links, &routing_table,
+                    my_peer_id, channel_id, &ice_msg,
+                ).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Spawn task to read answer and ICE candidates from the channel
+        let connector = connector.clone();
+        let channel_data_handlers = self.channel_data_handlers.clone();
+        let channels2 = self.channels.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = data_rx.recv().await {
+                if msg.is_empty() {
+                    continue;
+                }
+                let tag = msg[0];
+                let payload = &msg[1..];
+                let payload_str = match std::str::from_utf8(payload) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+
+                match tag {
+                    TAG_ANSWER => {
+                        log::debug!("WebRTC: received answer from {:?}", peer_id);
+                        if let Err(e) = connector.handle_answer(peer_id, payload_str).await {
+                            log::warn!("WebRTC handle_answer failed: {}", e);
+                            break;
+                        }
+                    }
+                    TAG_ICE_CANDIDATE => {
+                        if let Err(e) = connector.handle_ice_candidate(peer_id, payload_str).await {
+                            log::debug!("WebRTC ICE candidate error: {}", e);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // Wait for transport and do PeerLink handshake
+        let event_tx2 = self.event_tx.clone();
+        let identity2 = self.identity.clone();
         tokio::spawn(async move {
             match transport_rx.await {
                 Ok(transport) => {
                     let transport: Box<dyn crate::transport::Transport> = Box::new(transport);
-                    match crate::link::PeerLink::initiator(transport, &identity, Some(peer_id)).await {
+                    match crate::link::PeerLink::initiator(transport, &identity2, Some(peer_id)).await {
                         Ok(link) => {
                             let link = Arc::new(link);
                             log::info!(
                                 "WebRTC link established (initiator) to {:?}",
                                 link.remote_peer()
                             );
-                            let _ = event_tx
+                            let _ = event_tx2
                                 .send(NodeEvent::LinkUp(link.remote_peer(), link))
                                 .await;
                         }
@@ -146,93 +338,79 @@ impl Node {
                     log::warn!("WebRTC connection to {:?} was cancelled", peer_id);
                 }
             }
+            // Clean up
+            channel_data_handlers.lock().await.remove(&channel_id);
+            channels2.lock().await.remove(&channel_id);
         });
 
         Ok(())
     }
+}
 
-    pub(super) async fn handle_webrtc_offer(&self, _origin: PeerId, payload: &[u8]) -> Result<()> {
-        let offer = WebRtcOfferMsg::from_bytes(payload)?;
-        let connector = self
-            .webrtc_connector
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("WebRTC not enabled".into()))?;
-
-        let (sdp_answer, transport_rx) = connector.handle_offer(offer.sender, &offer.payload).await?;
-
-        // Send answer back via overlay routing
-        let answer_msg = WebRtcAnswerMsg {
-            sender: self.peer_id(),
-            payload: sdp_answer,
+/// Send data on a channel using the tunnel, without holding a &Node reference.
+/// Used from spawned tasks that can't borrow the node.
+async fn send_on_channel(
+    channels: &Arc<Mutex<HashMap<u32, (PeerId, Channel)>>>,
+    tunnel_table: &Arc<Mutex<TunnelTable>>,
+    links: &Arc<Mutex<LinkTable>>,
+    routing_table: &Arc<Mutex<RoutingTable>>,
+    our_peer_id: PeerId,
+    channel_id: u32,
+    data: &[u8],
+) -> Result<()> {
+    let (dest, sends) = {
+        let mut chs = channels.lock().await;
+        let (remote, ch) = chs
+            .get_mut(&channel_id)
+            .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
+        let dest = *remote;
+        let sends = ch.prepare_send(data.to_vec());
+        (dest, sends)
+    };
+    for (seq, payload) in sends {
+        let msg = ChannelDataMsg {
+            channel_id,
+            sequence: seq,
+            data: payload,
         };
-        let inner = answer_msg.to_wire_answer().encode();
-        let data_msg = DataMsg {
-            origin: self.peer_id(),
-            destination: offer.sender,
+        let inner = msg.to_wire().encode();
+
+        // Encrypt via tunnel
+        let encrypted = {
+            let tt = tunnel_table.lock().await;
+            let tunnel = tt
+                .get(&dest)
+                .ok_or_else(|| Error::Protocol(format!("no tunnel to {:?}", dest)))?;
+            tunnel.encrypt(&inner)
+        };
+
+        let enc_msg = EncryptedDataMsg {
+            origin: our_peer_id,
+            destination: dest,
             ttl: 64,
-            data: inner,
+            data: encrypted,
         };
-        self.route_message(&offer.sender, &data_msg.to_wire().encode())
-            .await?;
+        let encoded = enc_msg.to_wire_encrypted().encode();
 
-        // Wait for the data channel to open, then do PeerLink handshake as responder
-        let event_tx = self.event_tx.clone();
-        let identity = self.identity.clone();
-        let remote = offer.sender;
-        tokio::spawn(async move {
-            match transport_rx.await {
-                Ok(transport) => {
-                    let transport: Box<dyn crate::transport::Transport> = Box::new(transport);
-                    match crate::link::PeerLink::responder(transport, &identity).await {
-                        Ok(link) => {
-                            let link = Arc::new(link);
-                            log::info!(
-                                "WebRTC link established (responder) to {:?}",
-                                link.remote_peer()
-                            );
-                            let _ = event_tx
-                                .send(NodeEvent::LinkUp(link.remote_peer(), link))
-                                .await;
-                        }
-                        Err(e) => {
-                            log::warn!("WebRTC PeerLink handshake failed (responder): {}", e);
-                        }
-                    }
-                }
-                Err(_) => {
-                    log::warn!("WebRTC connection from {:?} was cancelled", remote);
-                }
+        // Route
+        {
+            let lks = links.lock().await;
+            if let Some(link) = lks.get(&dest) {
+                link.send_message(&encoded).await?;
+                continue;
             }
-        });
-
-        Ok(())
+        }
+        let next_hop = {
+            let table = routing_table.lock().await;
+            table
+                .lookup(&dest)
+                .map(|r| r.next_hop)
+                .ok_or(Error::NotFound)?
+        };
+        let lks = links.lock().await;
+        if let Some(link) = lks.get(&next_hop) {
+            link.send_message(&encoded).await?;
+        }
     }
-
-    pub(super) async fn handle_webrtc_answer(&self, _origin: PeerId, payload: &[u8]) -> Result<()> {
-        let answer = WebRtcAnswerMsg::from_bytes(payload)?;
-        let connector = self
-            .webrtc_connector
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("WebRTC not enabled".into()))?;
-
-        connector
-            .handle_answer(answer.sender, &answer.payload)
-            .await?;
-        log::debug!("WebRTC answer processed from {:?}", answer.sender);
-        Ok(())
-    }
-
-    pub(super) async fn handle_webrtc_ice_candidate(&self, _origin: PeerId, payload: &[u8]) -> Result<()> {
-        let ice = WebRtcIceCandidateMsg::from_bytes(payload)?;
-        let connector = self
-            .webrtc_connector
-            .as_ref()
-            .ok_or_else(|| Error::Protocol("WebRTC not enabled".into()))?;
-
-        connector
-            .handle_ice_candidate(ice.sender, &ice.payload)
-            .await?;
-        log::debug!("WebRTC ICE candidate processed from {:?}", ice.sender);
-        Ok(())
-    }
+    Ok(())
 }

@@ -128,10 +128,7 @@ fn proto_category(mt: MessageType) -> ProtoCategory {
         | MessageType::HandshakeAuth
         | MessageType::HandshakeConfirm
         | MessageType::Rekey
-        | MessageType::Keepalive
-        | MessageType::WebRtcOffer
-        | MessageType::WebRtcAnswer
-        | MessageType::WebRtcIceCandidate => ProtoCategory::Link,
+        | MessageType::Keepalive => ProtoCategory::Link,
 
         MessageType::RouteAdvertisement => ProtoCategory::Routing,
 

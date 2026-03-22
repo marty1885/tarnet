@@ -287,6 +287,12 @@ pub struct Node {
     circuit_groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
     /// WebRTC connection coordinator (None if WebRTC is disabled).
     webrtc_connector: Option<Arc<WebRtcConnector>>,
+    /// Per-channel data handlers: channel_id → sender for data on that channel.
+    /// Channels with a handler deliver data here instead of app_tx.
+    channel_data_handlers: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Port listeners: port_hash → sender that receives (peer_id, channel_id, data_rx)
+    /// when a new channel opens on that port.
+    channel_port_listeners: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>>>>,
     /// Cache of peer signing/KEM public keys (populated during link handshake).
     pubkey_cache: Arc<Mutex<PubkeyCache>>,
     /// Persistent write-through database (None for ephemeral/test nodes).
@@ -484,6 +490,8 @@ impl Node {
             identity_store: Arc::new(Mutex::new(identity_store)),
             circuit_groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
             webrtc_connector: None,
+            channel_data_handlers: Arc::new(Mutex::new(HashMap::new())),
+            channel_port_listeners: Arc::new(Mutex::new(HashMap::new())),
             pubkey_cache: Arc::new(Mutex::new(PubkeyCache::new(1024))),
             db,
             #[cfg(feature = "mainline-bootstrap")]
@@ -655,6 +663,11 @@ impl Node {
             tokio::spawn(async move {
                 discovery_retry_loop(discovery_addrs, disc, tx, identity, links_ref).await;
             });
+        }
+
+        // WebRTC signaling listener: accept incoming signaling on channel ports.
+        if self.webrtc_connector.is_some() {
+            self.start_webrtc_signaling_listener().await;
         }
 
         // WebRTC auto-upgrade: periodically try to establish direct WebRTC
@@ -2150,11 +2163,6 @@ impl Node {
                         log::debug!("DhtWatchNotify with unknown query_token, dropping");
                     }
                 }
-            }
-            MessageType::WebRtcOffer | MessageType::WebRtcAnswer | MessageType::WebRtcIceCandidate => {
-                // WebRTC signaling messages are overlay-routed inside DataMsg,
-                // not sent directly on links.
-                log::warn!("Received WebRTC signaling message outside DataMsg from {:?}", from);
             }
             MessageType::CircuitRelay => {
                 self.handle_circuit_relay(from, &msg.payload).await?;

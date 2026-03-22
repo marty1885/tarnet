@@ -139,10 +139,6 @@ enum_with_u16! {
         // Overlay-routed data (0x05xx)
         Data = 0x0500,
         EncryptedData = 0x0501,
-        // WebRTC signaling (0x06xx) — overlay-routed inside DataMsg
-        WebRtcOffer = 0x0600,
-        WebRtcAnswer = 0x0601,
-        WebRtcIceCandidate = 0x0602,
         // Circuit (0x07xx) — circuit-based forwarding
         CircuitCreate = 0x0700,
         CircuitCreated = 0x0701,
@@ -1568,60 +1564,6 @@ pub fn hash_port_name(name: &str) -> [u8; 32] {
     *blake3::hash(name.as_bytes()).as_bytes()
 }
 
-/// WebRTC signaling message: sender PeerId (32) || payload string (variable)
-/// Used for SDP offers, SDP answers, and ICE candidates — they all share the
-/// same wire layout.
-#[derive(Debug, Clone)]
-pub struct WebRtcSignalMsg {
-    pub sender: PeerId,
-    pub payload: String,
-}
-
-/// Type aliases preserving the old names for callers.
-pub type WebRtcOfferMsg = WebRtcSignalMsg;
-pub type WebRtcAnswerMsg = WebRtcSignalMsg;
-pub type WebRtcIceCandidateMsg = WebRtcSignalMsg;
-
-impl WebRtcSignalMsg {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let payload_bytes = self.payload.as_bytes();
-        let mut buf = Vec::with_capacity(32 + payload_bytes.len());
-        buf.extend_from_slice(self.sender.as_bytes());
-        buf.extend_from_slice(payload_bytes);
-        buf
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 32 {
-            return Err(Error::Wire("WebRtcSignal too short".into()));
-        }
-        let mut r = Reader::new(data);
-        let sender = r.read_array::<32>()?;
-        let payload_bytes = r.read_rest();
-        let payload = String::from_utf8(payload_bytes)
-            .map_err(|e| Error::Wire(format!("WebRtcSignal invalid UTF-8: {}", e)))?;
-        Ok(Self {
-            sender: PeerId(sender),
-            payload,
-        })
-    }
-
-    pub fn to_wire_offer(&self) -> WireMessage {
-        WireMessage::new(MessageType::WebRtcOffer, self.to_bytes())
-    }
-
-    pub fn to_wire_answer(&self) -> WireMessage {
-        WireMessage::new(MessageType::WebRtcAnswer, self.to_bytes())
-    }
-
-    pub fn to_wire_ice_candidate(&self) -> WireMessage {
-        WireMessage::new(MessageType::WebRtcIceCandidate, self.to_bytes())
-    }
-
-    pub fn to_wire_with_type(&self, msg_type: MessageType) -> WireMessage {
-        WireMessage::new(msg_type, self.to_bytes())
-    }
-}
 
 #[cfg(test)]
 mod tests {

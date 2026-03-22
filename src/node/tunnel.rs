@@ -176,11 +176,45 @@ impl Node {
                 let ch = Channel::new(open.channel_id, open.port, open.reliable, open.ordered);
                 channels.insert(open.channel_id, (from, ch));
                 log::debug!("Channel {} opened from {:?}", open.channel_id, from);
+
+                // Check if a port listener is registered for this port
+                let listeners = self.channel_port_listeners.lock().await;
+                if let Some(listener_tx) = listeners.get(&open.port) {
+                    let (data_tx, data_rx) = mpsc::unbounded_channel();
+                    self.channel_data_handlers.lock().await.insert(open.channel_id, data_tx);
+                    let _ = listener_tx.send((from, open.channel_id, data_rx));
+                }
             }
             MessageType::ChannelData => {
                 let data = ChannelDataMsg::from_bytes(&msg.payload)?;
                 if let Some((_, ch)) = channels.get_mut(&data.channel_id) {
                     let delivered = ch.receive_data(data.sequence, data.data);
+
+                    // Check if this channel has a data handler
+                    let handlers = self.channel_data_handlers.lock().await;
+                    if let Some(handler_tx) = handlers.get(&data.channel_id) {
+                        for payload in delivered {
+                            let _ = handler_tx.send(payload);
+                        }
+                        // Generate ACK, collect data, release lock, then send
+                        let ack_bytes = ch.generate_ack().map(|(ack_seq, selective)| {
+                            ChannelAckMsg {
+                                channel_id: data.channel_id,
+                                ack_seq,
+                                selective_acks: selective,
+                            }
+                            .to_wire()
+                            .encode()
+                        });
+                        drop(handlers);
+                        drop(channels);
+                        if let Some(inner) = ack_bytes {
+                            let _ = self.send_tunnel_data(&from, &inner).await;
+                        }
+                        return Ok(());
+                    }
+                    drop(handlers);
+
                     for payload in delivered {
                         let _ = self.app_tx.send((from, payload)).await;
                     }
@@ -210,6 +244,7 @@ impl Node {
             MessageType::ChannelClose => {
                 let close = ChannelCloseMsg::from_bytes(&msg.payload)?;
                 channels.remove(&close.channel_id);
+                self.channel_data_handlers.lock().await.remove(&close.channel_id);
                 log::debug!("Channel {} closed by {:?}", close.channel_id, from);
             }
             _ => {}
@@ -229,21 +264,6 @@ impl Node {
                     }
                     MessageType::TunnelKeyResponse => {
                         return self.handle_tunnel_key_response(from, &inner.payload).await;
-                    }
-                    MessageType::WebRtcOffer => {
-                        return self
-                            .handle_webrtc_offer(data.origin, &inner.payload)
-                            .await;
-                    }
-                    MessageType::WebRtcAnswer => {
-                        return self
-                            .handle_webrtc_answer(data.origin, &inner.payload)
-                            .await;
-                    }
-                    MessageType::WebRtcIceCandidate => {
-                        return self
-                            .handle_webrtc_ice_candidate(data.origin, &inner.payload)
-                            .await;
                     }
                     _ => {}
                 }
@@ -465,6 +485,22 @@ impl Node {
         let inner = open.to_wire().encode();
         self.send_tunnel_data(dest, &inner).await?;
         Ok(channel_id)
+    }
+
+    /// Open a reliable channel and return a receiver for incoming data on it.
+    /// Used for internal protocols (e.g., WebRTC signaling) that need bidirectional
+    /// communication on a channel without going through app_tx.
+    pub async fn channel_open_with_handler(
+        &self,
+        dest: &PeerId,
+        port_name: &str,
+        reliable: bool,
+        ordered: bool,
+    ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
+        let channel_id = self.channel_open(dest, port_name, reliable, ordered).await?;
+        let (data_tx, data_rx) = mpsc::unbounded_channel();
+        self.channel_data_handlers.lock().await.insert(channel_id, data_tx);
+        Ok((channel_id, data_rx))
     }
 
     /// Send data through a reliable channel.  The channel handles
