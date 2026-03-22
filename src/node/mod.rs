@@ -13,7 +13,7 @@ use crate::governor::{Governor, GovernorConfig, Verdict};
 use crate::channel::Channel;
 use crate::circuit::{
     CircuitAction, CircuitKey, CircuitTable, CongestionWindow, CryptoOp, HopCrypto, HopKey, ReplayWindow,
-    OutboundCircuit, CircuitState, RelayCell, RelayCellCommand, CELL_SIZE, CELL_BODY_SIZE, CELL_PAYLOAD_MAX,
+    OutboundCircuit, CircuitState as CircuitPhase, RelayCell, RelayCellCommand, CELL_SIZE, CELL_BODY_SIZE, CELL_PAYLOAD_MAX,
     build_extend_payload, parse_extend_payload, build_extended_payload, parse_extended_payload, EXTENDED_FLAG_REACHED,
     build_stream_begin_payload, parse_stream_begin_payload,
     build_introduce_payload, parse_introduce_payload,
@@ -178,11 +178,131 @@ const HIDDEN_SERVICE_MAINTAIN_INTERVAL: Duration = Duration::from_secs(240);
 const HIDDEN_SERVICE_REPUBLISH_AFTER: Duration = Duration::from_secs(480);
 
 /// Rendezvous point state entry.
-struct RendezvousEntry {
+pub(crate) struct RendezvousEntry {
     client_circuit_id: u32,
     client_from: PeerId,
     service_circuit_id: Option<u32>,
     service_from: Option<PeerId>,
+}
+
+/// Circuit-related state grouped together.
+#[derive(Clone)]
+pub struct CircuitState {
+    /// Circuit forwarding table.
+    pub table: Arc<Mutex<CircuitTable>>,
+    /// Outbound circuits we initiated (keyed by first_hop_circuit_id).
+    /// Wrapped in [`ManagedCircuit`] so dropping triggers automatic cleanup.
+    pub outbound: Arc<Mutex<HashMap<u32, ManagedCircuit>>>,
+    /// Pending circuit extensions: circuit_id → oneshot sender for CircuitCreated.
+    /// Used to wake the telescoping build when a hop confirms.
+    pub pending_extends: Arc<Mutex<HashMap<u32, oneshot::Sender<Vec<u8>>>>>,
+    /// Pending relay extends: outbound_circuit_id → (inbound_from, inbound_circuit_id).
+    /// When a relay sends CircuitCreate on behalf of an EXTEND, this maps the outbound
+    /// circuit_id to the inbound circuit so the CircuitCreated reply can be routed back.
+    pub relay_extend_pending: Arc<Mutex<HashMap<u32, (PeerId, u32, bool)>>>,
+    /// Backward crypto keying material for circuit hops.
+    /// Key: (circuit_id, from_peer) → (backward_key, backward_digest, nonce).
+    /// Stored at CREATE time, used when converting Endpoint → Forward on EXTEND.
+    pub hop_backward_keys: Arc<Mutex<HashMap<(u32, PeerId), ([u8; 32], [u8; 32], [u8; 16], u64)>>>,
+    /// Initiator-side send window notifications: circuit_id → Notify.
+    /// Wakes the spawned send task when a SENDME arrives from the endpoint.
+    pub sendme_notify: Arc<Mutex<HashMap<u32, Arc<tokio::sync::Notify>>>>,
+    /// Per-circuit relay cell queues: ensures cells on the same circuit are
+    /// processed in FIFO order rather than racing in spawned tasks.
+    /// Key: (circuit_id, from_peer) → sender into that circuit's processing task.
+    pub relay_queues: Arc<Mutex<HashMap<(u32, PeerId), mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Multipath circuit groups: destination → CircuitGroup.
+    pub groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
+}
+
+impl CircuitState {
+    fn new() -> Self {
+        Self {
+            table: Arc::new(Mutex::new(CircuitTable::new())),
+            outbound: Arc::new(Mutex::new(HashMap::new())),
+            pending_extends: Arc::new(Mutex::new(HashMap::new())),
+            relay_extend_pending: Arc::new(Mutex::new(HashMap::new())),
+            hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
+            sendme_notify: Arc::new(Mutex::new(HashMap::new())),
+            relay_queues: Arc::new(Mutex::new(HashMap::new())),
+            groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
+        }
+    }
+}
+
+/// Endpoint (stream connection) state grouped together.
+#[derive(Clone)]
+pub struct EndpointState {
+    /// Endpoint-side receive congestion windows: circuit_id → CongestionWindow.
+    /// Tracks receive credit for inbound DATA cells at circuit endpoints.
+    pub recv_congestion: Arc<Mutex<HashMap<u32, CongestionWindow>>>,
+    /// Endpoint-side send congestion windows: circuit_id → (CongestionWindow, Notify).
+    /// Gates outbound DATA cells from the endpoint back to the initiator.
+    /// The Notify wakes the spawned send task when a SENDME arrives.
+    pub send_congestion: Arc<Mutex<HashMap<u32, (CongestionWindow, Arc<tokio::sync::Notify>)>>>,
+    /// Active connection state: circuit_id → (tx for sending data to the circuit).
+    pub data_txs: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    /// Pending stream connect responses: circuit_id → oneshot (true=connected, false=refused).
+    pub pending_connects: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+}
+
+impl EndpointState {
+    fn new() -> Self {
+        Self {
+            recv_congestion: Arc::new(Mutex::new(HashMap::new())),
+            send_congestion: Arc::new(Mutex::new(HashMap::new())),
+            data_txs: Arc::new(Mutex::new(HashMap::new())),
+            pending_connects: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// Hidden service state grouped together.
+#[derive(Clone)]
+pub struct HiddenServiceState {
+    /// Circuits we built TO intro points for our hidden services.
+    /// Maps service_id → Vec<(intro_peer_id, circuit_id)>
+    pub intros: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Vec<(PeerId, u32)>>>>,
+    /// Tracks when each hidden service was last successfully published.
+    pub last_publish: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Instant>>>,
+    /// Introduction point registrations: circuit_id → registered ServiceId
+    pub intro_registrations: Arc<Mutex<HashMap<u32, (tarnet_api::types::ServiceId, PeerId)>>>,
+    /// Rendezvous point state: cookie → RendezvousEntry
+    pub(crate) rendezvous: Arc<Mutex<HashMap<[u8; 32], RendezvousEntry>>>,
+}
+
+impl HiddenServiceState {
+    fn new() -> Self {
+        Self {
+            intros: Arc::new(Mutex::new(HashMap::new())),
+            last_publish: Arc::new(Mutex::new(HashMap::new())),
+            intro_registrations: Arc::new(Mutex::new(HashMap::new())),
+            rendezvous: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// Channel state grouped together.
+#[derive(Clone)]
+pub struct ChannelState {
+    /// Channels: channel_id → (remote_peer, channel)
+    pub channels: Arc<Mutex<HashMap<u32, (PeerId, Channel)>>>,
+    /// Per-channel data handlers: channel_id → sender for data on that channel.
+    /// Channels with a handler deliver data here instead of app_tx.
+    pub data_handlers: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Port listeners: port_hash → sender that receives (peer_id, channel_id, data_rx)
+    /// when a new channel opens on that port.
+    pub port_listeners: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>>>>,
+}
+
+impl ChannelState {
+    fn new() -> Self {
+        Self {
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            data_handlers: Arc::new(Mutex::new(HashMap::new())),
+            port_listeners: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 /// A tarnet node: manages transports, links, routing, tunnels, and channels.
@@ -195,8 +315,7 @@ pub struct Node {
     routing_table: Arc<Mutex<RoutingTable>>,
     dht_store: Arc<Mutex<DhtStore>>,
     tunnel_table: Arc<Mutex<TunnelTable>>,
-    /// Channels: channel_id → (remote_peer, channel)
-    channels: Arc<Mutex<HashMap<u32, (PeerId, Channel)>>>,
+    channel_state: ChannelState,
     event_tx: mpsc::Sender<NodeEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<NodeEvent>>>,
     /// Channel for delivering data to the application layer.
@@ -233,69 +352,25 @@ pub struct Node {
     query_tokens: Arc<Mutex<HashMap<[u8; 32], (PeerId, Instant)>>>,
     /// Monotonically increasing sequence number for signed content records.
     signed_content_sequence: Arc<Mutex<u64>>,
-    /// Circuit forwarding table.
-    circuit_table: Arc<Mutex<CircuitTable>>,
-    /// Outbound circuits we initiated (keyed by first_hop_circuit_id).
-    /// Wrapped in [`ManagedCircuit`] so dropping triggers automatic cleanup.
-    outbound_circuits: Arc<Mutex<HashMap<u32, ManagedCircuit>>>,
+    circuits: CircuitState,
     /// Sender half of the circuit-drop cleanup channel.
     circuit_drop_tx: mpsc::UnboundedSender<CircuitDropEvent>,
     /// Receiver half, taken by start() to spawn the cleanup task.
     circuit_drop_rx: Mutex<Option<mpsc::UnboundedReceiver<CircuitDropEvent>>>,
-    /// Pending circuit extensions: circuit_id → oneshot sender for CircuitCreated.
-    /// Used to wake the telescoping build when a hop confirms.
-    pending_circuit_extends: Arc<Mutex<HashMap<u32, oneshot::Sender<Vec<u8>>>>>,
-    /// Pending stream connect responses: circuit_id → oneshot (true=connected, false=refused).
-    pending_stream_connects: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
-    /// Pending relay extends: outbound_circuit_id → (inbound_from, inbound_circuit_id).
-    /// When a relay sends CircuitCreate on behalf of an EXTEND, this maps the outbound
-    /// circuit_id to the inbound circuit so the CircuitCreated reply can be routed back.
-    relay_extend_pending: Arc<Mutex<HashMap<u32, (PeerId, u32, bool)>>>,
-    /// Backward crypto keying material for circuit hops.
-    /// Key: (circuit_id, from_peer) → (backward_key, backward_digest, nonce).
-    /// Stored at CREATE time, used when converting Endpoint → Forward on EXTEND.
-    hop_backward_keys: Arc<Mutex<HashMap<(u32, PeerId), ([u8; 32], [u8; 32], [u8; 16], u64)>>>,
+    endpoints: EndpointState,
     /// Active listeners: (ServiceId, port) pairs we accept connections on.
     listeners: Arc<Mutex<Vec<(tarnet_api::types::ServiceId, u16)>>>,
     /// Incoming connections queue (from accept).
     incoming_connections_tx: mpsc::Sender<tarnet_api::service::Connection>,
     incoming_connections_rx: Mutex<Option<mpsc::Receiver<tarnet_api::service::Connection>>>,
-    /// Active connection state: circuit_id → (tx for sending data to the circuit).
-    connection_data_txs: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
-    /// Endpoint-side receive congestion windows: circuit_id → CongestionWindow.
-    /// Tracks receive credit for inbound DATA cells at circuit endpoints.
-    endpoint_congestion: Arc<Mutex<HashMap<u32, CongestionWindow>>>,
-    /// Endpoint-side send congestion windows: circuit_id → (CongestionWindow, Notify).
-    /// Gates outbound DATA cells from the endpoint back to the initiator.
-    /// The Notify wakes the spawned send task when a SENDME arrives.
-    endpoint_send_congestion: Arc<Mutex<HashMap<u32, (CongestionWindow, Arc<tokio::sync::Notify>)>>>,
-    /// Initiator-side send window notifications: circuit_id → Notify.
-    /// Wakes the spawned send task when a SENDME arrives from the endpoint.
-    circuit_sendme_notify: Arc<Mutex<HashMap<u32, Arc<tokio::sync::Notify>>>>,
-    /// Rendezvous point state: cookie → RendezvousEntry
-    rendezvous_table: Arc<Mutex<HashMap<[u8; 32], RendezvousEntry>>>,
-    /// Introduction point registrations: circuit_id → registered ServiceId
-    intro_registrations: Arc<Mutex<HashMap<u32, (tarnet_api::types::ServiceId, PeerId)>>>,
-    /// Circuits we built TO intro points for our hidden services
-    /// Maps service_id → Vec<(intro_peer_id, circuit_id)>
-    hidden_service_intros: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Vec<(PeerId, u32)>>>>,
-    /// Tracks when each hidden service was last successfully published.
-    hidden_service_last_publish: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Instant>>>,
+    hidden: HiddenServiceState,
     /// Identity store: named keypairs with privacy levels.
     identity_store: Arc<Mutex<IdentityStore>>,
-    /// Multipath circuit groups: destination → CircuitGroup.
-    circuit_groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
     /// WebRTC connection coordinator (None if WebRTC is disabled).
     webrtc_connector: Option<Arc<WebRtcConnector>>,
     /// Random secret embedded in hello records so only peers who have seen
     /// our hello can derive the WebRTC signaling channel port name.
     signaling_secret: [u8; 16],
-    /// Per-channel data handlers: channel_id → sender for data on that channel.
-    /// Channels with a handler deliver data here instead of app_tx.
-    channel_data_handlers: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
-    /// Port listeners: port_hash → sender that receives (peer_id, channel_id, data_rx)
-    /// when a new channel opens on that port.
-    channel_port_listeners: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>>>>,
     /// Cache of peer signing/KEM public keys (populated during link handshake).
     pubkey_cache: Arc<Mutex<PubkeyCache>>,
     /// Persistent write-through database (None for ephemeral/test nodes).
@@ -308,10 +383,6 @@ pub struct Node {
     /// Resource governor: per-link-peer budgeting, strike system, circuit rate limiting.
     /// Always-on core infrastructure (unlike the optional firewall).
     governor: Mutex<Governor>,
-    /// Per-circuit relay cell queues: ensures cells on the same circuit are
-    /// processed in FIFO order rather than racing in spawned tasks.
-    /// Key: (circuit_id, from_peer) → sender into that circuit's processing task.
-    circuit_relay_queues: Arc<Mutex<HashMap<(u32, PeerId), mpsc::UnboundedSender<Vec<u8>>>>>,
     /// Lock-free statistics registry shared across all subsystems.
     pub stats: Arc<crate::stats::StatsRegistry>,
     /// Global bandwidth limiter shared across all links.
@@ -450,7 +521,7 @@ impl Node {
             routing_table: Arc::new(Mutex::new(RoutingTable::new(peer_id))),
             dht_store: Arc::new(Mutex::new(dht_store)),
             tunnel_table: Arc::new(Mutex::new(TunnelTable::new())),
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channel_state: ChannelState::new(),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
             app_rx: Mutex::new(Some(app_rx)),
@@ -471,38 +542,23 @@ impl Node {
             kbucket: Arc::new(Mutex::new(KBucketTable::new(&peer_id))),
             query_tokens: Arc::new(Mutex::new(HashMap::new())),
             signed_content_sequence: Arc::new(Mutex::new(sc_seq)),
-            circuit_table: Arc::new(Mutex::new(CircuitTable::new())),
+            circuits: CircuitState::new(),
             circuit_drop_tx,
             circuit_drop_rx: Mutex::new(Some(circuit_drop_rx)),
-            outbound_circuits: Arc::new(Mutex::new(HashMap::new())),
-            pending_circuit_extends: Arc::new(Mutex::new(HashMap::new())),
-            pending_stream_connects: Arc::new(Mutex::new(HashMap::new())),
-            relay_extend_pending: Arc::new(Mutex::new(HashMap::new())),
-            hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
+            endpoints: EndpointState::new(),
             listeners: Arc::new(Mutex::new(Vec::new())),
             incoming_connections_tx: incoming_conn_tx,
             incoming_connections_rx: Mutex::new(Some(incoming_conn_rx)),
-            connection_data_txs: Arc::new(Mutex::new(HashMap::new())),
-            endpoint_congestion: Arc::new(Mutex::new(HashMap::new())),
-            endpoint_send_congestion: Arc::new(Mutex::new(HashMap::new())),
-            circuit_sendme_notify: Arc::new(Mutex::new(HashMap::new())),
-            rendezvous_table: Arc::new(Mutex::new(HashMap::new())),
-            intro_registrations: Arc::new(Mutex::new(HashMap::new())),
-            hidden_service_intros: Arc::new(Mutex::new(HashMap::new())),
-            hidden_service_last_publish: Arc::new(Mutex::new(HashMap::new())),
+            hidden: HiddenServiceState::new(),
             identity_store: Arc::new(Mutex::new(identity_store)),
-            circuit_groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
             webrtc_connector: None,
             signaling_secret: rand::random(),
-            channel_data_handlers: Arc::new(Mutex::new(HashMap::new())),
-            channel_port_listeners: Arc::new(Mutex::new(HashMap::new())),
             pubkey_cache: Arc::new(Mutex::new(PubkeyCache::new(1024))),
             db,
             #[cfg(feature = "mainline-bootstrap")]
             mainline_enabled: false,
             firewall: Mutex::new(None),
             governor: Mutex::new(Governor::new(GovernorConfig::default())),
-            circuit_relay_queues: Arc::new(Mutex::new(HashMap::new())),
             stats: Arc::new(crate::stats::StatsRegistry::new()),
             bandwidth: Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0)),
             started_at: std::time::Instant::now(),
@@ -938,12 +994,12 @@ impl Node {
         // Circuit drop cleanup task: handles async work triggered by the RAII
         // drop guard (CircuitDestroy message, connection teardown, multipath failover).
         let cd_links = self.links.clone();
-        let cd_groups = self.circuit_groups.clone();
-        let cd_conn_txs = self.connection_data_txs.clone();
-        let cd_ep_cong = self.endpoint_congestion.clone();
-        let cd_ep_send_cong = self.endpoint_send_congestion.clone();
-        let cd_sendme_notify = self.circuit_sendme_notify.clone();
-        let cd_relay_queues = self.circuit_relay_queues.clone();
+        let cd_groups = self.circuits.groups.clone();
+        let cd_conn_txs = self.endpoints.data_txs.clone();
+        let cd_ep_cong = self.endpoints.recv_congestion.clone();
+        let cd_ep_send_cong = self.endpoints.send_congestion.clone();
+        let cd_sendme_notify = self.circuits.sendme_notify.clone();
+        let cd_relay_queues = self.circuits.relay_queues.clone();
         let mut circuit_drop_rx = self
             .circuit_drop_rx
             .lock()
@@ -996,7 +1052,7 @@ impl Node {
         // Periodic circuit keepalive: send padding on idle circuits, destroy dead ones.
         // Actual cleanup (destroy message, failover, connection teardown) is handled
         // automatically by the CircuitDropGuard when circuits are removed from the map.
-        let ck_circuits = self.outbound_circuits.clone();
+        let ck_circuits = self.circuits.outbound.clone();
         let ck_links = self.links.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(CIRCUIT_KEEPALIVE_INTERVAL);
@@ -1009,7 +1065,7 @@ impl Node {
                 {
                     let circuits = ck_circuits.lock().await;
                     for (&cid, circuit) in circuits.iter() {
-                        if circuit.state != CircuitState::Ready {
+                        if circuit.state != CircuitPhase::Ready {
                             continue;
                         }
                         let elapsed = now.duration_since(circuit.last_activity);
@@ -1062,7 +1118,7 @@ impl Node {
             let mut interval = tokio::time::interval(crate::governor::GOVERNOR_TICK_INTERVAL);
             loop {
                 interval.tick().await;
-                let ct_len = gov_ref.circuit_table.lock().await.len();
+                let ct_len = gov_ref.circuits.table.lock().await.len();
                 gov_ref.governor.lock().await.tick(ct_len);
             }
         });
@@ -1097,7 +1153,7 @@ impl Node {
         });
 
         // Periodic retransmit check and dead channel detection
-        let retransmit_channels = self.channels.clone();
+        let retransmit_channels = self.channel_state.channels.clone();
         let retransmit_tunnel_table = self.tunnel_table.clone();
         let retransmit_links = self.links.clone();
         let retransmit_routing = self.routing_table.clone();
@@ -1394,7 +1450,7 @@ impl Node {
                     }
                     // Resource governor: per-link-peer budgeting.
                     {
-                        let circuits_for_peer = self.circuit_table.lock().await
+                        let circuits_for_peer = self.circuits.table.lock().await
                             .circuits_per_peer()
                             .get(&from)
                             .copied()
@@ -1416,7 +1472,7 @@ impl Node {
                             msg.payload[2], msg.payload[3],
                         ]);
                         let queue_key = (circuit_id, from);
-                        let mut queues = self.circuit_relay_queues.lock().await;
+                        let mut queues = self.circuits.relay_queues.lock().await;
                         let tx = queues.entry(queue_key).or_insert_with(|| {
                             let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
                             let node = node_arc.clone();
@@ -1460,7 +1516,7 @@ impl Node {
             };
 
             if limit > 0 && count >= limit {
-                let circuit_counts = self.circuit_table.lock().await.circuits_per_peer();
+                let circuit_counts = self.circuits.table.lock().await.circuits_per_peer();
                 if let Some((victim_peer, victim_link_id)) =
                     links.pick_eviction_candidate(is_outbound, &circuit_counts)
                 {
@@ -1660,7 +1716,7 @@ impl Node {
             if peer_gone {
                 self.routing_table.lock().await.remove_next_hop(peer_id);
                 self.dht_watches.lock().await.remove_peer(peer_id);
-                self.circuit_table.lock().await.remove_peer(peer_id);
+                self.circuits.table.lock().await.remove_peer(peer_id);
                 let _ = self
                     .channel_event_tx
                     .send(ChannelEvent::PeerDisconnected { peer_id: *peer_id })
@@ -1685,7 +1741,7 @@ impl Node {
             self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
-            self.circuit_table.lock().await.remove_peer(&peer_id);
+            self.circuits.table.lock().await.remove_peer(&peer_id);
             let _ = self
                 .channel_event_tx
                 .send(ChannelEvent::PeerDisconnected { peer_id })
@@ -1702,7 +1758,7 @@ impl Node {
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
             // Clean up all circuits involving this peer
-            self.circuit_table.lock().await.remove_peer(&peer_id);
+            self.circuits.table.lock().await.remove_peer(&peer_id);
             // Notify application that this peer is gone
             let _ = self
                 .channel_event_tx
@@ -1795,54 +1851,19 @@ impl Node {
 
                 // Forward to targeted peers if new and hop limit not exhausted
                 if is_new && put.hop_limit > 0 {
-                    // Bloom is advisory: skip peers in the bloom UNLESS they are
-                    // among the k-closest to the key. This prevents bloom-stuffing
-                    // attacks from censoring the storage nodes that matter most.
-                    let bloom = BloomFilter::from_bytes(put.bloom);
+                    let old_bloom = put.bloom;
                     let mut fwd_bloom = BloomFilter::new();
                     fwd_bloom.insert(&self.peer_id());
                     put.bloom = fwd_bloom.to_bytes();
                     put.hop_count = put.hop_count.saturating_add(1);
 
-                    let kb = self.kbucket.lock().await;
-                    let all_peers = kb.all_peers();
-                    let l2nse = kb.estimate_l2nse();
-                    drop(kb);
-
-                    let params = DhtQueryParams::from_l2nse(l2nse);
-                    // R5N-style hybrid: random walk for the first l2nse hops,
-                    // then greedy convergence toward the key.
-                    let targets = if put.hop_count < (l2nse.round().min(255.0) as u8) {
-                        random_select(&all_peers, params.fan_out)
-                    } else {
-                        probabilistic_select(&key, &all_peers, params.fan_out)
-                    };
-
                     let encoded = put.to_wire().encode();
-
-                    let links = self.links.lock().await;
-                    if targets.is_empty() {
-                        for (peer_id, link) in links.iter() {
-                            if *peer_id != from && !bloom.contains(peer_id) {
-                                let _ = link.send_message(&encoded).await;
-                            }
-                        }
-                    } else {
-                        for (pid, _) in &targets {
-                            if *pid != from
-                                && (!bloom.contains(pid)
-                                    || is_k_closest(pid, &key, &all_peers, DHT_K))
-                            {
-                                if let Some(link) = links.get(pid) {
-                                    let _ = link.send_message(&encoded).await;
-                                }
-                            }
-                        }
-                    }
+                    self.dht_forward(&key, old_bloom, put.hop_count, &encoded, from).await;
 
                     // Notify remote watchers via query token routing
                     let watchers = self.dht_watches.lock().await.get_watchers(&put.key);
                     if !watchers.is_empty() {
+                        let links = self.links.lock().await;
                         for (token, via_peer) in watchers {
                             if via_peer != from {
                                 let notify = DhtWatchNotifyMsg {
@@ -1928,47 +1949,14 @@ impl Node {
                 // so we track forwarding separately via bloom membership.
                 if get.hop_limit > 0 {
                     get.hop_limit -= 1;
-                    // Advisory bloom: respect it for non-critical peers,
-                    // override it for k-closest to resist bloom stuffing.
-                    let bloom = BloomFilter::from_bytes(get.bloom);
+                    let old_bloom = get.bloom;
                     let mut fwd_bloom = BloomFilter::new();
                     fwd_bloom.insert(&self.peer_id());
                     get.bloom = fwd_bloom.to_bytes();
                     get.hop_count = get.hop_count.saturating_add(1);
 
-                    let kb = self.kbucket.lock().await;
-                    let all_peers = kb.all_peers();
-                    let l2nse = kb.estimate_l2nse();
-                    drop(kb);
-
-                    let params = DhtQueryParams::from_l2nse(l2nse);
-                    let targets = if get.hop_count < (l2nse.round().min(255.0) as u8) {
-                        random_select(&all_peers, params.fan_out)
-                    } else {
-                        probabilistic_select(&key, &all_peers, params.fan_out)
-                    };
-
                     let encoded = get.to_wire().encode();
-
-                    let links = self.links.lock().await;
-                    if targets.is_empty() {
-                        for (peer_id, link) in links.iter() {
-                            if *peer_id != from && !bloom.contains(peer_id) {
-                                let _ = link.send_message(&encoded).await;
-                            }
-                        }
-                    } else {
-                        for (pid, _) in &targets {
-                            if *pid != from
-                                && (!bloom.contains(pid)
-                                    || is_k_closest(pid, &key, &all_peers, DHT_K))
-                            {
-                                if let Some(link) = links.get(pid) {
-                                    let _ = link.send_message(&encoded).await;
-                                }
-                            }
-                        }
-                    }
+                    self.dht_forward(&key, old_bloom, get.hop_count, &encoded, from).await;
                 }
             }
             MessageType::DhtGetResponse => {
@@ -2280,10 +2268,10 @@ impl Node {
 
         // Circuits
         let circuits = {
-            let ct = self.circuit_table.lock().await;
-            let outbound = self.outbound_circuits.lock().await.len();
-            let rendezvous = self.rendezvous_table.lock().await.len();
-            let intro = self.intro_registrations.lock().await.len();
+            let ct = self.circuits.table.lock().await;
+            let outbound = self.circuits.outbound.lock().await.len();
+            let rendezvous = self.hidden.rendezvous.lock().await.len();
+            let intro = self.hidden.intro_registrations.lock().await.len();
             CircuitStatus {
                 relay_forwards: ct.forward_count(),
                 relay_endpoints: ct.endpoint_count(),

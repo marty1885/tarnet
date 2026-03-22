@@ -29,7 +29,7 @@ impl Node {
             data: build_rendezvous_establish_payload(&cookie),
         };
         {
-            let mut circuits = self.outbound_circuits.lock().await;
+            let mut circuits = self.circuits.outbound.lock().await;
             let circuit = circuits.get_mut(&rend_circuit_id).unwrap();
             let (fh, cid, cell) = circuit.send_relay_cell(&establish_cell);
             drop(circuits);
@@ -58,7 +58,7 @@ impl Node {
         let (ack_tx, ack_rx) = oneshot::channel();
         let (joined_tx, joined_rx) = oneshot::channel();
         {
-            let mut pending = self.pending_circuit_extends.lock().await;
+            let mut pending = self.circuits.pending_extends.lock().await;
             pending.insert(intro_circuit_id, ack_tx);
             pending.insert(rend_circuit_id, joined_tx);
         }
@@ -77,7 +77,7 @@ impl Node {
             ),
         };
         {
-            let mut circuits = self.outbound_circuits.lock().await;
+            let mut circuits = self.circuits.outbound.lock().await;
             let circuit = circuits.get_mut(&intro_circuit_id).unwrap();
             let (fh, cid, cell) = circuit.send_relay_cell(&introduce_cell);
             drop(circuits);
@@ -101,7 +101,7 @@ impl Node {
         // Derive e2e hop key from the same KEM shared secret used for INTRODUCE encryption.
         let e2e_hop = crate::circuit::HopKey::from_shared_secret(&shared_secret);
         {
-            let mut circuits = self.outbound_circuits.lock().await;
+            let mut circuits = self.circuits.outbound.lock().await;
             let circuit = circuits.get_mut(&rend_circuit_id).unwrap();
             // Replace all hop keys with only the e2e key. The rendezvous point
             // bridges the two circuits at the cell level (Forward with no crypto),
@@ -120,18 +120,18 @@ impl Node {
         let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);
         let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
 
-        self.connection_data_txs
+        self.endpoints.data_txs
             .lock()
             .await
             .insert(rend_circuit_id, circuit_tx);
 
         let rend_sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuit_sendme_notify
+        self.circuits.sendme_notify
             .lock()
             .await
             .insert(rend_circuit_id, rend_sendme_notify.clone());
 
-        let node_circuits = self.outbound_circuits.clone();
+        let node_circuits = self.circuits.outbound.clone();
         let node_links = self.links.clone();
         tokio::spawn(async move {
             let mut rx = circuit_rx;
@@ -247,7 +247,7 @@ impl Node {
                 data: build_intro_register_payload(&service_id),
             };
             {
-                let mut circuits = self.outbound_circuits.lock().await;
+                let mut circuits = self.circuits.outbound.lock().await;
                 let circuit = circuits
                     .get_mut(&circuit_id)
                     .ok_or_else(|| Error::Protocol("circuit disappeared".into()))?;
@@ -263,7 +263,7 @@ impl Node {
 
             // Wait for IntroRegistered
             let (tx, rx) = oneshot::channel();
-            self.pending_circuit_extends
+            self.circuits.pending_extends
                 .lock()
                 .await
                 .insert(circuit_id, tx);
@@ -288,7 +288,7 @@ impl Node {
         }
 
         // Store intro circuits for later use
-        self.hidden_service_intros
+        self.hidden.intros
             .lock()
             .await
             .insert(service_id, intro_circuits);
@@ -333,8 +333,8 @@ impl Node {
 
     /// Tear down all intro circuits for a hidden service and remove tracking state.
     pub(super) async fn teardown_hidden_service(&self, service_id: &tarnet_api::types::ServiceId) {
-        let removed = self.hidden_service_intros.lock().await.remove(service_id);
-        self.hidden_service_last_publish.lock().await.remove(service_id);
+        let removed = self.hidden.intros.lock().await.remove(service_id);
+        self.hidden.last_publish.lock().await.remove(service_id);
         // Remove the listener registration for this ServiceId
         self.listeners.lock().await.retain(|(s, _)| s != service_id);
         if let Some(circuits) = removed {
@@ -344,7 +344,7 @@ impl Node {
                 service_id
             );
             // Circuits will be cleaned up via their drop guards
-            let mut oc = self.outbound_circuits.lock().await;
+            let mut oc = self.circuits.outbound.lock().await;
             for (_, circuit_id) in circuits {
                 oc.remove(&circuit_id);
             }
@@ -444,8 +444,8 @@ impl Node {
 
             // Check if we need to (re)publish
             let needs_publish = {
-                let intros = self.hidden_service_intros.lock().await;
-                let last_pub = self.hidden_service_last_publish.lock().await;
+                let intros = self.hidden.intros.lock().await;
+                let last_pub = self.hidden.last_publish.lock().await;
                 let has_enough = intros
                     .get(&sid)
                     .map(|v| v.len() >= desired_intros as usize)
@@ -463,9 +463,9 @@ impl Node {
 
             // Tear down stale intro circuits before re-publishing
             {
-                let mut intros = self.hidden_service_intros.lock().await;
+                let mut intros = self.hidden.intros.lock().await;
                 if let Some(old) = intros.remove(&sid) {
-                    let mut oc = self.outbound_circuits.lock().await;
+                    let mut oc = self.circuits.outbound.lock().await;
                     for (_, circuit_id) in old {
                         oc.remove(&circuit_id);
                     }
@@ -474,7 +474,7 @@ impl Node {
 
             match self.publish_hidden_service(sid, desired_intros as usize).await {
                 Ok(()) => {
-                    self.hidden_service_last_publish
+                    self.hidden.last_publish
                         .lock()
                         .await
                         .insert(sid, Instant::now());
@@ -535,7 +535,7 @@ impl Node {
             data: cookie.to_vec(),
         };
         {
-            let mut circuits = self.outbound_circuits.lock().await;
+            let mut circuits = self.circuits.outbound.lock().await;
             if let Some(circuit) = circuits.get_mut(&circuit_id) {
                 let (fh, cid, cell) = circuit.send_relay_cell(&join_cell);
                 drop(circuits);
@@ -560,7 +560,7 @@ impl Node {
         let e2e_hop =
             crate::circuit::HopKey::from_shared_secret_responder(&shared_secret);
         {
-            let mut circuits = self.outbound_circuits.lock().await;
+            let mut circuits = self.circuits.outbound.lock().await;
             if let Some(circuit) = circuits.get_mut(&circuit_id) {
                 circuit.hop_keys = vec![e2e_hop];
             }
@@ -575,18 +575,18 @@ impl Node {
         let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);
         let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
 
-        self.connection_data_txs
+        self.endpoints.data_txs
             .lock()
             .await
             .insert(circuit_id, circuit_tx);
 
         let svc_sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuit_sendme_notify
+        self.circuits.sendme_notify
             .lock()
             .await
             .insert(circuit_id, svc_sendme_notify.clone());
 
-        let node_circuits = self.outbound_circuits.clone();
+        let node_circuits = self.circuits.outbound.clone();
         let node_links = self.links.clone();
         tokio::spawn(async move {
             let mut rx = circuit_rx;

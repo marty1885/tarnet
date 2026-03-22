@@ -8,6 +8,53 @@ pub(super) fn blake3_hash_64(input: &[u8]) -> [u8; 64] {
 }
 
 impl Node {
+    /// Forward a DHT message to targeted peers using R5N-style hybrid routing:
+    /// random walk for the first l2nse hops, then greedy convergence toward the key.
+    /// Advisory bloom is respected for non-critical peers but overridden for
+    /// k-closest to resist bloom-stuffing attacks.
+    pub(super) async fn dht_forward(
+        &self,
+        key: &DhtId,
+        old_bloom: [u8; 256],
+        hop_count: u8,
+        encoded: &[u8],
+        from: PeerId,
+    ) {
+        let bloom = BloomFilter::from_bytes(old_bloom);
+
+        let kb = self.kbucket.lock().await;
+        let all_peers = kb.all_peers();
+        let l2nse = kb.estimate_l2nse();
+        drop(kb);
+
+        let params = DhtQueryParams::from_l2nse(l2nse);
+        let targets = if hop_count < (l2nse.round().min(255.0) as u8) {
+            random_select(&all_peers, params.fan_out)
+        } else {
+            probabilistic_select(key, &all_peers, params.fan_out)
+        };
+
+        let links = self.links.lock().await;
+        if targets.is_empty() {
+            for (peer_id, link) in links.iter() {
+                if *peer_id != from && !bloom.contains(peer_id) {
+                    let _ = link.send_message(encoded).await;
+                }
+            }
+        } else {
+            for (pid, _) in &targets {
+                if *pid != from
+                    && (!bloom.contains(pid)
+                        || is_k_closest(pid, key, &all_peers, DHT_K))
+                {
+                    if let Some(link) = links.get(pid) {
+                        let _ = link.send_message(encoded).await;
+                    }
+                }
+            }
+        }
+    }
+
     /// Compute DHT query parameters from the current L2NSE estimate.
     pub async fn dht_query_params(&self) -> DhtQueryParams {
         let kb = self.kbucket.lock().await;

@@ -169,7 +169,7 @@ impl Node {
     }
 
     async fn handle_channel_message(&self, from: PeerId, msg: WireMessage) -> Result<()> {
-        let mut channels = self.channels.lock().await;
+        let mut channels = self.channel_state.channels.lock().await;
         match msg.msg_type {
             MessageType::ChannelOpen => {
                 let open = ChannelOpenMsg::from_bytes(&msg.payload)?;
@@ -178,10 +178,10 @@ impl Node {
                 log::debug!("Channel {} opened from {:?}", open.channel_id, from);
 
                 // Check if a port listener is registered for this port
-                let listeners = self.channel_port_listeners.lock().await;
+                let listeners = self.channel_state.port_listeners.lock().await;
                 if let Some(listener_tx) = listeners.get(&open.port) {
                     let (data_tx, data_rx) = mpsc::unbounded_channel();
-                    self.channel_data_handlers.lock().await.insert(open.channel_id, data_tx);
+                    self.channel_state.data_handlers.lock().await.insert(open.channel_id, data_tx);
                     let _ = listener_tx.send((from, open.channel_id, data_rx));
                 }
             }
@@ -191,7 +191,7 @@ impl Node {
                     let delivered = ch.receive_data(data.sequence, data.data);
 
                     // Check if this channel has a data handler
-                    let handlers = self.channel_data_handlers.lock().await;
+                    let handlers = self.channel_state.data_handlers.lock().await;
                     if let Some(handler_tx) = handlers.get(&data.channel_id) {
                         for payload in delivered {
                             let _ = handler_tx.send(payload);
@@ -244,7 +244,7 @@ impl Node {
             MessageType::ChannelClose => {
                 let close = ChannelCloseMsg::from_bytes(&msg.payload)?;
                 channels.remove(&close.channel_id);
-                self.channel_data_handlers.lock().await.remove(&close.channel_id);
+                self.channel_state.data_handlers.lock().await.remove(&close.channel_id);
                 log::debug!("Channel {} closed by {:?}", close.channel_id, from);
             }
             _ => {}
@@ -470,7 +470,7 @@ impl Node {
         let ch = Channel::new(channel_id, port, reliable, ordered);
 
         // Register locally
-        self.channels
+        self.channel_state.channels
             .lock()
             .await
             .insert(channel_id, (*dest, ch));
@@ -499,7 +499,7 @@ impl Node {
         let channel_id: u32 = rand::thread_rng().gen();
         let ch = Channel::new(channel_id, port, reliable, ordered);
 
-        self.channels
+        self.channel_state.channels
             .lock()
             .await
             .insert(channel_id, (*dest, ch));
@@ -527,7 +527,7 @@ impl Node {
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
         let channel_id = self.channel_open(dest, port_name, reliable, ordered).await?;
         let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.channel_data_handlers.lock().await.insert(channel_id, data_tx);
+        self.channel_state.data_handlers.lock().await.insert(channel_id, data_tx);
         Ok((channel_id, data_rx))
     }
 
@@ -541,7 +541,7 @@ impl Node {
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
         let channel_id = self.channel_open_port(dest, port, reliable, ordered).await?;
         let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.channel_data_handlers.lock().await.insert(channel_id, data_tx);
+        self.channel_state.data_handlers.lock().await.insert(channel_id, data_tx);
         Ok((channel_id, data_rx))
     }
 
@@ -549,7 +549,7 @@ impl Node {
     /// sequencing, ACKs, and retransmission automatically.
     pub async fn channel_send(&self, channel_id: u32, data: &[u8]) -> Result<()> {
         let (dest, sends) = {
-            let mut channels = self.channels.lock().await;
+            let mut channels = self.channel_state.channels.lock().await;
             let (remote, ch) = channels
                 .get_mut(&channel_id)
                 .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
@@ -572,7 +572,7 @@ impl Node {
     /// Close a channel.
     pub async fn channel_close(&self, channel_id: u32) -> Result<()> {
         let dest = {
-            let mut channels = self.channels.lock().await;
+            let mut channels = self.channel_state.channels.lock().await;
             let (remote, _) = channels
                 .remove(&channel_id)
                 .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;

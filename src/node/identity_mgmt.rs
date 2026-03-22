@@ -42,7 +42,7 @@ impl Node {
             tarnet_api::types::PrivacyLevel::Hidden { intro_points } => {
                 match self.publish_hidden_service(sid, intro_points as usize).await {
                     Ok(()) => {
-                        self.hidden_service_last_publish
+                        self.hidden.last_publish
                             .lock()
                             .await
                             .insert(sid, Instant::now());
@@ -131,7 +131,7 @@ impl Node {
                     let _ = self.circuit_listen(sid, 0).await;
                     match self.publish_hidden_service(sid, intro_points as usize).await {
                         Ok(()) => {
-                            self.hidden_service_last_publish
+                            self.hidden.last_publish
                                 .lock().await.insert(sid, Instant::now());
                         }
                         Err(e) => {
@@ -161,7 +161,7 @@ impl Node {
                     let _ = self.circuit_listen(sid, 0).await;
                     match self.publish_hidden_service(sid, new_n as usize).await {
                         Ok(()) => {
-                            self.hidden_service_last_publish
+                            self.hidden.last_publish
                                 .lock().await.insert(sid, Instant::now());
                         }
                         Err(e) => {

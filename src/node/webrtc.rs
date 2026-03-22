@@ -73,12 +73,12 @@ impl Node {
     async fn register_webrtc_port_listener(&self, port_hash: [u8; 32], connector: Arc<WebRtcConnector>) {
 
         let (listener_tx, mut listener_rx) = mpsc::unbounded_channel::<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>();
-        self.channel_port_listeners.lock().await.insert(port_hash, listener_tx);
+        self.channel_state.port_listeners.lock().await.insert(port_hash, listener_tx);
 
         let event_tx = self.event_tx.clone();
         let identity = self.identity.clone();
-        let channel_data_handlers = self.channel_data_handlers.clone();
-        let channels = self.channels.clone();
+        let channel_data_handlers = self.channel_state.data_handlers.clone();
+        let channels = self.channel_state.channels.clone();
         let tunnel_table = self.tunnel_table.clone();
         let links = self.links.clone();
         let routing_table = self.routing_table.clone();
@@ -242,7 +242,7 @@ impl Node {
         self.channel_send(channel_id, &offer_msg).await?;
 
         // Spawn ICE trickle sender (our candidates → channel)
-        let channels = self.channels.clone();
+        let channels = self.channel_state.channels.clone();
         let tunnel_table = self.tunnel_table.clone();
         let links = self.links.clone();
         let routing_table = self.routing_table.clone();
@@ -263,8 +263,8 @@ impl Node {
 
         // Spawn task to read answer and ICE candidates from the channel
         let connector = connector.clone();
-        let channel_data_handlers = self.channel_data_handlers.clone();
-        let channels2 = self.channels.clone();
+        let channel_data_handlers = self.channel_state.data_handlers.clone();
+        let channels2 = self.channel_state.channels.clone();
         tokio::spawn(async move {
             while let Some(msg) = data_rx.recv().await {
                 if msg.is_empty() {
