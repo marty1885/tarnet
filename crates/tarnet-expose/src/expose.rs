@@ -272,7 +272,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                 }
 
                 // Check for @ conflict: if @ already points elsewhere, refuse.
-                match state.api.tns_get_label("@").await {
+                match state.api.tns_get_label(None, "@").await {
                     Ok(Some((records, _))) => {
                         // @ is set. Check if it's our own Identity or something else.
                         let is_self = records.iter().any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == self_sid));
@@ -682,10 +682,10 @@ mod tests {
         async fn tns_resolve_name(&self, _: &str) -> ApiResult<TnsResolution> {
             Ok(TnsResolution::NotFound)
         }
-        async fn tns_set_label(&self, _: &str, _: Vec<TnsRecord>, _: bool) -> ApiResult<()> { Ok(()) }
-        async fn tns_get_label(&self, _: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> { Ok(None) }
-        async fn tns_remove_label(&self, _: &str) -> ApiResult<()> { Ok(()) }
-        async fn tns_list_labels(&self) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> { Ok(vec![]) }
+        async fn tns_set_label(&self, _: Option<&str>, _: &str, _: Vec<TnsRecord>, _: bool) -> ApiResult<()> { Ok(()) }
+        async fn tns_get_label(&self, _: Option<&str>, _: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> { Ok(None) }
+        async fn tns_remove_label(&self, _: Option<&str>, _: &str) -> ApiResult<()> { Ok(()) }
+        async fn tns_list_labels(&self, _: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> { Ok(vec![]) }
 
         async fn create_identity(&self, _: &str, _: PrivacyLevel, _: u8, _: IdentityScheme) -> ApiResult<ServiceId> {
             Ok(self.identities[0].1)

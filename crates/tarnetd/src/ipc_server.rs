@@ -389,23 +389,23 @@ async fn dispatch_request(
         }
 
         METHOD_TNS_SET_LABEL => {
-            let (label, records, publish): (String, Vec<tarnet_api::service::TnsRecord>, bool) =
+            let (identity, label, records, publish): (Option<String>, String, Vec<tarnet_api::service::TnsRecord>, bool) =
                 match decode_payload(payload) {
                     Ok(v) => v,
                     Err(e) => return err_response(request_id, &e.to_string()),
                 };
-            match api.tns_set_label(&label, records, publish).await {
+            match api.tns_set_label(identity.as_deref(), &label, records, publish).await {
                 Ok(()) => ok_response(request_id, &[]),
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }
 
         METHOD_TNS_GET_LABEL => {
-            let label: String = match decode_payload(payload) {
+            let (identity, label): (Option<String>, String) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.tns_get_label(&label).await {
+            match api.tns_get_label(identity.as_deref(), &label).await {
                 Ok(Some((records, publish))) => {
                     ok_response(request_id, &encode_payload(&(records, publish)))
                 }
@@ -415,18 +415,22 @@ async fn dispatch_request(
         }
 
         METHOD_TNS_REMOVE_LABEL => {
-            let label: String = match decode_payload(payload) {
+            let (identity, label): (Option<String>, String) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.tns_remove_label(&label).await {
+            match api.tns_remove_label(identity.as_deref(), &label).await {
                 Ok(()) => ok_response(request_id, &[]),
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }
 
         METHOD_TNS_LIST_LABELS => {
-            match api.tns_list_labels().await {
+            let identity: Option<String> = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.tns_list_labels(identity.as_deref()).await {
                 Ok(entries) => ok_response(request_id, &encode_payload(&entries)),
                 Err(e) => err_response(request_id, &e.to_string()),
             }

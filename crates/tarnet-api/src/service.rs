@@ -309,16 +309,20 @@ pub trait ServiceApi: Send + Sync {
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution>;
 
     /// Set a local label with associated records and publish flag.
-    async fn tns_set_label(&self, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()>;
+    /// If `identity` is None, uses the default identity.
+    async fn tns_set_label(&self, identity: Option<&str>, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()>;
 
     /// Get a local label's records and publish flag.
-    async fn tns_get_label(&self, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>>;
+    /// If `identity` is None, uses the default identity.
+    async fn tns_get_label(&self, identity: Option<&str>, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>>;
 
     /// Remove a local label.
-    async fn tns_remove_label(&self, label: &str) -> ApiResult<()>;
+    /// If `identity` is None, uses the default identity.
+    async fn tns_remove_label(&self, identity: Option<&str>, label: &str) -> ApiResult<()>;
 
     /// List all local labels with their records and publish flags.
-    async fn tns_list_labels(&self) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>>;
+    /// If `identity` is None, uses the default identity.
+    async fn tns_list_labels(&self, identity: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>>;
 
     // ── Identity management ──
 

@@ -127,21 +127,34 @@ enum TnsCommand {
         /// Publish to the DHT (default: private/local-only)
         #[arg(long)]
         public: bool,
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// Show records for a name
     #[command(arg_required_else_help = true)]
     Get {
         /// Record name
         name: String,
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// Remove a record
     #[command(arg_required_else_help = true)]
     Rm {
         /// Record name
         name: String,
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// List all records in your zone
-    List,
+    List {
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
+    },
     /// Resolve a name (from your zone by default)
     #[command(arg_required_else_help = true)]
     Resolve {
@@ -158,6 +171,9 @@ enum TnsCommand {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// Import zone records from a JSON file
     #[command(arg_required_else_help = true)]
@@ -167,12 +183,18 @@ enum TnsCommand {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// Remove all records from the zone
     Clear {
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Identity to operate on (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
 }
 
@@ -481,11 +503,12 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
     let client = connect_daemon(cli).await;
 
     match cmd {
-        TnsCommand::Set { name, record_type, value, public } => {
+        TnsCommand::Set { name, record_type, value, public, identity } => {
+            let id = identity.as_deref();
             let record = parse_tns_record(record_type, value);
             let records = vec![record];
 
-            match client.tns_set_label(name, records, *public).await {
+            match client.tns_set_label(id, name, records, *public).await {
                 Ok(()) => {
                     let status = if *public { "[public]" } else { "[private]" };
                     println!("{} {}", name, status);
@@ -496,8 +519,8 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::Get { name } => {
-            match client.tns_get_label(name).await {
+        TnsCommand::Get { name, identity } => {
+            match client.tns_get_label(identity.as_deref(), name).await {
                 Ok(Some((records, public))) => {
                     let status = if public { "[public]" } else { "[private]" };
                     println!("{} {}:", name, status);
@@ -515,8 +538,8 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::Rm { name } => {
-            match client.tns_remove_label(name).await {
+        TnsCommand::Rm { name, identity } => {
+            match client.tns_remove_label(identity.as_deref(), name).await {
                 Ok(()) => println!("Removed '{}'", name),
                 Err(e) => {
                     eprintln!("Failed: {}", e);
@@ -524,8 +547,8 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::List => {
-            match client.tns_list_labels().await {
+        TnsCommand::List { identity } => {
+            match client.tns_list_labels(identity.as_deref()).await {
                 Ok(entries) => {
                     if entries.is_empty() {
                         println!("No records.");
@@ -571,8 +594,9 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::Export { file, yes } => {
-            let entries = match client.tns_list_labels().await {
+        TnsCommand::Export { file, yes, identity } => {
+            let id = identity.as_deref();
+            let entries = match client.tns_list_labels(id).await {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("Failed: {}", e);
@@ -611,7 +635,7 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 println!("{}", json);
             }
         }
-        TnsCommand::Import { file, yes } => {
+        TnsCommand::Import { file, yes, identity } => {
             let data = match std::fs::read_to_string(file) {
                 Ok(d) => d,
                 Err(e) => {
@@ -643,15 +667,16 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
 
             let mut ok = 0usize;
             for entry in &entries {
-                match client.tns_set_label(&entry.label, entry.records.clone(), entry.publish).await {
+                match client.tns_set_label(identity.as_deref(), &entry.label, entry.records.clone(), entry.publish).await {
                     Ok(()) => ok += 1,
                     Err(e) => eprintln!("Failed to import '{}': {}", entry.label, e),
                 }
             }
             eprintln!("Imported {}/{} record(s).", ok, entries.len());
         }
-        TnsCommand::Clear { yes } => {
-            let entries = match client.tns_list_labels().await {
+        TnsCommand::Clear { yes, identity } => {
+            let id = identity.as_deref();
+            let entries = match client.tns_list_labels(id).await {
                 Ok(e) => e,
                 Err(e) => {
                     eprintln!("Failed: {}", e);
@@ -674,7 +699,7 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
 
             let mut ok = 0usize;
             for (label, _, _) in &entries {
-                match client.tns_remove_label(label).await {
+                match client.tns_remove_label(id, label).await {
                     Ok(()) => ok += 1,
                     Err(e) => eprintln!("Failed to remove '{}': {}", label, e),
                 }

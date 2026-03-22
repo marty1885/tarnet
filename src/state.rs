@@ -151,13 +151,16 @@ impl StateDb {
                  PRIMARY KEY (key, signer)
              );
              CREATE TABLE IF NOT EXISTS tns_labels (
-                 label TEXT PRIMARY KEY,
-                 publish INTEGER NOT NULL DEFAULT 0
+                 identity TEXT NOT NULL DEFAULT '',
+                 label TEXT NOT NULL,
+                 publish INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (identity, label)
              );
              CREATE TABLE IF NOT EXISTS tns_records (
+                 identity TEXT NOT NULL DEFAULT '',
                  label TEXT NOT NULL,
                  record BLOB NOT NULL,
-                 FOREIGN KEY (label) REFERENCES tns_labels(label) ON DELETE CASCADE
+                 FOREIGN KEY (identity, label) REFERENCES tns_labels(identity, label) ON DELETE CASCADE
              );",
         )
         .map_err(sqlite_err)?;
@@ -349,25 +352,25 @@ impl StateDb {
 
     // ── Labels (TNS local store) ──
 
-    pub fn label_set(&self, label: &str, records: &[Vec<u8>], publish: bool) -> Result<()> {
+    pub fn label_set(&self, identity: &str, label: &str, records: &[Vec<u8>], publish: bool) -> Result<()> {
         let conn = self.lock()?;
         conn.execute_batch("BEGIN").map_err(sqlite_err)?;
         let result = (|| {
             conn.execute(
-                "INSERT INTO tns_labels(label, publish) VALUES(?1, ?2)
-                 ON CONFLICT(label) DO UPDATE SET publish = excluded.publish",
-                params![label, publish as i32],
+                "INSERT INTO tns_labels(identity, label, publish) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(identity, label) DO UPDATE SET publish = excluded.publish",
+                params![identity, label, publish as i32],
             )
             .map_err(sqlite_err)?;
             conn.execute(
-                "DELETE FROM tns_records WHERE label = ?1",
-                params![label],
+                "DELETE FROM tns_records WHERE identity = ?1 AND label = ?2",
+                params![identity, label],
             )
             .map_err(sqlite_err)?;
             for rec_bytes in records {
                 conn.execute(
-                    "INSERT INTO tns_records(label, record) VALUES(?1, ?2)",
-                    params![label, rec_bytes],
+                    "INSERT INTO tns_records(identity, label, record) VALUES(?1, ?2, ?3)",
+                    params![identity, label, rec_bytes],
                 )
                 .map_err(sqlite_err)?;
             }
@@ -381,12 +384,12 @@ impl StateDb {
         result
     }
 
-    pub fn label_get(&self, label: &str) -> Result<Option<(Vec<Vec<u8>>, bool)>> {
+    pub fn label_get(&self, identity: &str, label: &str) -> Result<Option<(Vec<Vec<u8>>, bool)>> {
         let conn = self.lock()?;
         let publish: Option<bool> = conn
             .query_row(
-                "SELECT publish FROM tns_labels WHERE label = ?1",
-                params![label],
+                "SELECT publish FROM tns_labels WHERE identity = ?1 AND label = ?2",
+                params![identity, label],
                 |row| {
                     let v: i32 = row.get(0)?;
                     Ok(v != 0)
@@ -399,38 +402,39 @@ impl StateDb {
             None => return Ok(None),
         };
         let mut stmt = conn
-            .prepare("SELECT record FROM tns_records WHERE label = ?1")
+            .prepare("SELECT record FROM tns_records WHERE identity = ?1 AND label = ?2")
             .map_err(sqlite_err)?;
         let rows = stmt
-            .query_map(params![label], |row| row.get::<_, Vec<u8>>(0))
+            .query_map(params![identity, label], |row| row.get::<_, Vec<u8>>(0))
             .map_err(sqlite_err)?;
         let records = rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sqlite_err)?;
         Ok(Some((records, publish)))
     }
 
-    pub fn label_remove(&self, label: &str) -> Result<()> {
+    pub fn label_remove(&self, identity: &str, label: &str) -> Result<()> {
         let conn = self.lock()?;
         conn.execute(
-            "DELETE FROM tns_labels WHERE label = ?1",
-            params![label],
+            "DELETE FROM tns_labels WHERE identity = ?1 AND label = ?2",
+            params![identity, label],
         )
         .map_err(sqlite_err)?;
         Ok(())
     }
 
-    pub fn label_list(&self) -> Result<Vec<(String, Vec<Vec<u8>>, bool)>> {
+    pub fn label_list(&self, identity: &str) -> Result<Vec<(String, Vec<Vec<u8>>, bool)>> {
         let conn = self.lock()?;
         let mut stmt = conn
             .prepare(
                 "SELECT l.label, l.publish, r.record
                  FROM tns_labels l
-                 LEFT JOIN tns_records r ON r.label = l.label
+                 LEFT JOIN tns_records r ON r.identity = l.identity AND r.label = l.label
+                 WHERE l.identity = ?1
                  ORDER BY l.label",
             )
             .map_err(sqlite_err)?;
         let mapped = stmt
-            .query_map([], |row| {
+            .query_map(params![identity], |row| {
                 let label: String = row.get(0)?;
                 let publish: i32 = row.get(1)?;
                 let record: Option<Vec<u8>> = row.get(2)?;
@@ -536,17 +540,17 @@ mod tests {
 
         // Labels
         let zone_rec = vec![1u8, 0x42, 0x42, 0x42]; // dummy record blob
-        db.label_set("alice", &[zone_rec.clone()], false).unwrap();
-        let result = db.label_get("alice").unwrap();
+        db.label_set("", "alice", &[zone_rec.clone()], false).unwrap();
+        let result = db.label_get("", "alice").unwrap();
         assert!(result.is_some());
         let (blobs, publish) = result.unwrap();
         assert_eq!(blobs, vec![zone_rec]);
         assert!(!publish);
-        let list = db.label_list().unwrap();
+        let list = db.label_list("").unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].0, "alice");
-        db.label_remove("alice").unwrap();
-        assert!(db.label_get("alice").unwrap().is_none());
+        db.label_remove("", "alice").unwrap();
+        assert!(db.label_get("", "alice").unwrap().is_none());
 
         cleanup(&path);
     }

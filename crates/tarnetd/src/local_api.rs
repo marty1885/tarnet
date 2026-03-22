@@ -143,13 +143,42 @@ impl LocalServiceApi {
         self.tns_cache.lock().await.clear();
     }
 
+    /// Resolve an identity option to a DB key string.
+    /// None or "default" → the default identity's label (or "" if unnamed).
+    async fn identity_db_key(&self, identity: Option<&str>) -> ApiResult<String> {
+        match identity {
+            Some(id_str) if !id_str.is_empty() && id_str != "default" => Ok(id_str.to_string()),
+            _ => {
+                // Find the default identity's label.
+                let sid = self.node.default_service_id().await;
+                let identities = self.node.list_identities().await;
+                for (label, s, _, _, _, _, _) in &identities {
+                    if *s == sid {
+                        return Ok(label.clone());
+                    }
+                }
+                Ok(String::new())
+            }
+        }
+    }
+
+    /// Get the keypair for the given identity (or the default).
+    async fn keypair_for_identity(&self, identity: Option<&str>) -> ApiResult<tarnet::identity::Keypair> {
+        let sid = self.resolve_identity(identity.unwrap_or("")).await?;
+        self.node.keypair_for_service(&sid).await.ok_or_else(|| {
+            ApiError::Service(format!("no keypair found for identity '{}'", identity.unwrap_or("default")))
+        })
+    }
+
     /// Uncached TNS name resolution (called by the cached wrapper).
     fn tns_resolve_name_inner<'a>(&'a self, name: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<TnsResolution>> + Send + 'a>> {
         Box::pin(async move {
         // Check if the rightmost label (root of the name) is a local label.
+        // Search the default identity's zone.
+        let id_key = self.identity_db_key(None).await?;
         let labels: Vec<&str> = name.split('.').collect();
         if let Some(root_label) = labels.last() {
-            if let Ok(Some((record_blobs, _publish))) = self.db.label_get(root_label) {
+            if let Ok(Some((record_blobs, _publish))) = self.db.label_get(&id_key, root_label) {
                 let records: Vec<TnsRecord> = record_blobs
                     .iter()
                     .filter_map(|b| tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
@@ -445,23 +474,11 @@ impl ServiceApi for LocalServiceApi {
         records: Vec<TnsRecord>,
         ttl_secs: u32,
     ) -> ApiResult<()> {
+        let id_key = self.identity_db_key(identity).await?;
         tns::validate_records(&records).map_err(map_err)?;
-        tns::validate_published_aliases(&records, &self.db).map_err(map_err)?;
+        tns::validate_published_aliases(&records, &self.db, &id_key).map_err(map_err)?;
 
-        let zone_keypair = match identity {
-            Some(id_str) => {
-                let sid = self.resolve_identity(id_str).await?;
-                self.node.keypair_for_service(&sid).await.ok_or_else(|| {
-                    ApiError::Service(format!("no keypair found for identity '{}'", id_str))
-                })?
-            }
-            None => {
-                let sid = self.node.default_service_id().await;
-                self.node.keypair_for_service(&sid).await.unwrap_or_else(|| {
-                    tarnet::identity::Keypair::from_full_bytes(&self.node.identity.to_full_bytes()).unwrap()
-                })
-            }
-        };
+        let zone_keypair = self.keypair_for_identity(identity).await?;
         tns::publish(&self.node, &zone_keypair, label, &records, ttl_secs)
             .await
             .map_err(map_err)?;
@@ -494,22 +511,18 @@ impl ServiceApi for LocalServiceApi {
         Ok(result)
     }
 
-    async fn tns_set_label(&self, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()> {
+    async fn tns_set_label(&self, identity: Option<&str>, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()> {
+        let id_key = self.identity_db_key(identity).await?;
         tns::validate_records(&records).map_err(map_err)?;
         if publish {
-            tns::validate_published_aliases(&records, &self.db).map_err(map_err)?;
+            tns::validate_published_aliases(&records, &self.db, &id_key).map_err(map_err)?;
         }
         let record_blobs: Vec<Vec<u8>> = records.iter().map(|r| tns::tns_record_to_bytes(r)).collect();
-        self.db.label_set(label, &record_blobs, publish).map_err(map_err)?;
+        self.db.label_set(&id_key, label, &record_blobs, publish).map_err(map_err)?;
 
         // Auto-publish to DHT when marked public.
         if publish {
-            let zone_keypair = {
-                let sid = self.node.default_service_id().await;
-                self.node.keypair_for_service(&sid).await.unwrap_or_else(|| {
-                    tarnet::identity::Keypair::from_full_bytes(&self.node.identity.to_full_bytes()).unwrap()
-                })
-            };
+            let zone_keypair = self.keypair_for_identity(identity).await?;
             tns::publish(&self.node, &zone_keypair, label, &records, 3600)
                 .await
                 .map_err(map_err)?;
@@ -519,8 +532,9 @@ impl ServiceApi for LocalServiceApi {
         Ok(())
     }
 
-    async fn tns_get_label(&self, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
-        match self.db.label_get(label).map_err(map_err)? {
+    async fn tns_get_label(&self, identity: Option<&str>, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
+        let id_key = self.identity_db_key(identity).await?;
+        match self.db.label_get(&id_key, label).map_err(map_err)? {
             Some((blobs, publish)) => {
                 let records = blobs
                     .iter()
@@ -532,14 +546,16 @@ impl ServiceApi for LocalServiceApi {
         }
     }
 
-    async fn tns_remove_label(&self, label: &str) -> ApiResult<()> {
-        self.db.label_remove(label).map_err(map_err)?;
+    async fn tns_remove_label(&self, identity: Option<&str>, label: &str) -> ApiResult<()> {
+        let id_key = self.identity_db_key(identity).await?;
+        self.db.label_remove(&id_key, label).map_err(map_err)?;
         self.tns_cache_clear().await;
         Ok(())
     }
 
-    async fn tns_list_labels(&self) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
-        let raw = self.db.label_list().map_err(map_err)?;
+    async fn tns_list_labels(&self, identity: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
+        let id_key = self.identity_db_key(identity).await?;
+        let raw = self.db.label_list(&id_key).map_err(map_err)?;
         Ok(raw
             .into_iter()
             .map(|(label, blobs, publish)| {

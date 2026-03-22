@@ -545,14 +545,16 @@ impl ServiceApi for IpcServiceApi {
         decode_payload(&resp)
     }
 
-    async fn tns_set_label(&self, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()> {
-        let payload = encode_payload(&(label.to_string(), records, publish));
+    async fn tns_set_label(&self, identity: Option<&str>, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()> {
+        let id_str: Option<String> = identity.map(|s| s.to_string());
+        let payload = encode_payload(&(id_str, label.to_string(), records, publish));
         let (status, resp) = self.request(METHOD_TNS_SET_LABEL, &payload).await?;
         Self::check_status(status, &resp)
     }
 
-    async fn tns_get_label(&self, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
-        let payload = encode_payload(&label.to_string());
+    async fn tns_get_label(&self, identity: Option<&str>, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
+        let id_str: Option<String> = identity.map(|s| s.to_string());
+        let payload = encode_payload(&(id_str, label.to_string()));
         let (status, resp) = self.request(METHOD_TNS_GET_LABEL, &payload).await?;
         if status == STATUS_NOT_FOUND {
             return Ok(None);
@@ -561,14 +563,17 @@ impl ServiceApi for IpcServiceApi {
         decode_payload(&resp)
     }
 
-    async fn tns_remove_label(&self, label: &str) -> ApiResult<()> {
-        let payload = encode_payload(&label.to_string());
+    async fn tns_remove_label(&self, identity: Option<&str>, label: &str) -> ApiResult<()> {
+        let id_str: Option<String> = identity.map(|s| s.to_string());
+        let payload = encode_payload(&(id_str, label.to_string()));
         let (status, resp) = self.request(METHOD_TNS_REMOVE_LABEL, &payload).await?;
         Self::check_status(status, &resp)
     }
 
-    async fn tns_list_labels(&self) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
-        let (status, resp) = self.request(METHOD_TNS_LIST_LABELS, &[]).await?;
+    async fn tns_list_labels(&self, identity: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
+        let id_str: Option<String> = identity.map(|s| s.to_string());
+        let payload = encode_payload(&id_str);
+        let (status, resp) = self.request(METHOD_TNS_LIST_LABELS, &payload).await?;
         Self::check_status(status, &resp)?;
         decode_payload(&resp)
     }

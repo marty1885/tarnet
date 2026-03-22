@@ -719,6 +719,7 @@ pub fn validate_records(records: &[TnsRecord]) -> Result<()> {
 pub fn validate_published_aliases(
     records: &[TnsRecord],
     db: &crate::state::StateDb,
+    identity: &str,
 ) -> Result<()> {
     for record in records {
         if let TnsRecord::Alias(target) = record {
@@ -728,7 +729,7 @@ pub fn validate_published_aliases(
                 continue;
             }
             // Check if the target label exists locally and is unpublished.
-            if let Ok(Some((_, target_publish))) = db.label_get(target) {
+            if let Ok(Some((_, target_publish))) = db.label_get(identity, target) {
                 if !target_publish {
                     return Err(Error::Protocol(format!(
                         "published alias target '{}' references an unpublished label",
@@ -950,35 +951,35 @@ mod tests {
 
         // Set and get
         let zone_bytes = tns_record_to_bytes(&TnsRecord::Zone(zone));
-        db.label_set("alice", &[zone_bytes.clone()], false).unwrap();
-        let result = db.label_get("alice").unwrap();
+        db.label_set("","alice", &[zone_bytes.clone()], false).unwrap();
+        let result = db.label_get("","alice").unwrap();
         assert!(result.is_some());
         let (blobs, publish) = result.unwrap();
         assert_eq!(blobs.len(), 1);
         assert!(!publish);
 
         // Not found
-        assert!(db.label_get("bob").unwrap().is_none());
+        assert!(db.label_get("","bob").unwrap().is_none());
 
         // Overwrite
         let zone2 = ServiceId::from_signing_pubkey(&[0x43; 32]);
         let zone2_bytes = tns_record_to_bytes(&TnsRecord::Zone(zone2));
-        db.label_set("alice", &[zone2_bytes], true).unwrap();
-        let (_, publish) = db.label_get("alice").unwrap().unwrap();
+        db.label_set("","alice", &[zone2_bytes], true).unwrap();
+        let (_, publish) = db.label_get("","alice").unwrap().unwrap();
         assert!(publish);
 
         // List
         let zone_bytes2 = tns_record_to_bytes(&TnsRecord::Zone(zone));
-        db.label_set("bob", &[zone_bytes2], false).unwrap();
-        let list = db.label_list().unwrap();
+        db.label_set("","bob", &[zone_bytes2], false).unwrap();
+        let list = db.label_list("",).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].0, "alice");
         assert_eq!(list[1].0, "bob");
 
         // Remove
-        db.label_remove("alice").unwrap();
-        assert!(db.label_get("alice").unwrap().is_none());
-        assert_eq!(db.label_list().unwrap().len(), 1);
+        db.label_remove("","alice").unwrap();
+        assert!(db.label_get("","alice").unwrap().is_none());
+        assert_eq!(db.label_list("",).unwrap().len(), 1);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1467,20 +1468,20 @@ mod tests {
         let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(
             ServiceId::from_signing_pubkey(&[0x01; 32]),
         ));
-        db.label_set("@", &[at_bytes], false).unwrap();
+        db.label_set("","@", &[at_bytes], false).unwrap();
 
         // Publishing an alias to "@" should fail — "@" is unpublished.
         let records = vec![TnsRecord::Alias("@".into())];
-        assert!(validate_published_aliases(&records, &db).is_err());
+        assert!(validate_published_aliases(&records, &db, "").is_err());
 
         // Now publish "@"
         let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(
             ServiceId::from_signing_pubkey(&[0x01; 32]),
         ));
-        db.label_set("@", &[at_bytes], true).unwrap();
+        db.label_set("","@", &[at_bytes], true).unwrap();
 
         // Same alias should now pass.
-        assert!(validate_published_aliases(&records, &db).is_ok());
+        assert!(validate_published_aliases(&records, &db, "").is_ok());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1508,11 +1509,11 @@ mod tests {
         let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(
             ServiceId::from_signing_pubkey(&[0x01; 32]),
         ));
-        db.label_set("@", &[at_bytes], false).unwrap();
+        db.label_set("","@", &[at_bytes], false).unwrap();
 
         // validate_published_aliases rejects this...
         let records = vec![TnsRecord::Alias("@".into())];
-        assert!(validate_published_aliases(&records, &db).is_err());
+        assert!(validate_published_aliases(&records, &db, "").is_err());
 
         // ...but validate_records alone is fine (alias target "@" is a bare label).
         assert!(validate_records(&records).is_ok());
@@ -1536,7 +1537,7 @@ mod tests {
         let db = StateDb::open(&path).unwrap();
 
         let records = vec![TnsRecord::Alias("@".into())];
-        assert!(validate_published_aliases(&records, &db).is_ok());
+        assert!(validate_published_aliases(&records, &db, "").is_ok());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1678,9 +1679,9 @@ mod tests {
             ServiceId::from_signing_pubkey(&[1; 32]),
         ));
         let rec2 = tns_record_to_bytes(&TnsRecord::Text("hello".into()));
-        db.label_set("multi", &[rec1.clone(), rec2.clone()], true).unwrap();
+        db.label_set("","multi", &[rec1.clone(), rec2.clone()], true).unwrap();
 
-        let (blobs, publish) = db.label_get("multi").unwrap().unwrap();
+        let (blobs, publish) = db.label_get("","multi").unwrap().unwrap();
         assert_eq!(blobs.len(), 2);
         assert!(publish);
 
@@ -1715,10 +1716,10 @@ mod tests {
         let rec2 = tns_record_to_bytes(&TnsRecord::Identity(
             ServiceId::from_signing_pubkey(&[2; 32]),
         ));
-        db.label_set("x", &[rec1], false).unwrap();
-        db.label_set("x", &[rec2.clone()], true).unwrap();
+        db.label_set("","x", &[rec1], false).unwrap();
+        db.label_set("","x", &[rec2.clone()], true).unwrap();
 
-        let (blobs, publish) = db.label_get("x").unwrap().unwrap();
+        let (blobs, publish) = db.label_get("","x").unwrap().unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0], rec2);
         assert!(publish);
@@ -1742,9 +1743,9 @@ mod tests {
         let rec = tns_record_to_bytes(&TnsRecord::Identity(
             ServiceId::from_signing_pubkey(&[1; 32]),
         ));
-        db.label_set("del", &[rec.clone(), rec], false).unwrap();
-        db.label_remove("del").unwrap();
-        assert!(db.label_get("del").unwrap().is_none());
+        db.label_set("","del", &[rec.clone(), rec], false).unwrap();
+        db.label_remove("","del").unwrap();
+        assert!(db.label_get("","del").unwrap().is_none());
 
         let _ = std::fs::remove_file(&path);
     }
