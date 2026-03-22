@@ -47,12 +47,9 @@ enum Command {
     Connect {
         /// Target: ServiceId (base32), PeerId (hex), or TNS name
         target: String,
-        /// Port to connect to (circuit mode only)
+        /// Port to connect to
         #[arg(long, default_value_t = 80)]
         port: u16,
-        /// Identity to connect as (affects circuit source)
-        #[arg(long)]
-        identity: Option<String>,
     },
     /// Listen for incoming connections (netcat-like I/O)
     Listen {
@@ -261,7 +258,7 @@ async fn main() {
         Command::Dht { command } => cmd_dht(&cli, command).await,
         Command::Tns { command } => cmd_tns(&cli, command).await,
         Command::Identity { command } => cmd_identity(&cli, command).await,
-        Command::Connect { target, port, identity } => cmd_connect(&cli, target, *port, identity).await,
+        Command::Connect { target, port } => cmd_connect(&cli, target, *port).await,
         Command::Listen { identity, port } => cmd_listen(&cli, identity, *port).await,
         Command::Tarify { identity, command } => cmd_tarify(&cli, identity.as_deref(), command).await,
         Command::Status => cmd_status(&cli).await,
@@ -765,48 +762,6 @@ fn print_resolution(name: &str, resolution: &TnsResolution) {
 
 // ── Connection commands ──
 
-/// A tunnel wrapped as a DataStream.
-struct TunnelStream {
-    client: Arc<IpcServiceApi>,
-    peer: PeerId,
-    data_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-}
-
-impl TunnelStream {
-    fn new(
-        client: Arc<IpcServiceApi>,
-        peer: PeerId,
-        mut event_rx: tokio::sync::mpsc::Receiver<NodeEvent>,
-    ) -> Self {
-        let (data_tx, data_rx) = tokio::sync::mpsc::channel(64);
-        tokio::spawn(async move {
-            while let Some(event) = event_rx.recv().await {
-                if let NodeEvent::Data { peer: _, payload } = event {
-                    if data_tx.send(payload).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        });
-        Self { client, peer, data_rx: tokio::sync::Mutex::new(data_rx) }
-    }
-}
-
-#[async_trait::async_trait]
-impl tarnet_api::service::DataStream for TunnelStream {
-    async fn send(&self, data: &[u8]) -> tarnet_api::error::ApiResult<()> {
-        self.client.send_tunnel_data(&self.peer, data).await
-    }
-    async fn recv(&self) -> tarnet_api::error::ApiResult<Vec<u8>> {
-        self.data_rx
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or(tarnet_api::error::ApiError::NotConnected)
-    }
-}
-
 /// Bidirectional stdin/stdout bridge over any DataStream.
 async fn stdio_bridge(
     stream: &dyn DataStream,
@@ -855,88 +810,12 @@ async fn stdio_bridge(
     }
 }
 
-/// True if `s` looks like a PeerId (64 hex characters).
-fn is_peer_id(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-async fn cmd_connect(cli: &Cli, target: &str, port: u16, identity: &Option<String>) {
+async fn cmd_connect(cli: &Cli, target: &str, port: u16) {
     let client = connect_daemon(cli).await;
 
-    if is_peer_id(target) {
-        // PeerId → tunnel mode
-        let dest = parse_peer_id(target);
+    eprintln!("Connecting to {} port {}...", target, port);
 
-        eprintln!("=== tarnet connect (tunnel) ===");
-        eprintln!("  Peer ID:  {}", client.peer_id());
-        eprintln!("  Target:   {}", dest);
-        eprintln!();
-        eprintln!("Creating tunnel...");
-
-        let remote_peer = match client.create_tunnel(dest).await {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Tunnel creation failed: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        eprintln!("Tunnel established with {}. Type to send, Ctrl-C to quit.", remote_peer);
-        eprintln!();
-
-        let event_rx = client.subscribe_events().await.unwrap();
-        let stream = TunnelStream::new(client.clone(), remote_peer, event_rx);
-        let mut disconnect_rx = client.subscribe_disconnect();
-        stdio_bridge(&stream, &mut disconnect_rx).await;
-        return;
-    }
-
-    // ServiceId / TNS name → circuit mode
-    eprintln!("=== tarnet connect ===");
-    eprintln!("  Target:   {}", target);
-    eprintln!("  Port:     {}", port);
-    if let Some(id) = identity {
-        eprintln!("  Identity: {}", id);
-    }
-    eprintln!();
-    eprintln!("Connecting...");
-
-    let conn = if let Some(id) = identity {
-        let zone_sid = match client.resolve_identity(id).await {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("Unknown identity '{}': {}", id, e);
-                std::process::exit(1);
-            }
-        };
-        if let Ok(sid) = ServiceId::parse(target) {
-            client.connect(sid, port).await
-        } else {
-            match client.tns_resolve(zone_sid, target).await {
-                Ok(TnsResolution::Records(records)) => {
-                    if let Some(TnsRecord::Identity(sid)) = records.iter().find(|r| matches!(r, TnsRecord::Identity(_))) {
-                        client.connect(*sid, port).await
-                    } else {
-                        eprintln!("No connectable Identity record found for '{}'", target);
-                        std::process::exit(1);
-                    }
-                }
-                Ok(TnsResolution::NotFound) => {
-                    eprintln!("{}: not found in identity '{}'", target, id);
-                    std::process::exit(1);
-                }
-                Ok(TnsResolution::Error(e)) => {
-                    eprintln!("Resolve error: {}", e);
-                    std::process::exit(1);
-                }
-                Err(e) => Err(e),
-            }
-        }
-    } else {
-        client.connect_to(target, port).await
-    };
-
-    let conn = match conn {
+    let conn = match client.connect_to(target, port).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Connection failed: {}", e);
