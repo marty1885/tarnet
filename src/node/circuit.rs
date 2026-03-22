@@ -1757,6 +1757,20 @@ impl Node {
                 // Fallback: try routing to dest directly
                 if connected.contains(dest) {
                     result.push(*dest);
+                } else {
+                    // Destination unknown — pick a random connected peer and
+                    // let relay-decided routing figure it out hop-by-hop.
+                    use rand::seq::SliceRandom;
+                    let mut rng = rand::thread_rng();
+                    let mut candidates: Vec<PeerId> = connected.to_vec();
+                    candidates.shuffle(&mut rng);
+                    if let Some(peer) = candidates.first() {
+                        log::debug!(
+                            "plan_circuit_path: no route to {:?}, using random first hop {:?}",
+                            target, peer,
+                        );
+                        result.push(*peer);
+                    }
                 }
             }
             result

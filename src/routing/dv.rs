@@ -4,7 +4,7 @@ use crate::types::{Error, PeerId, Result};
 use crate::wire::{RouteAdvertisement, RouteEntry};
 use tarnet_api::types::SigningAlgo;
 
-use super::RoutingTable;
+use super::{RouteSource, RoutingTable};
 
 /// Generate a signed route advertisement from our routing table.
 pub fn generate_advertisement(
@@ -72,7 +72,7 @@ pub fn process_advertisement(table: &mut RoutingTable, ad: &RouteAdvertisement, 
         }
         // Cost to reach destination through advertiser = entry.cost + 1 (link cost)
         let total_cost = entry.cost.saturating_add(1);
-        if table.update(entry.destination, ad.advertiser, total_cost) {
+        if table.update_with_source(entry.destination, ad.advertiser, total_cost, RouteSource::Advertisement) {
             changed = true;
         }
     }
