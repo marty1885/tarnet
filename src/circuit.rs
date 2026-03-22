@@ -81,6 +81,9 @@ pub struct HopCrypto {
     pub key: [u8; 32],
     /// Digest key for relay cell integrity at endpoints.
     pub digest_key: [u8; 32],
+    /// Per-circuit nonce prefix derived from shared secret.
+    /// Ensures nonce uniqueness even if keys are accidentally reused.
+    pub nonce_prefix: [u8; 16],
     pub op: CryptoOp,
     /// Replay window for this hop (only meaningful for Decrypt).
     pub replay: ReplayWindow,
@@ -107,7 +110,7 @@ impl HopCrypto {
     ///   - Always returns `true`.
     pub fn process_cell(&mut self, cell: &mut [u8; CELL_SIZE]) -> bool {
         let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(nonce_val);
+        let nonce = build_nonce(&self.nonce_prefix, nonce_val);
         let aead = XChaCha20Poly1305::new((&self.key).into());
         match self.op {
             CryptoOp::Decrypt => {
@@ -292,12 +295,12 @@ impl CircuitTable {
 // Nonce construction
 // ---------------------------------------------------------------------------
 
-/// Build a 24-byte XChaCha20 nonce from a counter.
-/// Format: "circuit\0" (8) || counter_le (8) || zeros (8)
-fn build_nonce(counter: u64) -> [u8; 24] {
+/// Build a 24-byte XChaCha20 nonce from a per-circuit prefix and counter.
+/// Format: prefix (16) || counter_le (8)
+fn build_nonce(prefix: &[u8; 16], counter: u64) -> [u8; 24] {
     let mut nonce = [0u8; 24];
-    nonce[..8].copy_from_slice(b"circuit\0");
-    nonce[8..16].copy_from_slice(&counter.to_le_bytes());
+    nonce[..16].copy_from_slice(prefix);
+    nonce[16..].copy_from_slice(&counter.to_le_bytes());
     nonce
 }
 
@@ -540,15 +543,21 @@ pub struct HopKeys {
     pub forward_digest: [u8; 32],
     pub backward_key: [u8; 32],
     pub backward_digest: [u8; 32],
+    /// Per-circuit nonce prefix derived from shared secret.
+    pub nonce_prefix: [u8; 16],
 }
 
 /// Derive the symmetric keys for a circuit hop from a DH shared secret.
 pub fn derive_hop_keys(shared_secret: &[u8; 32]) -> HopKeys {
+    let nonce_material = kdf(shared_secret, "tarnet circuit nonce");
+    let mut nonce_prefix = [0u8; 16];
+    nonce_prefix.copy_from_slice(&nonce_material[..16]);
     HopKeys {
         forward_key: kdf(shared_secret, "tarnet circuit hop enc"),
         forward_digest: kdf(shared_secret, "tarnet circuit hop enc digest"),
         backward_key: kdf(shared_secret, "tarnet circuit hop dec"),
         backward_digest: kdf(shared_secret, "tarnet circuit hop dec digest"),
+        nonce_prefix,
     }
 }
 
@@ -571,6 +580,8 @@ pub struct HopKey {
     pub backward_key: [u8; 32],
     /// Digest key for backward relay cell integrity.
     pub backward_digest: [u8; 32],
+    /// Per-circuit nonce prefix derived from shared secret.
+    pub nonce_prefix: [u8; 16],
 }
 
 impl HopKey {
@@ -581,6 +592,7 @@ impl HopKey {
             forward_digest: keys.forward_digest,
             backward_key: keys.backward_key,
             backward_digest: keys.backward_digest,
+            nonce_prefix: keys.nonce_prefix,
         }
     }
 
@@ -595,6 +607,7 @@ impl HopKey {
             forward_digest: keys.backward_digest,
             backward_key: keys.forward_key,
             backward_digest: keys.forward_digest,
+            nonce_prefix: keys.nonce_prefix,
         }
     }
 
@@ -603,7 +616,7 @@ impl HopKey {
     /// then computes and writes the hop tag. Nonce is preserved.
     pub fn encrypt_forward(&self, cell: &mut [u8; CELL_SIZE]) {
         let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(nonce_val);
+        let nonce = build_nonce(&self.nonce_prefix, nonce_val);
         let aead = XChaCha20Poly1305::new((&self.forward_key).into());
         let tag = aead
             .encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE])
@@ -617,7 +630,7 @@ impl HopKey {
     /// Only the outermost layer's tag survives; inner tags are overwritten.
     pub fn decrypt_backward(&self, cell: &mut [u8; CELL_SIZE]) {
         let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(nonce_val);
+        let nonce = build_nonce(&self.nonce_prefix, nonce_val);
         let aead = XChaCha20Poly1305::new((&self.backward_key).into());
         // Use encrypt_in_place_detached for decryption: ChaCha20 is a
         // symmetric stream cipher (encrypt == decrypt). This avoids
@@ -1334,18 +1347,21 @@ mod tests {
         let mut relay1_fwd = HopCrypto {
             key: keys1.forward_key,
             digest_key: keys1.forward_digest,
+            nonce_prefix: keys1.nonce_prefix,
             op: CryptoOp::Decrypt,
             replay: ReplayWindow::new(),
         };
         let mut relay2_fwd = HopCrypto {
             key: keys2.forward_key,
             digest_key: keys2.forward_digest,
+            nonce_prefix: keys2.nonce_prefix,
             op: CryptoOp::Decrypt,
             replay: ReplayWindow::new(),
         };
         let mut relay3_fwd = HopCrypto {
             key: keys3.forward_key,
             digest_key: keys3.forward_digest,
+            nonce_prefix: keys3.nonce_prefix,
             op: CryptoOp::Decrypt,
             replay: ReplayWindow::new(),
         };
@@ -1404,9 +1420,9 @@ mod tests {
 
         // Endpoint (hop3) encrypts backward, then each relay adds a layer.
         // All read the same nonce from the cell trailer.
-        let mut r3_bwd = HopCrypto { key: bkeys3.backward_key, digest_key: bkeys3.backward_digest, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
-        let mut r2_bwd = HopCrypto { key: bkeys2.backward_key, digest_key: bkeys2.backward_digest, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
-        let mut r1_bwd = HopCrypto { key: bkeys1.backward_key, digest_key: bkeys1.backward_digest, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
+        let mut r3_bwd = HopCrypto { key: bkeys3.backward_key, digest_key: bkeys3.backward_digest, nonce_prefix: bkeys3.nonce_prefix, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
+        let mut r2_bwd = HopCrypto { key: bkeys2.backward_key, digest_key: bkeys2.backward_digest, nonce_prefix: bkeys2.nonce_prefix, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
+        let mut r1_bwd = HopCrypto { key: bkeys1.backward_key, digest_key: bkeys1.backward_digest, nonce_prefix: bkeys1.nonce_prefix, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
 
         r3_bwd.process_cell(&mut cell);
         r2_bwd.process_cell(&mut cell);

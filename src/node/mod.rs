@@ -253,7 +253,7 @@ pub struct Node {
     /// Backward crypto keying material for circuit hops.
     /// Key: (circuit_id, from_peer) → (backward_key, backward_digest, nonce).
     /// Stored at CREATE time, used when converting Endpoint → Forward on EXTEND.
-    hop_backward_keys: Arc<Mutex<HashMap<(u32, PeerId), ([u8; 32], [u8; 32], u64)>>>,
+    hop_backward_keys: Arc<Mutex<HashMap<(u32, PeerId), ([u8; 32], [u8; 32], [u8; 16], u64)>>>,
     /// Active listeners: (ServiceId, port) pairs we accept connections on.
     listeners: Arc<Mutex<Vec<(tarnet_api::types::ServiceId, u16)>>>,
     /// Incoming connections queue (from accept).

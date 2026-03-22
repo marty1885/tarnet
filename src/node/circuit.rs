@@ -5,6 +5,7 @@ use super::*;
 fn encrypt_backward_cell(
     bwd_key: [u8; 32],
     bwd_digest: [u8; 32],
+    nonce_prefix: [u8; 16],
     nonce: u64,
     circuit_id: u32,
     command: RelayCellCommand,
@@ -22,6 +23,7 @@ fn encrypt_backward_cell(
     let mut crypto = HopCrypto {
         key: bwd_key,
         digest_key: bwd_digest,
+        nonce_prefix,
         op: CryptoOp::Encrypt,
         replay: ReplayWindow::new(),
     };
@@ -422,12 +424,12 @@ impl Node {
         command: RelayCellCommand,
         data: &[u8],
     ) -> Result<()> {
-        let (bwd_key, bwd_digest, nonce) = self
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) = self
             .get_hop_backward_crypto(circuit_id, from)
             .await
             .ok_or_else(|| Error::Protocol("no backward keys for circuit".into()))?;
 
-        let encoded = encrypt_backward_cell(bwd_key, bwd_digest, nonce, circuit_id, command, data);
+        let encoded = encrypt_backward_cell(bwd_key, bwd_digest, nonce_prefix, nonce, circuit_id, command, data);
         self.send_to_peer(&from, &encoded).await
     }
 
@@ -540,21 +542,21 @@ impl Node {
                     let bwd_info = {
                         let mut map = hop_backward_keys.lock().await;
                         if let Some(entry) = map.get_mut(&(circuit_id, from)) {
-                            let nonce = entry.2;
-                            entry.2 += 1;
-                            Some((entry.0, entry.1, nonce))
+                            let nonce = entry.3;
+                            entry.3 += 1;
+                            Some((entry.0, entry.1, entry.2, nonce))
                         } else {
                             None
                         }
                     };
 
-                    let (bwd_key, bwd_digest, nonce) = match bwd_info {
+                    let (bwd_key, bwd_digest, nonce_prefix, nonce) = match bwd_info {
                         Some(info) => info,
                         None => { broken = true; break; }
                     };
 
                     let encoded = encrypt_backward_cell(
-                        bwd_key, bwd_digest, nonce, circuit_id,
+                        bwd_key, bwd_digest, nonce_prefix, nonce, circuit_id,
                         RelayCellCommand::Data, &chunk,
                     );
                     let links_guard = links.lock().await;
@@ -673,9 +675,10 @@ impl Node {
         // the cell trailer — no per-relay counter needed.
         let bwd_crypto = {
             let map = self.hop_backward_keys.lock().await;
-            map.get(&(inbound_circuit_id, from)).map(|&(key, digest_key, _)| HopCrypto {
+            map.get(&(inbound_circuit_id, from)).map(|&(key, digest_key, nonce_prefix, _)| HopCrypto {
                 key,
                 digest_key,
+                nonce_prefix,
                 op: CryptoOp::Encrypt,
                 replay: ReplayWindow::new(),
             })
@@ -764,6 +767,7 @@ impl Node {
                 crypto: Some(HopCrypto {
                     key: hop_keys.forward_key,
                     digest_key: hop_keys.forward_digest,
+                    nonce_prefix: hop_keys.nonce_prefix,
                     op: CryptoOp::Decrypt,
                     replay: ReplayWindow::new(),
                 }),
@@ -773,7 +777,7 @@ impl Node {
 
         // Store backward crypto keying material for later EXTEND handling.
         // We need this when converting Endpoint → Forward.
-        self.store_hop_backward_crypto(msg.circuit_id, from, hop_keys.backward_key, hop_keys.backward_digest)
+        self.store_hop_backward_crypto(msg.circuit_id, from, hop_keys.backward_key, hop_keys.backward_digest, hop_keys.nonce_prefix)
             .await;
 
         // Reply with CircuitCreated containing the KEM ciphertext (TLV format).
@@ -806,7 +810,7 @@ impl Node {
             // it back through the inbound circuit.
 
             // Get the backward crypto for the inbound circuit.
-            let bwd_info: Option<([u8; 32], [u8; 32], u64)> = self
+            let bwd_info = self
                 .get_hop_backward_crypto(inbound_circuit_id, inbound_from)
                 .await;
 
@@ -824,16 +828,17 @@ impl Node {
             };
 
             // Serialize with backward MAC key and encrypt with backward key.
-            let bwd_digest = bwd_info.map(|(_, m, _)| m).unwrap_or([0u8; 32]);
+            let bwd_digest = bwd_info.map(|(_, m, _, _)| m).unwrap_or([0u8; 32]);
             let body = reply_cell.to_cell(&bwd_digest);
             let mut cell = [0u8; CELL_SIZE];
             cell[..CELL_BODY_SIZE].copy_from_slice(&body);
 
-            if let Some((bwd_key, bwd_digest_key, nonce)) = bwd_info {
+            if let Some((bwd_key, bwd_digest_key, nonce_prefix, nonce)) = bwd_info {
                 cell[CELL_BODY_SIZE..CELL_BODY_SIZE + 8].copy_from_slice(&nonce.to_le_bytes());
                 let mut crypto = HopCrypto {
                     key: bwd_key,
                     digest_key: bwd_digest_key,
+                    nonce_prefix,
                     op: CryptoOp::Encrypt,
                     replay: ReplayWindow::new(),
                 };
@@ -953,7 +958,7 @@ impl Node {
         };
         // Send backward relay cell
         let bwd_info = self.get_hop_backward_crypto(circuit_id, from).await;
-        let (bwd_key, bwd_digest, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = reply.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -961,6 +966,7 @@ impl Node {
         let mut crypto = HopCrypto {
             key: bwd_key,
             digest_key: bwd_digest,
+            nonce_prefix,
             op: CryptoOp::Encrypt,
             replay: ReplayWindow::new(),
         };
@@ -1007,7 +1013,7 @@ impl Node {
         let bwd_info = self
             .get_hop_backward_crypto(service_circuit_id, service_from)
             .await;
-        let (bwd_key, bwd_digest, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = intro_cell.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1015,6 +1021,7 @@ impl Node {
         let mut crypto = HopCrypto {
             key: bwd_key,
             digest_key: bwd_digest,
+            nonce_prefix,
             op: CryptoOp::Encrypt,
             replay: ReplayWindow::new(),
         };
@@ -1034,7 +1041,7 @@ impl Node {
             data: vec![],
         };
         let bwd_info = self.get_hop_backward_crypto(circuit_id, from).await;
-        let (bwd_key, bwd_digest, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = ack.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1042,6 +1049,7 @@ impl Node {
         let mut crypto = HopCrypto {
             key: bwd_key,
             digest_key: bwd_digest,
+            nonce_prefix,
             op: CryptoOp::Encrypt,
             replay: ReplayWindow::new(),
         };
@@ -1140,7 +1148,7 @@ impl Node {
         let bwd_info = self
             .get_hop_backward_crypto(client_circuit_id, client_from)
             .await;
-        let (bwd_key, bwd_digest, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = joined.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1148,6 +1156,7 @@ impl Node {
         let mut crypto = HopCrypto {
             key: bwd_key,
             digest_key: bwd_digest,
+            nonce_prefix,
             op: CryptoOp::Encrypt,
             replay: ReplayWindow::new(),
         };
@@ -1166,11 +1175,12 @@ impl Node {
         from_peer: PeerId,
         bwd_key: [u8; 32],
         bwd_digest: [u8; 32],
+        nonce_prefix: [u8; 16],
     ) {
         self.hop_backward_keys
             .lock()
             .await
-            .insert((circuit_id, from_peer), (bwd_key, bwd_digest, 0));
+            .insert((circuit_id, from_peer), (bwd_key, bwd_digest, nonce_prefix, 0));
     }
 
     /// Get backward crypto keys for a circuit hop, returning and incrementing the nonce.
@@ -1178,12 +1188,12 @@ impl Node {
         &self,
         circuit_id: u32,
         from_peer: PeerId,
-    ) -> Option<([u8; 32], [u8; 32], u64)> {
+    ) -> Option<([u8; 32], [u8; 32], [u8; 16], u64)> {
         let mut map = self.hop_backward_keys.lock().await;
         let entry = map.get_mut(&(circuit_id, from_peer))?;
-        let nonce = entry.2;
-        entry.2 += 1;
-        Some((entry.0, entry.1, nonce))
+        let nonce = entry.3;
+        entry.3 += 1;
+        Some((entry.0, entry.1, entry.2, nonce))
     }
 
     pub async fn build_circuit(&self, first_hop: PeerId, waypoints: Vec<PeerId>) -> Result<u32> {
