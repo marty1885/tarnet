@@ -245,7 +245,18 @@ pub struct EndpointState {
     pub data_txs: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     /// Pending stream connect responses: circuit_id → oneshot (true=connected, false=refused).
     pub pending_connects: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    /// Track which link-peer owns each stream: circuit_id → peer_id.
+    /// Used for per-peer stream limiting to prevent SYN flood from one peer
+    /// blocking connections from others.
+    pub stream_owners: Arc<Mutex<HashMap<u32, PeerId>>>,
 }
+
+/// Per-peer stream limit. Each link peer can have at most this many
+/// concurrent streams to this node.
+pub const MAX_STREAMS_PER_PEER: usize = 128;
+
+/// Global stream limit. Safety net for total endpoint resource consumption.
+pub const MAX_STREAMS_GLOBAL: usize = 1024;
 
 impl EndpointState {
     fn new() -> Self {
@@ -254,6 +265,7 @@ impl EndpointState {
             send_congestion: Arc::new(Mutex::new(HashMap::new())),
             data_txs: Arc::new(Mutex::new(HashMap::new())),
             pending_connects: Arc::new(Mutex::new(HashMap::new())),
+            stream_owners: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1012,6 +1024,7 @@ impl Node {
         let cd_links = self.links.clone();
         let cd_groups = self.circuits.groups.clone();
         let cd_conn_txs = self.endpoints.data_txs.clone();
+        let cd_stream_owners = self.endpoints.stream_owners.clone();
         let cd_ep_cong = self.endpoints.recv_congestion.clone();
         let cd_ep_send_cong = self.endpoints.send_congestion.clone();
         let cd_sendme_notify = self.circuits.sendme_notify.clone();
@@ -1036,6 +1049,7 @@ impl Node {
 
                 // Clean up connection state
                 cd_conn_txs.lock().await.remove(&ev.circuit_id);
+                cd_stream_owners.lock().await.remove(&ev.circuit_id);
                 cd_ep_cong.lock().await.remove(&ev.circuit_id);
                 cd_ep_send_cong.lock().await.remove(&ev.circuit_id);
                 cd_sendme_notify.lock().await.remove(&ev.circuit_id);

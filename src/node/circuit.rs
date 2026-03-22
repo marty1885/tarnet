@@ -487,6 +487,33 @@ impl Node {
             return Ok(());
         }
 
+        // Per-peer and global stream limits to prevent SYN flood.
+        {
+            let owners = self.endpoints.stream_owners.lock().await;
+            // Global limit.
+            if owners.len() >= super::MAX_STREAMS_GLOBAL {
+                drop(owners);
+                log::warn!("STREAM_BEGIN rejected: global stream limit reached");
+                self.send_endpoint_relay_cell(
+                    from, circuit_id, RelayCellCommand::StreamRefused, &[],
+                ).await?;
+                return Ok(());
+            }
+            // Per-peer limit.
+            let peer_count = owners.values().filter(|p| **p == from).count();
+            if peer_count >= super::MAX_STREAMS_PER_PEER {
+                drop(owners);
+                log::warn!(
+                    "STREAM_BEGIN rejected: peer {:?} at stream limit ({}/{})",
+                    from, peer_count, super::MAX_STREAMS_PER_PEER,
+                );
+                self.send_endpoint_relay_cell(
+                    from, circuit_id, RelayCellCommand::StreamRefused, &[],
+                ).await?;
+                return Ok(());
+            }
+        }
+
         log::info!(
             "Incoming connection: {:?} port {} on circuit_id={}",
             service_id,
@@ -503,6 +530,11 @@ impl Node {
             .lock()
             .await
             .insert(circuit_id, circuit_tx);
+        // Track ownership for per-peer stream limiting.
+        self.endpoints.stream_owners
+            .lock()
+            .await
+            .insert(circuit_id, from);
         // Initialize endpoint-side receive window for flow control.
         self.endpoints.recv_congestion
             .lock()
@@ -601,7 +633,20 @@ impl Node {
             app_rx,
         );
 
-        let _ = self.incoming_connections_tx.send(conn).await;
+        if self.incoming_connections_tx.try_send(conn).is_err() {
+            // Accept queue full — clean up the state we just allocated.
+            log::warn!("STREAM_BEGIN: accept queue full, dropping connection on circuit {}", circuit_id);
+            self.endpoints.data_txs.lock().await.remove(&circuit_id);
+            self.endpoints.stream_owners.lock().await.remove(&circuit_id);
+            self.endpoints.recv_congestion.lock().await.remove(&circuit_id);
+            self.endpoints.send_congestion.lock().await.remove(&circuit_id);
+            self.send_endpoint_relay_cell(
+                from, circuit_id,
+                RelayCellCommand::StreamRefused,
+                &[],
+            ).await?;
+            return Ok(());
+        }
 
         // Send StreamConnected back to the initiator.
         self.send_endpoint_relay_cell(
@@ -923,6 +968,10 @@ impl Node {
 
         // Clean up connection state.
         self.endpoints.data_txs
+            .lock()
+            .await
+            .remove(&msg.circuit_id);
+        self.endpoints.stream_owners
             .lock()
             .await
             .remove(&msg.circuit_id);
