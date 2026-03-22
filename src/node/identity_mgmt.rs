@@ -220,6 +220,7 @@ impl Node {
         HelloRecord {
             peer_id: self.peer_id(),
             capabilities: capabilities::RELAY | capabilities::TUNNEL,
+            signaling_secret: self.signaling_secret,
             transports,
             introducers,
             global_addresses: global_addrs,

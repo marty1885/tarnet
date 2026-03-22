@@ -287,6 +287,9 @@ pub struct Node {
     circuit_groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
     /// WebRTC connection coordinator (None if WebRTC is disabled).
     webrtc_connector: Option<Arc<WebRtcConnector>>,
+    /// Random secret embedded in hello records so only peers who have seen
+    /// our hello can derive the WebRTC signaling channel port name.
+    signaling_secret: [u8; 16],
     /// Per-channel data handlers: channel_id → sender for data on that channel.
     /// Channels with a handler deliver data here instead of app_tx.
     channel_data_handlers: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
@@ -490,6 +493,7 @@ impl Node {
             identity_store: Arc::new(Mutex::new(identity_store)),
             circuit_groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
             webrtc_connector: None,
+            signaling_secret: rand::random(),
             channel_data_handlers: Arc::new(Mutex::new(HashMap::new())),
             channel_port_listeners: Arc::new(Mutex::new(HashMap::new())),
             pubkey_cache: Arc::new(Mutex::new(PubkeyCache::new(1024))),
@@ -1211,6 +1215,7 @@ impl Node {
         let hello_seq = self.hello_sequence.clone();
         let hello_kbucket = self.kbucket.clone();
         let hello_webrtc_enabled = self.webrtc_connector.is_some();
+        let hello_signaling_secret = self.signaling_secret;
         tokio::spawn(async move {
             // Wait a bit for initial links to establish
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -1229,6 +1234,7 @@ impl Node {
                 let hello = HelloRecord {
                     peer_id,
                     capabilities: capabilities::RELAY | capabilities::TUNNEL,
+                    signaling_secret: hello_signaling_secret,
                     transports,
                     introducers,
                     global_addresses: global_addrs,

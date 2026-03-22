@@ -1167,14 +1167,19 @@ impl ChannelCloseMsg {
 /// so others can reach them through the overlay.
 ///
 /// Wire format:
-///   peer_id(32) || capabilities(u32 BE) || transport_count(u16) ||
-///   transports(u16 BE...) || introducer_count(u16) || introducers(PeerId...) ||
+///   peer_id(32) || capabilities(u32 BE) || signaling_secret(16) ||
+///   transport_count(u16) || transports(u16 BE...) ||
+///   introducer_count(u16) || introducers(PeerId...) ||
 ///   addr_count(u16) || global_addresses(ScopedAddress...)
 #[derive(Debug, Clone)]
 pub struct HelloRecord {
     pub peer_id: PeerId,
     /// Bitflags describing node capabilities.
     pub capabilities: u32,
+    /// Random secret used to derive the WebRTC signaling channel port name.
+    /// Only peers who have received this hello can compute the port,
+    /// preventing unsolicited signaling from nodes that haven't seen the hello.
+    pub signaling_secret: [u8; 16],
     /// Transport types this peer speaks (e.g. Tcp4, Tcp6, Serial).
     /// Tells others what kinds of connections are possible, without
     /// revealing specific addresses.
@@ -1213,6 +1218,7 @@ impl HelloRecord {
         let mut buf = Vec::new();
         buf.extend_from_slice(self.peer_id.as_bytes());
         buf.extend_from_slice(&self.capabilities.to_be_bytes());
+        buf.extend_from_slice(&self.signaling_secret);
         buf.extend_from_slice(&(self.transports.len() as u16).to_be_bytes());
         for t in &self.transports {
             buf.extend_from_slice(&t.as_u16().to_be_bytes());
@@ -1229,14 +1235,15 @@ impl HelloRecord {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        // Minimum: peer_id(32) + capabilities(4) + transport_count(2) +
-        //          introducer_count(2) + addr_count(2) = 42
-        if data.len() < 42 {
+        // Minimum: peer_id(32) + capabilities(4) + signaling_secret(16) +
+        //          transport_count(2) + introducer_count(2) + addr_count(2) = 58
+        if data.len() < 58 {
             return Err(Error::Wire("HelloRecord too short".into()));
         }
         let mut r = Reader::new(data);
         let peer_id = r.read_array::<32>()?;
         let capabilities = r.read_u32()?;
+        let signaling_secret = r.read_array::<16>()?;
         let transport_count = r.read_u16()? as usize;
 
         let mut transports = Vec::with_capacity(transport_count);
@@ -1267,6 +1274,7 @@ impl HelloRecord {
         Ok(Self {
             peer_id: PeerId(peer_id),
             capabilities,
+            signaling_secret,
             transports,
             introducers,
             global_addresses,
@@ -1768,6 +1776,7 @@ mod tests {
         let hello = HelloRecord {
             peer_id: PeerId([0x55; 32]),
             capabilities: capabilities::RELAY | capabilities::TUNNEL,
+            signaling_secret: [0xCC; 16],
             transports: vec![TransportType::Tcp4, TransportType::Tcp6],
             introducers: vec![PeerId([0xAA; 32])],
             global_addresses: vec![
@@ -1793,6 +1802,7 @@ mod tests {
             decoded.capabilities,
             capabilities::RELAY | capabilities::TUNNEL
         );
+        assert_eq!(decoded.signaling_secret, [0xCC; 16]);
         assert_eq!(decoded.transports.len(), 2);
         assert_eq!(decoded.transports[0], TransportType::Tcp4);
         assert_eq!(decoded.transports[1], TransportType::Tcp6);
@@ -1820,6 +1830,7 @@ mod tests {
         let hello = HelloRecord {
             peer_id: PeerId([0x33; 32]),
             capabilities: 0,
+            signaling_secret: [0xDD; 16],
             transports: vec![],
             introducers: vec![PeerId([0xBB; 32])],
             global_addresses: vec![],
@@ -1839,6 +1850,7 @@ mod tests {
         let hello = HelloRecord {
             peer_id: PeerId([0x33; 32]),
             capabilities: 0,
+            signaling_secret: [0; 16],
             transports: vec![],
             introducers: vec![],
             global_addresses: vec![],
@@ -1880,6 +1892,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&[0x55u8; 32]); // peer_id
         buf.extend_from_slice(&0u32.to_be_bytes()); // capabilities
+        buf.extend_from_slice(&[0u8; 16]); // signaling_secret
         buf.extend_from_slice(&0u16.to_be_bytes()); // transport_count = 0
         buf.extend_from_slice(&0u16.to_be_bytes()); // introducer_count = 0
         buf.extend_from_slice(&2u16.to_be_bytes()); // addr_count = 2

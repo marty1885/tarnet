@@ -8,6 +8,12 @@ const TAG_ICE_CANDIDATE: u8 = 0x03;
 /// Port name prefix for WebRTC signaling channels.
 const WEBRTC_PORT_PREFIX: &str = "_tarnet_webrtc_transport_";
 
+/// Derive the signaling channel port name from a hello record's secret.
+fn signaling_port_name(secret: &[u8; 16]) -> String {
+    let hex: String = secret.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("{}{}", WEBRTC_PORT_PREFIX, hex)
+}
+
 impl Node {
     // ── WebRTC ──────────────────────────────────────────────────
 
@@ -54,29 +60,17 @@ impl Node {
         Ok(())
     }
 
-    /// Start the WebRTC signaling listener on channel port(s) derived from
-    /// our global addresses. Must be called after addresses are known (during run).
+    /// Start the WebRTC signaling listener on a channel port derived from
+    /// our signaling secret. Only peers who have received our hello record
+    /// can compute the port name.
     pub(super) async fn start_webrtc_signaling_listener(&self) {
         let connector = match self.webrtc_connector.as_ref() {
             Some(c) => c.clone(),
             None => return,
         };
 
-        let addrs = self.global_addrs.lock().await.clone();
-        if addrs.is_empty() {
-            // No global addresses yet — register a single listener without IP suffix
-            self.register_webrtc_port_listener(WEBRTC_PORT_PREFIX.to_string(), connector).await;
-            return;
-        }
-
-        for addr in &addrs {
-            if let Some(connect_str) = addr.to_connect_string() {
-                // Extract IP (strip port if present)
-                let ip = connect_str.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&connect_str);
-                let port_name = format!("{}{}", WEBRTC_PORT_PREFIX, ip);
-                self.register_webrtc_port_listener(port_name, connector.clone()).await;
-            }
-        }
+        let port_name = signaling_port_name(&self.signaling_secret);
+        self.register_webrtc_port_listener(port_name, connector).await;
     }
 
     async fn register_webrtc_port_listener(&self, port_name: String, connector: Arc<WebRtcConnector>) {
@@ -218,13 +212,7 @@ impl Node {
 
     /// Compute the WebRTC signaling port name for a peer based on their hello record.
     fn webrtc_port_name_for_peer(hello: &HelloRecord) -> String {
-        if let Some(addr) = hello.global_addresses.first() {
-            if let Some(connect_str) = addr.to_connect_string() {
-                let ip = connect_str.rsplit_once(':').map(|(ip, _)| ip).unwrap_or(&connect_str);
-                return format!("{}{}", WEBRTC_PORT_PREFIX, ip);
-            }
-        }
-        WEBRTC_PORT_PREFIX.to_string()
+        signaling_port_name(&hello.signaling_secret)
     }
 
     /// Initiate a WebRTC connection to a remote peer via channel-based signaling.
