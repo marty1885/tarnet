@@ -465,14 +465,7 @@ impl Node {
             }
         }
 
-        // Check if we're listening on this ServiceId + port.
-        let listeners = self.listeners.lock().await;
-        let listening = listeners.iter().any(|(sid, p)| {
-            (*p == 0 || *p == port) && (sid.is_all() || *sid == service_id)
-        });
-        drop(listeners);
-
-        if !listening {
+        if !self.has_matching_listener(service_id, port).await {
             log::debug!(
                 "STREAM_BEGIN rejected: not listening on {:?} port {}",
                 service_id,
@@ -624,7 +617,7 @@ impl Node {
             }
         });
 
-        // Build the Connection and queue it for accept().
+        // Build the Connection and route it to the matching listener.
         let conn = tarnet_api::service::Connection::new(
             service_id,
             port,
@@ -633,9 +626,18 @@ impl Node {
             app_rx,
         );
 
-        if self.incoming_connections_tx.try_send(conn).is_err() {
-            // Accept queue full — clean up the state we just allocated.
-            log::warn!("STREAM_BEGIN: accept queue full, dropping connection on circuit {}", circuit_id);
+        let dispatch = self.dispatch_incoming_connection(service_id, port, conn).await;
+        if !matches!(dispatch, ListenerDispatch::Enqueued) {
+            let reason = match dispatch {
+                ListenerDispatch::NoListener => "listener disappeared before enqueue",
+                ListenerDispatch::QueueFull => "listener queue full",
+                ListenerDispatch::Enqueued => unreachable!(),
+            };
+            log::warn!(
+                "STREAM_BEGIN rejected: {} on circuit {}",
+                reason,
+                circuit_id
+            );
             self.endpoints.data_txs.lock().await.remove(&circuit_id);
             self.endpoints.stream_owners.lock().await.remove(&circuit_id);
             self.endpoints.recv_congestion.lock().await.remove(&circuit_id);
@@ -1650,10 +1652,7 @@ impl Node {
         //    should be connecting to a remote node.
         {
             let is_local_service = self.keypair_for_service(&service_id).await.is_some();
-            let listeners = self.listeners.lock().await;
-            let local = is_local_service && listeners.iter().any(|(sid, p)| {
-                (*p == 0 || *p == port) && (sid.is_all() || *sid == service_id)
-            });
+            let local = is_local_service && self.has_matching_listener(service_id, port).await;
             if local {
                 log::info!("circuit_connect: loopback to local listener {:?} port {}", service_id, port);
                 let (client_tx, server_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -1663,11 +1662,18 @@ impl Node {
                     self.circuits.table.lock().await.alloc_id(true, |id| oc.contains_key(&id))
                 };
 
-                // Queue server-side Connection for accept()
                 let server_conn = tarnet_api::service::Connection::new(
                     service_id, port, conn_id, server_tx, client_rx,
                 );
-                let _ = self.incoming_connections_tx.send(server_conn).await;
+                match self.dispatch_incoming_connection(service_id, port, server_conn).await {
+                    ListenerDispatch::Enqueued => {}
+                    ListenerDispatch::NoListener => {
+                        return Err(Error::Protocol("no listener for local service".into()));
+                    }
+                    ListenerDispatch::QueueFull => {
+                        return Err(Error::Protocol("listener queue full".into()));
+                    }
+                }
 
                 // Return client-side Connection
                 return Ok(tarnet_api::service::Connection::new(

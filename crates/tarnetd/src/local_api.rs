@@ -14,7 +14,8 @@ use tarnet::state::StateDb;
 use tarnet::tns;
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::service::{
-    Connection, DhtEntry, HelloInfo, NodeEvent, ServiceApi, TnsRecord, TnsResolution, WatchEvent,
+    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, ServiceApi, TnsRecord,
+    TnsResolution, WatchEvent,
 };
 use tarnet_api::types::{DhtId, PeerId, ServiceId};
 
@@ -271,15 +272,27 @@ impl ServiceApi for LocalServiceApi {
             .map_err(map_err)
     }
 
-    async fn listen(&self, service_id: ServiceId, port: u16) -> ApiResult<()> {
+    async fn listen(
+        &self,
+        service_id: ServiceId,
+        port: u16,
+        options: ListenerOptions,
+    ) -> ApiResult<Listener> {
         self.node
-            .circuit_listen(service_id, port)
+            .circuit_listen(service_id, port, options)
             .await
             .map_err(map_err)
     }
 
-    async fn accept(&self) -> ApiResult<Connection> {
-        self.node.circuit_accept().await.map_err(map_err)
+    async fn accept(&self, listener: &Listener) -> ApiResult<Connection> {
+        self.node.circuit_accept(listener.id).await.map_err(map_err)
+    }
+
+    async fn close_listener(&self, listener: &Listener) -> ApiResult<()> {
+        self.node
+            .circuit_close_listener(listener.id)
+            .await
+            .map_err(map_err)
     }
 
     async fn listen_hidden(
@@ -287,15 +300,22 @@ impl ServiceApi for LocalServiceApi {
         service_id: ServiceId,
         port: u16,
         num_intro_points: usize,
-    ) -> ApiResult<()> {
-        self.node
-            .circuit_listen(service_id, port)
+        options: ListenerOptions,
+    ) -> ApiResult<Listener> {
+        let listener = self
+            .node
+            .circuit_listen(service_id, port, options)
             .await
             .map_err(map_err)?;
-        self.node
+        if let Err(e) = self
+            .node
             .publish_hidden_service(service_id, num_intro_points)
             .await
-            .map_err(map_err)
+        {
+            let _ = self.node.circuit_close_listener(listener.id).await;
+            return Err(map_err(e));
+        }
+        Ok(listener)
     }
 
     async fn send_data(&self, dest: &PeerId, payload: &[u8]) -> ApiResult<()> {

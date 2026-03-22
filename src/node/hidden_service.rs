@@ -1,5 +1,16 @@
 use super::*;
 
+fn listener_matches(listener: &Listener, service_id: tarnet_api::types::ServiceId, port: u16) -> bool {
+    (listener.port == 0 || listener.port == port)
+        && (listener.service_id.is_all() || listener.service_id == service_id)
+}
+
+fn listeners_overlap(a: &Listener, b: &Listener) -> bool {
+    let port_overlap = a.port == 0 || b.port == 0 || a.port == b.port;
+    let service_overlap = a.service_id.is_all() || b.service_id.is_all() || a.service_id == b.service_id;
+    port_overlap && service_overlap
+}
+
 impl Node {
     pub async fn connect_via_rendezvous(
         &self,
@@ -72,6 +83,7 @@ impl Node {
             data: build_introduce_payload(
                 &rendezvous_peer,
                 &cookie,
+                port,
                 &kem_ciphertext,
                 &shared_secret,
             ),
@@ -192,31 +204,130 @@ impl Node {
         Ok(conn)
     }
 
-    /// Register a listener for incoming circuit connections (idempotent).
+    /// Register a listener for incoming circuit connections.
     pub async fn circuit_listen(
         &self,
         service_id: tarnet_api::types::ServiceId,
         port: u16,
-    ) -> Result<()> {
+        options: ListenerOptions,
+    ) -> Result<Listener> {
         let mut listeners = self.listeners.lock().await;
-        if listeners.iter().any(|(s, p)| *s == service_id && *p == port) {
-            return Ok(());
+        let pending = Listener {
+            id: 0,
+            service_id,
+            port,
+            options,
+        };
+
+        for existing in listeners.values() {
+            if listeners_overlap(&existing.listener, &pending)
+                && !(existing.listener.options.reuse_port && options.reuse_port)
+            {
+                return Err(Error::Protocol(format!(
+                    "listener overlap on {:?} port {}",
+                    service_id, port
+                )));
+            }
         }
-        listeners.push((service_id, port));
+
+        let listener_id = loop {
+            let id = self.listener_next_id.fetch_add(1, Ordering::Relaxed);
+            if id != 0 && !listeners.contains_key(&id) {
+                break id;
+            }
+        };
+        let listener = Listener {
+            id: listener_id,
+            service_id,
+            port,
+            options,
+        };
+        let (tx, rx) = mpsc::channel(64);
+        listeners.insert(
+            listener_id,
+            Arc::new(ListenerState {
+                listener,
+                tx: Mutex::new(Some(tx)),
+                rx: Mutex::new(rx),
+            }),
+        );
         log::info!("Listening on {:?} port {}", service_id, port);
-        Ok(())
+        Ok(listener)
     }
 
     /// Accept the next incoming circuit connection.
-    pub async fn circuit_accept(&self) -> Result<tarnet_api::service::Connection> {
-        // Take the receiver on first call, then keep using it.
-        let mut rx_guard = self.incoming_connections_rx.lock().await;
-        let rx = rx_guard
-            .as_mut()
-            .ok_or_else(|| Error::Protocol("accept receiver already taken".into()))?;
+    pub async fn circuit_accept(&self, listener_id: u32) -> Result<Connection> {
+        let listener = {
+            let listeners = self.listeners.lock().await;
+            listeners
+                .get(&listener_id)
+                .cloned()
+                .ok_or_else(|| Error::Protocol("unknown listener id".into()))?
+        };
+        let mut rx = listener.rx.lock().await;
         rx.recv()
             .await
-            .ok_or_else(|| Error::Protocol("incoming connection channel closed".into()))
+            .ok_or_else(|| Error::Protocol("listener channel closed".into()))
+    }
+
+    pub async fn circuit_close_listener(&self, listener_id: u32) -> Result<()> {
+        let removed = self.listeners.lock().await.remove(&listener_id);
+        match removed {
+            Some(listener) => {
+                listener.tx.lock().await.take();
+                listener.rx.lock().await.close();
+                Ok(())
+            }
+            None => Err(Error::Protocol("unknown listener id".into())),
+        }
+    }
+
+    pub(super) async fn has_matching_listener(
+        &self,
+        service_id: tarnet_api::types::ServiceId,
+        port: u16,
+    ) -> bool {
+        let listeners = self.listeners.lock().await;
+        listeners
+            .values()
+            .any(|listener| listener_matches(&listener.listener, service_id, port))
+    }
+
+    pub(super) async fn dispatch_incoming_connection(
+        &self,
+        service_id: tarnet_api::types::ServiceId,
+        port: u16,
+        conn: Connection,
+    ) -> ListenerDispatch {
+        let listeners = {
+            let listeners = self.listeners.lock().await;
+            let mut matches: Vec<_> = listeners
+                .values()
+                .filter(|listener| listener_matches(&listener.listener, service_id, port))
+                .cloned()
+                .collect();
+            matches.sort_by_key(|listener| listener.listener.id);
+            matches
+        };
+
+        if listeners.is_empty() {
+            return ListenerDispatch::NoListener;
+        }
+
+        let index = if listeners.len() == 1 {
+            0
+        } else {
+            (self.listener_rr.fetch_add(1, Ordering::Relaxed) as usize) % listeners.len()
+        };
+
+        let tx = listeners[index].tx.lock().await.clone();
+        match tx {
+            Some(tx) => match tx.try_send(conn) {
+                Ok(()) => ListenerDispatch::Enqueued,
+                Err(_) => ListenerDispatch::QueueFull,
+            },
+            None => ListenerDispatch::NoListener,
+        }
     }
 
     /// Publish a hidden service with introduction points.
@@ -335,8 +446,6 @@ impl Node {
     pub(super) async fn teardown_hidden_service(&self, service_id: &tarnet_api::types::ServiceId) {
         let removed = self.hidden.intros.lock().await.remove(service_id);
         self.hidden.last_publish.lock().await.remove(service_id);
-        // Remove the listener registration for this ServiceId
-        self.listeners.lock().await.retain(|(s, _)| s != service_id);
         if let Some(circuits) = removed {
             log::info!(
                 "Tearing down {} intro circuit(s) for {:?}",
@@ -439,9 +548,6 @@ impl Node {
         }
 
         for (sid, desired_intros) in hidden_identities {
-            // Ensure circuit_listen is registered for this ServiceId (idempotent)
-            let _ = self.circuit_listen(sid, 0).await;
-
             // Check if we need to (re)publish
             let needs_publish = {
                 let intros = self.hidden.intros.lock().await;
@@ -504,7 +610,7 @@ impl Node {
             }
         };
 
-        let (rendezvous_peer, cookie, shared_secret) =
+        let (rendezvous_peer, cookie, port, shared_secret) =
             match parse_introduce_payload(payload, &service_keypair.identity.kem) {
                 Ok(v) => v,
                 Err(e) => {
@@ -639,11 +745,55 @@ impl Node {
         let service_id = self.default_service_id().await;
         let conn = tarnet_api::service::Connection::new(
             service_id,
-            0,
+            port,
             circuit_id,
             app_tx,
             app_rx,
         );
-        let _ = self.incoming_connections_tx.send(conn).await;
+        match self.dispatch_incoming_connection(service_id, port, conn).await {
+            ListenerDispatch::Enqueued => {}
+            ListenerDispatch::NoListener => {
+                log::debug!("Dropping hidden-service connection: no listener for {:?}", service_id);
+            }
+            ListenerDispatch::QueueFull => {
+                log::warn!(
+                    "Dropping hidden-service connection: listener queue full for {:?}",
+                    service_id
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listener(service_id: tarnet_api::types::ServiceId, port: u16, reuse_port: bool) -> Listener {
+        Listener {
+            id: 1,
+            service_id,
+            port,
+            options: ListenerOptions { reuse_port },
+        }
+    }
+
+    #[test]
+    fn listener_matching_and_overlap_follow_wildcards() {
+        let exact = listener(tarnet_api::types::ServiceId::LOCAL, 80, false);
+        let any_port = listener(tarnet_api::types::ServiceId::LOCAL, 0, false);
+        let any_service = listener(tarnet_api::types::ServiceId::ALL, 80, false);
+
+        assert!(listener_matches(&exact, tarnet_api::types::ServiceId::LOCAL, 80));
+        assert!(!listener_matches(&exact, tarnet_api::types::ServiceId::LOCAL, 81));
+        assert!(listener_matches(&any_port, tarnet_api::types::ServiceId::LOCAL, 81));
+        assert!(listener_matches(&any_service, tarnet_api::types::ServiceId::LOCAL, 80));
+
+        assert!(listeners_overlap(&exact, &any_port));
+        assert!(listeners_overlap(&exact, &any_service));
+        assert!(!listeners_overlap(
+            &exact,
+            &listener(tarnet_api::types::ServiceId::LOCAL, 81, false)
+        ));
     }
 }

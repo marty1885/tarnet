@@ -27,7 +27,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::ipc::*;
 use tarnet_api::service::{
-    Connection, DhtEntry, HelloInfo, NodeEvent, ServiceApi, TnsRecord, TnsResolution,
+    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, ServiceApi, TnsRecord,
+    TnsResolution,
 };
 use tarnet_api::types::{DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo};
 
@@ -323,30 +324,48 @@ impl ServiceApi for IpcServiceApi {
         let (status, resp) = self.request(METHOD_CONNECT, &payload).await?;
         Self::check_status(status, &resp)?;
         let r: ConnectResp = decode_payload(&resp)?;
-        self.make_ipc_connection(r.conn_id, r.remote_service_id, port)
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.port)
             .await
     }
 
-    async fn listen(&self, service_id: ServiceId, port: u16) -> ApiResult<()> {
-        let payload = encode_payload(&(service_id, port));
+    async fn listen(
+        &self,
+        service_id: ServiceId,
+        port: u16,
+        options: ListenerOptions,
+    ) -> ApiResult<Listener> {
+        let payload = encode_payload(&ListenReq {
+            service_id,
+            port,
+            options,
+        });
         let (status, resp) = self.request(METHOD_LISTEN, &payload).await?;
-        Self::check_status(status, &resp)
+        Self::check_status(status, &resp)?;
+        Ok(decode_payload::<ListenResp>(&resp)?.listener)
     }
 
-    async fn accept(&self) -> ApiResult<Connection> {
+    async fn accept(&self, listener: &Listener) -> ApiResult<Connection> {
         // Accept blocks until a connection arrives — use a very long timeout
         // so we don't time out waiting for incoming connections.
         let (status, resp) = self
             .request_with_timeout(
                 METHOD_ACCEPT,
-                &[],
+                &encode_payload(&AcceptReq {
+                    listener_id: listener.id,
+                }),
                 std::time::Duration::from_secs(3600),
             )
             .await?;
         Self::check_status(status, &resp)?;
         let r: ConnectResp = decode_payload(&resp)?;
-        self.make_ipc_connection(r.conn_id, r.remote_service_id, 0)
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.port)
             .await
+    }
+
+    async fn close_listener(&self, listener: &Listener) -> ApiResult<()> {
+        let payload = encode_payload(&listener.id);
+        let (status, resp) = self.request(METHOD_LISTENER_CLOSE, &payload).await?;
+        Self::check_status(status, &resp)
     }
 
     async fn listen_hidden(
@@ -354,10 +373,17 @@ impl ServiceApi for IpcServiceApi {
         service_id: ServiceId,
         port: u16,
         num_intro_points: usize,
-    ) -> ApiResult<()> {
-        let payload = encode_payload(&(service_id, port, num_intro_points as u16));
+        options: ListenerOptions,
+    ) -> ApiResult<Listener> {
+        let payload = encode_payload(&ListenHiddenReq {
+            service_id,
+            port,
+            num_intro_points: num_intro_points as u16,
+            options,
+        });
         let (status, resp) = self.request(METHOD_LISTEN_HIDDEN, &payload).await?;
-        Self::check_status(status, &resp)
+        Self::check_status(status, &resp)?;
+        Ok(decode_payload::<ListenResp>(&resp)?.listener)
     }
 
     // ── DHT: content-addressed ──
@@ -639,7 +665,7 @@ impl ServiceApi for IpcServiceApi {
         let (status, resp) = self.request(METHOD_CONNECT_TO, &payload).await?;
         Self::check_status(status, &resp)?;
         let r: ConnectResp = decode_payload(&resp)?;
-        self.make_ipc_connection(r.conn_id, r.remote_service_id, port)
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.port)
             .await
     }
 

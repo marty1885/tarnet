@@ -35,9 +35,6 @@ impl Node {
             }
         }
 
-        // Register listener so incoming StreamBegin for this ServiceId is accepted
-        let _ = self.circuit_listen(sid, 0).await;
-
         match privacy {
             tarnet_api::types::PrivacyLevel::Hidden { intro_points } => {
                 match self.publish_hidden_service(sid, intro_points as usize).await {
@@ -128,7 +125,6 @@ impl Node {
             match (old_privacy, privacy) {
                 // Public → Hidden: publish intro points
                 (PL::Public, PL::Hidden { intro_points }) => {
-                    let _ = self.circuit_listen(sid, 0).await;
                     match self.publish_hidden_service(sid, intro_points as usize).await {
                         Ok(()) => {
                             self.hidden.last_publish
@@ -145,7 +141,6 @@ impl Node {
                 // Hidden → Public: tear down intro points, publish peer record
                 (PL::Hidden { .. }, PL::Public) => {
                     self.teardown_hidden_service(&sid).await;
-                    let _ = self.circuit_listen(sid, 0).await;
                     if let Err(e) = self.publish_peer_record(sid).await {
                         log::warn!(
                             "Peer record publish after Hidden→Public for '{}' failed (will retry): {}",
@@ -158,7 +153,6 @@ impl Node {
                     if old_n != new_n =>
                 {
                     self.teardown_hidden_service(&sid).await;
-                    let _ = self.circuit_listen(sid, 0).await;
                     match self.publish_hidden_service(sid, new_n as usize).await {
                         Ok(()) => {
                             self.hidden.last_publish

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use serde::Deserialize;
-use tarnet_api::service::{ServiceApi, TnsRecord};
+use tarnet_api::service::{Listener, ListenerOptions, ServiceApi, TnsRecord};
 use tarnet_api::types::{PrivacyLevel, ServiceId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -44,8 +44,14 @@ fn default_protocol() -> String {
 /// Shared state for the expose service.
 struct ExposeState<S: ServiceApi> {
     api: Arc<S>,
-    /// ServiceId -> Vec<LoadedService> (multiple services can share an identity)
-    services: Mutex<HashMap<ServiceId, Vec<LoadedService>>>,
+    services: Mutex<Vec<RegisteredService>>,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredService {
+    service_id: ServiceId,
+    listener: Listener,
+    service: LoadedService,
 }
 
 /// Validate a subdomain label: must be non-empty, no dots, only lowercase
@@ -177,12 +183,12 @@ fn listen_port(config: &ServiceConfig) -> Option<u16> {
     config.port.or_else(|| parse_local_port(&config.local))
 }
 
-/// Build ServiceId -> Vec<LoadedService> map, registering listeners for each.
+/// Register listeners for each loaded service.
 async fn register_services<S: ServiceApi>(
     api: &S,
     loaded: &[LoadedService],
-) -> HashMap<ServiceId, Vec<LoadedService>> {
-    let mut map: HashMap<ServiceId, Vec<LoadedService>> = HashMap::new();
+) -> Vec<RegisteredService> {
+    let mut services = Vec::new();
 
     for svc in loaded {
         let identity_label = svc.config.identity.as_deref();
@@ -206,18 +212,71 @@ async fn register_services<S: ServiceApi>(
             }
         };
 
-        // Register listener on this ServiceId + port.
-        // The node's circuit_listen is idempotent, so duplicates are fine.
-        if let Err(e) = api.listen(sid, port).await {
-            error!("Failed to listen on {:?} port {} for '{}': {}", sid, port, svc.filename, e);
-            continue;
-        }
-
-        map.entry(sid).or_default().push(svc.clone());
+        let listener = match api.listen(sid, port, ListenerOptions::default()).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                error!("Failed to listen on {:?} port {} for '{}': {}", sid, port, svc.filename, e);
+                continue;
+            }
+        };
+        services.push(RegisteredService {
+            service_id: sid,
+            listener,
+            service: svc.clone(),
+        });
         info!("Registered service '{}' on {:?} port {}", svc.filename, sid, port);
     }
 
-    map
+    services
+}
+
+async fn close_services<S: ServiceApi>(api: &S, services: &[RegisteredService]) {
+    for service in services {
+        if let Err(e) = api.close_listener(&service.listener).await {
+            warn!(
+                "Failed to close listener on {:?} port {} for '{}': {}",
+                service.service_id,
+                service.listener.port,
+                service.service.filename,
+                e
+            );
+        }
+    }
+}
+
+fn spawn_accept_tasks<S: ServiceApi + 'static>(api: Arc<S>, services: &[RegisteredService]) {
+    for registered in services.iter().cloned() {
+        let api = api.clone();
+        tokio::spawn(async move {
+            loop {
+                let conn = match api.accept(&registered.listener).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        info!(
+                            "Listener {:?} port {} for '{}' stopped accepting: {}",
+                            registered.service_id,
+                            registered.listener.port,
+                            registered.service.filename,
+                            e
+                        );
+                        break;
+                    }
+                };
+
+                let service_name = registered.service.filename.clone();
+                let local_addr = registered.service.config.local.clone();
+                let protocol = registered.service.config.protocol.clone();
+
+                tokio::spawn(async move {
+                    if protocol == "udp" {
+                        pipe_udp::<S>(conn, &local_addr, &service_name).await;
+                    } else {
+                        pipe_tcp::<S>(conn, &local_addr, &service_name).await;
+                    }
+                });
+            }
+        });
+    }
 }
 
 async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
@@ -226,92 +285,89 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
     // Track which identities have already published their apex Identity record.
     let mut apex_published: HashMap<String, bool> = HashMap::new();
 
-    for svcs in services.values() {
-        for svc in svcs {
-            if !svc.config.publish {
+    for registered in services.iter() {
+        let svc = &registered.service;
+        if !svc.config.publish {
+            continue;
+        }
+
+        let identity_label = svc.config.identity.as_deref();
+        let (self_sid, privacy) = match lookup_identity_privacy(&*state.api, identity_label).await {
+            Some(v) => v,
+            None => continue,
+        };
+
+        // Hidden identities: the daemon automatically publishes and maintains
+        // intro points. Expose only handles TNS records for public services.
+        if matches!(privacy, PrivacyLevel::Hidden { .. }) {
+            info!(
+                "Skipping TNS publish for '{}' (hidden identity — daemon manages intro points)",
+                svc.filename,
+            );
+            continue;
+        }
+
+        let identity_key = identity_label.unwrap_or("default").to_string();
+
+        if let Some(ref subdomain) = svc.config.subdomain {
+            // Subdomain mode: publish <subdomain> → Identity(self_sid).
+            let identity_record = TnsRecord::Identity(self_sid);
+            match state
+                .api
+                .tns_publish(identity_label, subdomain, vec![identity_record], 3600)
+                .await
+            {
+                Ok(()) => info!("Published TNS record for '{}.{}'", subdomain, identity_key),
+                Err(e) => error!(
+                    "{}: failed to publish subdomain '{}': {}",
+                    svc.filename, subdomain, e
+                ),
+            }
+        } else {
+            // Apex mode: publish Identity(self_sid) at "@".
+            // Only need to do this once per identity.
+            if *apex_published.get(&identity_key).unwrap_or(&false) {
                 continue;
             }
 
-            let identity_label = svc.config.identity.as_deref();
-            let (self_sid, privacy) = match lookup_identity_privacy(&*state.api, identity_label).await {
-                Some(v) => v,
-                None => continue,
-            };
-
-            // Hidden identities: the daemon automatically publishes and maintains
-            // intro points. Expose only handles TNS records for public services.
-            if matches!(privacy, PrivacyLevel::Hidden { .. }) {
-                info!(
-                    "Skipping TNS publish for '{}' (hidden identity — daemon manages intro points)",
-                    svc.filename,
-                );
-                continue;
+            // Check for @ conflict: if @ already points elsewhere, refuse.
+            match state.api.tns_get_label(None, "@").await {
+                Ok(Some((records, _))) => {
+                    let is_self = records.iter().any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == self_sid));
+                    let has_other = records.iter().any(|r| match r {
+                        TnsRecord::Identity(sid) => *sid != self_sid,
+                        TnsRecord::Alias(_) | TnsRecord::Zone(_) => true,
+                        _ => false,
+                    });
+                    if has_other && !is_self {
+                        error!(
+                            "{}: cannot publish at apex (@): record already points elsewhere. \
+                             Set subdomain = \"{}\" in the config to publish as a subdomain instead.",
+                            svc.filename, svc.filename,
+                        );
+                        continue;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to check @ label: {}", e);
+                }
             }
 
-            let identity_key = identity_label.unwrap_or("default").to_string();
-
-            if let Some(ref subdomain) = svc.config.subdomain {
-                // Subdomain mode: publish <subdomain> → Identity(self_sid).
-                let identity_record = TnsRecord::Identity(self_sid);
-                match state
-                    .api
-                    .tns_publish(identity_label, subdomain, vec![identity_record], 3600)
-                    .await
-                {
-                    Ok(()) => info!("Published TNS record for '{}.{}'", subdomain, identity_key),
-                    Err(e) => error!(
-                        "{}: failed to publish subdomain '{}': {}",
-                        svc.filename, subdomain, e
-                    ),
+            let identity_record = TnsRecord::Identity(self_sid);
+            match state
+                .api
+                .tns_publish(identity_label, "@", vec![identity_record], 3600)
+                .await
+            {
+                Ok(()) => {
+                    info!("Published Identity at apex (@) for identity '{}'", identity_key);
+                    apex_published.insert(identity_key, true);
                 }
-            } else {
-                // Apex mode: publish Identity(self_sid) at "@".
-                // Only need to do this once per identity.
-                if *apex_published.get(&identity_key).unwrap_or(&false) {
-                    continue;
-                }
-
-                // Check for @ conflict: if @ already points elsewhere, refuse.
-                match state.api.tns_get_label(None, "@").await {
-                    Ok(Some((records, _))) => {
-                        // @ is set. Check if it's our own Identity or something else.
-                        let is_self = records.iter().any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == self_sid));
-                        let has_other = records.iter().any(|r| match r {
-                            TnsRecord::Identity(sid) => *sid != self_sid,
-                            TnsRecord::Alias(_) | TnsRecord::Zone(_) => true,
-                            _ => false,
-                        });
-                        if has_other && !is_self {
-                            error!(
-                                "{}: cannot publish at apex (@): record already points elsewhere. \
-                                 Set subdomain = \"{}\" in the config to publish as a subdomain instead.",
-                                svc.filename, svc.filename,
-                            );
-                            continue;
-                        }
-                    }
-                    Ok(None) => { /* @ is unset, good to go */ }
-                    Err(e) => {
-                        warn!("Failed to check @ label: {}", e);
-                        // Proceed anyway — best effort.
-                    }
-                }
-
-                let identity_record = TnsRecord::Identity(self_sid);
-                match state
-                    .api
-                    .tns_publish(identity_label, "@", vec![identity_record], 3600)
-                    .await
-                {
-                    Ok(()) => {
-                        info!("Published Identity at apex (@) for identity '{}'", identity_key);
-                        apex_published.insert(identity_key, true);
-                    }
-                    Err(e) => error!(
-                        "{}: failed to publish Identity at apex: {}",
-                        svc.filename, e
-                    ),
-                }
+                Err(e) => error!(
+                    "{}: failed to publish Identity at apex: {}",
+                    svc.filename, e
+                ),
             }
         }
     }
@@ -474,6 +530,10 @@ pub async fn run_expose<S: ServiceApi + 'static>(
         api: api.clone(),
         services: Mutex::new(services),
     });
+    {
+        let current = state.services.lock().await.clone();
+        spawn_accept_tasks(api.clone(), &current);
+    }
 
     // Publish TNS records.
     publish_services(&state).await;
@@ -499,8 +559,12 @@ pub async fn run_expose<S: ServiceApi + 'static>(
 
             match load_services(&config_dir_reload) {
                 Ok(new_loaded) => {
+                    let old_services = state_reload.services.lock().await.clone();
+                    close_services(&*state_reload.api, &old_services).await;
                     let new_services = register_services(&*state_reload.api, &new_loaded).await;
                     *state_reload.services.lock().await = new_services;
+                    let current = state_reload.services.lock().await.clone();
+                    spawn_accept_tasks(state_reload.api.clone(), &current);
                     publish_services(&state_reload).await;
                     if let Some(tx) = reply_tx {
                         let _ = tx.send(Ok(()));
@@ -518,47 +582,7 @@ pub async fn run_expose<S: ServiceApi + 'static>(
 
     info!("Accepting connections...");
 
-    // Main loop: accept circuit connections and pipe to local backends.
-    loop {
-        let conn = match api.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("Accept error: {}", e);
-                break;
-            }
-        };
-
-        let sid = conn.remote_service_id;
-        let port = conn.port;
-
-        // Look up which service config handles this ServiceId + port.
-        let svc = {
-            let services = state.services.lock().await;
-            services.get(&sid).and_then(|svcs| {
-                svcs.iter().find(|s| listen_port(&s.config) == Some(port)).cloned()
-            })
-        };
-
-        let svc = match svc {
-            Some(s) => s,
-            None => {
-                warn!("No service registered for {:?} port {}", sid, port);
-                continue;
-            }
-        };
-
-        let service_name = svc.filename.clone();
-        let local_addr = svc.config.local.clone();
-        let protocol = svc.config.protocol.clone();
-
-        tokio::spawn(async move {
-            if protocol == "udp" {
-                pipe_udp::<S>(conn, &local_addr, &service_name).await;
-            } else {
-                pipe_tcp::<S>(conn, &local_addr, &service_name).await;
-            }
-        });
-    }
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
@@ -609,12 +633,15 @@ mod tests {
         async fn default_service_id(&self) -> ServiceId { self.identities[0].1 }
         async fn resolve_identity(&self, _: &str) -> ApiResult<ServiceId> { Ok(self.identities[0].1) }
         async fn connect(&self, _: ServiceId, _: u16) -> ApiResult<Connection> { Err(ApiError::NotConnected) }
-        async fn listen(&self, _: ServiceId, _: u16) -> ApiResult<()> { Ok(()) }
-        async fn accept(&self) -> ApiResult<Connection> { Err(ApiError::NotConnected) }
+        async fn listen(&self, service_id: ServiceId, port: u16, options: ListenerOptions) -> ApiResult<Listener> {
+            Ok(Listener { id: 1, service_id, port, options })
+        }
+        async fn accept(&self, _: &Listener) -> ApiResult<Connection> { Err(ApiError::NotConnected) }
+        async fn close_listener(&self, _: &Listener) -> ApiResult<()> { Ok(()) }
 
-        async fn listen_hidden(&self, _: ServiceId, _: u16, _: usize) -> ApiResult<()> {
+        async fn listen_hidden(&self, service_id: ServiceId, port: u16, _: usize, options: ListenerOptions) -> ApiResult<Listener> {
             self.listen_hidden_called.store(true, Ordering::SeqCst);
-            Ok(())
+            Ok(Listener { id: 1, service_id, port, options })
         }
 
         async fn dht_put(&self, _: &[u8]) -> DhtId { DhtId([0; 64]) }

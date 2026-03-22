@@ -11,6 +11,7 @@ use tarnet::routing::RoutingTable;
 use tarnet::state::{StateDb, StorageLimits};
 use tarnet::transport::tcp::{TcpDiscovery, TcpTransport};
 use tarnet::types::{DhtId, PeerId, RecordType};
+use tarnet_api::service::ListenerOptions;
 use tarnet_api::types::ServiceId;
 use tarnet::wire::*;
 use tokio::net::{TcpListener, TcpStream};
@@ -1057,12 +1058,15 @@ async fn circuit_connect_accept_bidi() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Register B as a listener
-    node_b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     // Spawn accept on B in the background
     let nb2 = node_b.clone();
     let accept_handle = tokio::spawn(async move {
-        nb2.circuit_accept().await.unwrap()
+        nb2.circuit_accept(listener_b.id).await.unwrap()
     });
 
     // Start A, connected to B
@@ -1147,7 +1151,10 @@ async fn hidden_service_rendezvous() {
     );
 
     // C registers as listener and publishes hidden service
-    node_c.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_c = node_c
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
     node_c
         .publish_hidden_service(service_id_c, 1)
         .await
@@ -1205,7 +1212,7 @@ async fn hidden_service_rendezvous() {
     // C accepts incoming connections in the background.
     let node_c_accept = node_c.clone();
     let service_conn_handle = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept())
+        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept(listener_c.id))
             .await
             .expect("accept timed out")
             .expect("accept failed")
@@ -1274,10 +1281,14 @@ async fn flow_control_bulk_transfer() {
     tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok(); });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    node_b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let nb2 = node_b.clone();
-    let accept_handle = tokio::spawn(async move { nb2.circuit_accept().await.unwrap() });
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
 
     // Start A, connected to B
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use tarnet_api::service::{DataStream, ServiceApi, TnsRecord, TnsResolution};
+use tarnet_api::service::{DataStream, ListenerOptions, ServiceApi, TnsRecord, TnsResolution};
 use tarnet_api::types::{PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -866,10 +866,13 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
         }
     };
 
-    if let Err(e) = client.listen(service_id, port).await {
-        eprintln!("Listen failed: {}", e);
-        std::process::exit(1);
-    }
+    let listener = match client.listen(service_id, port, ListenerOptions::default()).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("Listen failed: {}", e);
+            std::process::exit(1);
+        }
+    };
     eprintln!("Listening on {} port {}.", service_id, port);
     eprintln!("Waiting for connections... (Ctrl-C to quit)");
 
@@ -878,9 +881,10 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
 
     let accept_client = client.clone();
     let accept_conns = connections.clone();
+    let accept_listener = listener;
     tokio::spawn(async move {
         loop {
-            match accept_client.accept().await {
+            match accept_client.accept(&accept_listener).await {
                 Ok(conn) => {
                     eprintln!("[+] Connection from {}", conn.remote_service_id);
                     let conn = Arc::new(conn);

@@ -16,6 +16,7 @@ use serde::{Serialize, Deserialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::{ApiError, ApiResult};
+use crate::service::{Listener, ListenerOptions};
 use crate::types::{IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo};
 
 // ── Frame types ──
@@ -76,6 +77,8 @@ pub const METHOD_DELETE_IDENTITY: u16 = 0x0021;
 pub const METHOD_CONN_SEND: u16 = 0x0022;
 /// Close a connection: conn_id(u32)
 pub const METHOD_CONN_CLOSE: u16 = 0x0023;
+/// Close a listener: listener_id(u32)
+pub const METHOD_LISTENER_CLOSE: u16 = 0x0026;
 
 // Daemon control
 /// Reload daemon configuration (equivalent to SIGHUP).
@@ -260,9 +263,9 @@ pub async fn recv_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> ApiResult<Ip
 // ── Version handshake ──
 
 /// IPC protocol version. Increment when making breaking changes.
-pub const IPC_VERSION: u16 = 4;
+pub const IPC_VERSION: u16 = 5;
 /// Minimum IPC version we can talk to.
-pub const IPC_MIN_VERSION: u16 = 4;
+pub const IPC_MIN_VERSION: u16 = 5;
 /// Magic bytes for version handshake.
 pub const IPC_MAGIC: &[u8; 4] = b"TNET";
 
@@ -380,6 +383,36 @@ pub struct SignedContentEntry {
 pub struct ConnectResp {
     pub conn_id: u32,
     pub remote_service_id: ServiceId,
+    pub port: u16,
+}
+
+/// Request to listen on a service/port.
+#[derive(Serialize, Deserialize)]
+pub struct ListenReq {
+    pub service_id: ServiceId,
+    pub port: u16,
+    pub options: ListenerOptions,
+}
+
+/// Request to listen and publish a hidden service.
+#[derive(Serialize, Deserialize)]
+pub struct ListenHiddenReq {
+    pub service_id: ServiceId,
+    pub port: u16,
+    pub num_intro_points: u16,
+    pub options: ListenerOptions,
+}
+
+/// Request to accept on a specific listener.
+#[derive(Serialize, Deserialize)]
+pub struct AcceptReq {
+    pub listener_id: u32,
+}
+
+/// Response from LISTEN or LISTEN_HIDDEN.
+#[derive(Serialize, Deserialize)]
+pub struct ListenResp {
+    pub listener: Listener,
 }
 
 /// One entry in a list_identities response.

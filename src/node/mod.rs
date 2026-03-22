@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,7 @@ use crate::transport::webrtc::WebRtcConnector;
 use crate::tunnel::{Tunnel, TunnelTable};
 use crate::types::{DhtId, Error, LinkId, PeerId, RecordType, Result, ScopedAddress, TransportType};
 use crate::wire::*;
+use tarnet_api::service::{Connection, Listener, ListenerOptions};
 
 mod circuit;
 mod dht;
@@ -318,6 +320,18 @@ impl ChannelState {
     }
 }
 
+struct ListenerState {
+    listener: Listener,
+    tx: Mutex<Option<mpsc::Sender<Connection>>>,
+    rx: Mutex<mpsc::Receiver<Connection>>,
+}
+
+enum ListenerDispatch {
+    NoListener,
+    Enqueued,
+    QueueFull,
+}
+
 /// A tarnet node: manages transports, links, routing, tunnels, and channels.
 pub struct Node {
     pub identity: Arc<Keypair>,
@@ -371,11 +385,10 @@ pub struct Node {
     /// Receiver half, taken by start() to spawn the cleanup task.
     circuit_drop_rx: Mutex<Option<mpsc::UnboundedReceiver<CircuitDropEvent>>>,
     endpoints: EndpointState,
-    /// Active listeners: (ServiceId, port) pairs we accept connections on.
-    listeners: Arc<Mutex<Vec<(tarnet_api::types::ServiceId, u16)>>>,
-    /// Incoming connections queue (from accept).
-    incoming_connections_tx: mpsc::Sender<tarnet_api::service::Connection>,
-    incoming_connections_rx: Mutex<Option<mpsc::Receiver<tarnet_api::service::Connection>>>,
+    /// Active listeners keyed by listener id.
+    listeners: Arc<Mutex<HashMap<u32, Arc<ListenerState>>>>,
+    listener_next_id: AtomicU32,
+    listener_rr: AtomicU64,
     hidden: HiddenServiceState,
     /// Identity store: named keypairs with privacy levels.
     identity_store: Arc<Mutex<IdentityStore>>,
@@ -529,7 +542,6 @@ impl Node {
         let (tunnel_notify_tx, tunnel_notify_rx) = mpsc::channel(256);
         let (dht_watch_tx, dht_watch_rx) = mpsc::channel(256);
         let (channel_event_tx, channel_event_rx) = mpsc::channel(256);
-        let (incoming_conn_tx, incoming_conn_rx) = mpsc::channel(64);
         let (circuit_drop_tx, circuit_drop_rx) = mpsc::unbounded_channel();
         let mut dht_store = DhtStore::with_limits(&peer_id, storage_limits);
         dht_store.import_records(dht_records);
@@ -566,9 +578,9 @@ impl Node {
             circuit_drop_tx,
             circuit_drop_rx: Mutex::new(Some(circuit_drop_rx)),
             endpoints: EndpointState::new(),
-            listeners: Arc::new(Mutex::new(Vec::new())),
-            incoming_connections_tx: incoming_conn_tx,
-            incoming_connections_rx: Mutex::new(Some(incoming_conn_rx)),
+            listeners: Arc::new(Mutex::new(HashMap::new())),
+            listener_next_id: AtomicU32::new(1),
+            listener_rr: AtomicU64::new(0),
             hidden: HiddenServiceState::new(),
             identity_store: Arc::new(Mutex::new(identity_store)),
             webrtc_connector: None,
@@ -814,14 +826,6 @@ impl Node {
                     node.maintain_peer_records().await;
                 }
             });
-        }
-
-        // Register listeners for all identities so incoming StreamBegin is accepted
-        {
-            let identities = self.list_identities().await;
-            for (_, sid, _, _, _, _, _) in &identities {
-                let _ = self.circuit_listen(*sid, 0).await;
-            }
         }
 
         // Run the event loop

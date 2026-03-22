@@ -11,12 +11,13 @@ use tokio::sync::Mutex;
 
 use tarnet_api::error::ApiResult;
 use tarnet_api::ipc::*;
-use tarnet_api::service::{Connection, NodeEvent, ServiceApi};
+use tarnet_api::service::{Connection, Listener, ListenerOptions, NodeEvent, ServiceApi};
 use tarnet_api::types::{DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
 
 /// Per-client connection table: maps conn_id -> Connection.
 /// Shared between the dispatch task and event-pushing tasks.
 type ConnTable = Arc<Mutex<HashMap<u32, Arc<Connection>>>>;
+type ListenerTable = Arc<Mutex<HashMap<u32, Listener>>>;
 
 /// Allocate an opaque client-local handle ID for a connection.
 /// The handle space is scoped to a single Unix socket connection.
@@ -26,6 +27,16 @@ fn allocate_client_conn_id(conns: &HashMap<u32, Arc<Connection>>) -> u32 {
         let conn_id = rng.gen::<u32>();
         if conn_id != 0 && !conns.contains_key(&conn_id) {
             return conn_id;
+        }
+    }
+}
+
+fn allocate_client_listener_id(listeners: &HashMap<u32, Listener>) -> u32 {
+    let mut rng = rand::thread_rng();
+    loop {
+        let listener_id = rng.gen::<u32>();
+        if listener_id != 0 && !listeners.contains_key(&listener_id) {
+            return listener_id;
         }
     }
 }
@@ -52,11 +63,39 @@ async fn register_connection(
         internal_conn_id
     );
 
-    spawn_conn_recv_relay(client_conn_id, conn, writer.clone(), conns.clone());
+    spawn_conn_recv_relay(client_conn_id, conn.clone(), writer.clone(), conns.clone());
 
     ConnectResp {
         conn_id: client_conn_id,
         remote_service_id,
+        port: conn.port,
+    }
+}
+
+async fn register_listener(listeners: &ListenerTable, listener: Listener) -> ListenResp {
+    let client_listener_id = {
+        let mut guard = listeners.lock().await;
+        let client_listener_id = allocate_client_listener_id(&guard);
+        guard.insert(client_listener_id, listener);
+        client_listener_id
+    };
+
+    ListenResp {
+        listener: Listener {
+            id: client_listener_id,
+            service_id: listener.service_id,
+            port: listener.port,
+            options: listener.options,
+        },
+    }
+}
+
+async fn close_client_listeners(api: &dyn ServiceApi, listeners: &ListenerTable) {
+    let listeners: Vec<Listener> = listeners.lock().await.drain().map(|(_, listener)| listener).collect();
+    for listener in listeners {
+        if let Err(e) = api.close_listener(&listener).await {
+            log::debug!("Failed to close IPC listener {}: {}", listener.id, e);
+        }
     }
 }
 
@@ -113,6 +152,7 @@ async fn handle_client(
     let (mut reader, writer) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer));
     let conns: ConnTable = Arc::new(Mutex::new(HashMap::new()));
+    let listeners: ListenerTable = Arc::new(Mutex::new(HashMap::new()));
 
     // Auto-subscribe: start relaying all events to this client immediately.
     if let Ok(mut rx) = api.subscribe_events().await {
@@ -140,8 +180,11 @@ async fn handle_client(
         });
     }
 
-    loop {
-        let frame = recv_frame(&mut reader).await?;
+    let result: ApiResult<()> = loop {
+        let frame = match recv_frame(&mut reader).await {
+            Ok(frame) => frame,
+            Err(e) => break Err(e),
+        };
 
         match frame {
             IpcFrame::Request {
@@ -216,15 +259,36 @@ async fn handle_client(
                         let mut w = writer.lock().await;
                         let _ = send_frame(&mut *w, &ok_response(request_id, &[])).await;
                     }
+                    METHOD_LISTENER_CLOSE => {
+                        let client_listener_id: u32 = match decode_payload(&payload) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                let mut w = writer.lock().await;
+                                let _ = send_frame(&mut *w, &ok_response(request_id, &[])).await;
+                                continue;
+                            }
+                        };
+                        let listener = listeners.lock().await.remove(&client_listener_id);
+                        let response = match listener {
+                            Some(listener) => match api.close_listener(&listener).await {
+                                Ok(()) => ok_response(request_id, &[]),
+                                Err(e) => err_response(request_id, &e.to_string()),
+                            },
+                            None => err_response(request_id, "unknown listener id"),
+                        };
+                        let mut w = writer.lock().await;
+                        let _ = send_frame(&mut *w, &response).await;
+                    }
                     _ => {
                         let api = api.clone();
                         let writer = writer.clone();
                         let conns = conns.clone();
+                        let listeners = listeners.clone();
                         // Handle each request concurrently so one slow DHT lookup
                         // doesn't block quick peer_id queries.
                         tokio::spawn(async move {
                             let response =
-                                dispatch_request(&*api, method, &payload, request_id, &writer, &conns).await;
+                                dispatch_request(&*api, method, &payload, request_id, &writer, &conns, &listeners).await;
                             let mut w = writer.lock().await;
                             if let Err(e) = send_frame(&mut *w, &response).await {
                                 log::debug!("Failed to send IPC response: {}", e);
@@ -237,7 +301,10 @@ async fn handle_client(
                 log::warn!("Unexpected frame type from client");
             }
         }
-    }
+    };
+
+    close_client_listeners(&*api, &listeners).await;
+    result
 }
 
 /// Spawn a task that relays conn.recv() -> EVENT_CONN_DATA / EVENT_CONN_CLOSED to the client.
@@ -284,6 +351,7 @@ async fn dispatch_request(
     request_id: u32,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     conns: &ConnTable,
+    listeners: &ListenerTable,
 ) -> IpcFrame {
     match method {
         METHOD_GET_PEER_ID => {
@@ -498,12 +566,15 @@ async fn dispatch_request(
         }
 
         METHOD_LISTEN => {
-            let (sid, port): (ServiceId, u16) = match decode_payload(payload) {
+            let req: ListenReq = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.listen(sid, port).await {
-                Ok(()) => ok_response(request_id, &[]),
+            match api.listen(req.service_id, req.port, req.options).await {
+                Ok(listener) => {
+                    let resp = encode_payload(&register_listener(listeners, listener).await);
+                    ok_response(request_id, &resp)
+                }
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }
@@ -523,7 +594,19 @@ async fn dispatch_request(
         }
 
         METHOD_ACCEPT => {
-            match api.accept().await {
+            let req: AcceptReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            let listener = {
+                let guard = listeners.lock().await;
+                guard.get(&req.listener_id).copied()
+            };
+            let listener = match listener {
+                Some(listener) => listener,
+                None => return err_response(request_id, "unknown listener id"),
+            };
+            match api.accept(&listener).await {
                 Ok(conn) => {
                     let resp = encode_payload(&register_connection(conns, conn, writer).await);
                     ok_response(request_id, &resp)
@@ -537,19 +620,30 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.listen_hidden(sid, 0, count as usize).await {
-                Ok(()) => ok_response(request_id, &[]),
+            match api.listen_hidden(sid, 0, count as usize, ListenerOptions::default()).await {
+                Ok(listener) => {
+                    let _ = register_listener(listeners, listener).await;
+                    ok_response(request_id, &[])
+                }
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }
 
         METHOD_LISTEN_HIDDEN => {
-            let (sid, port, count): (ServiceId, u16, u16) = match decode_payload(payload) {
+            let req: ListenHiddenReq = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.listen_hidden(sid, port, count as usize).await {
-                Ok(()) => ok_response(request_id, &[]),
+            match api.listen_hidden(
+                req.service_id,
+                req.port,
+                req.num_intro_points as usize,
+                req.options,
+            ).await {
+                Ok(listener) => {
+                    let resp = encode_payload(&register_listener(listeners, listener).await);
+                    ok_response(request_id, &resp)
+                }
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }
@@ -692,6 +786,25 @@ mod tests {
                     tokio::sync::mpsc::channel(1).0,
                     tokio::sync::mpsc::channel(1).1,
                 )),
+            );
+        }
+    }
+
+    #[test]
+    fn allocated_client_listener_ids_are_nonzero_and_unique() {
+        let mut listeners = HashMap::new();
+        for _ in 0..512 {
+            let listener_id = allocate_client_listener_id(&listeners);
+            assert_ne!(listener_id, 0);
+            assert!(!listeners.contains_key(&listener_id));
+            listeners.insert(
+                listener_id,
+                Listener {
+                    id: listener_id,
+                    service_id: ServiceId::LOCAL,
+                    port: 80,
+                    options: ListenerOptions::default(),
+                },
             );
         }
     }

@@ -106,6 +106,23 @@ pub struct Connection {
     rx: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
 }
 
+/// Listener options for inbound service binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ListenerOptions {
+    /// Allow overlapping listeners when all matching listeners also opt in.
+    pub reuse_port: bool,
+}
+
+/// A listener handle returned from `listen()` or `listen_hidden()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Listener {
+    /// Opaque listener handle.
+    pub id: u32,
+    pub service_id: ServiceId,
+    pub port: u16,
+    pub options: ListenerOptions,
+}
+
 impl Connection {
     pub fn new(
         remote_service_id: ServiceId,
@@ -222,10 +239,19 @@ pub trait ServiceApi: Send + Sync {
 
     /// Listen for incoming connections on the given ServiceId and port.
     /// Use `ServiceId::ALL` to accept on any managed ServiceId.
-    async fn listen(&self, service_id: ServiceId, port: u16) -> ApiResult<()>;
+    async fn listen(
+        &self,
+        service_id: ServiceId,
+        port: u16,
+        options: ListenerOptions,
+    ) -> ApiResult<Listener>;
 
-    /// Accept the next incoming connection. Blocks until one arrives.
-    async fn accept(&self) -> ApiResult<Connection>;
+    /// Accept the next incoming connection for a specific listener.
+    /// Blocks until one arrives.
+    async fn accept(&self, listener: &Listener) -> ApiResult<Connection>;
+
+    /// Close a listener and release its bind.
+    async fn close_listener(&self, listener: &Listener) -> ApiResult<()>;
 
     /// Combined listen + publish hidden service. Registers the listener and
     /// publishes IntroductionPoint records in a single call.
@@ -234,7 +260,8 @@ pub trait ServiceApi: Send + Sync {
         service_id: ServiceId,
         port: u16,
         num_intro_points: usize,
-    ) -> ApiResult<()>;
+        options: ListenerOptions,
+    ) -> ApiResult<Listener>;
 
     // ── DHT: content-addressed (anonymous, self-authenticating) ──
 

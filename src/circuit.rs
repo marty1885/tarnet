@@ -1002,15 +1002,17 @@ pub fn parse_stream_begin_payload(
 pub fn build_introduce_payload(
     rendezvous_peer: &PeerId,
     cookie: &[u8; 32],
+    port: u16,
     kem_ciphertext: &[u8],
     shared_secret: &[u8; 32],
 ) -> Vec<u8> {
     let enc_key = kdf(shared_secret, "tarnet introduce enc");
 
-    // Plaintext: rendezvous_peer(32) || cookie(32)
-    let mut plaintext = Vec::with_capacity(64);
+    // Plaintext: rendezvous_peer(32) || cookie(32) || port(2)
+    let mut plaintext = Vec::with_capacity(66);
     plaintext.extend_from_slice(rendezvous_peer.as_bytes());
     plaintext.extend_from_slice(cookie);
+    plaintext.extend_from_slice(&port.to_be_bytes());
 
     let mut nonce = [0u8; 24];
     RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
@@ -1020,7 +1022,7 @@ pub fn build_introduce_payload(
         .encrypt((&nonce).into(), Payload { msg: &plaintext, aad: b"" })
         .expect("AEAD encryption should not fail");
 
-    // Wire: ct_len(2) || kem_ciphertext(variable) || nonce(24) || encrypted(64+16)
+    // Wire: ct_len(2) || kem_ciphertext(variable) || nonce(24) || encrypted(66+16)
     let ct_len = kem_ciphertext.len() as u16;
     let mut payload = Vec::with_capacity(2 + kem_ciphertext.len() + 24 + ciphertext.len());
     payload.extend_from_slice(&ct_len.to_be_bytes());
@@ -1032,25 +1034,25 @@ pub fn build_introduce_payload(
 
 /// Parse and decrypt an INTRODUCE payload using the service's KEM keypair.
 ///
-/// Returns `(rendezvous_peer_id, cookie, shared_secret)`.
+/// Returns `(rendezvous_peer_id, cookie, port, shared_secret)`.
 pub fn parse_introduce_payload(
     data: &[u8],
     service_kem: &crate::identity::KemKeypair,
-) -> Result<(PeerId, [u8; 32], [u8; 32])> {
+) -> Result<(PeerId, [u8; 32], u16, [u8; 32])> {
     if data.len() < 2 {
         return Err(Error::Wire("INTRODUCE payload too short".into()));
     }
 
     let ct_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    // 64 bytes ciphertext + 16 bytes tag = 80 bytes encrypted
-    let min_len = 2 + ct_len + 24 + 64 + 16;
+    // 66 bytes ciphertext + 16 bytes tag = 82 bytes encrypted
+    let min_len = 2 + ct_len + 24 + 66 + 16;
     if data.len() < min_len {
         return Err(Error::Wire("INTRODUCE payload truncated".into()));
     }
 
     let kem_ct = &data[2..2 + ct_len];
     let nonce = &data[2 + ct_len..2 + ct_len + 24];
-    let ciphertext_with_tag = &data[2 + ct_len + 24..2 + ct_len + 24 + 64 + 16];
+    let ciphertext_with_tag = &data[2 + ct_len + 24..2 + ct_len + 24 + 66 + 16];
 
     // Recover shared secret via KEM decapsulation
     let shared_bytes = service_kem
@@ -1069,8 +1071,9 @@ pub fn parse_introduce_payload(
     peer.copy_from_slice(&plaintext[..32]);
     let mut cookie = [0u8; 32];
     cookie.copy_from_slice(&plaintext[32..64]);
+    let port = u16::from_be_bytes([plaintext[64], plaintext[65]]);
 
-    Ok((PeerId(peer), cookie, shared_bytes))
+    Ok((PeerId(peer), cookie, port, shared_bytes))
 }
 
 /// Build a rendezvous cookie payload (used by both ESTABLISH and JOIN).

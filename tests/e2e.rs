@@ -14,6 +14,7 @@ use tarnet::transport::firewall::{FirewallDiscovery, FirewallPolicy};
 use tarnet::transport::tcp::TcpDiscovery;
 use tarnet::types::RecordType;
 use tarnet::wire::*;
+use tarnet_api::service::ListenerOptions;
 use tarnet_api::types::{IdentityScheme, PrivacyLevel, ServiceId};
 
 // ── Test helpers ──
@@ -109,9 +110,13 @@ async fn baseline_circuit_connect() {
     let nb = node_b.clone();
     tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    node_b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
     let nb2 = node_b.clone();
-    let accept_handle = tokio::spawn(async move { nb2.circuit_accept().await.unwrap() });
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
 
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let na = node_a.clone();
@@ -162,10 +167,14 @@ async fn identity_create_and_connect() {
     // ServiceId is hash-based; no verify() method needed
 
     let service_id_b = node_b.default_service_id().await;
-    node_b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let nb2 = node_b.clone();
-    let accept_handle = tokio::spawn(async move { nb2.circuit_accept().await.unwrap() });
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
 
     // Start A
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
@@ -203,10 +212,13 @@ async fn identity_connect_refused() {
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
     let default_sid = b.default_service_id().await;
-    b.circuit_listen(default_sid, 80).await.unwrap();
+    let listener_b = b
+        .circuit_listen(default_sid, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let b2 = b.clone();
-    tokio::spawn(async move { b2.circuit_accept().await });
+    tokio::spawn(async move { b2.circuit_accept(listener_b.id).await });
 
     // Try connecting to a non-existent ServiceId
     let fake_sid = ServiceId::from_signing_pubkey(&[0xAA; 32]);
@@ -233,13 +245,19 @@ async fn multiple_identities_same_node() {
     let sid_web = b.create_identity("web", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
     let sid_ssh = b.create_identity("ssh", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
 
-    b.circuit_listen(sid_web, 80).await.unwrap();
-    b.circuit_listen(sid_ssh, 22).await.unwrap();
+    let listener_web = b
+        .circuit_listen(sid_web, 80, ListenerOptions::default())
+        .await
+        .unwrap();
+    let listener_ssh = b
+        .circuit_listen(sid_ssh, 22, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let b2 = b.clone();
-    let accept1 = tokio::spawn(async move { b2.circuit_accept().await.unwrap() });
+    let accept1 = tokio::spawn(async move { b2.circuit_accept(listener_web.id).await.unwrap() });
     let b3 = b.clone();
-    let accept2 = tokio::spawn(async move { b3.circuit_accept().await.unwrap() });
+    let accept2 = tokio::spawn(async move { b3.circuit_accept(listener_ssh.id).await.unwrap() });
 
     let conn_web = tokio::time::timeout(
         Duration::from_secs(10),
@@ -270,10 +288,13 @@ async fn wildcard_listener() {
     let nodes = spawn_chain(2).await;
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
-    b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let b2 = b.clone();
-    let accept = tokio::spawn(async move { b2.circuit_accept().await.unwrap() });
+    let accept = tokio::spawn(async move { b2.circuit_accept(listener_b.id).await.unwrap() });
 
     let default_sid = b.default_service_id().await;
     let conn = tokio::time::timeout(
@@ -300,10 +321,13 @@ async fn large_message_not_truncated() {
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
     let sid = b.default_service_id().await;
-    b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let b2 = b.clone();
-    let accept = tokio::spawn(async move { b2.circuit_accept().await.unwrap() });
+    let accept = tokio::spawn(async move { b2.circuit_accept(listener_b.id).await.unwrap() });
 
     let conn_a = tokio::time::timeout(
         Duration::from_secs(10),
@@ -340,26 +364,25 @@ async fn large_message_not_truncated() {
     assert_eq!(received, payload);
 }
 
-/// Public identity auto-registers a listener — no manual circuit_listen needed.
-/// Connects on port 80 (not 0) to verify port-0 wildcard works.
-///
-/// Regression test: previously only Hidden identities called circuit_listen(),
-/// so StreamBegin to a Public identity's ServiceId was refused with
-/// "remote is not listening on this ServiceId/port".
+/// Public identities require an explicit listener registration.
+/// Connects on port 80 to verify the identity's listener receives traffic.
 #[tokio::test]
-async fn public_identity_auto_listens() {
+async fn public_identity_explicit_listener() {
     init_log();
     let nodes = spawn_chain(2).await;
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
-    // Create a public identity on B — do NOT call circuit_listen manually.
-    // create_identity registers on port 0 (wildcard), so any port should match.
+    // Create a public identity on B and register a listener explicitly.
     let sid = b.create_identity("blog", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
+    let listener_b = b
+        .circuit_listen(sid, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let b2 = b.clone();
-    let accept = tokio::spawn(async move { b2.circuit_accept().await.unwrap() });
+    let accept = tokio::spawn(async move { b2.circuit_accept(listener_b.id).await.unwrap() });
 
-    // A connects on port 80 — the auto-registered port-0 listener must accept it.
+    // A connects on port 80 — the explicit listener must accept it.
     let conn_a = tokio::time::timeout(
         Duration::from_secs(10),
         a.circuit_connect(sid, 80, Some(b.peer_id()), None),
@@ -1028,7 +1051,10 @@ async fn cross_algo_connect_pq_to_classic() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // C listens
-    c.node.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_c = c.node
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     // Publish C's service via TNS on A's store (simulate propagation)
     let zone_kp_c = Keypair::from_full_bytes(&c.node.identity.to_full_bytes()).unwrap();
@@ -1051,7 +1077,7 @@ async fn cross_algo_connect_pq_to_classic() {
     // C accepts in background
     let node_c_accept = c.node.clone();
     let accept_handle = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept())
+        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept(listener_c.id))
             .await
             .expect("accept timed out")
             .expect("accept failed")
@@ -1107,7 +1133,10 @@ async fn cross_algo_connect_classic_to_pq() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // C (PQ) listens
-    c.node.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_c = c.node
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
 
     // Publish C's service via TNS on A's store
     let zone_kp_c = Keypair::from_full_bytes(&c.node.identity.to_full_bytes()).unwrap();
@@ -1128,7 +1157,7 @@ async fn cross_algo_connect_classic_to_pq() {
 
     let node_c_accept = c.node.clone();
     let accept_handle = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept())
+        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept(listener_c.id))
             .await
             .expect("accept timed out")
             .expect("accept failed")
@@ -1316,8 +1345,14 @@ async fn two_node_pressure() {
     assert!(wait_route(&a.node, b.node.peer_id(), Duration::from_secs(10)).await, "A has no route to B");
     assert!(wait_route(&b.node, a.node.peer_id(), Duration::from_secs(10)).await, "B has no route to A");
 
-    a.node.circuit_listen(ServiceId::ALL, 0).await.unwrap();
-    b.node.circuit_listen(ServiceId::ALL, 0).await.unwrap();
+    let listener_a = a.node
+        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+        .await
+        .unwrap();
+    let listener_b = b.node
+        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let sid_b = b.node.default_service_id().await;
     let pid_b = b.node.peer_id();
@@ -1334,7 +1369,7 @@ async fn two_node_pressure() {
     let accept_b = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..NUM_CONNS {
-            let conn = tokio::time::timeout(Duration::from_secs(30), b_node.circuit_accept())
+            let conn = tokio::time::timeout(Duration::from_secs(30), b_node.circuit_accept(listener_b.id))
                 .await.expect("accept on B timed out").expect("accept on B failed");
             let seed = conn.port as u64;
             handles.push(tokio::spawn(async move {
@@ -1349,7 +1384,7 @@ async fn two_node_pressure() {
     let accept_a = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..NUM_CONNS {
-            let conn = tokio::time::timeout(Duration::from_secs(30), a_node.circuit_accept())
+            let conn = tokio::time::timeout(Duration::from_secs(30), a_node.circuit_accept(listener_a.id))
                 .await.expect("accept on A timed out").expect("accept on A failed");
             let seed = conn.port as u64 + 10000;
             handles.push(tokio::spawn(async move {
@@ -1437,9 +1472,18 @@ async fn mesh_pressure() {
     assert!(has_route_ag, "A should have a route to G");
 
     // Register listeners.
-    a.node.circuit_listen(ServiceId::ALL, 0).await.unwrap();
-    f.node.circuit_listen(ServiceId::ALL, 0).await.unwrap();
-    g.node.circuit_listen(ServiceId::ALL, 0).await.unwrap();
+    let listener_a = a.node
+        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+        .await
+        .unwrap();
+    let listener_f = f.node
+        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+        .await
+        .unwrap();
+    let listener_g = g.node
+        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+        .await
+        .unwrap();
 
     let sid_a = a.node.default_service_id().await;
     let sid_f = f.node.default_service_id().await;
@@ -1462,7 +1506,7 @@ async fn mesh_pressure() {
         let mut handles = Vec::new();
         // A accepts connections from F and G (they send back)
         for _ in 0..NUM_CONNS {
-            let conn = tokio::time::timeout(Duration::from_secs(30), a_node.circuit_accept())
+            let conn = tokio::time::timeout(Duration::from_secs(30), a_node.circuit_accept(listener_a.id))
                 .await.expect("accept on A timed out").expect("accept on A failed");
             let seed = conn.port as u64;
             handles.push(tokio::spawn(async move {
@@ -1476,7 +1520,7 @@ async fn mesh_pressure() {
     let accept_f = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let conn = tokio::time::timeout(Duration::from_secs(30), f_node.circuit_accept())
+            let conn = tokio::time::timeout(Duration::from_secs(30), f_node.circuit_accept(listener_f.id))
                 .await.expect("accept on F timed out").expect("accept on F failed");
             let seed = conn.port as u64;
             handles.push(tokio::spawn(async move {
@@ -1490,7 +1534,7 @@ async fn mesh_pressure() {
     let accept_g = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let conn = tokio::time::timeout(Duration::from_secs(30), g_node.circuit_accept())
+            let conn = tokio::time::timeout(Duration::from_secs(30), g_node.circuit_accept(listener_g.id))
                 .await.expect("accept on G timed out").expect("accept on G failed");
             let seed = conn.port as u64;
             handles.push(tokio::spawn(async move {
@@ -1687,9 +1731,13 @@ async fn firewall_pair(
     let nb = node_b.clone();
     tokio::spawn(async move { nb.run(disc_b, vec![], vec![]).await.ok() });
     tokio::time::sleep(Duration::from_millis(50)).await;
-    node_b.circuit_listen(ServiceId::ALL, 80).await.unwrap();
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .await
+        .unwrap();
     let nb2 = node_b.clone();
-    let accept_handle = tokio::spawn(async move { nb2.circuit_accept().await.unwrap() });
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
 
     // Client A — plain TCP
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
