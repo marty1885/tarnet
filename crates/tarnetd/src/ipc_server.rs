@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rand::Rng;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
@@ -16,6 +17,48 @@ use tarnet_api::types::{DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
 /// Per-client connection table: maps conn_id -> Connection.
 /// Shared between the dispatch task and event-pushing tasks.
 type ConnTable = Arc<Mutex<HashMap<u32, Arc<Connection>>>>;
+
+/// Allocate an opaque client-local handle ID for a connection.
+/// The handle space is scoped to a single Unix socket connection.
+fn allocate_client_conn_id(conns: &HashMap<u32, Arc<Connection>>) -> u32 {
+    let mut rng = rand::thread_rng();
+    loop {
+        let conn_id = rng.gen::<u32>();
+        if conn_id != 0 && !conns.contains_key(&conn_id) {
+            return conn_id;
+        }
+    }
+}
+
+async fn register_connection(
+    conns: &ConnTable,
+    conn: Connection,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+) -> ConnectResp {
+    let internal_conn_id = conn.id;
+    let remote_service_id = conn.remote_service_id;
+    let conn = Arc::new(conn);
+
+    let client_conn_id = {
+        let mut guard = conns.lock().await;
+        let client_conn_id = allocate_client_conn_id(&guard);
+        guard.insert(client_conn_id, conn.clone());
+        client_conn_id
+    };
+
+    log::debug!(
+        "IPC connection registered: client_conn_id={} internal_conn_id={}",
+        client_conn_id,
+        internal_conn_id
+    );
+
+    spawn_conn_recv_relay(client_conn_id, conn, writer.clone(), conns.clone());
+
+    ConnectResp {
+        conn_id: client_conn_id,
+        remote_service_id,
+    }
+}
 
 /// Run the IPC server on the given Unix socket path.
 /// Accepts client connections and dispatches requests to the service API.
@@ -202,6 +245,7 @@ fn spawn_conn_recv_relay(
     conn_id: u32,
     conn: Arc<Connection>,
     writer: Arc<Mutex<OwnedWriteHalf>>,
+    conns: ConnTable,
 ) {
     tokio::spawn(async move {
         loop {
@@ -218,6 +262,7 @@ fn spawn_conn_recv_relay(
                     }
                 }
                 Err(_) => {
+                    conns.lock().await.remove(&conn_id);
                     let frame = IpcFrame::Event {
                         event_type: EVENT_CONN_CLOSED,
                         payload: encode_payload(&conn_id),
@@ -470,14 +515,7 @@ async fn dispatch_request(
             };
             match api.connect(sid, port).await {
                 Ok(conn) => {
-                    let conn_id = conn.id;
-                    let resp = encode_payload(&ConnectResp {
-                        conn_id,
-                        remote_service_id: conn.remote_service_id,
-                    });
-                    let conn = Arc::new(conn);
-                    conns.lock().await.insert(conn_id, conn.clone());
-                    spawn_conn_recv_relay(conn_id, conn, writer.clone());
+                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
                     ok_response(request_id, &resp)
                 }
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -487,14 +525,7 @@ async fn dispatch_request(
         METHOD_ACCEPT => {
             match api.accept().await {
                 Ok(conn) => {
-                    let conn_id = conn.id;
-                    let resp = encode_payload(&ConnectResp {
-                        conn_id,
-                        remote_service_id: conn.remote_service_id,
-                    });
-                    let conn = Arc::new(conn);
-                    conns.lock().await.insert(conn_id, conn.clone());
-                    spawn_conn_recv_relay(conn_id, conn, writer.clone());
+                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
                     ok_response(request_id, &resp)
                 }
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -606,14 +637,7 @@ async fn dispatch_request(
             };
             match api.connect_to(&target, port).await {
                 Ok(conn) => {
-                    let conn_id = conn.id;
-                    let resp = encode_payload(&ConnectResp {
-                        conn_id,
-                        remote_service_id: conn.remote_service_id,
-                    });
-                    let conn = Arc::new(conn);
-                    conns.lock().await.insert(conn_id, conn.clone());
-                    spawn_conn_recv_relay(conn_id, conn, writer.clone());
+                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
                     ok_response(request_id, &resp)
                 }
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -645,5 +669,30 @@ fn err_response(request_id: u32, msg: &str) -> IpcFrame {
         request_id,
         status: STATUS_ERROR,
         payload: msg.as_bytes().to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocated_client_conn_ids_are_nonzero_and_unique() {
+        let mut conns = HashMap::new();
+        for _ in 0..512 {
+            let conn_id = allocate_client_conn_id(&conns);
+            assert_ne!(conn_id, 0);
+            assert!(!conns.contains_key(&conn_id));
+            conns.insert(
+                conn_id,
+                Arc::new(Connection::new(
+                    ServiceId::LOCAL,
+                    0,
+                    conn_id,
+                    tokio::sync::mpsc::channel(1).0,
+                    tokio::sync::mpsc::channel(1).1,
+                )),
+            );
+        }
     }
 }
