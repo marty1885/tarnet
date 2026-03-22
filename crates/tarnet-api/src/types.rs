@@ -89,6 +89,23 @@ impl KemAlgo {
             _ => Err("unknown KEM algorithm"),
         }
     }
+
+    /// Negotiate the KEM algorithm to use for rekey given both sides' identity
+    /// KEM algorithms. Returns the strongest algorithm both sides can perform.
+    ///
+    /// Each pair of algorithms requires an explicit match arm — the numeric
+    /// values carry no ordering, so adding a new variant forces the compiler
+    /// to handle every combination.
+    pub fn negotiate_rekey(my: Self, peer: Self) -> Self {
+        match (my, peer) {
+            (Self::X25519, Self::X25519) => Self::X25519,
+            (Self::MlkemX25519, Self::MlkemX25519) => Self::MlkemX25519,
+            (Self::MlkemX25519, Self::X25519)
+            | (Self::X25519, Self::MlkemX25519) => Self::X25519,
+            // Future variants: add explicit arms here.
+            // The compiler will enforce exhaustiveness.
+        }
+    }
 }
 
 impl fmt::Display for KemAlgo {

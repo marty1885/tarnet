@@ -754,7 +754,6 @@ fn rekey_msg_roundtrip() {
     let kp = Keypair::generate();
     let pubkey = kp.identity.signing.signing_pubkey_bytes();
     let mut rekey = RekeyMsg {
-        new_ephemeral_pubkey: [0xCC; 32],
         kem_algo: kp.identity.kem_algo() as u8,
         kem_pubkey: vec![0xDD; 8],
         kem_ciphertext: vec![0xEE; 16],
@@ -764,7 +763,7 @@ fn rekey_msg_roundtrip() {
 
     let bytes = rekey.to_bytes();
     let decoded = RekeyMsg::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.new_ephemeral_pubkey, [0xCC; 32]);
+    assert_eq!(decoded.kem_algo, kp.identity.kem_algo() as u8);
 
     // Verify the signature
     let valid = identity::verify(

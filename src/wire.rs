@@ -287,11 +287,14 @@ impl HandshakeConfirmMsg {
     }
 }
 
-/// RekeyMsg: new_ephemeral_pubkey(32) || kem_algo(u8) || kem_pk_len(u16 BE) || kem_pubkey || kem_ct_len(u16 BE) || kem_ciphertext || sig_len(u16 BE) || signature
+/// RekeyMsg: kem_algo(u8) || kem_pk_len(u16 BE) || kem_pubkey || kem_ct_len(u16 BE) || kem_ciphertext || sig_len(u16 BE) || signature
+///
+/// The KEM type owns the entire key exchange. For X25519, the KEM pubkey *is*
+/// the ephemeral X25519 public key. For hybrid (MlkemX25519), it contains
+/// both the X25519 and ML-KEM public keys.
 #[derive(Debug, Clone)]
 pub struct RekeyMsg {
-    pub new_ephemeral_pubkey: [u8; 32],
-    /// KEM algorithm for ephemeral PQ exchange.
+    /// KEM algorithm for this rekey exchange.
     pub kem_algo: u8,
     /// Ephemeral KEM public key (sent by initiator for responder to encapsulate to).
     pub kem_pubkey: Vec<u8>,
@@ -301,18 +304,17 @@ pub struct RekeyMsg {
 }
 
 impl RekeyMsg {
-    /// Bytes covered by the signature: x25519 ephemeral + KEM pubkey + KEM ciphertext.
+    /// Bytes covered by the signature: kem_algo + KEM pubkey + KEM ciphertext.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + self.kem_pubkey.len() + self.kem_ciphertext.len());
-        buf.extend_from_slice(&self.new_ephemeral_pubkey);
+        let mut buf = Vec::with_capacity(1 + self.kem_pubkey.len() + self.kem_ciphertext.len());
+        buf.push(self.kem_algo);
         buf.extend_from_slice(&self.kem_pubkey);
         buf.extend_from_slice(&self.kem_ciphertext);
         buf
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(32 + 1 + 2 + self.kem_pubkey.len() + 2 + self.kem_ciphertext.len() + 2 + self.signature.len());
-        buf.extend_from_slice(&self.new_ephemeral_pubkey);
+        let mut buf = Vec::with_capacity(1 + 2 + self.kem_pubkey.len() + 2 + self.kem_ciphertext.len() + 2 + self.signature.len());
         buf.push(self.kem_algo);
         buf.extend_from_slice(&(self.kem_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.kem_pubkey);
@@ -324,12 +326,11 @@ impl RekeyMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        // Minimum: 32 + 1 + 2 + 0 + 2 + 0 + 2 + 0 = 39
-        if data.len() < 39 {
+        // Minimum: 1 + 2 + 0 + 2 + 0 + 2 + 0 = 7
+        if data.len() < 7 {
             return Err(Error::Wire("RekeyMsg too short".into()));
         }
         let mut r = Reader::new(data);
-        let new_ephemeral_pubkey = r.read_array::<32>()?;
         let kem_algo = r.read_u8()?;
         let kem_pk_len = r.read_u16()? as usize;
         let kem_pubkey = r.read_bytes(kem_pk_len)?;
@@ -338,7 +339,6 @@ impl RekeyMsg {
         let sig_len = r.read_u16()? as usize;
         let signature = r.read_bytes(sig_len)?;
         Ok(Self {
-            new_ephemeral_pubkey,
             kem_algo,
             kem_pubkey,
             kem_ciphertext,

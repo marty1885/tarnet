@@ -186,6 +186,8 @@ pub struct PeerLink {
     remote_signing_pubkey: Vec<u8>,
     is_initiator: bool,
     identity: std::sync::Arc<Keypair>,
+    /// Negotiated KEM algorithm for rekey exchanges.
+    rekey_kem_algo: KemAlgo,
     _drain_task: tokio::task::JoinHandle<()>,
     /// Transport name captured at construction for status display.
     transport_name: &'static str,
@@ -355,6 +357,7 @@ impl PeerLink {
             remote_signing_algo,
             remote_signing_pubkey: peer_hello.signing_pubkey,
             is_initiator: true,
+            rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
             identity: std::sync::Arc::new(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap()),
             _drain_task,
             transport_name,
@@ -452,6 +455,8 @@ impl PeerLink {
         );
         let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
             .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
+        let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
+            .map_err(|e| Error::Crypto(format!("unknown KEM algo: {}", e)))?;
         let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
         if !identity::verify(remote_signing_algo, &peer_hello.signing_pubkey, &peer_transcript, &peer_auth.signature) {
             return Err(Error::Crypto("peer auth signature invalid".into()));
@@ -505,6 +510,7 @@ impl PeerLink {
             remote_signing_algo,
             remote_signing_pubkey: peer_hello.signing_pubkey,
             is_initiator: false,
+            rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
             identity: std::sync::Arc::new(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap()),
             _drain_task,
             transport_name,
@@ -619,23 +625,18 @@ impl PeerLink {
         self.crypto.lock().await.send_count() >= REKEY_INTERVAL
     }
 
-    /// Perform re-keying with hybrid X25519 + PQ KEM exchange.
+    /// Perform re-keying using the negotiated KEM algorithm.
     ///
-    /// Initiator: sends ephemeral X25519 + KEM pubkey, receives KEM ciphertext back.
-    /// Responder: receives ephemeral X25519 + KEM pubkey, encapsulates and sends back.
+    /// The KEM type owns the entire key exchange — no bare X25519 overlay.
+    /// Initiator: generates ephemeral KEM keypair, sends pubkey, receives ciphertext.
+    /// Responder: receives pubkey, encapsulates, sends ciphertext back.
     pub async fn rekey(&self) -> Result<()> {
-        let mut rng = rand::rngs::OsRng;
-        let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
-        let eph_public = X25519Public::from(&eph_secret);
-
-        let kem_algo = self.identity.identity.kem.algo();
+        let kem_algo = self.rekey_kem_algo;
 
         if self.is_initiator {
-            // Generate ephemeral KEM keypair
             let eph_kem = KemKeypair::generate_ephemeral(kem_algo);
 
             let mut rekey_msg = RekeyMsg {
-                new_ephemeral_pubkey: eph_public.to_bytes(),
                 kem_algo: kem_algo as u8,
                 kem_pubkey: eph_kem.kem_pubkey_bytes(),
                 kem_ciphertext: Vec::new(),
@@ -659,23 +660,11 @@ impl PeerLink {
                 return Err(Error::Crypto("rekey signature invalid".into()));
             }
 
-            // X25519 DH
-            let peer_eph = X25519Public::from(peer_rekey.new_ephemeral_pubkey);
-            let x25519_ss = eph_secret.diffie_hellman(&peer_eph);
-
-            // KEM decapsulate
             let kem_ss = eph_kem.decapsulate(&peer_rekey.kem_ciphertext)
                 .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
 
-            // Combine
-            let new_shared_bytes = {
-                let mut combined = Vec::with_capacity(64);
-                combined.extend_from_slice(&x25519_ss.to_bytes());
-                combined.extend_from_slice(&kem_ss);
-                blake3::derive_key("tarnet rekey", &combined)
-            };
-
-            let new_crypto = LinkCrypto::derive(&new_shared_bytes, true);
+            let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
+            let new_crypto = LinkCrypto::derive(&new_shared, true);
             *self.crypto.lock().await = new_crypto;
         } else {
             // Responder: receive first, then send
@@ -692,18 +681,12 @@ impl PeerLink {
                 return Err(Error::Crypto("rekey signature invalid".into()));
             }
 
-            // X25519 DH
-            let peer_eph = X25519Public::from(peer_rekey.new_ephemeral_pubkey);
-            let x25519_ss = eph_secret.diffie_hellman(&peer_eph);
-
-            // KEM encapsulate to initiator's ephemeral KEM pubkey
             let peer_kem_algo = KemAlgo::from_u8(peer_rekey.kem_algo)
                 .map_err(|e| Error::Crypto(format!("unknown rekey KEM algo: {}", e)))?;
             let (kem_ss, kem_ct) = KemKeypair::encapsulate_to(&peer_rekey.kem_pubkey, peer_kem_algo)
                 .map_err(|e| Error::Crypto(format!("rekey KEM encapsulate failed: {}", e)))?;
 
             let mut rekey_msg = RekeyMsg {
-                new_ephemeral_pubkey: eph_public.to_bytes(),
                 kem_algo: kem_algo as u8,
                 kem_pubkey: Vec::new(),
                 kem_ciphertext: kem_ct,
@@ -713,15 +696,8 @@ impl PeerLink {
 
             self.send_message(&rekey_msg.to_wire().encode()).await?;
 
-            // Combine
-            let new_shared_bytes = {
-                let mut combined = Vec::with_capacity(64);
-                combined.extend_from_slice(&x25519_ss.to_bytes());
-                combined.extend_from_slice(&kem_ss);
-                blake3::derive_key("tarnet rekey", &combined)
-            };
-
-            let new_crypto = LinkCrypto::derive(&new_shared_bytes, false);
+            let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
+            let new_crypto = LinkCrypto::derive(&new_shared, false);
             *self.crypto.lock().await = new_crypto;
         }
 
