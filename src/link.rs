@@ -622,9 +622,8 @@ impl PeerLink {
         (tx, task)
     }
 
-    /// Send an encrypted message over the link.
+    /// Send an encrypted message over the bulk (data) queue.
     ///
-    /// The message is encrypted and placed into a bounded outbound queue.
     /// If the queue is full (peer is congested), the cell is silently
     /// dropped — end-to-end flow control handles recovery.
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
@@ -640,6 +639,7 @@ impl PeerLink {
             }
         }
     }
+
 
     /// Receive and decrypt a message from the link.
     pub async fn recv_message(&self) -> Result<Vec<u8>> {

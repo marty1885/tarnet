@@ -435,6 +435,9 @@ impl Node {
 
     /// Handle STREAM_BEGIN at the endpoint — the client wants to open a connection.
     /// Check if we're listening, create an incoming Connection, queue it for accept().
+    ///
+    /// Idempotent: if this circuit already has a stream (retransmitted StreamBegin),
+    /// re-send StreamConnected without re-creating channels.
     async fn handle_stream_begin(
         &self,
         from: PeerId,
@@ -442,6 +445,25 @@ impl Node {
         payload: &[u8],
     ) -> Result<()> {
         let (service_id, port) = parse_stream_begin_payload(payload)?;
+
+        // Idempotent: if we already set up a stream on this circuit,
+        // just re-send StreamConnected (the first one may have been dropped).
+        {
+            let data_txs = self.endpoints.data_txs.lock().await;
+            if data_txs.contains_key(&circuit_id) {
+                drop(data_txs);
+                log::debug!(
+                    "STREAM_BEGIN retransmit on circuit {}, re-sending StreamConnected",
+                    circuit_id,
+                );
+                self.send_endpoint_relay_cell(
+                    from, circuit_id,
+                    RelayCellCommand::StreamConnected,
+                    &[],
+                ).await?;
+                return Ok(());
+            }
+        }
 
         // Check if we're listening on this ServiceId + port.
         let listeners = self.listeners.lock().await;
@@ -1680,9 +1702,40 @@ impl Node {
         min_hops: usize,
         connected: &[PeerId],
     ) -> Option<tarnet_api::service::Connection> {
-        let (waypoints, first_hops) = self.plan_circuit_path(dest_peer, min_hops, connected).await;
+        let (waypoints, mut first_hops) = self.plan_circuit_path(dest_peer, min_hops, connected).await;
+
+        // If no first hops found (destination beyond DV horizon), try a route probe.
+        // The probe walks the network and caches the route on success.
+        if first_hops.is_empty() {
+            log::info!("try_connect_to_peer: no route to {:?}, starting route probe", dest_peer);
+            if let Some(_cost) = self.route_probe(*dest_peer).await {
+                log::info!("try_connect_to_peer: route probe found {:?}, re-planning", dest_peer);
+                let (new_waypoints, new_first_hops) =
+                    self.plan_circuit_path(dest_peer, min_hops, connected).await;
+                // Use the freshly discovered route.
+                first_hops = new_first_hops;
+                // Re-plan may give different waypoints too.
+                return self.try_build_with_hops(service_id, port, dest_peer, &new_waypoints, &first_hops).await;
+            } else {
+                log::info!("try_connect_to_peer: route probe for {:?} failed", dest_peer);
+                return None;
+            }
+        }
+
+        self.try_build_with_hops(service_id, port, dest_peer, &waypoints, &first_hops).await
+    }
+
+    /// Try each first_hop candidate to build a circuit and establish a connection.
+    async fn try_build_with_hops(
+        &self,
+        service_id: tarnet_api::types::ServiceId,
+        port: u16,
+        dest_peer: &PeerId,
+        waypoints: &[PeerId],
+        first_hops: &[PeerId],
+    ) -> Option<tarnet_api::service::Connection> {
         for first_hop in first_hops {
-            match self.build_circuit(first_hop, waypoints.clone()).await {
+            match self.build_circuit(*first_hop, waypoints.to_vec()).await {
                 Ok(circuit_id) => {
                     match self.setup_circuit_connection(service_id, port, circuit_id).await {
                         Ok(conn) => return Some(conn),
@@ -1781,55 +1834,83 @@ impl Node {
     }
 
     /// Set up a Connection over an already-built circuit (sends STREAM_BEGIN, wires data channels).
+    ///
+    /// Uses TCP-style retransmission with exponential backoff and jitter:
+    /// retries StreamBegin up to `MAX_STREAM_RETRIES` times if no response,
+    /// because relay cells can be silently dropped under link congestion.
     async fn setup_circuit_connection(
         &self,
         service_id: tarnet_api::types::ServiceId,
         port: u16,
         circuit_id: u32,
     ) -> Result<tarnet_api::service::Connection> {
-        // Register a pending stream connect before sending STREAM_BEGIN.
-        let (connect_tx, connect_rx) = oneshot::channel::<bool>();
-        self.endpoints.pending_connects
-            .lock()
-            .await
-            .insert(circuit_id, connect_tx);
+        const MAX_STREAM_RETRIES: u32 = 5;
+        const INITIAL_TIMEOUT_MS: u64 = 1000;
 
-        // Send STREAM_BEGIN to the endpoint so it knows what service/port we want.
-        {
-            let stream_begin = RelayCell {
-                command: RelayCellCommand::StreamBegin,
-                stream_id: 0,
-                data: build_stream_begin_payload(&service_id, port),
-            };
-            let mut circuits = self.circuits.outbound.lock().await;
-            let circuit = circuits.get_mut(&circuit_id).unwrap();
-            let (fh, cid, cell) = circuit.send_relay_cell(&stream_begin);
-            drop(circuits);
+        let stream_begin_payload = build_stream_begin_payload(&service_id, port);
+        let mut timeout_ms = INITIAL_TIMEOUT_MS;
 
-            let msg = CircuitRelayMsg {
-                circuit_id: cid,
-                data: cell.to_vec(),
-            };
-            self.send_to_peer(&fh, &msg.to_wire().encode()).await?;
+        for attempt in 0..=MAX_STREAM_RETRIES {
+            // Register a fresh pending connect each attempt.
+            let (connect_tx, connect_rx) = oneshot::channel::<bool>();
+            self.endpoints.pending_connects
+                .lock()
+                .await
+                .insert(circuit_id, connect_tx);
+
+            // Send STREAM_BEGIN.
+            {
+                let stream_begin = RelayCell {
+                    command: RelayCellCommand::StreamBegin,
+                    stream_id: 0,
+                    data: stream_begin_payload.clone(),
+                };
+                let mut circuits = self.circuits.outbound.lock().await;
+                let circuit = match circuits.get_mut(&circuit_id) {
+                    Some(c) => c,
+                    None => return Err(Error::Protocol("circuit gone during stream setup".into())),
+                };
+                let (fh, cid, cell) = circuit.send_relay_cell(&stream_begin);
+                drop(circuits);
+
+                let msg = CircuitRelayMsg {
+                    circuit_id: cid,
+                    data: cell.to_vec(),
+                };
+                self.send_to_peer(&fh, &msg.to_wire().encode()).await?;
+            }
+
+            // Wait for StreamConnected or StreamRefused.
+            match tokio::time::timeout(
+                Duration::from_millis(timeout_ms),
+                connect_rx,
+            ).await {
+                Ok(Ok(true)) => break,  // accepted
+                Ok(Ok(false)) => {
+                    return Err(Error::Protocol("stream refused: remote is not listening on this ServiceId/port".into()));
+                }
+                Ok(Err(_)) => {
+                    return Err(Error::Protocol("stream connect channel dropped".into()));
+                }
+                Err(_) => {
+                    // Timeout — retransmit with exponential backoff + jitter.
+                    if attempt == MAX_STREAM_RETRIES {
+                        self.endpoints.pending_connects.lock().await.remove(&circuit_id);
+                        return Err(Error::Protocol("stream connect timeout after retries".into()));
+                    }
+                    log::debug!(
+                        "StreamBegin timeout on circuit {} (attempt {}/{}), retrying",
+                        circuit_id, attempt + 1, MAX_STREAM_RETRIES,
+                    );
+                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
+                    timeout_ms *= 2;
+                    // Add jitter: ±25% of current timeout
+                    let jitter = (timeout_ms / 4) as i64;
+                    let jitter_val = (rand::random::<u64>() % (jitter as u64 * 2 + 1)) as i64 - jitter;
+                    timeout_ms = (timeout_ms as i64 + jitter_val).max(500) as u64;
+                }
+            }
         }
-
-        // Wait for StreamConnected or StreamRefused (5 second timeout).
-        match tokio::time::timeout(
-            Duration::from_secs(5),
-            connect_rx,
-        ).await {
-            Ok(Ok(true)) => { /* accepted */ }
-            Ok(Ok(false)) => {
-                return Err(Error::Protocol("stream refused: remote is not listening on this ServiceId/port".into()));
-            }
-            Ok(Err(_)) => {
-                return Err(Error::Protocol("stream connect channel dropped".into()));
-            }
-            Err(_) => {
-                self.endpoints.pending_connects.lock().await.remove(&circuit_id);
-                return Err(Error::Protocol("stream connect timeout: no response from remote".into()));
-            }
-        };
 
         // Set up data channels for the Connection.
         let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);

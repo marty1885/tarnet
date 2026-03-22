@@ -120,6 +120,8 @@ enum_with_u16! {
         Keepalive = 0x0005,
         // Routing (0x01xx)
         RouteAdvertisement = 0x0100,
+        RouteProbe = 0x0101,
+        RouteProbeFound = 0x0102,
         // DHT (0x02xx)
         DhtPut = 0x0200,
         DhtGet = 0x0201,
@@ -517,6 +519,77 @@ impl RouteAdvertisement {
 
     pub fn to_wire(&self) -> WireMessage {
         WireMessage::new(MessageType::RouteAdvertisement, self.to_bytes())
+    }
+}
+
+/// RouteProbe: lightweight non-circuit route discovery.
+/// nonce(16) || target(32) || ttl(u16 BE) || hops(u16 BE)
+#[derive(Debug, Clone)]
+pub struct RouteProbeMsg {
+    pub nonce: [u8; 16],
+    pub target: PeerId,
+    pub ttl: u16,
+    pub hops: u16,
+}
+
+impl RouteProbeMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(52);
+        buf.extend_from_slice(&self.nonce);
+        buf.extend_from_slice(self.target.as_bytes());
+        buf.extend_from_slice(&self.ttl.to_be_bytes());
+        buf.extend_from_slice(&self.hops.to_be_bytes());
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < 52 {
+            return Err(Error::Wire("RouteProbe too short".into()));
+        }
+        let mut r = Reader::new(data);
+        let nonce = r.read_array::<16>()?;
+        let target = PeerId(r.read_array::<32>()?);
+        let ttl = r.read_u16()?;
+        let hops = r.read_u16()?;
+        Ok(Self { nonce, target, ttl, hops })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::RouteProbe, self.to_bytes())
+    }
+}
+
+/// RouteProbeFound: reply to a RouteProbe when the target is found.
+/// nonce(16) || target(32) || cost(u16 BE)
+#[derive(Debug, Clone)]
+pub struct RouteProbeFoundMsg {
+    pub nonce: [u8; 16],
+    pub target: PeerId,
+    pub cost: u16,
+}
+
+impl RouteProbeFoundMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(50);
+        buf.extend_from_slice(&self.nonce);
+        buf.extend_from_slice(self.target.as_bytes());
+        buf.extend_from_slice(&self.cost.to_be_bytes());
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < 50 {
+            return Err(Error::Wire("RouteProbeFound too short".into()));
+        }
+        let mut r = Reader::new(data);
+        let nonce = r.read_array::<16>()?;
+        let target = PeerId(r.read_array::<32>()?);
+        let cost = r.read_u16()?;
+        Ok(Self { nonce, target, cost })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::RouteProbeFound, self.to_bytes())
     }
 }
 

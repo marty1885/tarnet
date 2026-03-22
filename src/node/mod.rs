@@ -47,6 +47,7 @@ mod circuit;
 mod dht;
 mod hidden_service;
 mod identity_mgmt;
+mod route_probe;
 mod tunnel;
 mod webrtc;
 
@@ -391,6 +392,13 @@ pub struct Node {
     started_at: std::time::Instant,
     /// TNS resolution cache: avoids repeated DHT lookups for recently resolved names.
     tns_cache: Arc<Mutex<crate::tns::TnsCache>>,
+    /// RouteProbe reverse-path table: nonce → (sender, timestamp).
+    /// Used to forward RouteProbeFound replies back to the originator.
+    probe_reverse: Arc<Mutex<HashMap<[u8; 16], (PeerId, Instant)>>>,
+    /// RouteProbe seen nonces for duplicate suppression.
+    probe_seen: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
+    /// Pending route probes: target → list of completion notifiers.
+    pending_probes: Arc<Mutex<HashMap<PeerId, Vec<oneshot::Sender<u16>>>>>,
 }
 
 /// Restore a Keypair from persisted identity data.
@@ -563,6 +571,9 @@ impl Node {
             bandwidth: Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0)),
             started_at: std::time::Instant::now(),
             tns_cache: Arc::new(Mutex::new(crate::tns::TnsCache::new())),
+            probe_reverse: Arc::new(Mutex::new(HashMap::new())),
+            probe_seen: Arc::new(Mutex::new(HashMap::new())),
+            pending_probes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -925,6 +936,8 @@ impl Node {
         let links_ref = self.links.clone();
         let routing_ref = self.routing_table.clone();
         let identity = self.identity.clone();
+        let probe_seen_ref = self.probe_seen.clone();
+        let probe_reverse_ref = self.probe_reverse.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(ROUTE_AD_INTERVAL);
             loop {
@@ -949,8 +962,11 @@ impl Node {
                     }
                 }
 
-                // Also expire old routes
+                // Also expire old routes and stale probe state
                 routing_ref.lock().await.expire(ROUTE_EXPIRY);
+                let cutoff = Instant::now() - Duration::from_secs(60);
+                probe_seen_ref.lock().await.retain(|_, t| *t > cutoff);
+                probe_reverse_ref.lock().await.retain(|_, (_, t)| *t > cutoff);
             }
         });
 
@@ -2169,6 +2185,12 @@ impl Node {
             }
             MessageType::CircuitDestroy => {
                 self.handle_circuit_destroy(from, &msg.payload).await?;
+            }
+            MessageType::RouteProbe => {
+                self.handle_route_probe(from, &msg.payload).await?;
+            }
+            MessageType::RouteProbeFound => {
+                self.handle_route_probe_found(from, &msg.payload).await?;
             }
             // Unknown message types are handled by the match's default
             // (from_u16 returns None, so they never reach this match)
