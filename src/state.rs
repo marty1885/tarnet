@@ -118,6 +118,8 @@ impl StateDb {
             .map_err(sqlite_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(sqlite_err)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(sqlite_err)?;
 
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS metadata (
@@ -126,15 +128,15 @@ impl StateDb {
              );
              CREATE TABLE IF NOT EXISTS identities (
                  label TEXT PRIMARY KEY,
-                 identity_scheme INTEGER NOT NULL DEFAULT 1,
+                 identity_scheme INTEGER NOT NULL,
                  signing_key_material BLOB NOT NULL,
-                 kem_key_material BLOB NOT NULL DEFAULT X'',
-                 signing_algo INTEGER NOT NULL DEFAULT 1,
-                 kem_algo INTEGER NOT NULL DEFAULT 1,
-                 privacy_type INTEGER NOT NULL DEFAULT 0,
-                 privacy_param INTEGER NOT NULL DEFAULT 0,
-                 outbound_hops INTEGER NOT NULL DEFAULT 1,
-                 is_default INTEGER NOT NULL DEFAULT 0
+                 kem_key_material BLOB NOT NULL,
+                 signing_algo INTEGER NOT NULL,
+                 kem_algo INTEGER NOT NULL,
+                 privacy_type INTEGER NOT NULL,
+                 privacy_param INTEGER NOT NULL,
+                 outbound_hops INTEGER NOT NULL,
+                 is_default INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS dht_records (
                  key BLOB NOT NULL,
@@ -144,8 +146,8 @@ impl StateDb {
                  ttl_secs INTEGER NOT NULL,
                  value BLOB NOT NULL,
                  signature BLOB NOT NULL,
-                 signer_algo INTEGER NOT NULL DEFAULT 1,
-                 signer_pubkey BLOB NOT NULL DEFAULT X'',
+                 signer_algo INTEGER NOT NULL,
+                 signer_pubkey BLOB NOT NULL,
                  PRIMARY KEY (key, signer)
              );
              CREATE TABLE IF NOT EXISTS tns_labels (
@@ -159,54 +161,6 @@ impl StateDb {
              );",
         )
         .map_err(sqlite_err)?;
-
-        // Enable foreign key support (required for ON DELETE CASCADE).
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(sqlite_err)?;
-
-        // Migrate legacy petnames table if it exists.
-        let has_petnames: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='petnames'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(sqlite_err)?
-            > 0;
-        if has_petnames {
-            // Migrate each petname to a Zone record (tag 0x01 + 32 bytes ServiceId).
-            // We must do this row-by-row because SQLite's || operator on hex
-            // literals and BLOBs can produce TEXT in some configurations.
-            {
-                let mut stmt = conn
-                    .prepare("SELECT name, zone_pubkey FROM petnames")
-                    .map_err(sqlite_err)?;
-                let rows: Vec<(String, Vec<u8>)> = stmt
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })
-                    .map_err(sqlite_err)?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                for (name, zone_pubkey) in rows {
-                    conn.execute(
-                        "INSERT OR IGNORE INTO tns_labels(label, publish) VALUES(?1, 0)",
-                        params![name],
-                    )
-                    .map_err(sqlite_err)?;
-                    let mut record_blob = Vec::with_capacity(1 + zone_pubkey.len());
-                    record_blob.push(0x01); // TAG_ZONE
-                    record_blob.extend_from_slice(&zone_pubkey);
-                    conn.execute(
-                        "INSERT OR IGNORE INTO tns_records(label, record) VALUES(?1, ?2)",
-                        params![name, record_blob],
-                    )
-                    .map_err(sqlite_err)?;
-                }
-            }
-            conn.execute_batch("DROP TABLE petnames;")
-                .map_err(sqlite_err)?;
-        }
 
         Ok(Self {
             conn: StdMutex::new(conn),
@@ -272,11 +226,9 @@ impl StateDb {
                 })
             })
             .map_err(sqlite_err)?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row.map_err(sqlite_err)?);
-        }
-        Ok(result)
+        let result = rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err);
+        result
     }
 
     pub fn save_identity(&self, id: &PersistedIdentity) -> Result<()> {
@@ -350,11 +302,9 @@ impl StateDb {
                 })
             })
             .map_err(sqlite_err)?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row.map_err(sqlite_err)?);
-        }
-        Ok(result)
+        let result = rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err);
+        result
     }
 
     pub fn upsert_dht_record(&self, record: &PersistedRecord) -> Result<()> {
@@ -401,25 +351,34 @@ impl StateDb {
 
     pub fn label_set(&self, label: &str, records: &[Vec<u8>], publish: bool) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO tns_labels(label, publish) VALUES(?1, ?2)
-             ON CONFLICT(label) DO UPDATE SET publish = excluded.publish",
-            params![label, publish as i32],
-        )
-        .map_err(sqlite_err)?;
-        conn.execute(
-            "DELETE FROM tns_records WHERE label = ?1",
-            params![label],
-        )
-        .map_err(sqlite_err)?;
-        for rec_bytes in records {
+        conn.execute_batch("BEGIN").map_err(sqlite_err)?;
+        let result = (|| {
             conn.execute(
-                "INSERT INTO tns_records(label, record) VALUES(?1, ?2)",
-                params![label, rec_bytes],
+                "INSERT INTO tns_labels(label, publish) VALUES(?1, ?2)
+                 ON CONFLICT(label) DO UPDATE SET publish = excluded.publish",
+                params![label, publish as i32],
             )
             .map_err(sqlite_err)?;
+            conn.execute(
+                "DELETE FROM tns_records WHERE label = ?1",
+                params![label],
+            )
+            .map_err(sqlite_err)?;
+            for rec_bytes in records {
+                conn.execute(
+                    "INSERT INTO tns_records(label, record) VALUES(?1, ?2)",
+                    params![label, rec_bytes],
+                )
+                .map_err(sqlite_err)?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(sqlite_err)?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
         }
-        Ok(())
+        result
     }
 
     pub fn label_get(&self, label: &str) -> Result<Option<(Vec<Vec<u8>>, bool)>> {
@@ -445,10 +404,8 @@ impl StateDb {
         let rows = stmt
             .query_map(params![label], |row| row.get::<_, Vec<u8>>(0))
             .map_err(sqlite_err)?;
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row.map_err(sqlite_err)?);
-        }
+        let records = rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
         Ok(Some((records, publish)))
     }
 
@@ -465,32 +422,34 @@ impl StateDb {
     pub fn label_list(&self) -> Result<Vec<(String, Vec<Vec<u8>>, bool)>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare("SELECT label, publish FROM tns_labels ORDER BY label")
+            .prepare(
+                "SELECT l.label, l.publish, r.record
+                 FROM tns_labels l
+                 LEFT JOIN tns_records r ON r.label = l.label
+                 ORDER BY l.label",
+            )
             .map_err(sqlite_err)?;
-        let label_rows = stmt
+        let mapped = stmt
             .query_map([], |row| {
                 let label: String = row.get(0)?;
                 let publish: i32 = row.get(1)?;
-                Ok((label, publish != 0))
+                let record: Option<Vec<u8>> = row.get(2)?;
+                Ok((label, publish != 0, record))
             })
             .map_err(sqlite_err)?;
-        let mut labels: Vec<(String, bool)> = Vec::new();
-        for row in label_rows {
-            labels.push(row.map_err(sqlite_err)?);
-        }
-        let mut result = Vec::new();
-        for (label, publish) in labels {
-            let mut rec_stmt = conn
-                .prepare("SELECT record FROM tns_records WHERE label = ?1")
-                .map_err(sqlite_err)?;
-            let rec_rows = rec_stmt
-                .query_map(params![&label], |row| row.get::<_, Vec<u8>>(0))
-                .map_err(sqlite_err)?;
-            let mut records = Vec::new();
-            for rec in rec_rows {
-                records.push(rec.map_err(sqlite_err)?);
+        let rows = mapped.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)?;
+
+        let mut result: Vec<(String, Vec<Vec<u8>>, bool)> = Vec::new();
+        for (label, publish, record) in rows {
+            if let Some(last) = result.last_mut().filter(|(l, _, _)| l == &label) {
+                if let Some(rec) = record {
+                    last.1.push(rec);
+                }
+            } else {
+                let records = record.map_or_else(Vec::new, |r| vec![r]);
+                result.push((label, records, publish));
             }
-            result.push((label, records, publish));
         }
         Ok(result)
     }
