@@ -1,12 +1,22 @@
 # tarnet
 
-An anonymous peer-to-peer overlay network. Peers form encrypted links over TCP, route messages via distance-vector routing, and provide a DHT and decentralized and private naming system (TNS).
+An overlay network reimagining how the internet should be and does not assume the internet exists. 
 
 Early, experimental software. Not audited.
 
+## Features
+
+* Cryptographic and flat address space
+* Idententies decoupled from machine ID
+* Decentralized name resoulution and zone delegation
+* Reverse proxy to expose TCP/UDP services to Tarnet
+* Multipath connections to tolorate unstable intermideate nodes
+* All traffic end to end and hop to hop encrypted
+* NAT punching support via WebRTC
+
 ## Building
 
-```
+```bash
 cargo build --release
 ```
 
@@ -16,91 +26,56 @@ Produces `tarnetd` (daemon) and `tarnet` (CLI) in `target/release/`.
 
 Start a node:
 
-```
+```bash
 tarnetd
 ```
 
-On first run it generates an identity key, listens on `0.0.0.0:7946`, and starts a SOCKS5 proxy on `127.0.0.1:1080`.
+On first run it generates machine and default identity key, listens on `0.0.0.0:7946`, and starts a SOCKS5 proxy on `127.0.0.1:1080`. Then `tarnet status` to check if things are working as expected:
 
-Start a second node and connect it to the first:
+```plaintext
+❯ tarnet status
+tarnetd up 40m0s peer b34a658630bb740f
+  name      privacy  hops   address
+  default   public   1      6D36JJHJ...KFP0
 
-```
-tarnetd \
-  --data-dir /tmp/node2 \
-  --config-dir /tmp/node2/config \
-  --listen 127.0.0.1:7947 \
-  --connect 127.0.0.1:7946
-```
+  -> f73300e9f2e8d6f8  ws      -  idle 27s
+  -> 6ed62053e1f5bb6d  webrtc  -  idle 5s
 
-Check status:
+  f73300e9f2e8d6f8  direct                cost 1
+  6ed62053e1f5bb6d  direct                cost 1
 
-```
-tarnet status
-tarnet --data-dir /tmp/node2 status
-```
+  dht 18 records / 18 keys  kbucket 2  watches none  nse ~16
+  circuits none
 
-## Connecting to peers
-
-Open a bidirectional tunnel (netcat-style):
-
-```
-tarnet listen                    # node A waits for a connection
-tarnet connect --peer <peer_id>  # node B connects
+            total       5m       1h       1d
+       ↑     2.9K     2.9K     2.9K     2.9K
+       ↓     1.4M   152.6K     1.4M     1.4M
+    pkt↑       10       10       10       10
+    pkt↓      626       68      626      626
 ```
 
-Or point any application at the SOCKS5 proxy (`127.0.0.1:1080`) — hostnames are resolved via TNS.
+A default idententity is creatred. `tarnet identity list` to view avaliable identities.
 
-## Exposing services
-
-Make a local TCP service reachable over the overlay. Drop a file in `~/.config/tarnet/services.d/`:
-
-```toml
-name = "my-web-server"
-local = "127.0.0.1:8080"
-publish = true
+```plaintext
+❯ tarnet identity list
+default
+  ServiceId:     Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0
+  Scheme:        falcon_ed25519
+  Signing:       falcon_ed25519
+  KEM:           mlkem_x25519
+  Privacy:       Public
+  Outbound hops: 1
 ```
 
-Reload with `tarnet reload` or `kill -HUP $(pidof tarnetd)`.
+In Tarnet, the service id associated with the identity is the equlivant of an IP addresse that can be listened on and connected to. Ports are arbitrary strings. 
 
-## DHT
+```plaintext
+❯ tarnet listen default
+Listening on Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0 port 'tarnet-echo'.
+Waiting for connections... (Ctrl-C to quit)
 
-Content-addressed storage:
-
+(in another terminal, or a different machine)
+❯ tarnet connect Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0
+Connecting to Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0 port 'tarnet-echo'...
+Connected to Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0. Type to send, Ctrl-C to quit.
 ```
-tarnet dht put "hello world"     # prints hash
-tarnet dht get <hash>            # retrieve by hash
-```
-
-## TNS (Tarnet Name System)
-
-Zone-based decentralized naming. Each identity key defines a zone.
-
-```
-tarnet tns publish mysite peer <peer_id>     # publish a record
-tarnet tns resolve alice.mysite              # resolve through delegation
-```
-
-## Tarify
-
-Route a command's traffic through tarnet (like `torify`).
-
-```
-tarnet tarify -- curl http://somehost
-```
-
-## Configuration
-
-tarnetd uses layered config: **code defaults < config file < CLI flags**.
-
-On startup it writes `~/.config/tarnet/tarnetd.defaults.toml` as a reference. Override settings in `~/.config/tarnet/tarnetd.toml`:
-
-```toml
-[socks]
-allow_clearnet = true # enables `tarify`-ed clients to access clearnet
-```
-
-Run `tarnetd --help` for all CLI options.
-
-## License
-
-Not yet specified.
