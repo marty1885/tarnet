@@ -12,11 +12,11 @@
 //! Response body: request_id(u32 BE) + status(u8) + response_data
 //! Event body:    event_type(u16 BE) + event_data
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::error::{ApiError, ApiResult};
-use crate::service::{Listener, ListenerOptions};
+use crate::service::{Listener, ListenerOptions, PortMode};
 use crate::types::{IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo};
 
 // ── Frame types ──
@@ -348,8 +348,7 @@ pub fn encode_payload<T: serde::Serialize>(value: &T) -> Vec<u8> {
 
 /// Decode a MessagePack IPC payload.
 pub fn decode_payload<'a, T: serde::Deserialize<'a>>(data: &'a [u8]) -> ApiResult<T> {
-    rmp_serde::from_slice(data)
-        .map_err(|e| ApiError::Protocol(format!("msgpack decode: {}", e)))
+    rmp_serde::from_slice(data).map_err(|e| ApiError::Protocol(format!("msgpack decode: {}", e)))
 }
 
 // ── IPC request/response types (shared between server and client) ──
@@ -383,14 +382,16 @@ pub struct SignedContentEntry {
 pub struct ConnectResp {
     pub conn_id: u32,
     pub remote_service_id: ServiceId,
-    pub port: u16,
+    pub mode: PortMode,
+    pub port: String,
 }
 
 /// Request to listen on a service/port.
 #[derive(Serialize, Deserialize)]
 pub struct ListenReq {
     pub service_id: ServiceId,
-    pub port: u16,
+    pub mode: PortMode,
+    pub port: String,
     pub options: ListenerOptions,
 }
 
@@ -398,7 +399,8 @@ pub struct ListenReq {
 #[derive(Serialize, Deserialize)]
 pub struct ListenHiddenReq {
     pub service_id: ServiceId,
-    pub port: u16,
+    pub mode: PortMode,
+    pub port: String,
     pub num_intro_points: u16,
     pub options: ListenerOptions,
 }

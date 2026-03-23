@@ -12,8 +12,8 @@ use crate::identity::{self, peer_id_from_signing_pubkey, KemKeypair, Keypair};
 use crate::transport::Transport;
 use crate::types::{Error, PeerId, Result};
 use crate::wire::{
-    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage,
-    WIRE_VERSION_MAX, WIRE_VERSION_MIN,
+    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage, WIRE_VERSION_MAX,
+    WIRE_VERSION_MIN,
 };
 use tarnet_api::types::{KemAlgo, SigningAlgo};
 
@@ -79,7 +79,13 @@ impl LinkCrypto {
 
         let cipher = XChaCha20Poly1305::new((&self.send_enc_key).into());
         let ciphertext = cipher
-            .encrypt((&nonce).into(), Payload { msg: &msg, aad: b"" })
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: &msg,
+                    aad: b"",
+                },
+            )
             .expect("AEAD encryption should not fail");
 
         // Wire: nonce(24) || ciphertext+tag
@@ -98,7 +104,13 @@ impl LinkCrypto {
 
         let cipher = XChaCha20Poly1305::new((&self.recv_enc_key).into());
         let mut plaintext = cipher
-            .decrypt(nonce.into(), Payload { msg: ciphertext_with_tag, aad: b"" })
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: ciphertext_with_tag,
+                    aad: b"",
+                },
+            )
             .map_err(|_| Error::Crypto("AEAD decryption failed".into()))?;
 
         // Extract sequence number
@@ -258,8 +270,10 @@ impl PeerLink {
 
         // Negotiate wire protocol version
         let negotiated_version = negotiate_version(
-            WIRE_VERSION_MIN, WIRE_VERSION_MAX,
-            peer_hello.min_version, peer_hello.max_version,
+            WIRE_VERSION_MIN,
+            WIRE_VERSION_MAX,
+            peer_hello.min_version,
+            peer_hello.max_version,
         )?;
 
         // Validate timestamp
@@ -283,12 +297,14 @@ impl PeerLink {
         // KEM encapsulate to responder's static KEM pubkey (identity binding)
         let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
             .map_err(|e| Error::Crypto(format!("unknown KEM algo: {}", e)))?;
-        let (static_kem_ss, static_kem_ct) = KemKeypair::encapsulate_to(&peer_hello.kem_pubkey, remote_kem_algo)
-            .map_err(|e| Error::Crypto(format!("KEM encapsulate (static) failed: {}", e)))?;
+        let (static_kem_ss, static_kem_ct) =
+            KemKeypair::encapsulate_to(&peer_hello.kem_pubkey, remote_kem_algo)
+                .map_err(|e| Error::Crypto(format!("KEM encapsulate (static) failed: {}", e)))?;
 
         // KEM encapsulate to responder's ephemeral KEM pubkey (PQ forward secrecy)
-        let (eph_kem_ss, eph_kem_ct) = KemKeypair::encapsulate_to(&peer_hello.eph_kem_pubkey, remote_kem_algo)
-            .map_err(|e| Error::Crypto(format!("KEM encapsulate (ephemeral) failed: {}", e)))?;
+        let (eph_kem_ss, eph_kem_ct) =
+            KemKeypair::encapsulate_to(&peer_hello.eph_kem_pubkey, remote_kem_algo)
+                .map_err(|e| Error::Crypto(format!("KEM encapsulate (ephemeral) failed: {}", e)))?;
 
         // Combine: ss = BLAKE3("tarnet link", x25519_ss || static_kem_ss || eph_kem_ss)
         let shared_bytes = {
@@ -349,7 +365,12 @@ impl PeerLink {
         let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
             .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
         let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
-        if !identity::verify(remote_signing_algo, &peer_hello.signing_pubkey, &peer_transcript, &peer_auth.signature) {
+        if !identity::verify(
+            remote_signing_algo,
+            &peer_hello.signing_pubkey,
+            &peer_transcript,
+            &peer_auth.signature,
+        ) {
             return Err(Error::Crypto("peer auth signature invalid".into()));
         }
 
@@ -377,7 +398,11 @@ impl PeerLink {
             return Err(Error::Crypto("key confirmation failed".into()));
         }
 
-        log::info!("Link established (initiator) with {:?}, wire v{}", remote_peer, negotiated_version);
+        log::info!(
+            "Link established (initiator) with {:?}, wire v{}",
+            remote_peer,
+            negotiated_version
+        );
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
         let (outbound_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
@@ -391,7 +416,9 @@ impl PeerLink {
             is_initiator: true,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
             negotiated_version,
-            identity: std::sync::Arc::new(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap()),
+            identity: std::sync::Arc::new(
+                Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
+            ),
             _drain_task,
             transport_name,
         })
@@ -415,8 +442,10 @@ impl PeerLink {
 
         // Negotiate wire protocol version
         let negotiated_version = negotiate_version(
-            WIRE_VERSION_MIN, WIRE_VERSION_MAX,
-            peer_hello.min_version, peer_hello.max_version,
+            WIRE_VERSION_MIN,
+            WIRE_VERSION_MAX,
+            peer_hello.min_version,
+            peer_hello.max_version,
         )?;
 
         // Validate timestamp
@@ -462,11 +491,15 @@ impl PeerLink {
         let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
 
         // KEM decapsulate static: recover shared secret from initiator's ciphertext
-        let static_kem_ss = identity.identity.kem.decapsulate(&peer_auth.kem_ciphertext)
+        let static_kem_ss = identity
+            .identity
+            .kem
+            .decapsulate(&peer_auth.kem_ciphertext)
             .map_err(|e| Error::Crypto(format!("KEM decapsulate (static) failed: {}", e)))?;
 
         // KEM decapsulate ephemeral: recover shared secret using our ephemeral KEM key
-        let eph_kem_ss = eph_kem.decapsulate(&peer_auth.eph_kem_ciphertext)
+        let eph_kem_ss = eph_kem
+            .decapsulate(&peer_auth.eph_kem_ciphertext)
             .map_err(|e| Error::Crypto(format!("KEM decapsulate (ephemeral) failed: {}", e)))?;
 
         // Combine: ss = BLAKE3("tarnet link", x25519_ss || static_kem_ss || eph_kem_ss)
@@ -503,7 +536,12 @@ impl PeerLink {
         let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
             .map_err(|e| Error::Crypto(format!("unknown KEM algo: {}", e)))?;
         let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
-        if !identity::verify(remote_signing_algo, &peer_hello.signing_pubkey, &peer_transcript, &peer_auth.signature) {
+        if !identity::verify(
+            remote_signing_algo,
+            &peer_hello.signing_pubkey,
+            &peer_transcript,
+            &peer_auth.signature,
+        ) {
             return Err(Error::Crypto("peer auth signature invalid".into()));
         }
 
@@ -545,7 +583,11 @@ impl PeerLink {
         let confirm = HandshakeConfirmMsg { confirm_hash };
         transport.send(&confirm.to_wire().encode()).await?;
 
-        log::info!("Link established (responder) with {:?}, wire v{}", remote_peer, negotiated_version);
+        log::info!(
+            "Link established (responder) with {:?}, wire v{}",
+            remote_peer,
+            negotiated_version
+        );
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
         let (outbound_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
@@ -559,7 +601,9 @@ impl PeerLink {
             is_initiator: false,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
             negotiated_version,
-            identity: std::sync::Arc::new(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap()),
+            identity: std::sync::Arc::new(
+                Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
+            ),
             _drain_task,
             transport_name,
         })
@@ -609,7 +653,10 @@ impl PeerLink {
     fn spawn_drain(
         transport: Arc<dyn Transport>,
         remote: PeerId,
-    ) -> (tokio::sync::mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
         let task = tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
@@ -639,7 +686,6 @@ impl PeerLink {
             }
         }
     }
-
 
     /// Receive and decrypt a message from the link.
     pub async fn recv_message(&self) -> Result<Vec<u8>> {
@@ -717,7 +763,8 @@ impl PeerLink {
                 return Err(Error::Crypto("rekey signature invalid".into()));
             }
 
-            let kem_ss = eph_kem.decapsulate(&peer_rekey.kem_ciphertext)
+            let kem_ss = eph_kem
+                .decapsulate(&peer_rekey.kem_ciphertext)
                 .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
 
             let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
@@ -740,8 +787,9 @@ impl PeerLink {
 
             let peer_kem_algo = KemAlgo::from_u8(peer_rekey.kem_algo)
                 .map_err(|e| Error::Crypto(format!("unknown rekey KEM algo: {}", e)))?;
-            let (kem_ss, kem_ct) = KemKeypair::encapsulate_to(&peer_rekey.kem_pubkey, peer_kem_algo)
-                .map_err(|e| Error::Crypto(format!("rekey KEM encapsulate failed: {}", e)))?;
+            let (kem_ss, kem_ct) =
+                KemKeypair::encapsulate_to(&peer_rekey.kem_pubkey, peer_kem_algo)
+                    .map_err(|e| Error::Crypto(format!("rekey KEM encapsulate failed: {}", e)))?;
 
             let mut rekey_msg = RekeyMsg {
                 kem_algo: kem_algo as u8,

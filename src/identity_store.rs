@@ -39,7 +39,11 @@ impl IdentityStore {
     }
 
     /// Create a store with a specific default keypair (for persistence).
-    pub fn with_default(default_keypair: Keypair, privacy: PrivacyLevel, outbound_hops: u8) -> Self {
+    pub fn with_default(
+        default_keypair: Keypair,
+        privacy: PrivacyLevel,
+        outbound_hops: u8,
+    ) -> Self {
         let label = "default".to_string();
         let mut store = Self {
             default_label: label.clone(),
@@ -128,8 +132,7 @@ impl IdentityStore {
 
     /// Backward compat: look up PeerId (full pubkey) for a local ServiceId.
     pub fn pubkey_for(&self, sid: &ServiceId) -> Option<PeerId> {
-        self.get_by_service_id(sid)
-            .map(|id| id.keypair.peer_id())
+        self.get_by_service_id(sid).map(|id| id.keypair.peer_id())
     }
 
     /// Update an identity's privacy and outbound_hops.
@@ -140,8 +143,7 @@ impl IdentityStore {
         privacy: PrivacyLevel,
         outbound_hops: u8,
     ) -> Result<(PrivacyLevel, u8), &'static str> {
-        let identity = self.identities.get_mut(label)
-            .ok_or("identity not found")?;
+        let identity = self.identities.get_mut(label).ok_or("identity not found")?;
         let old_privacy = identity.privacy;
         let old_hops = identity.outbound_hops;
         identity.privacy = privacy;
@@ -155,8 +157,7 @@ impl IdentityStore {
         if label == self.default_label {
             return Err("cannot delete the default identity");
         }
-        let identity = self.identities.remove(label)
-            .ok_or("identity not found")?;
+        let identity = self.identities.remove(label).ok_or("identity not found")?;
         let sid = identity.service_id();
         self.by_service_id.remove(&sid);
         Ok(sid)
@@ -166,8 +167,19 @@ impl IdentityStore {
         self.by_service_id.contains_key(sid)
     }
 
-    pub fn list(&self) -> Vec<(String, ServiceId, PrivacyLevel, u8, IdentityScheme, SigningAlgo, KemAlgo)> {
-        let mut identities: Vec<_> = self.identities
+    pub fn list(
+        &self,
+    ) -> Vec<(
+        String,
+        ServiceId,
+        PrivacyLevel,
+        u8,
+        IdentityScheme,
+        SigningAlgo,
+        KemAlgo,
+    )> {
+        let mut identities: Vec<_> = self
+            .identities
             .values()
             .map(|id| {
                 (
@@ -230,7 +242,8 @@ impl IdentityStore {
 
     /// Export all identities for persistence.
     pub fn export_all(&self) -> Vec<(String, Vec<u8>, PrivacyLevel, u8)> {
-        let mut identities: Vec<_> = self.identities
+        let mut identities: Vec<_> = self
+            .identities
             .values()
             .map(|id| {
                 (
@@ -244,9 +257,7 @@ impl IdentityStore {
         identities.sort_by(|a, b| {
             let a_is_default = a.0 == self.default_label;
             let b_is_default = b.0 == self.default_label;
-            b_is_default
-                .cmp(&a_is_default)
-                .then_with(|| a.0.cmp(&b.0))
+            b_is_default.cmp(&a_is_default).then_with(|| a.0.cmp(&b.0))
         });
         identities
     }
@@ -258,7 +269,6 @@ mod tests {
 
     #[test]
     fn default_identity_on_init() {
-
         let store = IdentityStore::new();
         let default = store.default_identity();
         assert_eq!(default.label, "default");
@@ -270,9 +280,15 @@ mod tests {
 
     #[test]
     fn create_and_get() {
-
         let mut store = IdentityStore::new();
-        let sid = store.create("myblog", PrivacyLevel::Hidden { intro_points: 3 }, 2, IdentityScheme::DEFAULT).unwrap();
+        let sid = store
+            .create(
+                "myblog",
+                PrivacyLevel::Hidden { intro_points: 3 },
+                2,
+                IdentityScheme::DEFAULT,
+            )
+            .unwrap();
 
         let identity = store.get("myblog").unwrap();
         assert_eq!(identity.label, "myblog");
@@ -283,25 +299,36 @@ mod tests {
 
     #[test]
     fn get_by_service_id() {
-
         let mut store = IdentityStore::new();
-        let sid = store.create("test", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).unwrap();
+        let sid = store
+            .create("test", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+            .unwrap();
         let identity = store.get_by_service_id(&sid).unwrap();
         assert_eq!(identity.label, "test");
     }
 
     #[test]
     fn duplicate_label_rejected() {
-
         let mut store = IdentityStore::new();
-        store.create("x", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).unwrap();
-        assert!(store.create("x", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).is_err());
+        store
+            .create("x", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+            .unwrap();
+        assert!(store
+            .create("x", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+            .is_err());
     }
 
     #[test]
     fn export_import_roundtrip() {
         let mut store = IdentityStore::new();
-        let sid = store.create("portable", PrivacyLevel::Hidden { intro_points: 2 }, 3, IdentityScheme::DEFAULT).unwrap();
+        let sid = store
+            .create(
+                "portable",
+                PrivacyLevel::Hidden { intro_points: 2 },
+                3,
+                IdentityScheme::DEFAULT,
+            )
+            .unwrap();
 
         let (label, key_material, privacy, hops) = store.export("portable").unwrap();
         assert_eq!(label, "portable");
@@ -309,15 +336,23 @@ mod tests {
         assert_eq!(hops, 3);
 
         let mut store2 = IdentityStore::new();
-        let sid2 = store2.import("portable", &key_material, privacy, hops).unwrap();
+        let sid2 = store2
+            .import("portable", &key_material, privacy, hops)
+            .unwrap();
         assert_eq!(sid, sid2);
     }
 
     #[test]
     fn update_privacy() {
-
         let mut store = IdentityStore::new();
-        store.create("svc", PrivacyLevel::Hidden { intro_points: 3 }, 2, IdentityScheme::DEFAULT).unwrap();
+        store
+            .create(
+                "svc",
+                PrivacyLevel::Hidden { intro_points: 3 },
+                2,
+                IdentityScheme::DEFAULT,
+            )
+            .unwrap();
 
         // Update to public
         let (old_priv, old_hops) = store.update("svc", PrivacyLevel::Public, 1).unwrap();
@@ -333,7 +368,9 @@ mod tests {
     #[test]
     fn remove_identity() {
         let mut store = IdentityStore::new();
-        let sid = store.create("temp", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).unwrap();
+        let sid = store
+            .create("temp", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+            .unwrap();
         assert!(store.get("temp").is_some());
         assert!(store.contains_service_id(&sid));
 
@@ -357,17 +394,24 @@ mod tests {
 
     #[test]
     fn update_nonexistent_fails() {
-
         let mut store = IdentityStore::new();
         assert!(store.update("nope", PrivacyLevel::Public, 1).is_err());
     }
 
     #[test]
     fn list_identities() {
-
         let mut store = IdentityStore::new();
-        store.create("a", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).unwrap();
-        store.create("b", PrivacyLevel::Hidden { intro_points: 1 }, 2, IdentityScheme::DEFAULT).unwrap();
+        store
+            .create("a", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+            .unwrap();
+        store
+            .create(
+                "b",
+                PrivacyLevel::Hidden { intro_points: 1 },
+                2,
+                IdentityScheme::DEFAULT,
+            )
+            .unwrap();
         let list = store.list();
         assert_eq!(list.len(), 3); // default + a + b
         assert_eq!(list[0].0, "a");
@@ -378,8 +422,17 @@ mod tests {
     #[test]
     fn export_all_keeps_default_first() {
         let mut store = IdentityStore::new();
-        store.create("z", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).unwrap();
-        store.create("a", PrivacyLevel::Hidden { intro_points: 2 }, 2, IdentityScheme::DEFAULT).unwrap();
+        store
+            .create("z", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+            .unwrap();
+        store
+            .create(
+                "a",
+                PrivacyLevel::Hidden { intro_points: 2 },
+                2,
+                IdentityScheme::DEFAULT,
+            )
+            .unwrap();
 
         let exported = store.export_all();
         assert_eq!(exported[0].0, "default");
@@ -389,7 +442,6 @@ mod tests {
 
     #[test]
     fn keypair_for_backward_compat() {
-
         let store = IdentityStore::new();
         let sid = store.default_service_id();
         assert!(store.keypair_for(&sid).is_some());
@@ -398,9 +450,15 @@ mod tests {
 
     #[test]
     fn resolve_label_or_sid() {
-
         let mut store = IdentityStore::new();
-        store.create("myservice", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).unwrap();
+        store
+            .create(
+                "myservice",
+                PrivacyLevel::Public,
+                1,
+                IdentityScheme::DEFAULT,
+            )
+            .unwrap();
 
         // Resolve by label
         assert!(store.resolve_label_or_sid("myservice").is_some());

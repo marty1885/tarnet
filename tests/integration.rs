@@ -11,27 +11,35 @@ use tarnet::routing::RoutingTable;
 use tarnet::state::{StateDb, StorageLimits};
 use tarnet::transport::tcp::{TcpDiscovery, TcpTransport};
 use tarnet::types::{DhtId, PeerId, RecordType};
-use tarnet_api::service::ListenerOptions;
-use tarnet_api::types::ServiceId;
 use tarnet::wire::*;
+use tarnet_api::service::{ListenerOptions, PortMode};
+use tarnet_api::types::ServiceId;
 use tokio::net::{TcpListener, TcpStream};
 
 fn hash_64(input: &[u8]) -> [u8; 64] {
     let mut out = [0u8; 64];
-    blake3::Hasher::new().update(input).finalize_xof().fill(&mut out);
+    blake3::Hasher::new()
+        .update(input)
+        .finalize_xof()
+        .fill(&mut out);
     out
 }
 
 fn make_pubkey_cache(kp: &Keypair) -> PubkeyCache {
     let mut cache = PubkeyCache::new(100);
-    cache.insert(kp.peer_id(), CachedPubkey {
-        signing_algo: kp.identity.signing_algo(),
-        signing_pk: kp.identity.signing.signing_pubkey_bytes(),
-        kem_algo: kp.identity.kem_algo(),
-        kem_pk: kp.identity.kem.kem_pubkey_bytes(),
-    });
+    cache.insert(
+        kp.peer_id(),
+        CachedPubkey {
+            signing_algo: kp.identity.signing_algo(),
+            signing_pk: kp.identity.signing.signing_pubkey_bytes(),
+            kem_algo: kp.identity.kem_algo(),
+            kem_pk: kp.identity.kem.kem_pubkey_bytes(),
+        },
+    );
     cache
 }
+
+const TEST_MODE: PortMode = PortMode::ReliableOrdered;
 
 /// Test that peer link handshake completes over TCP.
 #[tokio::test]
@@ -649,7 +657,12 @@ fn signature_validation_on_get_response() {
     };
 
     // Verify that signature check fails
-    let valid = identity::verify(kp.identity.signing_algo(), &pubkey, &put.signable_bytes(), &put.signature);
+    let valid = identity::verify(
+        kp.identity.signing_algo(),
+        &pubkey,
+        &put.signable_bytes(),
+        &put.signature,
+    );
     assert!(!valid, "Invalid signature should not verify");
 
     // Create one with a valid signature
@@ -804,7 +817,9 @@ async fn signed_content_multi_publisher() {
     let addr_b = disc_b.local_addrs()[0].to_string();
     let pb = provider_b.clone();
     tokio::spawn(async move {
-        pb.run(Box::new(disc_b), vec![addr_a.clone()], vec![]).await.ok();
+        pb.run(Box::new(disc_b), vec![addr_a.clone()], vec![])
+            .await
+            .ok();
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -892,21 +907,13 @@ async fn node_db_restores_sequences_and_records() {
     let path = std::env::temp_dir().join(format!("tarnet-integ-restore-{}.sqlite3", nanos));
     let db = Arc::new(StateDb::open(&path).unwrap());
 
-    let original = Node::with_db(
-        Keypair::generate(),
-        db.clone(),
-        StorageLimits::default(),
-    );
+    let original = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
 
     original.publish_hello().await;
     let signed_hash = original.dht_put_signed_content(b"payload", 300).await;
 
     // Read back persisted state through new Node
-    let restored = Node::with_db(
-        Keypair::generate(),
-        db.clone(),
-        StorageLimits::default(),
-    );
+    let restored = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
 
     assert!(restored.lookup_hello(&original.peer_id()).await.is_some());
     let restored_signed = restored.dht_get_signed_content(&signed_hash).await;
@@ -914,10 +921,7 @@ async fn node_db_restores_sequences_and_records() {
     assert_eq!(restored_signed[0].1, b"payload");
 
     // Verify metadata persisted
-    assert_eq!(
-        db.get_metadata("hello_sequence").unwrap(),
-        Some(1)
-    );
+    assert_eq!(db.get_metadata("hello_sequence").unwrap(), Some(1));
     assert!(db.get_metadata("signed_content_sequence").unwrap().unwrap() >= 1);
 
     let _ = std::fs::remove_file(&path);
@@ -1059,15 +1063,14 @@ async fn circuit_connect_accept_bidi() {
 
     // Register B as a listener
     let listener_b = node_b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
     // Spawn accept on B in the background
     let nb2 = node_b.clone();
-    let accept_handle = tokio::spawn(async move {
-        nb2.circuit_accept(listener_b.id).await.unwrap()
-    });
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
 
     // Start A, connected to B
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
@@ -1080,13 +1083,14 @@ async fn circuit_connect_accept_bidi() {
     // A connects to B (passing PeerId hint from B's address)
     let conn_a = tokio::time::timeout(
         Duration::from_secs(5),
-        node_a.circuit_connect(service_id_b, 80, Some(pid_b), None),
+        node_a.circuit_connect(service_id_b, TEST_MODE, "80", Some(pid_b), None),
     )
     .await
     .expect("connect timed out")
     .expect("connect failed");
 
-    assert_eq!(conn_a.port, 80);
+    assert_eq!(conn_a.port, "80");
+    assert_eq!(conn_a.mode, TEST_MODE);
     assert_eq!(conn_a.remote_service_id, service_id_b);
 
     // B should accept the connection
@@ -1095,7 +1099,8 @@ async fn circuit_connect_accept_bidi() {
         .expect("accept timed out")
         .expect("accept task failed");
 
-    assert_eq!(conn_b.port, 80);
+    assert_eq!(conn_b.port, "80");
+    assert_eq!(conn_b.mode, TEST_MODE);
 
     // A sends data to B
     conn_a.send(b"hello from A").await.unwrap();
@@ -1140,7 +1145,9 @@ async fn hidden_service_rendezvous() {
     let disc_c = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let nc = node_c.clone();
     tokio::spawn(async move {
-        nc.run(Box::new(disc_c), vec![addr_b_for_c], vec![]).await.ok();
+        nc.run(Box::new(disc_c), vec![addr_b_for_c], vec![])
+            .await
+            .ok();
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1152,7 +1159,7 @@ async fn hidden_service_rendezvous() {
 
     // C registers as listener and publishes hidden service
     let listener_c = node_c
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
     node_c
@@ -1164,7 +1171,9 @@ async fn hidden_service_rendezvous() {
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let na = node_a.clone();
     tokio::spawn(async move {
-        na.run(Box::new(disc_a), vec![addr_b_for_a], vec![]).await.ok();
+        na.run(Box::new(disc_a), vec![addr_b_for_a], vec![])
+            .await
+            .ok();
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -1181,7 +1190,8 @@ async fn hidden_service_rendezvous() {
 
     // Publish C's intro records on A's local DHT store
     // (simulating TNS resolution propagation).
-    let zone_kp_c = tarnet::identity::Keypair::from_full_bytes(&node_c.identity.to_full_bytes()).unwrap();
+    let zone_kp_c =
+        tarnet::identity::Keypair::from_full_bytes(&node_c.identity.to_full_bytes()).unwrap();
     let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
         relay_peer_id: node_b.peer_id(),
         kem_algo: node_c.identity.identity.kem_algo() as u8,
@@ -1197,10 +1207,7 @@ async fn hidden_service_rendezvous() {
         tarnet::tns::TnsResolution::Records(records) => {
             assert_eq!(records.len(), 1);
             match &records[0] {
-                tarnet::tns::TnsRecord::IntroductionPoint {
-                    relay_peer_id,
-                    ..
-                } => {
+                tarnet::tns::TnsRecord::IntroductionPoint { relay_peer_id, .. } => {
                     assert_eq!(*relay_peer_id, node_b.peer_id());
                 }
                 other => panic!("expected IntroductionPoint, got {:?}", other),
@@ -1212,10 +1219,13 @@ async fn hidden_service_rendezvous() {
     // C accepts incoming connections in the background.
     let node_c_accept = node_c.clone();
     let service_conn_handle = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept(listener_c.id))
-            .await
-            .expect("accept timed out")
-            .expect("accept failed")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            node_c_accept.circuit_accept(listener_c.id),
+        )
+        .await
+        .expect("accept timed out")
+        .expect("accept failed")
     });
 
     // A connects to C directly via the rendezvous protocol,
@@ -1225,13 +1235,14 @@ async fn hidden_service_rendezvous() {
     let intro_points = vec![(node_b.peer_id(), kem_algo, kem_pubkey)];
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
-        node_a.connect_via_rendezvous(service_id_c, 80, &intro_points),
+        node_a.connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points),
     )
     .await
     .expect("connect timed out")
     .expect("connect failed");
 
-    assert_eq!(client_conn.port, 80);
+    assert_eq!(client_conn.port, "80");
+    assert_eq!(client_conn.mode, TEST_MODE);
     assert_eq!(client_conn.remote_service_id, service_id_c);
 
     let service_conn = service_conn_handle.await.expect("accept task panicked");
@@ -1239,23 +1250,17 @@ async fn hidden_service_rendezvous() {
     // Bidirectional data exchange over the e2e-encrypted rendezvous.
     // If the DH shared secrets don't match, this will produce garbage.
     client_conn.send(b"hello from client").await.unwrap();
-    let received_at_service = tokio::time::timeout(
-        Duration::from_secs(5),
-        service_conn.recv(),
-    )
-    .await
-    .expect("recv at service timed out")
-    .expect("recv at service failed");
+    let received_at_service = tokio::time::timeout(Duration::from_secs(5), service_conn.recv())
+        .await
+        .expect("recv at service timed out")
+        .expect("recv at service failed");
     assert_eq!(received_at_service, b"hello from client");
 
     service_conn.send(b"hello from service").await.unwrap();
-    let received_at_client = tokio::time::timeout(
-        Duration::from_secs(5),
-        client_conn.recv(),
-    )
-    .await
-    .expect("recv at client timed out")
-    .expect("recv at client failed");
+    let received_at_client = tokio::time::timeout(Duration::from_secs(5), client_conn.recv())
+        .await
+        .expect("recv at client timed out")
+        .expect("recv at client failed");
     assert_eq!(received_at_client, b"hello from service");
 
     log::info!("Rendezvous e2e data exchange verified");
@@ -1278,11 +1283,13 @@ async fn flow_control_bulk_transfer() {
     let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let addr_b = disc_b.local_addrs()[0].to_string();
     let nb = node_b.clone();
-    tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok(); });
+    tokio::spawn(async move {
+        nb.run(Box::new(disc_b), vec![], vec![]).await.ok();
+    });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let listener_b = node_b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -1293,12 +1300,14 @@ async fn flow_control_bulk_transfer() {
     // Start A, connected to B
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let na = node_a.clone();
-    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok(); });
+    tokio::spawn(async move {
+        na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok();
+    });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let conn_a = tokio::time::timeout(
         Duration::from_secs(5),
-        node_a.circuit_connect(service_id_b, 80, Some(pid_b), None),
+        node_a.circuit_connect(service_id_b, TEST_MODE, "80", Some(pid_b), None),
     )
     .await
     .expect("connect timed out")
@@ -1391,7 +1400,9 @@ async fn link_backpressure_drops_cells() {
             link_a.send_message(&payload).await.unwrap();
         }
     });
-    deadline.await.expect("send_message should never block — timed out");
+    deadline
+        .await
+        .expect("send_message should never block — timed out");
 
     // Now drain everything that made it through.
     let mut received: usize = 0;
@@ -1404,13 +1415,16 @@ async fn link_backpressure_drops_cells() {
 
     log::info!(
         "backpressure test: sent {}, received {} (dropped {})",
-        total, received, total - received
+        total,
+        received,
+        total - received
     );
 
     assert!(received > 0, "at least some cells should arrive");
     assert!(
         received < total,
-        "all {} cells arrived — backpressure did not drop any", total
+        "all {} cells arrived — backpressure did not drop any",
+        total
     );
 }
 
@@ -1446,7 +1460,10 @@ fn congestion_window_stall_recovery() {
     // Backdate last_sendme_at to simulate timeout.
     cw.last_sendme_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(15));
     assert!(cw.check_stall(), "should detect stall after timeout");
-    assert!(cw.can_send(), "probe window should be open after stall recovery");
+    assert!(
+        cw.can_send(),
+        "probe window should be open after stall recovery"
+    );
 
     // Verify the window was halved (loss event).
     let expected_cwnd = (cwnd_after_sendme / 2).max(CWND_MIN);

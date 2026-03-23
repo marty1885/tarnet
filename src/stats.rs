@@ -44,8 +44,8 @@ impl<const N: usize> BucketRing<N> {
         // If we skipped buckets, zero them so stale data doesn't pollute sums.
         if prev_ms > 0 {
             let prev_idx = self.bucket_index(prev_ms);
-            let elapsed_buckets =
-                (timestamp_ms / self.bucket_duration_ms).wrapping_sub(prev_ms / self.bucket_duration_ms);
+            let elapsed_buckets = (timestamp_ms / self.bucket_duration_ms)
+                .wrapping_sub(prev_ms / self.bucket_duration_ms);
 
             if elapsed_buckets > 0 && elapsed_buckets <= N as u64 {
                 // Clear buckets between prev and current (exclusive of current,
@@ -108,8 +108,8 @@ pub struct RollingCounter {
 impl RollingCounter {
     pub fn new() -> Self {
         Self {
-            fine: BucketRing::new(1_000),      // 1s
-            medium: BucketRing::new(60_000),   // 1min
+            fine: BucketRing::new(1_000),       // 1s
+            medium: BucketRing::new(60_000),    // 1min
             coarse: BucketRing::new(3_600_000), // 1h
             total: AtomicU64::new(0),
         }

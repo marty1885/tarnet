@@ -22,10 +22,7 @@ pub async fn query_public_addr(servers: &[String], local_port: u16) -> Option<So
 
 async fn query_one(sock: &UdpSocket, server: &str) -> Option<SocketAddr> {
     // Resolve STUN server address
-    let target: SocketAddr = tokio::net::lookup_host(server)
-        .await
-        .ok()?
-        .next()?;
+    let target: SocketAddr = tokio::net::lookup_host(server).await.ok()?.next()?;
 
     // Build STUN Binding Request (20 bytes)
     let mut req = [0u8; 20];

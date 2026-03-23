@@ -87,22 +87,33 @@ impl TnsCache {
     }
 
     /// Insert a positive cache entry with TTL derived from the DHT record.
-    pub fn insert(&mut self, zone: ServiceId, label: String, records: Vec<TnsRecord>, ttl: Duration) {
+    pub fn insert(
+        &mut self,
+        zone: ServiceId,
+        label: String,
+        records: Vec<TnsRecord>,
+        ttl: Duration,
+    ) {
         self.evict_expired();
         if self.entries.len() >= TNS_CACHE_MAX_ENTRIES {
             // Evict the entry with the least remaining TTL.
-            let worst = self.entries.iter()
+            let worst = self
+                .entries
+                .iter()
                 .min_by_key(|(_, e)| e.remaining_ttl())
                 .map(|(k, _)| k.clone());
             if let Some(k) = worst {
                 self.entries.remove(&k);
             }
         }
-        self.entries.insert((zone, label), TnsCacheEntry {
-            records,
-            cached_at: Instant::now(),
-            ttl,
-        });
+        self.entries.insert(
+            (zone, label),
+            TnsCacheEntry {
+                records,
+                cached_at: Instant::now(),
+                ttl,
+            },
+        );
     }
 
     /// Insert a negative cache entry (name not found).
@@ -370,7 +381,13 @@ pub fn encrypt_record_set(zone: &ServiceId, label: &str, records: &[TnsRecord]) 
 
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let ciphertext = cipher
-        .encrypt((&nonce).into(), Payload { msg: &plaintext, aad: b"" })
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &plaintext,
+                aad: b"",
+            },
+        )
         .expect("AEAD encryption should not fail");
 
     let mut blob = Vec::with_capacity(24 + ciphertext.len());
@@ -390,7 +407,13 @@ pub fn decrypt_record_set(zone: &ServiceId, label: &str, blob: &[u8]) -> Result<
     let enc_key = tns_encryption_key(zone, label);
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let plaintext = cipher
-        .decrypt(nonce.into(), Payload { msg: ciphertext_with_tag, aad: b"" })
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext_with_tag,
+                aad: b"",
+            },
+        )
         .map_err(|_| Error::Crypto("TNS AEAD decryption failed".into()))?;
     deserialize_record_set(&plaintext)
 }
@@ -429,10 +452,7 @@ pub async fn resolve(node: &Node, zone: ServiceId, name: &str) -> TnsResolution 
 ///
 /// Petnames are just records in your own zone published as Delegation records.
 /// There is no special petname lookup — petnames ARE zone records.
-pub async fn resolve_name(
-    node: &Node,
-    name: &str,
-) -> TnsResolution {
+pub async fn resolve_name(node: &Node, name: &str) -> TnsResolution {
     let local_zone = node.default_service_id().await;
     resolve(node, local_zone, name).await
 }
@@ -509,8 +529,14 @@ async fn resolve_inner(
 
             // Follow the alias in the current zone. Absolute aliases (rightmost
             // component is a raw ServiceId) are parsed naturally by resolve_inner.
-            return Box::pin(resolve_inner(node, current_zone, &new_name, current_depth, local_zone))
-                .await;
+            return Box::pin(resolve_inner(
+                node,
+                current_zone,
+                &new_name,
+                current_depth,
+                local_zone,
+            ))
+            .await;
         }
 
         if is_terminal {
@@ -559,8 +585,15 @@ async fn fetch_records(
     // 2. Check local DHT store.
     if let Some((records, remaining_ttl)) = try_decrypt_local(node, zone, label, &dht_key).await {
         if !is_local_zone {
-            let ttl = if remaining_ttl.is_zero() { Duration::from_secs(60) } else { remaining_ttl };
-            node.tns_cache().lock().await.insert(*zone, label.to_string(), records.clone(), ttl);
+            let ttl = if remaining_ttl.is_zero() {
+                Duration::from_secs(60)
+            } else {
+                remaining_ttl
+            };
+            node.tns_cache()
+                .lock()
+                .await
+                .insert(*zone, label.to_string(), records.clone(), ttl);
         }
         return Ok(records);
     }
@@ -582,15 +615,26 @@ async fn fetch_records(
     loop {
         tokio::time::sleep(POLL_INTERVAL).await;
 
-        if let Some((records, remaining_ttl)) = try_decrypt_local(node, zone, label, &dht_key).await {
-            let ttl = if remaining_ttl.is_zero() { Duration::from_secs(60) } else { remaining_ttl };
-            node.tns_cache().lock().await.insert(*zone, label.to_string(), records.clone(), ttl);
+        if let Some((records, remaining_ttl)) = try_decrypt_local(node, zone, label, &dht_key).await
+        {
+            let ttl = if remaining_ttl.is_zero() {
+                Duration::from_secs(60)
+            } else {
+                remaining_ttl
+            };
+            node.tns_cache()
+                .lock()
+                .await
+                .insert(*zone, label.to_string(), records.clone(), ttl);
             return Ok(records);
         }
 
         if Instant::now() >= deadline {
             // Negative cache: remember that this name was not found.
-            node.tns_cache().lock().await.insert_negative(*zone, label.to_string());
+            node.tns_cache()
+                .lock()
+                .await
+                .insert_negative(*zone, label.to_string());
             return Ok(Vec::new());
         }
     }
@@ -612,9 +656,8 @@ async fn try_decrypt_local(
     dht_key: &DhtId,
 ) -> Option<(Vec<TnsRecord>, Duration)> {
     // If this is a local zone, find the expected PeerId from the identity store.
-    let expected_signer: Option<PeerId> = node
-        .keypair_for_service(zone).await
-        .map(|kp| kp.peer_id());
+    let expected_signer: Option<PeerId> =
+        node.keypair_for_service(zone).await.map(|kp| kp.peer_id());
 
     let raw_records = node.dht_get_records_at_key(dht_key).await;
     for record in &raw_records {
@@ -767,10 +810,7 @@ pub fn build_peer_record(keypair: &Keypair, peer_id: &PeerId) -> TnsRecord {
 
 /// Verify a Peer record against the expected ServiceId.
 /// Returns the PeerId if valid, or an error if forged/mismatched.
-pub fn verify_peer_record(
-    record: &TnsRecord,
-    expected_service_id: &ServiceId,
-) -> Result<PeerId> {
+pub fn verify_peer_record(record: &TnsRecord, expected_service_id: &ServiceId) -> Result<PeerId> {
     let TnsRecord::Peer {
         signing_algo,
         signing_pubkey,
@@ -796,7 +836,9 @@ pub fn verify_peer_record(
     msg.extend_from_slice(PEER_RECORD_DOMAIN);
     msg.extend_from_slice(peer_id.as_bytes());
     if !crate::identity::verify(algo, signing_pubkey, &msg, signature) {
-        return Err(Error::Crypto("Peer record signature verification failed".into()));
+        return Err(Error::Crypto(
+            "Peer record signature verification failed".into(),
+        ));
     }
 
     Ok(*peer_id)
@@ -903,7 +945,9 @@ mod tests {
         let zone = ServiceId::from_signing_pubkey(&[0x42; 32]);
         let wrong_zone = ServiceId::from_signing_pubkey(&[0x43; 32]);
         let label = "www";
-        let records = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[1; 32]))];
+        let records = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[1; 32],
+        ))];
         let blob = encrypt_record_set(&zone, label, &records);
         assert!(decrypt_record_set(&wrong_zone, label, &blob).is_err());
     }
@@ -911,7 +955,9 @@ mod tests {
     #[test]
     fn wrong_label_cannot_decrypt() {
         let zone = ServiceId::from_signing_pubkey(&[0x42; 32]);
-        let records = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[1; 32]))];
+        let records = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[1; 32],
+        ))];
         let blob = encrypt_record_set(&zone, "www", &records);
         assert!(decrypt_record_set(&zone, "mail", &blob).is_err());
     }
@@ -951,34 +997,35 @@ mod tests {
 
         // Set and get
         let zone_bytes = tns_record_to_bytes(&TnsRecord::Zone(zone));
-        db.label_set("","alice", &[zone_bytes.clone()], false).unwrap();
-        let result = db.label_get("","alice").unwrap();
+        db.label_set("", "alice", &[zone_bytes.clone()], false)
+            .unwrap();
+        let result = db.label_get("", "alice").unwrap();
         assert!(result.is_some());
         let (blobs, publish) = result.unwrap();
         assert_eq!(blobs.len(), 1);
         assert!(!publish);
 
         // Not found
-        assert!(db.label_get("","bob").unwrap().is_none());
+        assert!(db.label_get("", "bob").unwrap().is_none());
 
         // Overwrite
         let zone2 = ServiceId::from_signing_pubkey(&[0x43; 32]);
         let zone2_bytes = tns_record_to_bytes(&TnsRecord::Zone(zone2));
-        db.label_set("","alice", &[zone2_bytes], true).unwrap();
-        let (_, publish) = db.label_get("","alice").unwrap().unwrap();
+        db.label_set("", "alice", &[zone2_bytes], true).unwrap();
+        let (_, publish) = db.label_get("", "alice").unwrap().unwrap();
         assert!(publish);
 
         // List
         let zone_bytes2 = tns_record_to_bytes(&TnsRecord::Zone(zone));
-        db.label_set("","bob", &[zone_bytes2], false).unwrap();
-        let list = db.label_list("",).unwrap();
+        db.label_set("", "bob", &[zone_bytes2], false).unwrap();
+        let list = db.label_list("").unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].0, "alice");
         assert_eq!(list[1].0, "bob");
 
         // Remove
-        db.label_remove("","alice").unwrap();
-        assert!(db.label_get("","alice").unwrap().is_none());
+        db.label_remove("", "alice").unwrap();
+        assert!(db.label_get("", "alice").unwrap().is_none());
         assert_eq!(db.label_list("",).unwrap().len(), 1);
 
         let _ = std::fs::remove_file(&path);
@@ -999,7 +1046,9 @@ mod tests {
                 TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x22; 32])),
             ];
 
-            publish(&node, &zone_kp, "www", &records, 600).await.unwrap();
+            publish(&node, &zone_kp, "www", &records, 600)
+                .await
+                .unwrap();
 
             // Should be immediately resolvable from local store.
             let result = resolve(&node, zone_id, "www").await;
@@ -1099,9 +1148,15 @@ mod tests {
             let node = Node::new(identity);
             let target = ServiceId::from_signing_pubkey(&[0xAA; 32]);
 
-            publish(&node, &identity2, "server", &[TnsRecord::Identity(target)], 600)
-                .await
-                .unwrap();
+            publish(
+                &node,
+                &identity2,
+                "server",
+                &[TnsRecord::Identity(target)],
+                600,
+            )
+            .await
+            .unwrap();
 
             let result = resolve_name(&node, "server").await;
             match result {
@@ -1126,9 +1181,15 @@ mod tests {
             let target = ServiceId::from_signing_pubkey(&[0xAA; 32]);
 
             // Publish "tom" as Zone in our own zone
-            publish(&node, &identity2, "tom", &[TnsRecord::Zone(zone.identity.service_id())], 600)
-                .await
-                .unwrap();
+            publish(
+                &node,
+                &identity2,
+                "tom",
+                &[TnsRecord::Zone(zone.identity.service_id())],
+                600,
+            )
+            .await
+            .unwrap();
 
             // Publish "www" in zone Z
             publish(&node, &zone, "www", &[TnsRecord::Identity(target)], 600)
@@ -1218,7 +1279,9 @@ mod tests {
                 &node,
                 &zone,
                 "final",
-                &[TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0xAA; 32]))],
+                &[TnsRecord::Identity(ServiceId::from_signing_pubkey(
+                    &[0xAA; 32],
+                ))],
                 600,
             )
             .await
@@ -1262,7 +1325,9 @@ mod tests {
                 &node,
                 &zone,
                 "y",
-                &[TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0xBB; 32]))],
+                &[TnsRecord::Identity(ServiceId::from_signing_pubkey(
+                    &[0xBB; 32],
+                ))],
                 600,
             )
             .await
@@ -1409,25 +1474,20 @@ mod tests {
         .is_ok());
 
         // Zone + ContentRef (supplemental) — ok.
-        assert!(validate_records(&[
-            TnsRecord::Zone(zone_sid),
-            TnsRecord::ContentRef([0xAA; 64]),
-        ])
-        .is_ok());
+        assert!(
+            validate_records(&[TnsRecord::Zone(zone_sid), TnsRecord::ContentRef([0xAA; 64]),])
+                .is_ok()
+        );
 
         // Zone + Identity — rejected (both non-supplemental).
-        assert!(validate_records(&[
-            TnsRecord::Zone(zone_sid),
-            TnsRecord::Identity(id_sid),
-        ])
-        .is_err());
+        assert!(
+            validate_records(&[TnsRecord::Zone(zone_sid), TnsRecord::Identity(id_sid),]).is_err()
+        );
 
         // Zone + Alias — rejected (both non-supplemental).
-        assert!(validate_records(&[
-            TnsRecord::Zone(zone_sid),
-            TnsRecord::Alias("@".into()),
-        ])
-        .is_err());
+        assert!(
+            validate_records(&[TnsRecord::Zone(zone_sid), TnsRecord::Alias("@".into()),]).is_err()
+        );
     }
 
     #[test]
@@ -1465,20 +1525,20 @@ mod tests {
         let db = StateDb::open(&path).unwrap();
 
         // Create an unpublished label "@"
-        let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[0x01; 32]),
-        ));
-        db.label_set("","@", &[at_bytes], false).unwrap();
+        let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[0x01; 32],
+        )));
+        db.label_set("", "@", &[at_bytes], false).unwrap();
 
         // Publishing an alias to "@" should fail — "@" is unpublished.
         let records = vec![TnsRecord::Alias("@".into())];
         assert!(validate_published_aliases(&records, &db, "").is_err());
 
         // Now publish "@"
-        let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[0x01; 32]),
-        ));
-        db.label_set("","@", &[at_bytes], true).unwrap();
+        let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[0x01; 32],
+        )));
+        db.label_set("", "@", &[at_bytes], true).unwrap();
 
         // Same alias should now pass.
         assert!(validate_published_aliases(&records, &db, "").is_ok());
@@ -1506,10 +1566,10 @@ mod tests {
         ));
         let db = StateDb::open(&path).unwrap();
 
-        let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[0x01; 32]),
-        ));
-        db.label_set("","@", &[at_bytes], false).unwrap();
+        let at_bytes = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[0x01; 32],
+        )));
+        db.label_set("", "@", &[at_bytes], false).unwrap();
 
         // validate_published_aliases rejects this...
         let records = vec![TnsRecord::Alias("@".into())];
@@ -1557,15 +1617,9 @@ mod tests {
             publish(&node, &zone, "@", &[TnsRecord::Identity(target)], 600)
                 .await
                 .unwrap();
-            publish(
-                &node,
-                &zone,
-                "blog",
-                &[TnsRecord::Alias("@".into())],
-                600,
-            )
-            .await
-            .unwrap();
+            publish(&node, &zone, "blog", &[TnsRecord::Alias("@".into())], 600)
+                .await
+                .unwrap();
 
             let result = resolve(&node, zone.identity.service_id(), "blog").await;
             match result {
@@ -1601,18 +1655,11 @@ mod tests {
             publish(&node, &zone_b, "@", &[TnsRecord::Identity(target)], 600)
                 .await
                 .unwrap();
-            publish(
-                &node,
-                &zone_b,
-                "site",
-                &[TnsRecord::Alias("@".into())],
-                600,
-            )
-            .await
-            .unwrap();
+            publish(&node, &zone_b, "site", &[TnsRecord::Alias("@".into())], 600)
+                .await
+                .unwrap();
 
-            let result =
-                resolve(&node, zone_a.identity.service_id(), "site.friend").await;
+            let result = resolve(&node, zone_a.identity.service_id(), "site.friend").await;
             match result {
                 TnsResolution::Records(records) => {
                     assert_eq!(records, vec![TnsRecord::Identity(target)]);
@@ -1649,8 +1696,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result =
-                resolve(&node, zone_a.identity.service_id(), "shortcut").await;
+            let result = resolve(&node, zone_a.identity.service_id(), "shortcut").await;
             match result {
                 TnsResolution::Records(records) => {
                     assert_eq!(records, vec![TnsRecord::Identity(target)]);
@@ -1675,13 +1721,14 @@ mod tests {
         ));
         let db = StateDb::open(&path).unwrap();
 
-        let rec1 = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[1; 32]),
-        ));
+        let rec1 = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[1; 32],
+        )));
         let rec2 = tns_record_to_bytes(&TnsRecord::Text("hello".into()));
-        db.label_set("","multi", &[rec1.clone(), rec2.clone()], true).unwrap();
+        db.label_set("", "multi", &[rec1.clone(), rec2.clone()], true)
+            .unwrap();
 
-        let (blobs, publish) = db.label_get("","multi").unwrap().unwrap();
+        let (blobs, publish) = db.label_get("", "multi").unwrap().unwrap();
         assert_eq!(blobs.len(), 2);
         assert!(publish);
 
@@ -1710,16 +1757,16 @@ mod tests {
         ));
         let db = StateDb::open(&path).unwrap();
 
-        let rec1 = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[1; 32]),
-        ));
-        let rec2 = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[2; 32]),
-        ));
-        db.label_set("","x", &[rec1], false).unwrap();
-        db.label_set("","x", &[rec2.clone()], true).unwrap();
+        let rec1 = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[1; 32],
+        )));
+        let rec2 = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[2; 32],
+        )));
+        db.label_set("", "x", &[rec1], false).unwrap();
+        db.label_set("", "x", &[rec2.clone()], true).unwrap();
 
-        let (blobs, publish) = db.label_get("","x").unwrap().unwrap();
+        let (blobs, publish) = db.label_get("", "x").unwrap().unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0], rec2);
         assert!(publish);
@@ -1740,12 +1787,12 @@ mod tests {
         ));
         let db = StateDb::open(&path).unwrap();
 
-        let rec = tns_record_to_bytes(&TnsRecord::Identity(
-            ServiceId::from_signing_pubkey(&[1; 32]),
-        ));
-        db.label_set("","del", &[rec.clone(), rec], false).unwrap();
-        db.label_remove("","del").unwrap();
-        assert!(db.label_get("","del").unwrap().is_none());
+        let rec = tns_record_to_bytes(&TnsRecord::Identity(ServiceId::from_signing_pubkey(
+            &[1; 32],
+        )));
+        db.label_set("", "del", &[rec.clone(), rec], false).unwrap();
+        db.label_remove("", "del").unwrap();
+        assert!(db.label_get("", "del").unwrap().is_none());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1801,7 +1848,13 @@ mod tests {
         let service_id = kp.identity.service_id();
 
         // Tamper with the peer_id
-        if let TnsRecord::Peer { signing_algo, signing_pubkey, signature, .. } = &record {
+        if let TnsRecord::Peer {
+            signing_algo,
+            signing_pubkey,
+            signature,
+            ..
+        } = &record
+        {
             let tampered = TnsRecord::Peer {
                 signing_algo: *signing_algo,
                 signing_pubkey: signing_pubkey.clone(),

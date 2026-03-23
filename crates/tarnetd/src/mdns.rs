@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 const SERVICE_TYPE: &str = "_tarnet._tcp.local.";
@@ -30,18 +30,21 @@ pub fn start(
         SERVICE_TYPE,
         &instance_name,
         &host,
-        "",  // auto-detect IPs
+        "", // auto-detect IPs
         tcp_port,
         None, // no TXT properties needed; peer_id is in the instance name
     )
     .map_err(|e| format!("mDNS service info: {}", e))?
     .enable_addr_auto();
 
-    mdns.register(info).map_err(|e| format!("mDNS register: {}", e))?;
+    mdns.register(info)
+        .map_err(|e| format!("mDNS register: {}", e))?;
     log::info!("mDNS: registered as {}", instance_name);
 
     // Browse for other tarnet services
-    let receiver = mdns.browse(SERVICE_TYPE).map_err(|e| format!("mDNS browse: {}", e))?;
+    let receiver = mdns
+        .browse(SERVICE_TYPE)
+        .map_err(|e| format!("mDNS browse: {}", e))?;
 
     let (tx, rx) = mpsc::unbounded_channel();
     let our_instance = instance_name.clone();
@@ -60,13 +63,19 @@ pub fn start(
                     // Connecting to every address wastes links (they typically all
                     // route over the same physical NIC on a LAN).
                     let addrs: Vec<_> = info.get_addresses().iter().copied().collect();
-                    let best = addrs.iter().copied()
+                    let best = addrs
+                        .iter()
+                        .copied()
                         .filter(|a| !is_link_local(a))
                         .min_by_key(|a| if a.is_ipv4() { 0 } else { 1 })
                         .or_else(|| addrs.first().copied());
                     if let Some(addr) = best {
                         let peer_addr = format!("{}:{}", addr, port);
-                        log::info!("mDNS: discovered peer at {} (from {} addrs)", peer_addr, addrs.len());
+                        log::info!(
+                            "mDNS: discovered peer at {} (from {} addrs)",
+                            peer_addr,
+                            addrs.len()
+                        );
                         let _ = tx.send(peer_addr);
                     }
                 }
@@ -75,7 +84,12 @@ pub fn start(
         }
     });
 
-    Ok((rx, MdnsHandle { _daemon: Arc::new(mdns) }))
+    Ok((
+        rx,
+        MdnsHandle {
+            _daemon: Arc::new(mdns),
+        },
+    ))
 }
 
 /// Keeps the mDNS daemon alive. Drop to unregister and stop.

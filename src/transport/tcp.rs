@@ -122,9 +122,10 @@ impl TcpDiscovery {
 impl Discovery for TcpDiscovery {
     async fn accept(&self) -> Result<Box<dyn Transport>> {
         let mut rx = self.accept_rx.lock().await;
-        let (stream, addr) = rx.recv().await.ok_or_else(|| {
-            Error::Wire("all listeners closed".into())
-        })?;
+        let (stream, addr) = rx
+            .recv()
+            .await
+            .ok_or_else(|| Error::Wire("all listeners closed".into()))?;
         stream.set_nodelay(true)?;
         log::debug!("TCP accepted connection from {}", addr);
         Ok(Box::new(TcpTransport::new(stream)))

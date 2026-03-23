@@ -229,8 +229,8 @@ impl PeerTransport {
 #[derive(Debug, Clone)]
 pub struct LinkInfo {
     pub link_id: LinkId,
-    pub state: &'static str,      // "active" | "standby"
-    pub direction: &'static str,   // "outbound" | "inbound"
+    pub state: &'static str,     // "active" | "standby"
+    pub direction: &'static str, // "outbound" | "inbound"
     pub rtt_us: u64,
     pub loss_rate: u8,
     pub age_secs: u64,
@@ -370,21 +370,27 @@ impl LinkTable {
         self.peers
             .iter()
             .map(|(&peer_id, pt)| {
-                let links = pt.links.iter().map(|(&lid, sl)| {
-                    LinkInfo {
+                let links = pt
+                    .links
+                    .iter()
+                    .map(|(&lid, sl)| LinkInfo {
                         link_id: lid,
                         state: match sl.state {
                             LinkState::Active => "active",
                             LinkState::Standby => "standby",
                         },
-                        direction: if sl.is_outbound { "outbound" } else { "inbound" },
+                        direction: if sl.is_outbound {
+                            "outbound"
+                        } else {
+                            "inbound"
+                        },
                         rtt_us: sl.score.ewma_rtt_us,
                         loss_rate: sl.score.loss_rate,
                         age_secs: sl.created_at.elapsed().as_secs(),
                         idle_secs: sl.last_recv.elapsed().as_secs(),
                         transport: sl.link.transport_name(),
-                    }
-                }).collect();
+                    })
+                    .collect();
                 PeerInfo { peer_id, links }
             })
             .collect()

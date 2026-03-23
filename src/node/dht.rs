@@ -3,7 +3,10 @@ use super::*;
 /// Compute a 64-byte BLAKE3 hash (used for content-addressed DHT keys).
 pub(super) fn blake3_hash_64(input: &[u8]) -> [u8; 64] {
     let mut out = [0u8; 64];
-    blake3::Hasher::new().update(input).finalize_xof().fill(&mut out);
+    blake3::Hasher::new()
+        .update(input)
+        .finalize_xof()
+        .fill(&mut out);
     out
 }
 
@@ -44,8 +47,7 @@ impl Node {
         } else {
             for (pid, _) in &targets {
                 if *pid != from
-                    && (!bloom.contains(pid)
-                        || is_k_closest(pid, key, &all_peers, DHT_K))
+                    && (!bloom.contains(pid) || is_k_closest(pid, key, &all_peers, DHT_K))
                 {
                     if let Some(link) = links.get(pid) {
                         let _ = link.send_message(encoded).await;

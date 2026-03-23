@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::error::{ApiError, ApiResult};
@@ -84,7 +84,11 @@ pub enum TnsResolution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum NodeEvent {
     /// Incoming overlay data message.
-    Data { peer: PeerId, #[serde(with = "serde_bytes")] payload: Vec<u8> },
+    Data {
+        peer: PeerId,
+        #[serde(with = "serde_bytes")]
+        payload: Vec<u8>,
+    },
     /// Incoming tunnel establishment notification.
     Tunnel { peer: PeerId },
     /// DHT watch notification.
@@ -93,11 +97,21 @@ pub enum NodeEvent {
     PeerDisconnected(PeerId),
 }
 
+/// Delivery semantics for a bound Tarnet port.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PortMode {
+    ReliableOrdered,
+    ReliableUnordered,
+    UnreliableUnordered,
+}
+
 /// A bidirectional connection established via `connect()` or `accept()`.
-/// Data is exchanged through an onion circuit with end-to-end tunnel encryption.
+/// Data is exchanged as whole messages with mode-defined delivery guarantees.
 pub struct Connection {
     pub remote_service_id: ServiceId,
-    pub port: u16,
+    pub mode: PortMode,
+    pub port: String,
     /// Unique identifier for this connection (circuit_id internally).
     pub id: u32,
     /// Send data to the remote end.
@@ -114,25 +128,28 @@ pub struct ListenerOptions {
 }
 
 /// A listener handle returned from `listen()` or `listen_hidden()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Listener {
     /// Opaque listener handle.
     pub id: u32,
     pub service_id: ServiceId,
-    pub port: u16,
+    pub mode: PortMode,
+    pub port: String,
     pub options: ListenerOptions,
 }
 
 impl Connection {
     pub fn new(
         remote_service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: String,
         id: u32,
         tx: mpsc::Sender<Vec<u8>>,
         rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         Self {
             remote_service_id,
+            mode,
             port,
             id,
             tx,
@@ -151,9 +168,7 @@ impl Connection {
     /// Receive data from the remote end.
     pub async fn recv(&self) -> ApiResult<Vec<u8>> {
         let mut rx = self.rx.lock().await;
-        rx.recv()
-            .await
-            .ok_or(ApiError::NotConnected)
+        rx.recv().await.ok_or(ApiError::NotConnected)
     }
 }
 
@@ -161,24 +176,25 @@ impl std::fmt::Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection")
             .field("remote_service_id", &self.remote_service_id)
+            .field("mode", &self.mode)
             .field("port", &self.port)
             .field("id", &self.id)
             .finish()
     }
 }
 
-/// A bidirectional byte stream. Implemented by [`Connection`] (onion circuit)
+/// A bidirectional message channel. Implemented by [`Connection`] (onion circuit)
 /// and tunnel adapters (PeerId-based), allowing unified I/O handling.
 #[async_trait]
-pub trait DataStream: Send + Sync {
+pub trait MessageStream: Send + Sync {
     /// Send data to the remote end.
     async fn send(&self, data: &[u8]) -> ApiResult<()>;
-    /// Receive data from the remote end.
+    /// Receive one whole message from the remote end.
     async fn recv(&self) -> ApiResult<Vec<u8>>;
 }
 
 #[async_trait]
-impl DataStream for Connection {
+impl MessageStream for Connection {
     async fn send(&self, data: &[u8]) -> ApiResult<()> {
         self.tx
             .send(data.to_vec())
@@ -222,19 +238,25 @@ pub trait ServiceApi: Send + Sync {
 
     /// Connect to a remote service. Builds an onion circuit, establishes a tunnel,
     /// and returns a connection handle.
-    async fn connect(&self, service_id: ServiceId, port: u16) -> ApiResult<Connection>;
+    async fn connect(
+        &self,
+        service_id: ServiceId,
+        mode: PortMode,
+        port: &str,
+    ) -> ApiResult<Connection>;
 
     /// Connect as a specific source identity. Uses that identity's outbound hop
     /// count for circuit building. If `source_identity` is None, behaves like `connect()`.
     async fn connect_as(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         source_identity: Option<ServiceId>,
     ) -> ApiResult<Connection> {
         // Default implementation ignores source_identity.
         let _ = source_identity;
-        self.connect(service_id, port).await
+        self.connect(service_id, mode, port).await
     }
 
     /// Listen for incoming connections on the given ServiceId and port.
@@ -242,7 +264,8 @@ pub trait ServiceApi: Send + Sync {
     async fn listen(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         options: ListenerOptions,
     ) -> ApiResult<Listener>;
 
@@ -258,7 +281,8 @@ pub trait ServiceApi: Send + Sync {
     async fn listen_hidden(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         num_intro_points: usize,
         options: ListenerOptions,
     ) -> ApiResult<Listener>;
@@ -326,22 +350,28 @@ pub trait ServiceApi: Send + Sync {
     ) -> ApiResult<()>;
 
     /// Resolve a dot-separated name starting from a zone.
-    async fn tns_resolve(
-        &self,
-        zone: ServiceId,
-        name: &str,
-    ) -> ApiResult<TnsResolution>;
+    async fn tns_resolve(&self, zone: ServiceId, name: &str) -> ApiResult<TnsResolution>;
 
     /// Resolve a name relative to the local node's petnames/zone.
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution>;
 
     /// Set a local label with associated records and publish flag.
     /// If `identity` is None, uses the default identity.
-    async fn tns_set_label(&self, identity: Option<&str>, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()>;
+    async fn tns_set_label(
+        &self,
+        identity: Option<&str>,
+        label: &str,
+        records: Vec<TnsRecord>,
+        publish: bool,
+    ) -> ApiResult<()>;
 
     /// Get a local label's records and publish flag.
     /// If `identity` is None, uses the default identity.
-    async fn tns_get_label(&self, identity: Option<&str>, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>>;
+    async fn tns_get_label(
+        &self,
+        identity: Option<&str>,
+        label: &str,
+    ) -> ApiResult<Option<(Vec<TnsRecord>, bool)>>;
 
     /// Remove a local label.
     /// If `identity` is None, uses the default identity.
@@ -349,7 +379,10 @@ pub trait ServiceApi: Send + Sync {
 
     /// List all local labels with their records and publish flags.
     /// If `identity` is None, uses the default identity.
-    async fn tns_list_labels(&self, identity: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>>;
+    async fn tns_list_labels(
+        &self,
+        identity: Option<&str>,
+    ) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>>;
 
     // ── Identity management ──
 
@@ -363,15 +396,19 @@ pub trait ServiceApi: Send + Sync {
     ) -> ApiResult<ServiceId>;
 
     /// List all identities: (label, service_id, privacy, outbound_hops, scheme, signing_algo, kem_algo).
-    async fn list_identities(&self) -> ApiResult<Vec<(
-        String,
-        ServiceId,
-        crate::types::PrivacyLevel,
-        u8,
-        crate::types::IdentityScheme,
-        crate::types::SigningAlgo,
-        crate::types::KemAlgo,
-    )>>;
+    async fn list_identities(
+        &self,
+    ) -> ApiResult<
+        Vec<(
+            String,
+            ServiceId,
+            crate::types::PrivacyLevel,
+            u8,
+            crate::types::IdentityScheme,
+            crate::types::SigningAlgo,
+            crate::types::KemAlgo,
+        )>,
+    >;
 
     /// Delete a named identity. Cannot delete the default identity.
     async fn delete_identity(&self, label: &str) -> ApiResult<()>;
@@ -398,7 +435,7 @@ pub trait ServiceApi: Send + Sync {
     /// - PeerId (hex) — derives ServiceId via from_signing_pubkey
     /// - TNS name (petname or dotted name)
     /// Then builds a circuit to the resolved ServiceId.
-    async fn connect_to(&self, target: &str, port: u16) -> ApiResult<Connection>;
+    async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection>;
 
     // ── Low-level overlay/tunnel (advanced use only) ──
 
@@ -411,3 +448,5 @@ pub trait ServiceApi: Send + Sync {
     /// Send data through an established tunnel.
     async fn send_tunnel_data(&self, dest: &PeerId, data: &[u8]) -> ApiResult<()>;
 }
+
+pub use MessageStream as DataStream;

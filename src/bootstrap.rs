@@ -95,7 +95,6 @@ mod mainline_dht {
             }
             results
         }
-
     }
 }
 

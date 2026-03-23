@@ -144,11 +144,7 @@ impl HopCrypto {
             }
             CryptoOp::Encrypt => {
                 let tag = aead
-                    .encrypt_in_place_detached(
-                        (&nonce).into(),
-                        b"",
-                        &mut cell[..CELL_BODY_SIZE],
-                    )
+                    .encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE])
                     .expect("AEAD encryption should not fail");
                 // Preserve the nonce, overwrite the tag.
                 let mac_start = CELL_BODY_SIZE + CELL_NONCE_SIZE;
@@ -213,11 +209,7 @@ impl CircuitTable {
         let mut rng = rand::thread_rng();
         loop {
             let raw: u32 = rng.gen();
-            let id = if we_initiated_link {
-                raw | 1
-            } else {
-                raw & !1
-            };
+            let id = if we_initiated_link { raw | 1 } else { raw & !1 };
             if id != 0 && !is_taken(id) {
                 return id;
             }
@@ -246,11 +238,10 @@ impl CircuitTable {
 
     /// Remove all entries involving a given peer (link went down).
     pub fn remove_peer(&mut self, peer: &PeerId) {
-        self.entries
-            .retain(|k, v| {
-                k.from_peer != *peer
-                    && !matches!(v, CircuitAction::Forward { next_hop, .. } if next_hop == peer)
-            });
+        self.entries.retain(|k, v| {
+            k.from_peer != *peer
+                && !matches!(v, CircuitAction::Forward { next_hop, .. } if next_hop == peer)
+        });
     }
 
     /// Number of active circuit entries.
@@ -269,12 +260,18 @@ impl CircuitTable {
 
     /// Count forwarding entries (we're a relay, not the endpoint).
     pub fn forward_count(&self) -> usize {
-        self.entries.values().filter(|a| matches!(a, CircuitAction::Forward { .. })).count()
+        self.entries
+            .values()
+            .filter(|a| matches!(a, CircuitAction::Forward { .. }))
+            .count()
     }
 
     /// Count endpoint entries (circuit terminates at this node).
     pub fn endpoint_count(&self) -> usize {
-        self.entries.values().filter(|a| matches!(a, CircuitAction::Endpoint { .. })).count()
+        self.entries
+            .values()
+            .filter(|a| matches!(a, CircuitAction::Endpoint { .. }))
+            .count()
     }
 
     /// Count circuit entries involving each peer (as from_peer or next_hop).
@@ -314,8 +311,7 @@ fn cell_nonce(cell: &[u8; CELL_SIZE]) -> u64 {
 
 /// Write the 8-byte explicit nonce into a cell's trailer.
 fn set_cell_nonce(cell: &mut [u8; CELL_SIZE], nonce: u64) {
-    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + CELL_NONCE_SIZE]
-        .copy_from_slice(&nonce.to_le_bytes());
+    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + CELL_NONCE_SIZE].copy_from_slice(&nonce.to_le_bytes());
 }
 
 // ---------------------------------------------------------------------------
@@ -636,11 +632,7 @@ impl HopKey {
         // symmetric stream cipher (encrypt == decrypt). This avoids
         // AEAD tag verification, which would fail for inner onion layers
         // whose tags are overwritten by outer layers.
-        let _ = aead.encrypt_in_place_detached(
-            (&nonce).into(),
-            b"",
-            &mut cell[..CELL_BODY_SIZE],
-        );
+        let _ = aead.encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE]);
         // Zero the tag but preserve the nonce for multi-hop decryption.
         cell[CELL_BODY_SIZE + CELL_NONCE_SIZE..].fill(0);
     }
@@ -650,9 +642,7 @@ impl HopKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircuitState {
     /// Building: extending toward waypoints via DV routing.
-    Extending {
-        hops_built: usize,
-    },
+    Extending { hops_built: usize },
     /// Ready for use.
     Ready,
     /// Destroyed.
@@ -704,7 +694,10 @@ impl OutboundCircuit {
     }
 
     /// Send a relay cell through this circuit. Returns (first_hop, circuit_id, encrypted_cell).
-    pub fn send_relay_cell(&mut self, relay_cell: &RelayCell) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
+    pub fn send_relay_cell(
+        &mut self,
+        relay_cell: &RelayCell,
+    ) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
         let last = self.hop_keys.len() - 1;
         self.send_to_hop(relay_cell, last)
     }
@@ -738,11 +731,7 @@ impl OutboundCircuit {
 
     /// Receive and decrypt a relay cell from a specific intermediate hop.
     /// The nonce is read from the cell trailer.
-    pub fn recv_from_hop(
-        &self,
-        cell: &mut [u8; CELL_SIZE],
-        hop_index: usize,
-    ) -> Result<RelayCell> {
+    pub fn recv_from_hop(&self, cell: &mut [u8; CELL_SIZE], hop_index: usize) -> Result<RelayCell> {
         for hop in self.hop_keys[..=hop_index].iter() {
             hop.decrypt_backward(cell);
         }
@@ -884,11 +873,7 @@ impl CongestionWindow {
 ///
 /// The destination is the waypoint target — the relay routes toward it via DV,
 /// extending to its own best next_hop rather than requiring a direct link.
-pub fn build_extend_payload(
-    kem_algo: u8,
-    eph_pk: &[u8],
-    destination: &PeerId,
-) -> Vec<u8> {
+pub fn build_extend_payload(kem_algo: u8, eph_pk: &[u8], destination: &PeerId) -> Vec<u8> {
     let len = eph_pk.len() as u16;
     let mut payload = Vec::with_capacity(3 + eph_pk.len() + 32);
     payload.push(kem_algo);
@@ -953,29 +938,49 @@ pub fn parse_extended_payload(data: &[u8]) -> Result<(bool, u8, Vec<u8>)> {
 // ---------------------------------------------------------------------------
 
 /// Build a STREAM_BEGIN relay cell payload.
-/// Format: service_id(32) || port(2)
+/// Format: service_id(32) || mode(1) || port_len(2) || port(bytes)
 pub fn build_stream_begin_payload(
     service_id: &tarnet_api::types::ServiceId,
-    port: u16,
+    mode: tarnet_api::service::PortMode,
+    port: &str,
 ) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(34);
+    let port_bytes = port.as_bytes();
+    let port_len = u16::try_from(port_bytes.len()).expect("port name too long");
+    let mut payload = Vec::with_capacity(35 + port_bytes.len());
     payload.extend_from_slice(service_id.as_bytes());
-    payload.extend_from_slice(&port.to_be_bytes());
+    payload.push(mode as u8);
+    payload.extend_from_slice(&port_len.to_be_bytes());
+    payload.extend_from_slice(port_bytes);
     payload
 }
 
 /// Parse a STREAM_BEGIN relay cell payload.
-/// Returns (service_id, port).
+/// Returns (service_id, mode, port).
 pub fn parse_stream_begin_payload(
     data: &[u8],
-) -> Result<(tarnet_api::types::ServiceId, u16)> {
-    if data.len() < 34 {
+) -> Result<(
+    tarnet_api::types::ServiceId,
+    tarnet_api::service::PortMode,
+    String,
+)> {
+    if data.len() < 35 {
         return Err(Error::Wire("STREAM_BEGIN payload too short".into()));
     }
     let mut sid = [0u8; 32];
     sid.copy_from_slice(&data[..32]);
-    let port = u16::from_be_bytes([data[32], data[33]]);
-    Ok((tarnet_api::types::ServiceId(sid), port))
+    let mode = match data[32] {
+        0 => tarnet_api::service::PortMode::ReliableOrdered,
+        1 => tarnet_api::service::PortMode::ReliableUnordered,
+        2 => tarnet_api::service::PortMode::UnreliableUnordered,
+        other => return Err(Error::Wire(format!("unknown port mode {}", other))),
+    };
+    let port_len = u16::from_be_bytes([data[33], data[34]]) as usize;
+    if data.len() < 35 + port_len {
+        return Err(Error::Wire("STREAM_BEGIN port truncated".into()));
+    }
+    let port = String::from_utf8(data[35..35 + port_len].to_vec())
+        .map_err(|_| Error::Wire("STREAM_BEGIN port is not valid UTF-8".into()))?;
+    Ok((tarnet_api::types::ServiceId(sid), mode, port))
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,27 +1007,38 @@ pub fn parse_stream_begin_payload(
 pub fn build_introduce_payload(
     rendezvous_peer: &PeerId,
     cookie: &[u8; 32],
-    port: u16,
+    mode: tarnet_api::service::PortMode,
+    port: &str,
     kem_ciphertext: &[u8],
     shared_secret: &[u8; 32],
 ) -> Vec<u8> {
     let enc_key = kdf(shared_secret, "tarnet introduce enc");
+    let port_bytes = port.as_bytes();
+    let port_len = u16::try_from(port_bytes.len()).expect("port name too long");
 
-    // Plaintext: rendezvous_peer(32) || cookie(32) || port(2)
-    let mut plaintext = Vec::with_capacity(66);
+    // Plaintext: rendezvous_peer(32) || cookie(32) || mode(1) || port_len(2) || port(bytes)
+    let mut plaintext = Vec::with_capacity(67 + port_bytes.len());
     plaintext.extend_from_slice(rendezvous_peer.as_bytes());
     plaintext.extend_from_slice(cookie);
-    plaintext.extend_from_slice(&port.to_be_bytes());
+    plaintext.push(mode as u8);
+    plaintext.extend_from_slice(&port_len.to_be_bytes());
+    plaintext.extend_from_slice(port_bytes);
 
     let mut nonce = [0u8; 24];
     RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
 
     let aead = XChaCha20Poly1305::new((&enc_key).into());
     let ciphertext = aead
-        .encrypt((&nonce).into(), Payload { msg: &plaintext, aad: b"" })
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: &plaintext,
+                aad: b"",
+            },
+        )
         .expect("AEAD encryption should not fail");
 
-    // Wire: ct_len(2) || kem_ciphertext(variable) || nonce(24) || encrypted(66+16)
+    // Wire: ct_len(2) || kem_ciphertext(variable) || nonce(24) || encrypted(plaintext+16)
     let ct_len = kem_ciphertext.len() as u16;
     let mut payload = Vec::with_capacity(2 + kem_ciphertext.len() + 24 + ciphertext.len());
     payload.extend_from_slice(&ct_len.to_be_bytes());
@@ -1034,25 +1050,30 @@ pub fn build_introduce_payload(
 
 /// Parse and decrypt an INTRODUCE payload using the service's KEM keypair.
 ///
-/// Returns `(rendezvous_peer_id, cookie, port, shared_secret)`.
+/// Returns `(rendezvous_peer_id, cookie, mode, port, shared_secret)`.
 pub fn parse_introduce_payload(
     data: &[u8],
     service_kem: &crate::identity::KemKeypair,
-) -> Result<(PeerId, [u8; 32], u16, [u8; 32])> {
+) -> Result<(
+    PeerId,
+    [u8; 32],
+    tarnet_api::service::PortMode,
+    String,
+    [u8; 32],
+)> {
     if data.len() < 2 {
         return Err(Error::Wire("INTRODUCE payload too short".into()));
     }
 
     let ct_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    // 66 bytes ciphertext + 16 bytes tag = 82 bytes encrypted
-    let min_len = 2 + ct_len + 24 + 66 + 16;
+    let min_len = 2 + ct_len + 24 + 32 + 32 + 1 + 2 + 16;
     if data.len() < min_len {
         return Err(Error::Wire("INTRODUCE payload truncated".into()));
     }
 
     let kem_ct = &data[2..2 + ct_len];
     let nonce = &data[2 + ct_len..2 + ct_len + 24];
-    let ciphertext_with_tag = &data[2 + ct_len + 24..2 + ct_len + 24 + 66 + 16];
+    let ciphertext_with_tag = &data[2 + ct_len + 24..];
 
     // Recover shared secret via KEM decapsulation
     let shared_bytes = service_kem
@@ -1064,16 +1085,33 @@ pub fn parse_introduce_payload(
     // Decrypt and verify via AEAD
     let aead = XChaCha20Poly1305::new((&enc_key).into());
     let plaintext = aead
-        .decrypt(nonce.into(), Payload { msg: ciphertext_with_tag, aad: b"" })
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext_with_tag,
+                aad: b"",
+            },
+        )
         .map_err(|_| Error::Crypto("INTRODUCE AEAD decryption failed".into()))?;
 
     let mut peer = [0u8; 32];
     peer.copy_from_slice(&plaintext[..32]);
     let mut cookie = [0u8; 32];
     cookie.copy_from_slice(&plaintext[32..64]);
-    let port = u16::from_be_bytes([plaintext[64], plaintext[65]]);
+    let mode = match plaintext[64] {
+        0 => tarnet_api::service::PortMode::ReliableOrdered,
+        1 => tarnet_api::service::PortMode::ReliableUnordered,
+        2 => tarnet_api::service::PortMode::UnreliableUnordered,
+        other => return Err(Error::Wire(format!("unknown port mode {}", other))),
+    };
+    let port_len = u16::from_be_bytes([plaintext[65], plaintext[66]]) as usize;
+    if plaintext.len() < 67 + port_len {
+        return Err(Error::Wire("INTRODUCE port truncated".into()));
+    }
+    let port = String::from_utf8(plaintext[67..67 + port_len].to_vec())
+        .map_err(|_| Error::Wire("INTRODUCE port is not valid UTF-8".into()))?;
 
-    Ok((PeerId(peer), cookie, port, shared_bytes))
+    Ok((PeerId(peer), cookie, mode, port, shared_bytes))
 }
 
 /// Build a rendezvous cookie payload (used by both ESTABLISH and JOIN).
@@ -1423,9 +1461,27 @@ mod tests {
 
         // Endpoint (hop3) encrypts backward, then each relay adds a layer.
         // All read the same nonce from the cell trailer.
-        let mut r3_bwd = HopCrypto { key: bkeys3.backward_key, digest_key: bkeys3.backward_digest, nonce_prefix: bkeys3.nonce_prefix, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
-        let mut r2_bwd = HopCrypto { key: bkeys2.backward_key, digest_key: bkeys2.backward_digest, nonce_prefix: bkeys2.nonce_prefix, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
-        let mut r1_bwd = HopCrypto { key: bkeys1.backward_key, digest_key: bkeys1.backward_digest, nonce_prefix: bkeys1.nonce_prefix, op: CryptoOp::Encrypt, replay: ReplayWindow::new() };
+        let mut r3_bwd = HopCrypto {
+            key: bkeys3.backward_key,
+            digest_key: bkeys3.backward_digest,
+            nonce_prefix: bkeys3.nonce_prefix,
+            op: CryptoOp::Encrypt,
+            replay: ReplayWindow::new(),
+        };
+        let mut r2_bwd = HopCrypto {
+            key: bkeys2.backward_key,
+            digest_key: bkeys2.backward_digest,
+            nonce_prefix: bkeys2.nonce_prefix,
+            op: CryptoOp::Encrypt,
+            replay: ReplayWindow::new(),
+        };
+        let mut r1_bwd = HopCrypto {
+            key: bkeys1.backward_key,
+            digest_key: bkeys1.backward_digest,
+            nonce_prefix: bkeys1.nonce_prefix,
+            op: CryptoOp::Encrypt,
+            replay: ReplayWindow::new(),
+        };
 
         r3_bwd.process_cell(&mut cell);
         r2_bwd.process_cell(&mut cell);
@@ -1545,9 +1601,16 @@ mod tests {
     fn congestion_window_sendme_trigger() {
         let mut cw = CongestionWindow::new();
         for i in 0..SENDME_INC - 1 {
-            assert!(!cw.on_deliver([i as u8; DIGEST_SIZE]), "should not trigger at {}", i);
+            assert!(
+                !cw.on_deliver([i as u8; DIGEST_SIZE]),
+                "should not trigger at {}",
+                i
+            );
         }
-        assert!(cw.on_deliver([0xFF; DIGEST_SIZE]), "should trigger at SENDME_INC");
+        assert!(
+            cw.on_deliver([0xFF; DIGEST_SIZE]),
+            "should trigger at SENDME_INC"
+        );
     }
 
     // --- Replay window tests ---

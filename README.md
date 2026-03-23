@@ -73,6 +73,7 @@ In Tarnet, the service id associated with the identity is the equlivant of an IP
 ❯ tarnet listen default
 Listening on Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0 port 'tarnet-echo'.
 Waiting for connections... (Ctrl-C to quit)
+[+] Connection from 6D36JJHJ9W3W0CYSZB8ME7RG1C12V78G9255AJMXBYFJ2KMTKFP0
 
 (in another terminal, or a different machine)
 ❯ tarnet connect Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0

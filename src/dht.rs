@@ -12,7 +12,10 @@ use crate::types::{DhtId, PeerId, RecordType, Result};
 /// 64-byte XOF hash.
 fn hash_64(input: &[u8]) -> [u8; 64] {
     let mut out = [0u8; 64];
-    blake3::Hasher::new().update(input).finalize_xof().fill(&mut out);
+    blake3::Hasher::new()
+        .update(input)
+        .finalize_xof()
+        .fill(&mut out);
     out
 }
 
@@ -51,7 +54,9 @@ impl DhtQueryParams {
         let fan_out = if l2nse < 5.0 {
             DHT_K
         } else {
-            (l2nse * 2.0).round().clamp(DHT_K as f64, (DHT_K * 2) as f64) as usize
+            (l2nse * 2.0)
+                .round()
+                .clamp(DHT_K as f64, (DHT_K * 2) as f64) as usize
         };
         Self { hop_limit, fan_out }
     }
@@ -168,12 +173,19 @@ impl DhtStore {
 
     /// Number of distinct keys with non-expired records.
     pub fn key_count(&self) -> usize {
-        self.records.iter().filter(|(_, v)| v.iter().any(|r| !r.is_expired())).count()
+        self.records
+            .iter()
+            .filter(|(_, v)| v.iter().any(|r| !r.is_expired()))
+            .count()
     }
 
     /// Total number of non-expired records across all keys.
     pub fn record_count(&self) -> usize {
-        self.records.values().flat_map(|v| v.iter()).filter(|r| !r.is_expired()).count()
+        self.records
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|r| !r.is_expired())
+            .count()
     }
 
     /// Iterate over all non-expired records.
@@ -233,9 +245,7 @@ impl DhtStore {
         let mut record_count = self.total_record_count();
         let mut byte_count = self.total_bytes();
 
-        while record_count > self.limits.max_records
-            || byte_count > self.limits.max_total_bytes
-        {
+        while record_count > self.limits.max_records || byte_count > self.limits.max_total_bytes {
             let Some((key, idx)) = self.oldest_record_location() else {
                 break;
             };
@@ -796,10 +806,7 @@ pub fn probabilistic_select(
 
 /// Random peer selection for the random-walk phase of R5N-style routing.
 /// Picks up to `k` peers uniformly at random from the full peer set.
-pub fn random_select(
-    peers: &[(PeerId, DhtId)],
-    k: usize,
-) -> Vec<(PeerId, DhtId)> {
+pub fn random_select(peers: &[(PeerId, DhtId)], k: usize) -> Vec<(PeerId, DhtId)> {
     if peers.len() <= k {
         return peers.to_vec();
     }
@@ -829,7 +836,13 @@ pub fn content_address_put(value: &[u8]) -> (DhtId, Vec<u8>) {
 
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let ciphertext = cipher
-        .encrypt((&nonce).into(), Payload { msg: value, aad: b"" })
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: value,
+                aad: b"",
+            },
+        )
         .expect("AEAD encryption should not fail");
 
     // Stored blob: nonce || ciphertext+tag
@@ -852,7 +865,13 @@ pub fn content_address_get(content_hash: &[u8; 64], blob: &[u8]) -> Result<Vec<u
     let enc_key: [u8; 32] = *blake3::hash(content_hash).as_bytes();
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let plaintext = cipher
-        .decrypt(nonce.into(), Payload { msg: ciphertext_with_tag, aad: b"" })
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext_with_tag,
+                aad: b"",
+            },
+        )
         .map_err(|_| crate::types::Error::Crypto("content AEAD decryption failed".into()))?;
 
     // Verify: BLAKE3(plaintext) should equal content_hash

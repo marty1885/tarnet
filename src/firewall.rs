@@ -56,13 +56,7 @@ pub enum Match {
 }
 
 impl Match {
-    fn eval(
-        &self,
-        peer: &PeerId,
-        msg: &WireMessage,
-        state: ConnState,
-        rng: &mut StdRng,
-    ) -> bool {
+    fn eval(&self, peer: &PeerId, msg: &WireMessage, state: ConnState, rng: &mut StdRng) -> bool {
         match self {
             Match::Any => true,
             Match::MsgType(mt) => msg.msg_type == *mt,
@@ -142,16 +136,14 @@ fn proto_category(mt: MessageType) -> ProtoCategory {
         | MessageType::DhtFindClosest
         | MessageType::DhtFindClosestResponse => ProtoCategory::Dht,
 
-        MessageType::TunnelKeyExchange
-        | MessageType::TunnelKeyResponse => ProtoCategory::Tunnel,
+        MessageType::TunnelKeyExchange | MessageType::TunnelKeyResponse => ProtoCategory::Tunnel,
 
         MessageType::ChannelOpen
         | MessageType::ChannelData
         | MessageType::ChannelAck
         | MessageType::ChannelClose => ProtoCategory::Channel,
 
-        MessageType::Data
-        | MessageType::EncryptedData => ProtoCategory::Data,
+        MessageType::Data | MessageType::EncryptedData => ProtoCategory::Data,
 
         MessageType::CircuitCreate
         | MessageType::CircuitCreated

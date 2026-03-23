@@ -229,7 +229,8 @@ impl StateDb {
                 })
             })
             .map_err(sqlite_err)?;
-        let result = rows.collect::<rusqlite::Result<Vec<_>>>()
+        let result = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sqlite_err);
         result
     }
@@ -305,7 +306,8 @@ impl StateDb {
                 })
             })
             .map_err(sqlite_err)?;
-        let result = rows.collect::<rusqlite::Result<Vec<_>>>()
+        let result = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sqlite_err);
         result
     }
@@ -352,7 +354,13 @@ impl StateDb {
 
     // ── Labels (TNS local store) ──
 
-    pub fn label_set(&self, identity: &str, label: &str, records: &[Vec<u8>], publish: bool) -> Result<()> {
+    pub fn label_set(
+        &self,
+        identity: &str,
+        label: &str,
+        records: &[Vec<u8>],
+        publish: bool,
+    ) -> Result<()> {
         let conn = self.lock()?;
         conn.execute_batch("BEGIN").map_err(sqlite_err)?;
         let result = (|| {
@@ -407,7 +415,8 @@ impl StateDb {
         let rows = stmt
             .query_map(params![identity, label], |row| row.get::<_, Vec<u8>>(0))
             .map_err(sqlite_err)?;
-        let records = rows.collect::<rusqlite::Result<Vec<_>>>()
+        let records = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sqlite_err)?;
         Ok(Some((records, publish)))
     }
@@ -441,7 +450,8 @@ impl StateDb {
                 Ok((label, publish != 0, record))
             })
             .map_err(sqlite_err)?;
-        let rows = mapped.collect::<rusqlite::Result<Vec<_>>>()
+        let rows = mapped
+            .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sqlite_err)?;
 
         let mut result: Vec<(String, Vec<Vec<u8>>, bool)> = Vec::new();
@@ -502,7 +512,10 @@ mod tests {
         db.set_metadata("hello_sequence", 7).unwrap();
         db.set_metadata("signed_content_sequence", 11).unwrap();
         assert_eq!(db.get_metadata("hello_sequence").unwrap(), Some(7));
-        assert_eq!(db.get_metadata("signed_content_sequence").unwrap(), Some(11));
+        assert_eq!(
+            db.get_metadata("signed_content_sequence").unwrap(),
+            Some(11)
+        );
 
         // Identity
         let id = PersistedIdentity {
@@ -540,7 +553,8 @@ mod tests {
 
         // Labels
         let zone_rec = vec![1u8, 0x42, 0x42, 0x42]; // dummy record blob
-        db.label_set("", "alice", &[zone_rec.clone()], false).unwrap();
+        db.label_set("", "alice", &[zone_rec.clone()], false)
+            .unwrap();
         let result = db.label_get("", "alice").unwrap();
         assert!(result.is_some());
         let (blobs, publish) = result.unwrap();
@@ -629,7 +643,7 @@ mod tests {
 
     #[test]
     fn persisted_record_signature_verifies() {
-        use crate::identity::{self, Keypair, peer_id_from_signing_pubkey};
+        use crate::identity::{self, peer_id_from_signing_pubkey, Keypair};
         use crate::wire::DhtPutMsg;
         use tarnet_api::types::SigningAlgo;
 
@@ -656,7 +670,12 @@ mod tests {
         put.signature = kp.sign(&put.signable_bytes());
 
         let algo = SigningAlgo::from_u8(put.signer_algo).unwrap();
-        assert!(identity::verify(algo, &put.signer_pubkey, &put.signable_bytes(), &put.signature));
+        assert!(identity::verify(
+            algo,
+            &put.signer_pubkey,
+            &put.signable_bytes(),
+            &put.signature
+        ));
 
         let record = DhtRecord {
             key: crate::types::DhtId(key),

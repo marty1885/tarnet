@@ -1,21 +1,35 @@
 use super::*;
 
-fn listener_matches(listener: &Listener, service_id: tarnet_api::types::ServiceId, port: u16) -> bool {
-    (listener.port == 0 || listener.port == port)
+const ANY_PORT: &str = "*";
+
+fn port_matches(listener_port: &str, port: &str) -> bool {
+    listener_port == ANY_PORT || listener_port == port
+}
+
+fn listener_matches(
+    listener: &Listener,
+    service_id: tarnet_api::types::ServiceId,
+    mode: tarnet_api::service::PortMode,
+    port: &str,
+) -> bool {
+    listener.mode == mode
+        && port_matches(&listener.port, port)
         && (listener.service_id.is_all() || listener.service_id == service_id)
 }
 
 fn listeners_overlap(a: &Listener, b: &Listener) -> bool {
-    let port_overlap = a.port == 0 || b.port == 0 || a.port == b.port;
-    let service_overlap = a.service_id.is_all() || b.service_id.is_all() || a.service_id == b.service_id;
-    port_overlap && service_overlap
+    let port_overlap = port_matches(&a.port, &b.port) || port_matches(&b.port, &a.port);
+    let service_overlap =
+        a.service_id.is_all() || b.service_id.is_all() || a.service_id == b.service_id;
+    a.mode == b.mode && port_overlap && service_overlap
 }
 
 impl Node {
     pub async fn connect_via_rendezvous(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         intro_points: &[(PeerId, u8, Vec<u8>)],
     ) -> Result<tarnet_api::service::Connection> {
         let connected = self.connected_peers().await;
@@ -31,7 +45,9 @@ impl Node {
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
 
         // Build circuit to rendezvous point
-        let rend_circuit_id = self.build_circuit(rendezvous_peer, vec![rendezvous_peer]).await?;
+        let rend_circuit_id = self
+            .build_circuit(rendezvous_peer, vec![rendezvous_peer])
+            .await?;
 
         // Send RendezvousEstablish(cookie)
         let establish_cell = RelayCell {
@@ -83,6 +99,7 @@ impl Node {
             data: build_introduce_payload(
                 &rendezvous_peer,
                 &cookie,
+                mode,
                 port,
                 &kem_ciphertext,
                 &shared_secret,
@@ -132,13 +149,15 @@ impl Node {
         let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);
         let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
 
-        self.endpoints.data_txs
+        self.endpoints
+            .data_txs
             .lock()
             .await
             .insert(rend_circuit_id, circuit_tx);
 
         let rend_sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuits.sendme_notify
+        self.circuits
+            .sendme_notify
             .lock()
             .await
             .insert(rend_circuit_id, rend_sendme_notify.clone());
@@ -195,7 +214,8 @@ impl Node {
 
         let conn = tarnet_api::service::Connection::new(
             service_id,
-            port,
+            mode,
+            port.to_string(),
             rend_circuit_id,
             app_tx,
             app_rx,
@@ -208,14 +228,16 @@ impl Node {
     pub async fn circuit_listen(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         options: ListenerOptions,
     ) -> Result<Listener> {
         let mut listeners = self.listeners.lock().await;
         let pending = Listener {
             id: 0,
             service_id,
-            port,
+            mode,
+            port: port.to_string(),
             options,
         };
 
@@ -239,14 +261,15 @@ impl Node {
         let listener = Listener {
             id: listener_id,
             service_id,
-            port,
+            mode,
+            port: port.to_string(),
             options,
         };
         let (tx, rx) = mpsc::channel(64);
         listeners.insert(
             listener_id,
             Arc::new(ListenerState {
-                listener,
+                listener: listener.clone(),
                 tx: Mutex::new(Some(tx)),
                 rx: Mutex::new(rx),
             }),
@@ -285,25 +308,27 @@ impl Node {
     pub(super) async fn has_matching_listener(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
     ) -> bool {
         let listeners = self.listeners.lock().await;
         listeners
             .values()
-            .any(|listener| listener_matches(&listener.listener, service_id, port))
+            .any(|listener| listener_matches(&listener.listener, service_id, mode, port))
     }
 
     pub(super) async fn dispatch_incoming_connection(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         conn: Connection,
     ) -> ListenerDispatch {
         let listeners = {
             let listeners = self.listeners.lock().await;
             let mut matches: Vec<_> = listeners
                 .values()
-                .filter(|listener| listener_matches(&listener.listener, service_id, port))
+                .filter(|listener| listener_matches(&listener.listener, service_id, mode, port))
                 .cloned()
                 .collect();
             matches.sort_by_key(|listener| listener.listener.id);
@@ -338,7 +363,9 @@ impl Node {
     ) -> Result<()> {
         let connected = self.connected_peers().await;
         if connected.is_empty() {
-            return Err(Error::Protocol("no connected peers for intro points".into()));
+            return Err(Error::Protocol(
+                "no connected peers for intro points".into(),
+            ));
         }
 
         let count = num_intro_points.min(connected.len());
@@ -374,7 +401,8 @@ impl Node {
 
             // Wait for IntroRegistered
             let (tx, rx) = oneshot::channel();
-            self.circuits.pending_extends
+            self.circuits
+                .pending_extends
                 .lock()
                 .await
                 .insert(circuit_id, tx);
@@ -399,7 +427,8 @@ impl Node {
         }
 
         // Store intro circuits for later use
-        self.hidden.intros
+        self.hidden
+            .intros
             .lock()
             .await
             .insert(service_id, intro_circuits);
@@ -411,7 +440,8 @@ impl Node {
                 Some(kp) => crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap(),
                 None => {
                     // Fallback to node identity if service keypair not found
-                    crate::identity::Keypair::from_full_bytes(&self.identity.to_full_bytes()).unwrap()
+                    crate::identity::Keypair::from_full_bytes(&self.identity.to_full_bytes())
+                        .unwrap()
                 }
             }
         };
@@ -578,9 +608,13 @@ impl Node {
                 }
             }
 
-            match self.publish_hidden_service(sid, desired_intros as usize).await {
+            match self
+                .publish_hidden_service(sid, desired_intros as usize)
+                .await
+            {
                 Ok(()) => {
-                    self.hidden.last_publish
+                    self.hidden
+                        .last_publish
                         .lock()
                         .await
                         .insert(sid, Instant::now());
@@ -594,11 +628,7 @@ impl Node {
     }
 
     /// Handle an INTRODUCE message arriving at the service (forwarded by intro point).
-    pub(super) async fn handle_introduce_at_service(
-        &self,
-        _intro_circuit_id: u32,
-        payload: &[u8],
-    ) {
+    pub(super) async fn handle_introduce_at_service(&self, _intro_circuit_id: u32, payload: &[u8]) {
         // Decrypt the INTRODUCE payload using our service KEM keypair.
         // The client encrypted it to our KEM public key so the intro point can't read it.
         let service_keypair = {
@@ -606,11 +636,12 @@ impl Node {
             let sid = is.default_service_id();
             match is.keypair_for(&sid) {
                 Some(kp) => crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap(),
-                None => crate::identity::Keypair::from_full_bytes(&self.identity.to_full_bytes()).unwrap(),
+                None => crate::identity::Keypair::from_full_bytes(&self.identity.to_full_bytes())
+                    .unwrap(),
             }
         };
 
-        let (rendezvous_peer, cookie, port, shared_secret) =
+        let (rendezvous_peer, cookie, mode, port, shared_secret) =
             match parse_introduce_payload(payload, &service_keypair.identity.kem) {
                 Ok(v) => v,
                 Err(e) => {
@@ -625,7 +656,10 @@ impl Node {
         );
 
         // Build a circuit to the rendezvous peer
-        let circuit_id = match self.build_circuit(rendezvous_peer, vec![rendezvous_peer]).await {
+        let circuit_id = match self
+            .build_circuit(rendezvous_peer, vec![rendezvous_peer])
+            .await
+        {
             Ok(id) => id,
             Err(e) => {
                 log::debug!("Failed to build circuit to rendezvous: {}", e);
@@ -663,8 +697,7 @@ impl Node {
         // Now add e2e HopKey and replace all hop keys with only the e2e key.
         // The rendezvous point bridges the two circuits at the cell level
         // (Forward with no crypto), so circuit-level encryption must be removed.
-        let e2e_hop =
-            crate::circuit::HopKey::from_shared_secret_responder(&shared_secret);
+        let e2e_hop = crate::circuit::HopKey::from_shared_secret_responder(&shared_secret);
         {
             let mut circuits = self.circuits.outbound.lock().await;
             if let Some(circuit) = circuits.get_mut(&circuit_id) {
@@ -681,13 +714,15 @@ impl Node {
         let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);
         let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
 
-        self.endpoints.data_txs
+        self.endpoints
+            .data_txs
             .lock()
             .await
             .insert(circuit_id, circuit_tx);
 
         let svc_sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuits.sendme_notify
+        self.circuits
+            .sendme_notify
             .lock()
             .await
             .insert(circuit_id, svc_sendme_notify.clone());
@@ -744,16 +779,19 @@ impl Node {
 
         let service_id = self.default_service_id().await;
         let conn = tarnet_api::service::Connection::new(
-            service_id,
-            port,
-            circuit_id,
-            app_tx,
-            app_rx,
+            service_id, mode, port, circuit_id, app_tx, app_rx,
         );
-        match self.dispatch_incoming_connection(service_id, port, conn).await {
+        let port_name = conn.port.clone();
+        match self
+            .dispatch_incoming_connection(service_id, mode, &port_name, conn)
+            .await
+        {
             ListenerDispatch::Enqueued => {}
             ListenerDispatch::NoListener => {
-                log::debug!("Dropping hidden-service connection: no listener for {:?}", service_id);
+                log::debug!(
+                    "Dropping hidden-service connection: no listener for {:?}",
+                    service_id
+                );
             }
             ListenerDispatch::QueueFull => {
                 log::warn!(
@@ -769,31 +807,67 @@ impl Node {
 mod tests {
     use super::*;
 
-    fn listener(service_id: tarnet_api::types::ServiceId, port: u16, reuse_port: bool) -> Listener {
+    fn listener(
+        service_id: tarnet_api::types::ServiceId,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
+        reuse_port: bool,
+    ) -> Listener {
         Listener {
             id: 1,
             service_id,
-            port,
+            mode,
+            port: port.to_string(),
             options: ListenerOptions { reuse_port },
         }
     }
 
     #[test]
     fn listener_matching_and_overlap_follow_wildcards() {
-        let exact = listener(tarnet_api::types::ServiceId::LOCAL, 80, false);
-        let any_port = listener(tarnet_api::types::ServiceId::LOCAL, 0, false);
-        let any_service = listener(tarnet_api::types::ServiceId::ALL, 80, false);
+        let mode = tarnet_api::service::PortMode::ReliableOrdered;
+        let exact = listener(tarnet_api::types::ServiceId::LOCAL, mode, "80", false);
+        let any_port = listener(tarnet_api::types::ServiceId::LOCAL, mode, ANY_PORT, false);
+        let any_service = listener(tarnet_api::types::ServiceId::ALL, mode, "80", false);
 
-        assert!(listener_matches(&exact, tarnet_api::types::ServiceId::LOCAL, 80));
-        assert!(!listener_matches(&exact, tarnet_api::types::ServiceId::LOCAL, 81));
-        assert!(listener_matches(&any_port, tarnet_api::types::ServiceId::LOCAL, 81));
-        assert!(listener_matches(&any_service, tarnet_api::types::ServiceId::LOCAL, 80));
+        assert!(listener_matches(
+            &exact,
+            tarnet_api::types::ServiceId::LOCAL,
+            mode,
+            "80"
+        ));
+        assert!(!listener_matches(
+            &exact,
+            tarnet_api::types::ServiceId::LOCAL,
+            mode,
+            "81"
+        ));
+        assert!(listener_matches(
+            &any_port,
+            tarnet_api::types::ServiceId::LOCAL,
+            mode,
+            "81"
+        ));
+        assert!(listener_matches(
+            &any_service,
+            tarnet_api::types::ServiceId::LOCAL,
+            mode,
+            "80"
+        ));
 
         assert!(listeners_overlap(&exact, &any_port));
         assert!(listeners_overlap(&exact, &any_service));
         assert!(!listeners_overlap(
             &exact,
-            &listener(tarnet_api::types::ServiceId::LOCAL, 81, false)
+            &listener(tarnet_api::types::ServiceId::LOCAL, mode, "81", false)
+        ));
+        assert!(!listeners_overlap(
+            &exact,
+            &listener(
+                tarnet_api::types::ServiceId::LOCAL,
+                tarnet_api::service::PortMode::UnreliableUnordered,
+                "80",
+                false,
+            )
         ));
     }
 }

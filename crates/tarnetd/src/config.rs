@@ -263,13 +263,8 @@ pub fn resolve(
         .unwrap_or_else(|| tarnet_api::ipc::services_dir_for(config_dir));
 
     // If --stun was given, override both tcp and webrtc stun lists
-    let tcp_stun = cli
-        .stun
-        .clone()
-        .unwrap_or(config.transport.tcp.stun);
-    let webrtc_stun = cli
-        .stun
-        .unwrap_or(config.transport.webrtc.stun);
+    let tcp_stun = cli.stun.clone().unwrap_or(config.transport.tcp.stun);
+    let webrtc_stun = cli.stun.unwrap_or(config.transport.webrtc.stun);
 
     let tcp_advertise = cli.advertise_tcp
         || cli.public_addr.is_some()
@@ -286,14 +281,18 @@ pub fn resolve(
     let max_outbound = cli.max_outbound.unwrap_or(config.core.max_outbound);
 
     let upload_limit = tarnet::bandwidth::parse_bandwidth(
-        cli.upload_limit.as_deref().unwrap_or(&config.core.upload_limit),
+        cli.upload_limit
+            .as_deref()
+            .unwrap_or(&config.core.upload_limit),
     )
     .unwrap_or_else(|e| {
         eprintln!("Invalid upload_limit: {}", e);
         std::process::exit(1);
     });
     let download_limit = tarnet::bandwidth::parse_bandwidth(
-        cli.download_limit.as_deref().unwrap_or(&config.core.download_limit),
+        cli.download_limit
+            .as_deref()
+            .unwrap_or(&config.core.download_limit),
     )
     .unwrap_or_else(|e| {
         eprintln!("Invalid download_limit: {}", e);

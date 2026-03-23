@@ -35,10 +35,7 @@ pub async fn server_handshake(stream: &mut TcpStream) -> io::Result<ConnectReque
     // --- Auth negotiation ---
     let ver = stream.read_u8().await?;
     if ver != 0x05 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not SOCKS5",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "not SOCKS5"));
     }
 
     let nmethods = stream.read_u8().await?;
@@ -70,9 +67,16 @@ pub async fn server_handshake(stream: &mut TcpStream) -> io::Result<ConnectReque
         stream.write_all(&[0x01, 0x00]).await?;
 
         let label = String::from_utf8(username).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 in identity label")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid UTF-8 in identity label",
+            )
         })?;
-        if label.is_empty() { None } else { Some(label) }
+        if label.is_empty() {
+            None
+        } else {
+            Some(label)
+        }
     } else if methods.contains(&AUTH_NO_AUTH) {
         // No-auth.
         stream.write_all(&[0x05, AUTH_NO_AUTH]).await?;
@@ -113,9 +117,8 @@ pub async fn server_handshake(stream: &mut TcpStream) -> io::Result<ConnectReque
             let len = stream.read_u8().await? as usize;
             let mut buf = vec![0u8; len];
             stream.read_exact(&mut buf).await?;
-            String::from_utf8(buf).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "invalid domain name")
-            })?
+            String::from_utf8(buf)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid domain name"))?
         }
         0x01 => {
             // IPv4 — convert to dotted-decimal string
@@ -134,7 +137,11 @@ pub async fn server_handshake(stream: &mut TcpStream) -> io::Result<ConnectReque
 
     let port = stream.read_u16().await?;
 
-    Ok(ConnectRequest { hostname, port, identity })
+    Ok(ConnectRequest {
+        hostname,
+        port,
+        identity,
+    })
 }
 
 /// Send a SOCKS5 reply.

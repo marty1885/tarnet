@@ -2,7 +2,11 @@ use super::*;
 
 impl Node {
     /// Handle incoming TunnelKeyExchange — routed to us as destination.
-    pub(super) async fn handle_tunnel_key_exchange(&self, _from: PeerId, payload: &[u8]) -> Result<()> {
+    pub(super) async fn handle_tunnel_key_exchange(
+        &self,
+        _from: PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
         let ke = TunnelKeyExchangeMsg::from_bytes(payload)?;
 
         // Check timestamp drift
@@ -83,7 +87,11 @@ impl Node {
     }
 
     /// Handle incoming TunnelKeyResponse — completes a key exchange we initiated.
-    pub(super) async fn handle_tunnel_key_response(&self, _from: PeerId, payload: &[u8]) -> Result<()> {
+    pub(super) async fn handle_tunnel_key_response(
+        &self,
+        _from: PeerId,
+        payload: &[u8],
+    ) -> Result<()> {
         let kr = TunnelKeyResponseMsg::from_bytes(payload)?;
 
         // Look up pending exchange by our initiator nonce
@@ -165,7 +173,8 @@ impl Node {
                 .map(|r| r.next_hop)
                 .ok_or(Error::NotFound)?
         };
-        self.send_to_peer(&next_hop, &msg.to_wire_encrypted().encode()).await
+        self.send_to_peer(&next_hop, &msg.to_wire_encrypted().encode())
+            .await
     }
 
     async fn handle_channel_message(&self, from: PeerId, msg: WireMessage) -> Result<()> {
@@ -181,7 +190,11 @@ impl Node {
                 let listeners = self.channel_state.port_listeners.lock().await;
                 if let Some(listener_tx) = listeners.get(&open.port) {
                     let (data_tx, data_rx) = mpsc::unbounded_channel();
-                    self.channel_state.data_handlers.lock().await.insert(open.channel_id, data_tx);
+                    self.channel_state
+                        .data_handlers
+                        .lock()
+                        .await
+                        .insert(open.channel_id, data_tx);
                     let _ = listener_tx.send((from, open.channel_id, data_rx));
                 }
             }
@@ -244,7 +257,11 @@ impl Node {
             MessageType::ChannelClose => {
                 let close = ChannelCloseMsg::from_bytes(&msg.payload)?;
                 channels.remove(&close.channel_id);
-                self.channel_state.data_handlers.lock().await.remove(&close.channel_id);
+                self.channel_state
+                    .data_handlers
+                    .lock()
+                    .await
+                    .remove(&close.channel_id);
                 log::debug!("Channel {} closed by {:?}", close.channel_id, from);
             }
             _ => {}
@@ -449,7 +466,8 @@ impl Node {
             ttl: 64,
             data: encrypted,
         };
-        self.route_message(dest, &msg.to_wire_encrypted().encode()).await
+        self.route_message(dest, &msg.to_wire_encrypted().encode())
+            .await
     }
 
     // ── Channel-based reliable data exchange ──
@@ -470,7 +488,8 @@ impl Node {
         let ch = Channel::new(channel_id, port, reliable, ordered);
 
         // Register locally
-        self.channel_state.channels
+        self.channel_state
+            .channels
             .lock()
             .await
             .insert(channel_id, (*dest, ch));
@@ -499,7 +518,8 @@ impl Node {
         let channel_id: u32 = rand::thread_rng().gen();
         let ch = Channel::new(channel_id, port, reliable, ordered);
 
-        self.channel_state.channels
+        self.channel_state
+            .channels
             .lock()
             .await
             .insert(channel_id, (*dest, ch));
@@ -525,9 +545,15 @@ impl Node {
         reliable: bool,
         ordered: bool,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
-        let channel_id = self.channel_open(dest, port_name, reliable, ordered).await?;
+        let channel_id = self
+            .channel_open(dest, port_name, reliable, ordered)
+            .await?;
         let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.channel_state.data_handlers.lock().await.insert(channel_id, data_tx);
+        self.channel_state
+            .data_handlers
+            .lock()
+            .await
+            .insert(channel_id, data_tx);
         Ok((channel_id, data_rx))
     }
 
@@ -539,9 +565,15 @@ impl Node {
         reliable: bool,
         ordered: bool,
     ) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>)> {
-        let channel_id = self.channel_open_port(dest, port, reliable, ordered).await?;
+        let channel_id = self
+            .channel_open_port(dest, port, reliable, ordered)
+            .await?;
         let (data_tx, data_rx) = mpsc::unbounded_channel();
-        self.channel_state.data_handlers.lock().await.insert(channel_id, data_tx);
+        self.channel_state
+            .data_handlers
+            .lock()
+            .await
+            .insert(channel_id, data_tx);
         Ok((channel_id, data_rx))
     }
 

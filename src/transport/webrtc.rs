@@ -59,13 +59,12 @@ impl Transport for WebRtcTransport {
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
         let mut rx = self.rx.lock().await;
-        let data = rx
-            .recv()
-            .await
-            .ok_or_else(|| Error::Io(std::io::Error::new(
+        let data = rx.recv().await.ok_or_else(|| {
+            Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "data channel closed",
-            )))?;
+            ))
+        })?;
         if data.len() > buf.len() {
             return Err(Error::Wire(format!(
                 "message {} bytes exceeds buffer {}",
@@ -95,7 +94,8 @@ pub struct WebRtcConnector {
     api: API,
     config: RTCConfiguration,
     /// Pending connections: peer_id → (RTCPeerConnection, completion sender)
-    pending: Arc<Mutex<HashMap<PeerId, (Arc<RTCPeerConnection>, oneshot::Sender<WebRtcTransport>)>>>,
+    pending:
+        Arc<Mutex<HashMap<PeerId, (Arc<RTCPeerConnection>, oneshot::Sender<WebRtcTransport>)>>>,
 }
 
 impl WebRtcConnector {
@@ -110,9 +110,9 @@ impl WebRtcConnector {
         // so candidates arrive slower than in a direct browser-to-browser scenario.
         let mut setting_engine = SettingEngine::default();
         setting_engine.set_ice_timeouts(
-            Some(Duration::from_secs(15)),  // disconnected_timeout (default 5s)
-            Some(Duration::from_secs(30)),  // failed_timeout (default 25s)
-            Some(Duration::from_secs(5)),   // keep_alive_interval (default 2s)
+            Some(Duration::from_secs(15)), // disconnected_timeout (default 5s)
+            Some(Duration::from_secs(30)), // failed_timeout (default 25s)
+            Some(Duration::from_secs(5)),  // keep_alive_interval (default 2s)
         );
         setting_engine.set_host_acceptance_min_wait(Some(Duration::from_secs(3)));
         setting_engine.set_srflx_acceptance_min_wait(Some(Duration::from_secs(3)));
@@ -143,7 +143,11 @@ impl WebRtcConnector {
     pub async fn initiate(
         &self,
         peer_id: PeerId,
-    ) -> Result<(String, oneshot::Receiver<WebRtcTransport>, mpsc::UnboundedReceiver<String>)> {
+    ) -> Result<(
+        String,
+        oneshot::Receiver<WebRtcTransport>,
+        mpsc::UnboundedReceiver<String>,
+    )> {
         let pc = Arc::new(
             self.api
                 .new_peer_connection(self.config.clone())
@@ -230,7 +234,11 @@ impl WebRtcConnector {
         &self,
         peer_id: PeerId,
         sdp_offer: &str,
-    ) -> Result<(String, oneshot::Receiver<WebRtcTransport>, mpsc::UnboundedReceiver<String>)> {
+    ) -> Result<(
+        String,
+        oneshot::Receiver<WebRtcTransport>,
+        mpsc::UnboundedReceiver<String>,
+    )> {
         let pc = Arc::new(
             self.api
                 .new_peer_connection(self.config.clone())
@@ -282,8 +290,7 @@ impl WebRtcConnector {
                     Box::pin(async move {
                         let mut p = pending.lock().await;
                         if let Some((_, tx)) = p.remove(&pid2) {
-                            let transport =
-                                WebRtcTransport::new(dc_for_open, msg_rx, pc_clone);
+                            let transport = WebRtcTransport::new(dc_for_open, msg_rx, pc_clone);
                             let _ = tx.send(transport);
                         }
                     })
@@ -316,9 +323,9 @@ impl WebRtcConnector {
     /// Handle an incoming SDP answer for a pending outbound connection.
     pub async fn handle_answer(&self, peer_id: PeerId, sdp_answer: &str) -> Result<()> {
         let pending = self.pending.lock().await;
-        let (pc, _) = pending
-            .get(&peer_id)
-            .ok_or_else(|| Error::Protocol(format!("no pending WebRTC connection to {:?}", peer_id)))?;
+        let (pc, _) = pending.get(&peer_id).ok_or_else(|| {
+            Error::Protocol(format!("no pending WebRTC connection to {:?}", peer_id))
+        })?;
 
         let answer = RTCSessionDescription::answer(sdp_answer.to_string())
             .map_err(|e| Error::Protocol(format!("WebRTC parse answer: {}", e)))?;
@@ -394,13 +401,13 @@ impl WebRtcConnector {
             .map_err(|e| Error::Protocol(format!("WebRTC set_local_description: {}", e)))?;
 
         // Wait for gathering (with timeout)
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            gathering_done.recv(),
-        ).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(10), gathering_done.recv()).await;
 
         // Read back the local description which now includes all candidates
-        let local_desc = pc.local_description().await
+        let local_desc = pc
+            .local_description()
+            .await
             .ok_or_else(|| Error::Protocol("no local description after gathering".into()))?;
 
         self.pending.lock().await.insert(peer_id, (pc, tx));
@@ -450,8 +457,7 @@ impl WebRtcConnector {
                     Box::pin(async move {
                         let mut p = pending.lock().await;
                         if let Some((_, tx)) = p.remove(&pid2) {
-                            let transport =
-                                WebRtcTransport::new(dc_for_open, msg_rx, pc_clone);
+                            let transport = WebRtcTransport::new(dc_for_open, msg_rx, pc_clone);
                             let _ = tx.send(transport);
                         }
                     })
@@ -474,12 +480,12 @@ impl WebRtcConnector {
             .await
             .map_err(|e| Error::Protocol(format!("WebRTC set_local_description: {}", e)))?;
 
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            gathering_done.recv(),
-        ).await;
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(10), gathering_done.recv()).await;
 
-        let local_desc = pc.local_description().await
+        let local_desc = pc
+            .local_description()
+            .await
             .ok_or_else(|| Error::Protocol("no local description after gathering".into()))?;
 
         self.pending.lock().await.insert(peer_id, (pc, tx));
@@ -493,7 +499,10 @@ impl WebRtcConnector {
         let (pc, _) = match pending.get(&peer_id) {
             Some(entry) => entry,
             None => {
-                log::debug!("Ignoring stale ICE candidate from {:?} (no pending connection)", peer_id);
+                log::debug!(
+                    "Ignoring stale ICE candidate from {:?} (no pending connection)",
+                    peer_id
+                );
                 return Ok(());
             }
         };

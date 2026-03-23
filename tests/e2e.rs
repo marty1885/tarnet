@@ -7,20 +7,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tarnet::dht::DhtStore;
+use tarnet::firewall::{Action, Firewall, Match};
 use tarnet::identity::{self, Keypair};
 use tarnet::node::{ChannelEvent, Node};
-use tarnet::firewall::{Action, Firewall, Match};
 use tarnet::transport::firewall::{FirewallDiscovery, FirewallPolicy};
 use tarnet::transport::tcp::TcpDiscovery;
 use tarnet::types::RecordType;
 use tarnet::wire::*;
-use tarnet_api::service::ListenerOptions;
+use tarnet_api::service::{ListenerOptions, PortMode};
 use tarnet_api::types::{IdentityScheme, PrivacyLevel, ServiceId};
 
 // ── Test helpers ──
 
 fn init_log() {
     let _ = env_logger::builder().is_test(true).try_init();
+}
+
+const TEST_MODE: PortMode = PortMode::ReliableOrdered;
+
+fn port_seed(port: &str) -> u64 {
+    port.parse().expect("test port should be numeric")
 }
 
 struct TestNode {
@@ -62,7 +68,12 @@ async fn spawn_chain(count: usize) -> Vec<TestNode> {
             async move { a.connected_peers().await.contains(&pid_b) }
         })
         .await;
-        assert!(connected, "node {} should be connected to node {}", i, i + 1);
+        assert!(
+            connected,
+            "node {} should be connected to node {}",
+            i,
+            i + 1
+        );
     }
     nodes
 }
@@ -111,7 +122,7 @@ async fn baseline_circuit_connect() {
     tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok() });
     tokio::time::sleep(Duration::from_millis(50)).await;
     let listener_b = node_b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
     let nb2 = node_b.clone();
@@ -125,16 +136,23 @@ async fn baseline_circuit_connect() {
 
     let conn_a = tokio::time::timeout(
         Duration::from_secs(5),
-        node_a.circuit_connect(service_id_b, 80, Some(pid_b), None),
+        node_a.circuit_connect(service_id_b, TEST_MODE, "80", Some(pid_b), None),
     )
-    .await.unwrap().unwrap();
-    assert_eq!(conn_a.port, 80);
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(conn_a.port, "80");
 
     let conn_b = tokio::time::timeout(Duration::from_secs(5), accept_handle)
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
 
     conn_a.send(b"test").await.unwrap();
-    let data = tokio::time::timeout(Duration::from_secs(5), conn_b.recv()).await.unwrap().unwrap();
+    let data = tokio::time::timeout(Duration::from_secs(5), conn_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(data, b"test");
 }
 
@@ -157,18 +175,33 @@ async fn identity_create_and_connect() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Create identities on B and verify
-    let sid_web = node_b.create_identity("web", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
-    let sid_ssh = node_b.create_identity("ssh", PrivacyLevel::Hidden { intro_points: 3 }, 2, IdentityScheme::DEFAULT).await.unwrap();
+    let sid_web = node_b
+        .create_identity("web", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+        .await
+        .unwrap();
+    let sid_ssh = node_b
+        .create_identity(
+            "ssh",
+            PrivacyLevel::Hidden { intro_points: 3 },
+            2,
+            IdentityScheme::DEFAULT,
+        )
+        .await
+        .unwrap();
     let identities = node_b.list_identities().await;
     assert!(identities.len() >= 3); // default + web + ssh
-    assert!(identities.iter().any(|(l, s, _, _, _, _, _)| l == "web" && *s == sid_web));
-    assert!(identities.iter().any(|(l, _, p, h, _, _, _)| l == "ssh" && *p == PrivacyLevel::Hidden { intro_points: 3 } && *h == 2));
+    assert!(identities
+        .iter()
+        .any(|(l, s, _, _, _, _, _)| l == "web" && *s == sid_web));
+    assert!(identities.iter().any(|(l, _, p, h, _, _, _)| l == "ssh"
+        && *p == PrivacyLevel::Hidden { intro_points: 3 }
+        && *h == 2));
     assert_ne!(sid_web, sid_ssh);
     // ServiceId is hash-based; no verify() method needed
 
     let service_id_b = node_b.default_service_id().await;
     let listener_b = node_b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -184,19 +217,23 @@ async fn identity_create_and_connect() {
 
     let conn_a = tokio::time::timeout(
         Duration::from_secs(5),
-        node_a.circuit_connect(service_id_b, 80, Some(pid_b), None),
+        node_a.circuit_connect(service_id_b, TEST_MODE, "80", Some(pid_b), None),
     )
     .await
     .expect("connect timed out")
     .expect("connect failed");
 
     let conn_b = tokio::time::timeout(Duration::from_secs(5), accept_handle)
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
 
     // Bidirectional data
     conn_a.send(b"hello from A").await.unwrap();
     let data = tokio::time::timeout(Duration::from_secs(5), conn_b.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(data, b"hello from A");
 
     // NOTE: backward data path (B→A) has a known issue when create_identity
@@ -213,7 +250,7 @@ async fn identity_connect_refused() {
 
     let default_sid = b.default_service_id().await;
     let listener_b = b
-        .circuit_listen(default_sid, 80, ListenerOptions::default())
+        .circuit_listen(default_sid, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -224,7 +261,7 @@ async fn identity_connect_refused() {
     let fake_sid = ServiceId::from_signing_pubkey(&[0xAA; 32]);
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        a.circuit_connect(fake_sid, 80, Some(b.peer_id()), None),
+        a.circuit_connect(fake_sid, TEST_MODE, "80", Some(b.peer_id()), None),
     )
     .await;
 
@@ -242,15 +279,21 @@ async fn multiple_identities_same_node() {
     let nodes = spawn_chain(2).await;
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
-    let sid_web = b.create_identity("web", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
-    let sid_ssh = b.create_identity("ssh", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
+    let sid_web = b
+        .create_identity("web", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+        .await
+        .unwrap();
+    let sid_ssh = b
+        .create_identity("ssh", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+        .await
+        .unwrap();
 
     let listener_web = b
-        .circuit_listen(sid_web, 80, ListenerOptions::default())
+        .circuit_listen(sid_web, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
     let listener_ssh = b
-        .circuit_listen(sid_ssh, 22, ListenerOptions::default())
+        .circuit_listen(sid_ssh, TEST_MODE, "22", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -261,7 +304,7 @@ async fn multiple_identities_same_node() {
 
     let conn_web = tokio::time::timeout(
         Duration::from_secs(10),
-        a.circuit_connect(sid_web, 80, Some(b.peer_id()), None),
+        a.circuit_connect(sid_web, TEST_MODE, "80", Some(b.peer_id()), None),
     )
     .await
     .unwrap()
@@ -270,15 +313,19 @@ async fn multiple_identities_same_node() {
 
     let conn_ssh = tokio::time::timeout(
         Duration::from_secs(10),
-        a.circuit_connect(sid_ssh, 22, Some(b.peer_id()), None),
+        a.circuit_connect(sid_ssh, TEST_MODE, "22", Some(b.peer_id()), None),
     )
     .await
     .unwrap()
     .unwrap();
     assert_eq!(conn_ssh.remote_service_id, sid_ssh);
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), accept1).await.unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(5), accept2).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), accept1)
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), accept2)
+        .await
+        .unwrap();
 }
 
 /// Wildcard listener (ServiceId::ALL) accepts connections to any identity.
@@ -289,7 +336,7 @@ async fn wildcard_listener() {
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
     let listener_b = b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -299,14 +346,16 @@ async fn wildcard_listener() {
     let default_sid = b.default_service_id().await;
     let conn = tokio::time::timeout(
         Duration::from_secs(10),
-        a.circuit_connect(default_sid, 80, Some(b.peer_id()), None),
+        a.circuit_connect(default_sid, TEST_MODE, "80", Some(b.peer_id()), None),
     )
     .await
     .unwrap()
     .unwrap();
 
-    assert_eq!(conn.port, 80);
-    let _ = tokio::time::timeout(Duration::from_secs(5), accept).await.unwrap();
+    assert_eq!(conn.port, "80");
+    let _ = tokio::time::timeout(Duration::from_secs(5), accept)
+        .await
+        .unwrap();
 }
 
 /// Data larger than a single relay cell must not be silently truncated.
@@ -322,7 +371,7 @@ async fn large_message_not_truncated() {
 
     let sid = b.default_service_id().await;
     let listener_b = b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -331,12 +380,16 @@ async fn large_message_not_truncated() {
 
     let conn_a = tokio::time::timeout(
         Duration::from_secs(10),
-        a.circuit_connect(sid, 80, Some(b.peer_id()), None),
+        a.circuit_connect(sid, TEST_MODE, "80", Some(b.peer_id()), None),
     )
-    .await.unwrap().unwrap();
+    .await
+    .unwrap()
+    .unwrap();
 
     let conn_b = tokio::time::timeout(Duration::from_secs(5), accept)
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
 
     // Send ~7KB in one call — bigger than CELL_PAYLOAD_MAX (~1379 bytes).
     // This is a typical HTTP response size (headers + body).
@@ -373,9 +426,12 @@ async fn public_identity_explicit_listener() {
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
     // Create a public identity on B and register a listener explicitly.
-    let sid = b.create_identity("blog", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT).await.unwrap();
+    let sid = b
+        .create_identity("blog", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
+        .await
+        .unwrap();
     let listener_b = b
-        .circuit_listen(sid, 80, ListenerOptions::default())
+        .circuit_listen(sid, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -385,7 +441,7 @@ async fn public_identity_explicit_listener() {
     // A connects on port 80 — the explicit listener must accept it.
     let conn_a = tokio::time::timeout(
         Duration::from_secs(10),
-        a.circuit_connect(sid, 80, Some(b.peer_id()), None),
+        a.circuit_connect(sid, TEST_MODE, "80", Some(b.peer_id()), None),
     )
     .await
     .expect("connect timed out")
@@ -394,12 +450,16 @@ async fn public_identity_explicit_listener() {
     assert_eq!(conn_a.remote_service_id, sid);
 
     let conn_b = tokio::time::timeout(Duration::from_secs(5), accept)
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
 
     // Verify data flows
     conn_a.send(b"hello blog").await.unwrap();
     let data = tokio::time::timeout(Duration::from_secs(5), conn_b.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(data, b"hello blog");
 }
 
@@ -625,14 +685,24 @@ fn dht_signature_validation() {
 
     // Bad signature fails verification
     assert!(
-        !identity::verify(kp.identity.signing_algo(), &pubkey, &put.signable_bytes(), &put.signature),
+        !identity::verify(
+            kp.identity.signing_algo(),
+            &pubkey,
+            &put.signable_bytes(),
+            &put.signature
+        ),
         "Garbage signature should fail"
     );
 
     // Valid signature passes
     put.signature = kp.sign(&put.signable_bytes());
     assert!(
-        identity::verify(kp.identity.signing_algo(), &pubkey, &put.signable_bytes(), &put.signature),
+        identity::verify(
+            kp.identity.signing_algo(),
+            &pubkey,
+            &put.signable_bytes(),
+            &put.signature
+        ),
         "Valid signature should pass"
     );
 }
@@ -662,7 +732,12 @@ fn dht_wrong_signer_rejected() {
 
     // Verify against claimed signer (fake_kp) → should fail
     assert!(
-        !identity::verify(fake_kp.identity.signing_algo(), &fake_pubkey, &put.signable_bytes(), &put.signature),
+        !identity::verify(
+            fake_kp.identity.signing_algo(),
+            &fake_pubkey,
+            &put.signable_bytes(),
+            &put.signature
+        ),
         "Signature from wrong key should fail verification against claimed signer"
     );
 }
@@ -820,7 +895,10 @@ fn dht_signed_content_multi_signer() {
 
     let records = store.get(&key);
     assert_eq!(records.len(), 2, "Still two signers");
-    let a_record = records.iter().find(|r| r.signer == *kp_a.peer_id().as_bytes()).unwrap();
+    let a_record = records
+        .iter()
+        .find(|r| r.signer == *kp_a.peer_id().as_bytes())
+        .unwrap();
     assert_eq!(a_record.sequence, 2, "Signer A's record should be updated");
 }
 
@@ -877,7 +955,7 @@ async fn dht_watch_cross_node_notification() {
         "127.0.0.1:9999",
     )
     .unwrap()])
-    .await;
+        .await;
     c.publish_hello().await;
 
     let notified = tokio::time::timeout(Duration::from_secs(5), watch_rx.recv())
@@ -909,13 +987,11 @@ async fn circuit_build_through_relay() {
     );
 
     // Build a 2-hop circuit A → B → C
-    let circuit_id = tokio::time::timeout(
-        Duration::from_secs(5),
-        a.build_circuit(pid_b, vec![pid_c]),
-    )
-    .await
-    .expect("circuit build timed out")
-    .expect("circuit build failed");
+    let circuit_id =
+        tokio::time::timeout(Duration::from_secs(5), a.build_circuit(pid_b, vec![pid_c]))
+            .await
+            .expect("circuit build timed out")
+            .expect("circuit build failed");
 
     assert!(circuit_id > 0);
 
@@ -992,12 +1068,7 @@ async fn cross_algo_circuit_through_relay() {
         KemAlgo::MlkemX25519,
     )
     .await;
-    let c = spawn_node_with_algo(
-        vec![b.addr.clone()],
-        SigningAlgo::Ed25519,
-        KemAlgo::X25519,
-    )
-    .await;
+    let c = spawn_node_with_algo(vec![b.addr.clone()], SigningAlgo::Ed25519, KemAlgo::X25519).await;
 
     // Wait for A to have route to C
     let has_route = wait_for(Duration::from_secs(5), || {
@@ -1011,12 +1082,16 @@ async fn cross_algo_circuit_through_relay() {
         }
     })
     .await;
-    assert!(has_route, "ed25519 node A should have route to ed25519 node C through falcon relay B");
+    assert!(
+        has_route,
+        "ed25519 node A should have route to ed25519 node C through falcon relay B"
+    );
 
     // Build circuit A → B → C
     let circuit_id = tokio::time::timeout(
         Duration::from_secs(5),
-        a.node.build_circuit(b.node.peer_id(), vec![c.node.peer_id()]),
+        a.node
+            .build_circuit(b.node.peer_id(), vec![c.node.peer_id()]),
     )
     .await
     .expect("circuit build timed out")
@@ -1040,19 +1115,15 @@ async fn cross_algo_connect_pq_to_classic() {
         KemAlgo::MlkemX25519,
     )
     .await;
-    let c = spawn_node_with_algo(
-        vec![b.addr.clone()],
-        SigningAlgo::Ed25519,
-        KemAlgo::X25519,
-    )
-    .await;
+    let c = spawn_node_with_algo(vec![b.addr.clone()], SigningAlgo::Ed25519, KemAlgo::X25519).await;
 
     // Wait for links
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // C listens
-    let listener_c = c.node
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+    let listener_c = c
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -1077,10 +1148,13 @@ async fn cross_algo_connect_pq_to_classic() {
     // C accepts in background
     let node_c_accept = c.node.clone();
     let accept_handle = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept(listener_c.id))
-            .await
-            .expect("accept timed out")
-            .expect("accept failed")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            node_c_accept.circuit_accept(listener_c.id),
+        )
+        .await
+        .expect("accept timed out")
+        .expect("accept failed")
     });
 
     // A (PQ) connects to C (classic) via rendezvous
@@ -1089,13 +1163,14 @@ async fn cross_algo_connect_pq_to_classic() {
     let intro_points = vec![(b.node.peer_id(), kem_algo, kem_pubkey)];
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
-        a.node.connect_via_rendezvous(service_id_c, 80, &intro_points),
+        a.node
+            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points),
     )
     .await
     .expect("connect timed out")
     .expect("connect failed");
 
-    assert_eq!(client_conn.port, 80);
+    assert_eq!(client_conn.port, "80");
 
     let service_conn = accept_handle.await.expect("accept task panicked");
 
@@ -1104,7 +1179,10 @@ async fn cross_algo_connect_pq_to_classic() {
     let received = service_conn.recv().await.unwrap();
     assert_eq!(received, b"hello from PQ client");
 
-    service_conn.send(b"hello from classic service").await.unwrap();
+    service_conn
+        .send(b"hello from classic service")
+        .await
+        .unwrap();
     let received = client_conn.recv().await.unwrap();
     assert_eq!(received, b"hello from classic service");
 }
@@ -1117,12 +1195,7 @@ async fn cross_algo_connect_classic_to_pq() {
 
     // B = relay (classic), A = client (classic), C = service (PQ)
     let b = spawn_node_with_algo(vec![], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let a = spawn_node_with_algo(
-        vec![b.addr.clone()],
-        SigningAlgo::Ed25519,
-        KemAlgo::X25519,
-    )
-    .await;
+    let a = spawn_node_with_algo(vec![b.addr.clone()], SigningAlgo::Ed25519, KemAlgo::X25519).await;
     let c = spawn_node_with_algo(
         vec![b.addr.clone()],
         SigningAlgo::FalconEd25519,
@@ -1133,8 +1206,9 @@ async fn cross_algo_connect_classic_to_pq() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // C (PQ) listens
-    let listener_c = c.node
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+    let listener_c = c
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -1157,10 +1231,13 @@ async fn cross_algo_connect_classic_to_pq() {
 
     let node_c_accept = c.node.clone();
     let accept_handle = tokio::spawn(async move {
-        tokio::time::timeout(Duration::from_secs(10), node_c_accept.circuit_accept(listener_c.id))
-            .await
-            .expect("accept timed out")
-            .expect("accept failed")
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            node_c_accept.circuit_accept(listener_c.id),
+        )
+        .await
+        .expect("accept timed out")
+        .expect("accept failed")
     });
 
     // A (classic) connects to C (PQ) via rendezvous
@@ -1169,18 +1246,22 @@ async fn cross_algo_connect_classic_to_pq() {
     let intro_points = vec![(b.node.peer_id(), kem_algo, kem_pubkey)];
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
-        a.node.connect_via_rendezvous(service_id_c, 80, &intro_points),
+        a.node
+            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points),
     )
     .await
     .expect("connect timed out")
     .expect("connect failed");
 
-    assert_eq!(client_conn.port, 80);
+    assert_eq!(client_conn.port, "80");
 
     let service_conn = accept_handle.await.expect("accept task panicked");
 
     // Bidirectional data
-    client_conn.send(b"hello from classic client").await.unwrap();
+    client_conn
+        .send(b"hello from classic client")
+        .await
+        .unwrap();
     let received = service_conn.recv().await.unwrap();
     assert_eq!(received, b"hello from classic client");
 
@@ -1218,7 +1299,10 @@ async fn cross_algo_dht_signed_records() {
         }
     })
     .await;
-    assert!(result, "falcon_ed25519 node should verify ed25519-signed DHT record");
+    assert!(
+        result,
+        "falcon_ed25519 node should verify ed25519-signed DHT record"
+    );
 
     // B (falcon_ed25519) publishes signed content
     let value2 = b"signed by PQ falcon_ed25519";
@@ -1233,7 +1317,10 @@ async fn cross_algo_dht_signed_records() {
         }
     })
     .await;
-    assert!(result2, "ed25519 node should verify falcon_ed25519-signed DHT record");
+    assert!(
+        result2,
+        "ed25519 node should verify falcon_ed25519-signed DHT record"
+    );
 }
 
 /// TNS: falcon_ed25519 zone resolved by ed25519 node (and reverse).
@@ -1276,7 +1363,10 @@ async fn cross_algo_tns_resolution() {
         }
     })
     .await;
-    assert!(resolution, "falcon_ed25519 node should resolve ed25519 zone");
+    assert!(
+        resolution,
+        "falcon_ed25519 node should resolve ed25519 zone"
+    );
 
     // B (falcon_ed25519) publishes TNS record
     let zone_b_sid = b.node.identity.identity.service_id();
@@ -1302,7 +1392,10 @@ async fn cross_algo_tns_resolution() {
         }
     })
     .await;
-    assert!(resolution_b, "ed25519 node should resolve falcon_ed25519 zone");
+    assert!(
+        resolution_b,
+        "ed25519 node should resolve falcon_ed25519 zone"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1342,15 +1435,23 @@ async fn two_node_pressure() {
     let b = spawn_node(vec![a.addr.clone()]).await;
 
     // Wait for bidirectional route establishment.
-    assert!(wait_route(&a.node, b.node.peer_id(), Duration::from_secs(10)).await, "A has no route to B");
-    assert!(wait_route(&b.node, a.node.peer_id(), Duration::from_secs(10)).await, "B has no route to A");
+    assert!(
+        wait_route(&a.node, b.node.peer_id(), Duration::from_secs(10)).await,
+        "A has no route to B"
+    );
+    assert!(
+        wait_route(&b.node, a.node.peer_id(), Duration::from_secs(10)).await,
+        "B has no route to A"
+    );
 
-    let listener_a = a.node
-        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+    let listener_a = a
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "*", ListenerOptions::default())
         .await
         .unwrap();
-    let listener_b = b.node
-        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+    let listener_b = b
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "*", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -1369,14 +1470,21 @@ async fn two_node_pressure() {
     let accept_b = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..NUM_CONNS {
-            let conn = tokio::time::timeout(Duration::from_secs(30), b_node.circuit_accept(listener_b.id))
-                .await.expect("accept on B timed out").expect("accept on B failed");
-            let seed = conn.port as u64;
+            let conn = tokio::time::timeout(
+                Duration::from_secs(30),
+                b_node.circuit_accept(listener_b.id),
+            )
+            .await
+            .expect("accept on B timed out")
+            .expect("accept on B failed");
+            let seed = port_seed(&conn.port);
             handles.push(tokio::spawn(async move {
                 verify_prng_stream(conn, seed, CHUNKS, CHUNK_SZ).await;
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
     });
 
     // Accept on A (B → A connections)
@@ -1384,14 +1492,21 @@ async fn two_node_pressure() {
     let accept_a = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..NUM_CONNS {
-            let conn = tokio::time::timeout(Duration::from_secs(30), a_node.circuit_accept(listener_a.id))
-                .await.expect("accept on A timed out").expect("accept on A failed");
-            let seed = conn.port as u64 + 10000;
+            let conn = tokio::time::timeout(
+                Duration::from_secs(30),
+                a_node.circuit_accept(listener_a.id),
+            )
+            .await
+            .expect("accept on A timed out")
+            .expect("accept on A failed");
+            let seed = port_seed(&conn.port) + 10000;
             handles.push(tokio::spawn(async move {
                 verify_prng_stream(conn, seed, CHUNKS, CHUNK_SZ).await;
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
     });
 
     // A → B senders
@@ -1400,10 +1515,14 @@ async fn two_node_pressure() {
         let port = 100 + i;
         let a_node = a.node.clone();
         senders.push(tokio::spawn(async move {
+            let port_name = port.to_string();
             let conn = tokio::time::timeout(
                 Duration::from_secs(30),
-                a_node.circuit_connect(sid_b, port, Some(pid_b), None),
-            ).await.expect("A→B connect timed out").expect("A→B connect failed");
+                a_node.circuit_connect(sid_b, TEST_MODE, &port_name, Some(pid_b), None),
+            )
+            .await
+            .expect("A→B connect timed out")
+            .expect("A→B connect failed");
             send_prng_stream(&conn, port as u64, CHUNKS, CHUNK_SZ).await;
         }));
     }
@@ -1413,21 +1532,31 @@ async fn two_node_pressure() {
         let port = 200 + i;
         let b_node = b.node.clone();
         senders.push(tokio::spawn(async move {
+            let port_name = port.to_string();
             let conn = tokio::time::timeout(
                 Duration::from_secs(30),
-                b_node.circuit_connect(sid_a, port, Some(pid_a), None),
-            ).await.expect("B→A connect timed out").expect("B→A connect failed");
+                b_node.circuit_connect(sid_a, TEST_MODE, &port_name, Some(pid_a), None),
+            )
+            .await
+            .expect("B→A connect timed out")
+            .expect("B→A connect failed");
             send_prng_stream(&conn, port as u64 + 10000, CHUNKS, CHUNK_SZ).await;
         }));
     }
 
     let result = tokio::time::timeout(Duration::from_secs(60), async {
-        for h in senders { h.await.unwrap(); }
+        for h in senders {
+            h.await.unwrap();
+        }
         accept_b.await.unwrap();
         accept_a.await.unwrap();
-    }).await;
+    })
+    .await;
 
-    assert!(result.is_ok(), "two_node_pressure timed out — likely data loss or deadlock");
+    assert!(
+        result.is_ok(),
+        "two_node_pressure timed out — likely data loss or deadlock"
+    );
     log::info!(
         "Two-node pressure: {} connections, {} bytes total verified",
         NUM_CONNS * 2,
@@ -1472,16 +1601,19 @@ async fn mesh_pressure() {
     assert!(has_route_ag, "A should have a route to G");
 
     // Register listeners.
-    let listener_a = a.node
-        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+    let listener_a = a
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "*", ListenerOptions::default())
         .await
         .unwrap();
-    let listener_f = f.node
-        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+    let listener_f = f
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "*", ListenerOptions::default())
         .await
         .unwrap();
-    let listener_g = g.node
-        .circuit_listen(ServiceId::ALL, 0, ListenerOptions::default())
+    let listener_g = g
+        .node
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "*", ListenerOptions::default())
         .await
         .unwrap();
 
@@ -1506,42 +1638,63 @@ async fn mesh_pressure() {
         let mut handles = Vec::new();
         // A accepts connections from F and G (they send back)
         for _ in 0..NUM_CONNS {
-            let conn = tokio::time::timeout(Duration::from_secs(30), a_node.circuit_accept(listener_a.id))
-                .await.expect("accept on A timed out").expect("accept on A failed");
-            let seed = conn.port as u64;
+            let conn = tokio::time::timeout(
+                Duration::from_secs(30),
+                a_node.circuit_accept(listener_a.id),
+            )
+            .await
+            .expect("accept on A timed out")
+            .expect("accept on A failed");
+            let seed = port_seed(&conn.port);
             handles.push(tokio::spawn(async move {
                 verify_prng_stream(conn, seed + 10000, CHUNKS_PER_CONN, CHUNK_SIZE).await;
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
     });
 
     let f_node = f.node.clone();
     let accept_f = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let conn = tokio::time::timeout(Duration::from_secs(30), f_node.circuit_accept(listener_f.id))
-                .await.expect("accept on F timed out").expect("accept on F failed");
-            let seed = conn.port as u64;
+            let conn = tokio::time::timeout(
+                Duration::from_secs(30),
+                f_node.circuit_accept(listener_f.id),
+            )
+            .await
+            .expect("accept on F timed out")
+            .expect("accept on F failed");
+            let seed = port_seed(&conn.port);
             handles.push(tokio::spawn(async move {
                 verify_prng_stream(conn, seed, CHUNKS_PER_CONN, CHUNK_SIZE).await;
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
     });
 
     let g_node = g.node.clone();
     let accept_g = tokio::spawn(async move {
         let mut handles = Vec::new();
         for _ in 0..4 {
-            let conn = tokio::time::timeout(Duration::from_secs(30), g_node.circuit_accept(listener_g.id))
-                .await.expect("accept on G timed out").expect("accept on G failed");
-            let seed = conn.port as u64;
+            let conn = tokio::time::timeout(
+                Duration::from_secs(30),
+                g_node.circuit_accept(listener_g.id),
+            )
+            .await
+            .expect("accept on G timed out")
+            .expect("accept on G failed");
+            let seed = port_seed(&conn.port);
             handles.push(tokio::spawn(async move {
                 verify_prng_stream(conn, seed, CHUNKS_PER_CONN, CHUNK_SIZE).await;
             }));
         }
-        for h in handles { h.await.unwrap(); }
+        for h in handles {
+            h.await.unwrap();
+        }
     });
 
     // --- Spawn senders ---
@@ -1552,10 +1705,14 @@ async fn mesh_pressure() {
         // A → F
         let a_node = a.node.clone();
         sender_handles.push(tokio::spawn(async move {
+            let port_name = port.to_string();
             let conn = tokio::time::timeout(
                 Duration::from_secs(30),
-                a_node.circuit_connect(sid_f, port, Some(pid_f), None),
-            ).await.expect("A→F connect timed out").expect("A→F connect failed");
+                a_node.circuit_connect(sid_f, TEST_MODE, &port_name, Some(pid_f), None),
+            )
+            .await
+            .expect("A→F connect timed out")
+            .expect("A→F connect failed");
             send_prng_stream(&conn, port as u64, CHUNKS_PER_CONN, CHUNK_SIZE).await;
         }));
     }
@@ -1565,10 +1722,14 @@ async fn mesh_pressure() {
         // A → G
         let a_node = a.node.clone();
         sender_handles.push(tokio::spawn(async move {
+            let port_name = port.to_string();
             let conn = tokio::time::timeout(
                 Duration::from_secs(30),
-                a_node.circuit_connect(sid_g, port, Some(pid_g), None),
-            ).await.expect("A→G connect timed out").expect("A→G connect failed");
+                a_node.circuit_connect(sid_g, TEST_MODE, &port_name, Some(pid_g), None),
+            )
+            .await
+            .expect("A→G connect timed out")
+            .expect("A→G connect failed");
             send_prng_stream(&conn, port as u64, CHUNKS_PER_CONN, CHUNK_SIZE).await;
         }));
     }
@@ -1578,10 +1739,14 @@ async fn mesh_pressure() {
         let port = 300 + i;
         let f_node = f.node.clone();
         sender_handles.push(tokio::spawn(async move {
+            let port_name = port.to_string();
             let conn = tokio::time::timeout(
                 Duration::from_secs(30),
-                f_node.circuit_connect(sid_a, port, Some(pid_a), None),
-            ).await.expect("F→A connect timed out").expect("F→A connect failed");
+                f_node.circuit_connect(sid_a, TEST_MODE, &port_name, Some(pid_a), None),
+            )
+            .await
+            .expect("F→A connect timed out")
+            .expect("F→A connect failed");
             send_prng_stream(&conn, port as u64 + 10000, CHUNKS_PER_CONN, CHUNK_SIZE).await;
         }));
     }
@@ -1590,23 +1755,33 @@ async fn mesh_pressure() {
         let port = 400 + i;
         let g_node = g.node.clone();
         sender_handles.push(tokio::spawn(async move {
+            let port_name = port.to_string();
             let conn = tokio::time::timeout(
                 Duration::from_secs(30),
-                g_node.circuit_connect(sid_a, port, Some(pid_a), None),
-            ).await.expect("G→A connect timed out").expect("G→A connect failed");
+                g_node.circuit_connect(sid_a, TEST_MODE, &port_name, Some(pid_a), None),
+            )
+            .await
+            .expect("G→A connect timed out")
+            .expect("G→A connect failed");
             send_prng_stream(&conn, port as u64 + 10000, CHUNKS_PER_CONN, CHUNK_SIZE).await;
         }));
     }
 
     // --- Wait for everything ---
     let result = tokio::time::timeout(Duration::from_secs(120), async {
-        for h in sender_handles { h.await.unwrap(); }
+        for h in sender_handles {
+            h.await.unwrap();
+        }
         accept_f.await.unwrap();
         accept_g.await.unwrap();
         accept_a.await.unwrap();
-    }).await;
+    })
+    .await;
 
-    assert!(result.is_ok(), "mesh pressure test timed out — likely data loss or deadlock");
+    assert!(
+        result.is_ok(),
+        "mesh pressure test timed out — likely data loss or deadlock"
+    );
 
     let total = NUM_CONNS * 2 * TOTAL_BYTES; // both directions
     log::info!(
@@ -1648,19 +1823,20 @@ async fn verify_prng_stream(
     rng.fill(&mut expected);
 
     while total_received < total_expected {
-        let data = tokio::time::timeout(
-            Duration::from_secs(60),
-            conn.recv(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!(
-            "recv timed out at {}/{} bytes (seed={})",
-            total_received, total_expected, seed,
-        ))
-        .unwrap_or_else(|_| panic!(
-            "recv failed at {}/{} bytes (seed={})",
-            total_received, total_expected, seed,
-        ));
+        let data = tokio::time::timeout(Duration::from_secs(60), conn.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "recv timed out at {}/{} bytes (seed={})",
+                    total_received, total_expected, seed,
+                )
+            })
+            .unwrap_or_else(|_| {
+                panic!(
+                    "recv failed at {}/{} bytes (seed={})",
+                    total_received, total_expected, seed,
+                )
+            });
 
         // Verify byte-by-byte against expected PRNG stream.
         // Data may arrive in chunks of any size due to cell fragmentation.
@@ -1732,7 +1908,7 @@ async fn firewall_pair(
     tokio::spawn(async move { nb.run(disc_b, vec![], vec![]).await.ok() });
     tokio::time::sleep(Duration::from_millis(50)).await;
     let listener_b = node_b
-        .circuit_listen(ServiceId::ALL, 80, ListenerOptions::default())
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
         .await
         .unwrap();
     let nb2 = node_b.clone();
@@ -1742,11 +1918,7 @@ async fn firewall_pair(
     // Client A — plain TCP
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let na = node_a.clone();
-    tokio::spawn(async move {
-        na.run(Box::new(disc_a), vec![addr_b], vec![])
-            .await
-            .ok()
-    });
+    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
 
     // Wait for link
     let connected = wait_for(Duration::from_secs(10), || {
@@ -1761,7 +1933,7 @@ async fn firewall_pair(
     // (CREATE/CREATED/EXTEND) has no retransmission either.
     let conn_a = tokio::time::timeout(
         Duration::from_secs(10),
-        node_a.circuit_connect(service_id, 80, Some(pid_b), None),
+        node_a.circuit_connect(service_id, TEST_MODE, "80", Some(pid_b), None),
     )
     .await
     .expect("circuit connect timed out")
@@ -1786,10 +1958,7 @@ async fn firewall_pair(
 /// (node_a, node_b, channel_id).  Caller uses channel_send / app_rx.
 /// Drops are enabled AFTER the channel is established so the handshake
 /// and ChannelOpen succeed on a clean path.
-async fn channel_pair_with_drops(
-    drop_pct: u32,
-    port: &str,
-) -> (Arc<Node>, Arc<Node>, u32) {
+async fn channel_pair_with_drops(drop_pct: u32, port: &str) -> (Arc<Node>, Arc<Node>, u32) {
     let node_b = Arc::new(Node::new(Keypair::generate()));
     let node_a = Arc::new(Node::new(Keypair::generate()));
     let pid_b = node_b.peer_id();
@@ -1802,9 +1971,7 @@ async fn channel_pair_with_drops(
 
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let na = node_a.clone();
-    tokio::spawn(async move {
-        na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok()
-    });
+    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
 
     // Wait for link
     let linked = wait_for(Duration::from_secs(5), || {
@@ -1823,10 +1990,7 @@ async fn channel_pair_with_drops(
     assert_eq!(established, pid_b);
 
     // Open channel (reliable, ordered) — on the clean path
-    let ch_id = node_a
-        .channel_open(&pid_b, port, true, true)
-        .await
-        .unwrap();
+    let ch_id = node_a.channel_open(&pid_b, port, true, true).await.unwrap();
     // Give ChannelOpen time to arrive and be processed
     tokio::time::sleep(Duration::from_millis(300)).await;
 

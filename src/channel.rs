@@ -353,6 +353,4 @@ impl Channel {
             None => vec![],
         }
     }
-
 }
-

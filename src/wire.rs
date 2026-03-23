@@ -222,7 +222,18 @@ pub struct HandshakeHello {
 
 impl HandshakeHello {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let len = 32 + 1 + 2 + self.signing_pubkey.len() + 1 + 2 + self.kem_pubkey.len() + 8 + 32 + 2 + self.eph_kem_pubkey.len() + 2;
+        let len = 32
+            + 1
+            + 2
+            + self.signing_pubkey.len()
+            + 1
+            + 2
+            + self.kem_pubkey.len()
+            + 8
+            + 32
+            + 2
+            + self.eph_kem_pubkey.len()
+            + 2;
         let mut buf = Vec::with_capacity(len);
         buf.extend_from_slice(&self.ephemeral_pubkey);
         buf.push(self.signing_algo);
@@ -334,7 +345,14 @@ impl RekeyMsg {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 2 + self.kem_pubkey.len() + 2 + self.kem_ciphertext.len() + 2 + self.signature.len());
+        let mut buf = Vec::with_capacity(
+            1 + 2
+                + self.kem_pubkey.len()
+                + 2
+                + self.kem_ciphertext.len()
+                + 2
+                + self.signature.len(),
+        );
         buf.push(self.kem_algo);
         buf.extend_from_slice(&(self.kem_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.kem_pubkey);
@@ -392,7 +410,9 @@ impl KeepaliveMsg {
         if data.len() >= 8 {
             let mut r = Reader::new(data);
             let ts = r.read_u64()?;
-            Ok(Self { timestamp_us: Some(ts) })
+            Ok(Self {
+                timestamp_us: Some(ts),
+            })
         } else {
             Ok(Self { timestamp_us: None })
         }
@@ -417,7 +437,13 @@ pub struct HandshakeAuth {
 
 impl HandshakeAuth {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(2 + self.signature.len() + 2 + self.kem_ciphertext.len() + 2 + self.eph_kem_ciphertext.len());
+        let mut buf = Vec::with_capacity(
+            2 + self.signature.len()
+                + 2
+                + self.kem_ciphertext.len()
+                + 2
+                + self.eph_kem_ciphertext.len(),
+        );
         buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.signature);
         buf.extend_from_slice(&(self.kem_ciphertext.len() as u16).to_be_bytes());
@@ -436,17 +462,29 @@ impl HandshakeAuth {
         let signature = r.read_bytes(sig_len)?;
         let kem_ciphertext = if r.remaining() >= 2 {
             let ct_len = r.read_u16()? as usize;
-            if ct_len > 0 { r.read_bytes(ct_len)? } else { Vec::new() }
+            if ct_len > 0 {
+                r.read_bytes(ct_len)?
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
         let eph_kem_ciphertext = if r.remaining() >= 2 {
             let ct_len = r.read_u16()? as usize;
-            if ct_len > 0 { r.read_bytes(ct_len)? } else { Vec::new() }
+            if ct_len > 0 {
+                r.read_bytes(ct_len)?
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
-        Ok(Self { signature, kem_ciphertext, eph_kem_ciphertext })
+        Ok(Self {
+            signature,
+            kem_ciphertext,
+            eph_kem_ciphertext,
+        })
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -551,7 +589,12 @@ impl RouteProbeMsg {
         let target = PeerId(r.read_array::<32>()?);
         let ttl = r.read_u16()?;
         let hops = r.read_u16()?;
-        Ok(Self { nonce, target, ttl, hops })
+        Ok(Self {
+            nonce,
+            target,
+            ttl,
+            hops,
+        })
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -585,7 +628,11 @@ impl RouteProbeFoundMsg {
         let nonce = r.read_array::<16>()?;
         let target = PeerId(r.read_array::<32>()?);
         let cost = r.read_u16()?;
-        Ok(Self { nonce, target, cost })
+        Ok(Self {
+            nonce,
+            target,
+            cost,
+        })
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -1276,8 +1323,12 @@ pub mod capabilities {
     /// Format capability bitflags as a human-readable string.
     pub fn format(caps: u32) -> String {
         let mut names = Vec::new();
-        if caps & RELAY != 0 { names.push("relay"); }
-        if caps & TUNNEL != 0 { names.push("tunnel"); }
+        if caps & RELAY != 0 {
+            names.push("relay");
+        }
+        if caps & TUNNEL != 0 {
+            names.push("tunnel");
+        }
         if names.is_empty() {
             "none".to_string()
         } else {
@@ -1644,7 +1695,6 @@ impl CircuitDestroyMsg {
 pub fn hash_port_name(name: &str) -> [u8; 32] {
     *blake3::hash(name.as_bytes()).as_bytes()
 }
-
 
 #[cfg(test)]
 mod tests {

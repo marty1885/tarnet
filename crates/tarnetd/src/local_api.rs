@@ -14,8 +14,8 @@ use tarnet::state::StateDb;
 use tarnet::tns;
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::service::{
-    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, ServiceApi, TnsRecord,
-    TnsResolution, WatchEvent,
+    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi,
+    TnsRecord, TnsResolution, WatchEvent,
 };
 use tarnet_api::types::{DhtId, PeerId, ServiceId};
 
@@ -46,7 +46,11 @@ pub struct LocalServiceApi {
 impl LocalServiceApi {
     /// Create a new LocalServiceApi wrapping the given Node.
     /// Must be called before `Node::run()` so we can take the receivers.
-    pub async fn with_db(node: Arc<Node>, db: Arc<StateDb>, socks_addrs: Vec<std::net::SocketAddr>) -> Self {
+    pub async fn with_db(
+        node: Arc<Node>,
+        db: Arc<StateDb>,
+        socks_addrs: Vec<std::net::SocketAddr>,
+    ) -> Self {
         let (event_tx, _) = tokio::sync::broadcast::channel(512);
 
         // Take the node's receivers and merge into unified event broadcast.
@@ -133,10 +137,13 @@ impl LocalServiceApi {
             let now = Instant::now();
             cache.retain(|_, v| v.expires_at > now);
         }
-        cache.insert(key, TnsCacheEntry {
-            resolution,
-            expires_at: Instant::now() + ttl,
-        });
+        cache.insert(
+            key,
+            TnsCacheEntry {
+                resolution,
+                expires_at: Instant::now() + ttl,
+            },
+        );
     }
 
     /// Invalidate all cache entries (used when local labels change).
@@ -164,53 +171,63 @@ impl LocalServiceApi {
     }
 
     /// Get the keypair for the given identity (or the default).
-    async fn keypair_for_identity(&self, identity: Option<&str>) -> ApiResult<tarnet::identity::Keypair> {
+    async fn keypair_for_identity(
+        &self,
+        identity: Option<&str>,
+    ) -> ApiResult<tarnet::identity::Keypair> {
         let sid = self.resolve_identity(identity.unwrap_or("")).await?;
         self.node.keypair_for_service(&sid).await.ok_or_else(|| {
-            ApiError::Service(format!("no keypair found for identity '{}'", identity.unwrap_or("default")))
+            ApiError::Service(format!(
+                "no keypair found for identity '{}'",
+                identity.unwrap_or("default")
+            ))
         })
     }
 
     /// Uncached TNS name resolution (called by the cached wrapper).
-    fn tns_resolve_name_inner<'a>(&'a self, name: &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<TnsResolution>> + Send + 'a>> {
+    fn tns_resolve_name_inner<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<TnsResolution>> + Send + 'a>>
+    {
         Box::pin(async move {
-        // Check if the rightmost label (root of the name) is a local label.
-        // Search the default identity's zone.
-        let id_key = self.identity_db_key(None).await?;
-        let labels: Vec<&str> = name.split('.').collect();
-        if let Some(root_label) = labels.last() {
-            if let Ok(Some((record_blobs, _publish))) = self.db.label_get(&id_key, root_label) {
-                let records: Vec<TnsRecord> = record_blobs
-                    .iter()
-                    .filter_map(|b| tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
-                    .collect();
+            // Check if the rightmost label (root of the name) is a local label.
+            // Search the default identity's zone.
+            let id_key = self.identity_db_key(None).await?;
+            let labels: Vec<&str> = name.split('.').collect();
+            if let Some(root_label) = labels.last() {
+                if let Ok(Some((record_blobs, _publish))) = self.db.label_get(&id_key, root_label) {
+                    let records: Vec<TnsRecord> = record_blobs
+                        .iter()
+                        .filter_map(|b| tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
+                        .collect();
 
-                if labels.len() == 1 {
+                    if labels.len() == 1 {
+                        return Ok(TnsResolution::Records(records));
+                    }
+
+                    let remaining = labels[..labels.len() - 1].join(".");
+
+                    if let Some(alias_target) = records.iter().find_map(|r| match r {
+                        TnsRecord::Alias(s) => Some(s.clone()),
+                        _ => None,
+                    }) {
+                        let new_name = format!("{}.{}", remaining, alias_target);
+                        return self.tns_resolve_name_inner(&new_name).await;
+                    }
+
+                    if let Some(zone) = records.iter().find_map(|r| match r {
+                        TnsRecord::Zone(sid) => Some(*sid),
+                        _ => None,
+                    }) {
+                        return Ok(tns::resolve(&self.node, zone, &remaining).await);
+                    }
+
                     return Ok(TnsResolution::Records(records));
                 }
-
-                let remaining = labels[..labels.len() - 1].join(".");
-
-                if let Some(alias_target) = records.iter().find_map(|r| match r {
-                    TnsRecord::Alias(s) => Some(s.clone()),
-                    _ => None,
-                }) {
-                    let new_name = format!("{}.{}", remaining, alias_target);
-                    return self.tns_resolve_name_inner(&new_name).await;
-                }
-
-                if let Some(zone) = records.iter().find_map(|r| match r {
-                    TnsRecord::Zone(sid) => Some(*sid),
-                    _ => None,
-                }) {
-                    return Ok(tns::resolve(&self.node, zone, &remaining).await);
-                }
-
-                return Ok(TnsResolution::Records(records));
             }
-        }
 
-        Ok(tns::resolve_name(&self.node, name).await)
+            Ok(tns::resolve_name(&self.node, name).await)
         })
     }
 }
@@ -253,9 +270,14 @@ impl ServiceApi for LocalServiceApi {
         }
     }
 
-    async fn connect(&self, service_id: ServiceId, port: u16) -> ApiResult<Connection> {
+    async fn connect(
+        &self,
+        service_id: ServiceId,
+        mode: PortMode,
+        port: &str,
+    ) -> ApiResult<Connection> {
         self.node
-            .circuit_connect(service_id, port, None, None)
+            .circuit_connect(service_id, mode, port, None, None)
             .await
             .map_err(map_err)
     }
@@ -263,11 +285,12 @@ impl ServiceApi for LocalServiceApi {
     async fn connect_as(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         source_identity: Option<ServiceId>,
     ) -> ApiResult<Connection> {
         self.node
-            .circuit_connect(service_id, port, None, source_identity)
+            .circuit_connect(service_id, mode, port, None, source_identity)
             .await
             .map_err(map_err)
     }
@@ -275,11 +298,12 @@ impl ServiceApi for LocalServiceApi {
     async fn listen(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         options: ListenerOptions,
     ) -> ApiResult<Listener> {
         self.node
-            .circuit_listen(service_id, port, options)
+            .circuit_listen(service_id, mode, port, options)
             .await
             .map_err(map_err)
     }
@@ -298,13 +322,14 @@ impl ServiceApi for LocalServiceApi {
     async fn listen_hidden(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         num_intro_points: usize,
         options: ListenerOptions,
     ) -> ApiResult<Listener> {
         let listener = self
             .node
-            .circuit_listen(service_id, port, options)
+            .circuit_listen(service_id, mode, port, options)
             .await
             .map_err(map_err)?;
         if let Err(e) = self
@@ -359,8 +384,8 @@ impl ServiceApi for LocalServiceApi {
             return None;
         }
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(timeout_secs as u64);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Some(data) = self.node.dht_get_content(inner_hash).await {
@@ -376,17 +401,16 @@ impl ServiceApi for LocalServiceApi {
         DhtId(self.node.dht_put_signed_content(value, ttl_secs).await)
     }
 
-    async fn dht_get_signed(
-        &self,
-        key: &DhtId,
-        timeout_secs: u32,
-    ) -> Vec<DhtEntry> {
+    async fn dht_get_signed(&self, key: &DhtId, timeout_secs: u32) -> Vec<DhtEntry> {
         let inner_hash = key.as_bytes();
 
         // Check local store first.
         let results = self.node.dht_get_signed_content(inner_hash).await;
         if !results.is_empty() {
-            return results.into_iter().map(|(signer, data)| DhtEntry { signer, data }).collect();
+            return results
+                .into_iter()
+                .map(|(signer, data)| DhtEntry { signer, data })
+                .collect();
         }
 
         if timeout_secs == 0 {
@@ -398,13 +422,16 @@ impl ServiceApi for LocalServiceApi {
             return Vec::new();
         }
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(timeout_secs as u64);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let results = self.node.dht_get_signed_content(inner_hash).await;
             if !results.is_empty() {
-                return results.into_iter().map(|(signer, data)| DhtEntry { signer, data }).collect();
+                return results
+                    .into_iter()
+                    .map(|(signer, data)| DhtEntry { signer, data })
+                    .collect();
             }
             if tokio::time::Instant::now() >= deadline {
                 return Vec::new();
@@ -439,8 +466,8 @@ impl ServiceApi for LocalServiceApi {
             return None;
         }
 
-        let deadline = tokio::time::Instant::now()
-            + std::time::Duration::from_secs(timeout_secs as u64);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Some(hello) = self.node.lookup_hello(peer_id).await {
@@ -506,12 +533,12 @@ impl ServiceApi for LocalServiceApi {
         Ok(())
     }
 
-    async fn tns_resolve(
-        &self,
-        zone: ServiceId,
-        name: &str,
-    ) -> ApiResult<TnsResolution> {
-        let cache_key = format!("z:{}:{}", tarnet_api::types::encode_base32(zone.as_bytes()), name);
+    async fn tns_resolve(&self, zone: ServiceId, name: &str) -> ApiResult<TnsResolution> {
+        let cache_key = format!(
+            "z:{}:{}",
+            tarnet_api::types::encode_base32(zone.as_bytes()),
+            name
+        );
         if let Some(cached) = self.tns_cache_get(&cache_key).await {
             return Ok(cached);
         }
@@ -531,14 +558,25 @@ impl ServiceApi for LocalServiceApi {
         Ok(result)
     }
 
-    async fn tns_set_label(&self, identity: Option<&str>, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()> {
+    async fn tns_set_label(
+        &self,
+        identity: Option<&str>,
+        label: &str,
+        records: Vec<TnsRecord>,
+        publish: bool,
+    ) -> ApiResult<()> {
         let id_key = self.identity_db_key(identity).await?;
         tns::validate_records(&records).map_err(map_err)?;
         if publish {
             tns::validate_published_aliases(&records, &self.db, &id_key).map_err(map_err)?;
         }
-        let record_blobs: Vec<Vec<u8>> = records.iter().map(|r| tns::tns_record_to_bytes(r)).collect();
-        self.db.label_set(&id_key, label, &record_blobs, publish).map_err(map_err)?;
+        let record_blobs: Vec<Vec<u8>> = records
+            .iter()
+            .map(|r| tns::tns_record_to_bytes(r))
+            .collect();
+        self.db
+            .label_set(&id_key, label, &record_blobs, publish)
+            .map_err(map_err)?;
 
         // Auto-publish to DHT when marked public.
         if publish {
@@ -552,7 +590,11 @@ impl ServiceApi for LocalServiceApi {
         Ok(())
     }
 
-    async fn tns_get_label(&self, identity: Option<&str>, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
+    async fn tns_get_label(
+        &self,
+        identity: Option<&str>,
+        label: &str,
+    ) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
         let id_key = self.identity_db_key(identity).await?;
         match self.db.label_get(&id_key, label).map_err(map_err)? {
             Some((blobs, publish)) => {
@@ -573,7 +615,10 @@ impl ServiceApi for LocalServiceApi {
         Ok(())
     }
 
-    async fn tns_list_labels(&self, identity: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
+    async fn tns_list_labels(
+        &self,
+        identity: Option<&str>,
+    ) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
         let id_key = self.identity_db_key(identity).await?;
         let raw = self.db.label_list(&id_key).map_err(map_err)?;
         Ok(raw
@@ -603,7 +648,17 @@ impl ServiceApi for LocalServiceApi {
 
     async fn list_identities(
         &self,
-    ) -> ApiResult<Vec<(String, ServiceId, tarnet_api::types::PrivacyLevel, u8, tarnet_api::types::IdentityScheme, tarnet_api::types::SigningAlgo, tarnet_api::types::KemAlgo)>> {
+    ) -> ApiResult<
+        Vec<(
+            String,
+            ServiceId,
+            tarnet_api::types::PrivacyLevel,
+            u8,
+            tarnet_api::types::IdentityScheme,
+            tarnet_api::types::SigningAlgo,
+            tarnet_api::types::KemAlgo,
+        )>,
+    > {
         Ok(self.node.list_identities().await)
     }
 
@@ -627,10 +682,10 @@ impl ServiceApi for LocalServiceApi {
         Ok(self.socks_addrs.clone())
     }
 
-    async fn connect_to(&self, target: &str, port: u16) -> ApiResult<Connection> {
+    async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection> {
         // 1. Try parsing target directly as a ServiceId.
         if let Ok(sid) = ServiceId::parse(target) {
-            return self.connect(sid, port).await;
+            return self.connect(sid, mode, port).await;
         }
 
         // 2. Try resolving via TNS (local labels, dotted names).
@@ -639,7 +694,7 @@ impl ServiceApi for LocalServiceApi {
                 // Find a connectable record (Identity).
                 for rec in &records {
                     if let TnsRecord::Identity(sid) = rec {
-                        return self.connect(*sid, port).await;
+                        return self.connect(*sid, mode, port).await;
                     }
                 }
                 Err(ApiError::Service(format!(

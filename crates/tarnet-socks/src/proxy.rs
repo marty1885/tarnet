@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
-use tarnet_api::service::{ServiceApi, TnsRecord, TnsResolution};
+use tarnet_api::service::{PortMode, ServiceApi, TnsRecord, TnsResolution};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -113,12 +113,22 @@ async fn handle_client<S: ServiceApi + 'static>(
     let route = resolve_route(&state, &req.hostname, req.port, identity.as_deref()).await;
 
     match route {
-        Route::Tarnet { service_id, service_name, port } => {
-            handle_tarnet_route(state, stream, service_id, &service_name, port, identity.as_deref()).await
+        Route::Tarnet {
+            service_id,
+            service_name,
+            port,
+        } => {
+            handle_tarnet_route(
+                state,
+                stream,
+                service_id,
+                &service_name,
+                port,
+                identity.as_deref(),
+            )
+            .await
         }
-        Route::Clearnet { host, port } => {
-            handle_clearnet_route(stream, &host, port).await
-        }
+        Route::Clearnet { host, port } => handle_clearnet_route(stream, &host, port).await,
         Route::Refused => {
             warn!("Refusing connection to {}:{}", req.hostname, req.port);
             socks5::send_host_unreachable(&mut stream).await?;
@@ -168,7 +178,10 @@ async fn resolve_route<S: ServiceApi>(
                     port,
                 }
             } else {
-                warn!("TNS records found but no routable Identity for {}", hostname);
+                warn!(
+                    "TNS records found but no routable Identity for {}",
+                    hostname
+                );
                 Route::Refused
             }
         }
@@ -205,7 +218,10 @@ async fn handle_tarnet_route<S: ServiceApi + 'static>(
     port: u16,
     identity: Option<&str>,
 ) -> std::io::Result<()> {
-    info!("Tarnet route to {} service={} port={}", service_id, service_name, port);
+    info!(
+        "Tarnet route to {} service={} port={}",
+        service_id, service_name, port
+    );
 
     // Resolve source identity ServiceId for connect_as.
     let source_sid = if let Some(id_label) = identity {
@@ -214,7 +230,17 @@ async fn handle_tarnet_route<S: ServiceApi + 'static>(
         None
     };
 
-    let conn = match state.api.connect_as(service_id, port, source_sid).await {
+    let port_name = port.to_string();
+    let conn = match state
+        .api
+        .connect_as(
+            service_id,
+            PortMode::ReliableOrdered,
+            &port_name,
+            source_sid,
+        )
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to connect to {}: {}", service_id, e);

@@ -55,7 +55,9 @@ async fn main() {
     });
 
     // Run the node (accepts connections, connects to bootstrap, runs event loop)
-    node.run(Box::new(discovery), connect_addrs, vec![]).await.ok();
+    node.run(Box::new(discovery), connect_addrs, vec![])
+        .await
+        .ok();
 }
 
 fn get_flag(args: &[String], flag: &str) -> Option<String> {
@@ -84,10 +86,16 @@ fn load_identity(path: &str) -> Keypair {
         if bytes.len() == 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&bytes);
-            return Keypair::from_bytes(key);
+            #[allow(deprecated)]
+            {
+                return Keypair::from_bytes(key);
+            }
+        }
+        if let Ok(kp) = Keypair::from_full_bytes(&bytes) {
+            return kp;
         }
     }
     let kp = Keypair::generate();
-    std::fs::write(path, kp.to_bytes()).ok();
+    std::fs::write(path, kp.to_full_bytes()).ok();
     kp
 }

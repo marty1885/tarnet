@@ -34,7 +34,11 @@ async fn main() {
         std::process::exit(1);
     });
     std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
-        eprintln!("Failed to create config dir {}: {}", config_dir.display(), e);
+        eprintln!(
+            "Failed to create config dir {}: {}",
+            config_dir.display(),
+            e
+        );
         std::process::exit(1);
     });
     let services_dir = tarnet_api::ipc::services_dir_for(&config_dir);
@@ -68,11 +72,7 @@ async fn main() {
     let peer_id = identity.peer_id();
 
     #[allow(unused_mut)]
-    let mut node = Node::with_db(
-        identity,
-        db.clone(),
-        StorageLimits::default(),
-    );
+    let mut node = Node::with_db(identity, db.clone(), StorageLimits::default());
     node.set_link_limits(opts.max_inbound, opts.max_outbound);
     node.set_bandwidth_limits(opts.upload_limit, opts.download_limit);
 
@@ -92,7 +92,10 @@ async fn main() {
     // Enable WebRTC if configured
     if opts.webrtc_enabled && !opts.webrtc_stun.is_empty() {
         match node.enable_webrtc(opts.webrtc_stun.clone()) {
-            Ok(()) => log::info!("WebRTC enabled with {} STUN servers", opts.webrtc_stun.len()),
+            Ok(()) => log::info!(
+                "WebRTC enabled with {} STUN servers",
+                opts.webrtc_stun.len()
+            ),
             Err(e) => log::warn!("Failed to enable WebRTC: {}", e),
         }
     }
@@ -100,7 +103,11 @@ async fn main() {
     let node = Arc::new(node);
 
     // Create the service API BEFORE starting the node (takes receivers)
-    let socks_addrs = if opts.socks_enabled { opts.socks_bind.clone() } else { Vec::new() };
+    let socks_addrs = if opts.socks_enabled {
+        opts.socks_bind.clone()
+    } else {
+        Vec::new()
+    };
     let api = Arc::new(local_api::LocalServiceApi::with_db(node.clone(), db, socks_addrs).await);
 
     // Build hello addresses: only advertise TCP if explicitly opted in.
@@ -143,7 +150,15 @@ async fn main() {
     let address = tarnet_api::types::encode_base32(&node.default_service_address().await);
 
     // Startup banner
-    print_banner(&opts, &address, &peer_id, &local_addrs, &config_path, config_found, &public_display);
+    print_banner(
+        &opts,
+        &address,
+        &peer_id,
+        &local_addrs,
+        &config_path,
+        config_found,
+        &public_display,
+    );
 
     #[cfg(feature = "mainline-bootstrap")]
     if opts.mainline {
@@ -177,9 +192,15 @@ async fn main() {
     let ipc_api = api.clone() as Arc<dyn tarnet_api::service::ServiceApi>;
     let socket_path = opts.socket_path.clone();
     let ipc_reload = reload_notify.clone();
-    let ipc_expose_tx = if opts.expose_enabled { Some(expose_reload_tx.clone()) } else { None };
+    let ipc_expose_tx = if opts.expose_enabled {
+        Some(expose_reload_tx.clone())
+    } else {
+        None
+    };
     tokio::spawn(async move {
-        if let Err(e) = ipc_server::run_ipc_server(socket_path, ipc_api, ipc_reload, ipc_expose_tx).await {
+        if let Err(e) =
+            ipc_server::run_ipc_server(socket_path, ipc_api, ipc_reload, ipc_expose_tx).await
+        {
             log::error!("IPC server error: {}", e);
         }
     });
@@ -192,7 +213,10 @@ async fn main() {
         let allow_clearnet = opts.socks_allow_clearnet;
         tokio::spawn(async move {
             match tarnet_socks::proxy::run_proxy(
-                socks_api, &bind_addrs, allow_clearnet, shutdown_rx,
+                socks_api,
+                &bind_addrs,
+                allow_clearnet,
+                shutdown_rx,
             )
             .await
             {
@@ -228,8 +252,8 @@ async fn main() {
                 reload.notified().await;
                 match config::load_config(&config_path) {
                     Ok(cfg) => {
-                        let ul = tarnet::bandwidth::parse_bandwidth(&cfg.core.upload_limit)
-                            .unwrap_or(0);
+                        let ul =
+                            tarnet::bandwidth::parse_bandwidth(&cfg.core.upload_limit).unwrap_or(0);
                         let dl = tarnet::bandwidth::parse_bandwidth(&cfg.core.download_limit)
                             .unwrap_or(0);
                         node_ref.update_bandwidth_limits(ul, dl).await;
@@ -266,14 +290,21 @@ async fn main() {
                                     let _ = stream.set_nodelay(true);
                                     let transport: Box<dyn tarnet::transport::Transport> =
                                         Box::new(tarnet::transport::tcp::TcpTransport::new(stream));
-                                    match tarnet::link::PeerLink::initiator(transport, &id, None).await {
+                                    match tarnet::link::PeerLink::initiator(transport, &id, None)
+                                        .await
+                                    {
                                         Ok(link) => {
                                             let link = Arc::new(link);
-                                            log::info!("mDNS: connected to {:?}", link.remote_peer());
-                                            let _ = tx.send(tarnet::node::NodeEvent::LinkUp(
-                                                link.remote_peer(),
-                                                link,
-                                            )).await;
+                                            log::info!(
+                                                "mDNS: connected to {:?}",
+                                                link.remote_peer()
+                                            );
+                                            let _ = tx
+                                                .send(tarnet::node::NodeEvent::LinkUp(
+                                                    link.remote_peer(),
+                                                    link,
+                                                ))
+                                                .await;
                                         }
                                         Err(e) => log::warn!("mDNS peer handshake failed: {}", e),
                                     }
@@ -313,11 +344,10 @@ async fn main() {
 
     // Build composite discovery (TCP + optional WS listener + always WS connector)
     let discovery: Box<dyn tarnet::transport::Discovery> = if opts.ws_enabled {
-        let ws_discovery = tarnet::transport::ws::WsDiscovery::bind(
-            &opts.ws_listen, opts.ws_path.clone(),
-        )
-        .await
-        .expect("Failed to bind WebSocket");
+        let ws_discovery =
+            tarnet::transport::ws::WsDiscovery::bind(&opts.ws_listen, opts.ws_path.clone())
+                .await
+                .expect("Failed to bind WebSocket");
         log::info!(
             "WebSocket listening on {} (path: {})",
             ws_discovery.local_addr(),
@@ -356,30 +386,65 @@ fn print_banner(
     eprintln!("  Address:   {}", address);
     eprintln!("  PeerId:    {}", peer_id);
     eprintln!("  Data:      {}", opts.data_dir.display());
-    let config_status = if config_found { "" } else { " (not found, using defaults)" };
+    let config_status = if config_found {
+        ""
+    } else {
+        " (not found, using defaults)"
+    };
     eprintln!("  Config:    {}{}", config_path.display(), config_status);
     for addr in local_addrs {
         eprintln!("  TCP:       {}", addr);
     }
     eprintln!("  Public:    {}", public_display);
     if opts.webrtc_enabled {
-        eprintln!("  WebRTC:    enabled ({} STUN servers)", opts.webrtc_stun.len());
+        eprintln!(
+            "  WebRTC:    enabled ({} STUN servers)",
+            opts.webrtc_stun.len()
+        );
     } else {
         eprintln!("  WebRTC:    disabled");
     }
     if opts.ws_enabled {
         match &opts.ws_public_url {
-            Some(url) => eprintln!("  WS:        {} (path: {}, public: {})", opts.ws_listen, opts.ws_path, url),
-            None => eprintln!("  WS:        {} (path: {}, not advertised)", opts.ws_listen, opts.ws_path),
+            Some(url) => eprintln!(
+                "  WS:        {} (path: {}, public: {})",
+                opts.ws_listen, opts.ws_path, url
+            ),
+            None => eprintln!(
+                "  WS:        {} (path: {}, not advertised)",
+                opts.ws_listen, opts.ws_path
+            ),
         }
     }
-    let inbound_str = if opts.max_inbound == 0 { "unlimited".to_string() } else { opts.max_inbound.to_string() };
-    let outbound_str = if opts.max_outbound == 0 { "unlimited".to_string() } else { opts.max_outbound.to_string() };
-    eprintln!("  Links:     max {} inbound, {} outbound", inbound_str, outbound_str);
-    let ul_str = if opts.upload_limit == 0 { "unlimited".to_string() } else { format_bandwidth(opts.upload_limit) };
-    let dl_str = if opts.download_limit == 0 { "unlimited".to_string() } else { format_bandwidth(opts.download_limit) };
+    let inbound_str = if opts.max_inbound == 0 {
+        "unlimited".to_string()
+    } else {
+        opts.max_inbound.to_string()
+    };
+    let outbound_str = if opts.max_outbound == 0 {
+        "unlimited".to_string()
+    } else {
+        opts.max_outbound.to_string()
+    };
+    eprintln!(
+        "  Links:     max {} inbound, {} outbound",
+        inbound_str, outbound_str
+    );
+    let ul_str = if opts.upload_limit == 0 {
+        "unlimited".to_string()
+    } else {
+        format_bandwidth(opts.upload_limit)
+    };
+    let dl_str = if opts.download_limit == 0 {
+        "unlimited".to_string()
+    } else {
+        format_bandwidth(opts.download_limit)
+    };
     eprintln!("  Bandwidth: up {} / down {}", ul_str, dl_str);
-    eprintln!("  mDNS:      {}", if opts.mdns { "enabled" } else { "disabled" });
+    eprintln!(
+        "  mDNS:      {}",
+        if opts.mdns { "enabled" } else { "disabled" }
+    );
     eprintln!("  IPC:       {}", opts.socket_path.display());
     if opts.socks_enabled {
         let addrs: Vec<String> = opts.socks_bind.iter().map(|a| a.to_string()).collect();
@@ -586,20 +651,28 @@ fn print_usage() {
     eprintln!("  --config-dir <dir>      Config directory (default: $XDG_CONFIG_HOME/tarnet)");
     eprintln!("  --listen <addr>         TCP listen address (repeatable; default: 0.0.0.0:7946)");
     eprintln!("  --identity <file>       Identity key file (default: <data-dir>/identity.key)");
-    eprintln!("  --state <file>          Persistent SQLite state DB (default: <data-dir>/state.sqlite3)");
+    eprintln!(
+        "  --state <file>          Persistent SQLite state DB (default: <data-dir>/state.sqlite3)"
+    );
     eprintln!("  --bootstrap <uri>       Bootstrap peer transport URI (repeatable):");
     eprintln!("                            tcp://host:port  wss://host/path  ws://host/path");
     eprintln!("  --discovery <uri>       Discover peers via resolution protocol (repeatable):");
     eprintln!("                            mainline:<hex>");
     eprintln!("  --mainline              Announce on BitTorrent mainline DHT for remote bootstrap");
     eprintln!("  --advertise-tcp         Advertise TCP address in hello records (default: off)");
-    eprintln!("  --stun <url>            Override STUN server (repeatable; applies to TCP and WebRTC)");
+    eprintln!(
+        "  --stun <url>            Override STUN server (repeatable; applies to TCP and WebRTC)"
+    );
     eprintln!("  --public-addr <addr>    Explicit public address (implies --advertise-tcp)");
     eprintln!("  --no-webrtc             Disable WebRTC transport");
     eprintln!("  --ws                    Enable WebSocket transport");
-    eprintln!("  --ws-listen <addr>      WebSocket listen address (default: 0.0.0.0:8080; implies --ws)");
+    eprintln!(
+        "  --ws-listen <addr>      WebSocket listen address (default: 0.0.0.0:8080; implies --ws)"
+    );
     eprintln!("  --ws-path <path>        WebSocket upgrade path (default: /tarnet; implies --ws)");
-    eprintln!("  --ws-public-url <url>   Advertise WS URL in hello (e.g. wss://host/path; implies --ws)");
+    eprintln!(
+        "  --ws-public-url <url>   Advertise WS URL in hello (e.g. wss://host/path; implies --ws)"
+    );
     eprintln!("  --no-ws                 Disable WebSocket transport");
     eprintln!("  --no-mdns               Disable mDNS LAN discovery");
     eprintln!("  --socket <path>         IPC socket path (default: <data-dir>/sock)");
@@ -610,8 +683,12 @@ fn print_usage() {
     eprintln!("  --no-expose             Disable service exposure");
     eprintln!("  --max-inbound-links <n> Maximum inbound links (default: 128, 0 = unlimited)");
     eprintln!("  --max-outbound-links <n> Maximum outbound links (default: 48, 0 = unlimited)");
-    eprintln!("  --upload-limit <rate>   Upload bandwidth limit (e.g. 10Mbps, 1MB/s; 0 = unlimited)");
-    eprintln!("  --download-limit <rate> Download bandwidth limit (e.g. 50Mbps, 5MB/s; 0 = unlimited)");
+    eprintln!(
+        "  --upload-limit <rate>   Upload bandwidth limit (e.g. 10Mbps, 1MB/s; 0 = unlimited)"
+    );
+    eprintln!(
+        "  --download-limit <rate> Download bandwidth limit (e.g. 50Mbps, 5MB/s; 0 = unlimited)"
+    );
 }
 
 fn load_or_generate_identity(path: &PathBuf) -> Keypair {
@@ -630,9 +707,7 @@ fn load_or_generate_identity(path: &PathBuf) -> Keypair {
         let kp = match Keypair::from_full_bytes(&bytes) {
             Ok(k) => k,
             Err(e) => {
-                if bytes.len() == 32
-                    && tarnet_api::types::SigningAlgo::from_u8(bytes[0]).is_err()
-                {
+                if bytes.len() == 32 && tarnet_api::types::SigningAlgo::from_u8(bytes[0]).is_err() {
                     // Legacy v1: bare 32-byte Ed25519 seed (first byte is random,
                     // not a valid algo discriminant)
                     let mut key = [0u8; 32];

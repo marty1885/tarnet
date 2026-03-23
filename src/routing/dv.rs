@@ -49,10 +49,17 @@ pub fn generate_advertisement(
 
 /// Process a received route advertisement. Returns true if routing table changed.
 /// Verifies the signature using the advertiser's cached pubkey.
-pub fn process_advertisement(table: &mut RoutingTable, ad: &RouteAdvertisement, pubkey_cache: &mut PubkeyCache) -> Result<bool> {
+pub fn process_advertisement(
+    table: &mut RoutingTable,
+    ad: &RouteAdvertisement,
+    pubkey_cache: &mut PubkeyCache,
+) -> Result<bool> {
     // Look up advertiser's signing pubkey from cache (populated during link handshake)
     let cached = pubkey_cache.get(&ad.advertiser).ok_or_else(|| {
-        Error::Crypto(format!("no cached pubkey for advertiser {:?}", ad.advertiser))
+        Error::Crypto(format!(
+            "no cached pubkey for advertiser {:?}",
+            ad.advertiser
+        ))
     })?;
     let algo = SigningAlgo::from_u8(cached.signing_algo as u8)
         .map_err(|e| Error::Crypto(e.to_string()))?;
@@ -72,7 +79,12 @@ pub fn process_advertisement(table: &mut RoutingTable, ad: &RouteAdvertisement, 
         }
         // Cost to reach destination through advertiser = entry.cost + 1 (link cost)
         let total_cost = entry.cost.saturating_add(1);
-        if table.update_with_source(entry.destination, ad.advertiser, total_cost, RouteSource::Advertisement) {
+        if table.update_with_source(
+            entry.destination,
+            ad.advertiser,
+            total_cost,
+            RouteSource::Advertisement,
+        ) {
             changed = true;
         }
     }
@@ -112,12 +124,15 @@ mod tests {
     fn make_cache_for(kp: &Keypair) -> PubkeyCache {
         use crate::pubkey_cache::CachedPubkey;
         let mut cache = PubkeyCache::new(100);
-        cache.insert(kp.peer_id(), CachedPubkey {
-            signing_algo: kp.identity.signing_algo(),
-            signing_pk: kp.identity.signing.signing_pubkey_bytes(),
-            kem_algo: kp.identity.kem_algo(),
-            kem_pk: kp.identity.kem.kem_pubkey_bytes(),
-        });
+        cache.insert(
+            kp.peer_id(),
+            CachedPubkey {
+                signing_algo: kp.identity.signing_algo(),
+                signing_pk: kp.identity.signing.signing_pubkey_bytes(),
+                kem_algo: kp.identity.kem_algo(),
+                kem_pk: kp.identity.kem.kem_pubkey_bytes(),
+            },
+        );
         cache
     }
 

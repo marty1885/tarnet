@@ -2,13 +2,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use tarnet_api::service::{DataStream, ListenerOptions, ServiceApi, TnsRecord, TnsResolution};
+use tarnet_api::service::{
+    DataStream, ListenerOptions, PortMode, ServiceApi, TnsRecord, TnsResolution,
+};
 use tarnet_api::types::{PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Parser)]
-#[command(name = "tarnet", about = "Command-line interface for the tarnet overlay network", arg_required_else_help = true)]
+#[command(
+    name = "tarnet",
+    about = "Command-line interface for the tarnet overlay network",
+    arg_required_else_help = true
+)]
 struct Cli {
     /// IPC socket path (default: $XDG_DATA_HOME/tarnet/sock)
     #[arg(long, global = true)]
@@ -47,17 +53,23 @@ enum Command {
     Connect {
         /// Target: ServiceId (base32), PeerId (hex), or TNS name
         target: String,
-        /// Port to connect to
-        #[arg(long, default_value_t = 80)]
-        port: u16,
+        /// Delivery mode: reliable-ordered, reliable-unordered, or unreliable-unordered
+        #[arg(long, default_value = "reliable-ordered")]
+        mode: String,
+        /// Port name to connect to
+        #[arg(long, default_value = "80")]
+        port: String,
     },
     /// Listen for incoming connections (netcat-like I/O)
     Listen {
         /// Identity to listen on (label or ServiceId; defaults to default identity)
         identity: Option<String>,
-        /// Port to listen on
-        #[arg(long, default_value_t = 80)]
-        port: u16,
+        /// Delivery mode: reliable-ordered, reliable-unordered, or unreliable-unordered
+        #[arg(long, default_value = "reliable-ordered")]
+        mode: String,
+        /// Port name to listen on
+        #[arg(long, default_value = "80")]
+        port: String,
     },
     /// Run a command with traffic routed through tarnet
     #[command(arg_required_else_help = true)]
@@ -264,7 +276,11 @@ async fn connect_daemon(cli: &Cli) -> Arc<IpcServiceApi> {
     match IpcServiceApi::connect(&socket).await {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to connect to tarnetd at {}: {}", socket.display(), e);
+            eprintln!(
+                "Failed to connect to tarnetd at {}: {}",
+                socket.display(),
+                e
+            );
             eprintln!("Is tarnetd running?");
             std::process::exit(1);
         }
@@ -279,9 +295,15 @@ async fn main() {
         Command::Dht { command } => cmd_dht(&cli, command).await,
         Command::Tns { command } => cmd_tns(&cli, command).await,
         Command::Identity { command } => cmd_identity(&cli, command).await,
-        Command::Connect { target, port } => cmd_connect(&cli, target, *port).await,
-        Command::Listen { identity, port } => cmd_listen(&cli, identity, *port).await,
-        Command::Tarify { identity, command } => cmd_tarify(&cli, identity.as_deref(), command).await,
+        Command::Connect { target, mode, port } => cmd_connect(&cli, target, mode, port).await,
+        Command::Listen {
+            identity,
+            mode,
+            port,
+        } => cmd_listen(&cli, identity, mode, port).await,
+        Command::Tarify { identity, command } => {
+            cmd_tarify(&cli, identity.as_deref(), command).await
+        }
         Command::Status => cmd_status(&cli).await,
         Command::Reload => cmd_reload(&cli).await,
     }
@@ -293,10 +315,19 @@ async fn cmd_identity(cli: &Cli, cmd: &IdentityCommand) {
     let client = connect_daemon(cli).await;
 
     match cmd {
-        IdentityCommand::Create { label, privacy, intro_points, outbound_hops, scheme } => {
+        IdentityCommand::Create {
+            label,
+            privacy,
+            intro_points,
+            outbound_hops,
+            scheme,
+        } => {
             let privacy = parse_privacy(privacy, *intro_points);
             let scheme = parse_scheme(scheme);
-            match client.create_identity(label, privacy, *outbound_hops, scheme).await {
+            match client
+                .create_identity(label, privacy, *outbound_hops, scheme)
+                .await
+            {
                 Ok(sid) => {
                     println!("Created identity '{}': {}", label, sid);
                     println!("  Scheme:        {}", scheme);
@@ -309,7 +340,13 @@ async fn cmd_identity(cli: &Cli, cmd: &IdentityCommand) {
                 }
             }
         }
-        IdentityCommand::Update { label, privacy, intro_points, outbound_hops, yes } => {
+        IdentityCommand::Update {
+            label,
+            privacy,
+            intro_points,
+            outbound_hops,
+            yes,
+        } => {
             let privacy = parse_privacy(privacy, *intro_points);
 
             // Fetch current state to detect downgrades.
@@ -322,10 +359,17 @@ async fn cmd_identity(cli: &Cli, cmd: &IdentityCommand) {
             let (_, _, old_privacy, old_hops, _, _, _) = current.unwrap();
 
             let downgraded = match (*old_privacy, privacy) {
-                (tarnet_api::types::PrivacyLevel::Hidden { .. }, tarnet_api::types::PrivacyLevel::Public) => true,
                 (
-                    tarnet_api::types::PrivacyLevel::Hidden { intro_points: old_n },
-                    tarnet_api::types::PrivacyLevel::Hidden { intro_points: new_n },
+                    tarnet_api::types::PrivacyLevel::Hidden { .. },
+                    tarnet_api::types::PrivacyLevel::Public,
+                ) => true,
+                (
+                    tarnet_api::types::PrivacyLevel::Hidden {
+                        intro_points: old_n,
+                    },
+                    tarnet_api::types::PrivacyLevel::Hidden {
+                        intro_points: new_n,
+                    },
                 ) => new_n < old_n,
                 _ => false,
             };
@@ -386,29 +430,27 @@ async fn cmd_identity(cli: &Cli, cmd: &IdentityCommand) {
                 }
             }
         }
-        IdentityCommand::List => {
-            match client.list_identities().await {
-                Ok(identities) => {
-                    if identities.is_empty() {
-                        println!("No identities.");
-                    } else {
-                        for (label, sid, privacy, hops, scheme, signing, kem) in &identities {
-                            println!("{}", label);
-                            println!("  ServiceId:     {}", sid);
-                            println!("  Scheme:        {}", scheme);
-                            println!("  Signing:       {}", signing);
-                            println!("  KEM:           {}", kem);
-                            println!("  Privacy:       {:?}", privacy);
-                            println!("  Outbound hops: {}", hops);
-                        }
+        IdentityCommand::List => match client.list_identities().await {
+            Ok(identities) => {
+                if identities.is_empty() {
+                    println!("No identities.");
+                } else {
+                    for (label, sid, privacy, hops, scheme, signing, kem) in &identities {
+                        println!("{}", label);
+                        println!("  ServiceId:     {}", sid);
+                        println!("  Scheme:        {}", scheme);
+                        println!("  Signing:       {}", signing);
+                        println!("  KEM:           {}", kem);
+                        println!("  Privacy:       {:?}", privacy);
+                        println!("  Outbound hops: {}", hops);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Failed to list identities: {}", e);
-                    std::process::exit(1);
-                }
             }
-        }
+            Err(e) => {
+                eprintln!("Failed to list identities: {}", e);
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -503,7 +545,13 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
     let client = connect_daemon(cli).await;
 
     match cmd {
-        TnsCommand::Set { name, record_type, value, public, identity } => {
+        TnsCommand::Set {
+            name,
+            record_type,
+            value,
+            public,
+            identity,
+        } => {
             let id = identity.as_deref();
             let record = parse_tns_record(record_type, value);
             let records = vec![record];
@@ -547,27 +595,25 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::List { identity } => {
-            match client.tns_list_labels(identity.as_deref()).await {
-                Ok(entries) => {
-                    if entries.is_empty() {
-                        println!("No records.");
-                    } else {
-                        for (name, records, public) in &entries {
-                            let status = if *public { "[public]" } else { "[private]" };
-                            println!("{} {}:", name, status);
-                            for rec in records {
-                                print_tns_record(rec);
-                            }
+        TnsCommand::List { identity } => match client.tns_list_labels(identity.as_deref()).await {
+            Ok(entries) => {
+                if entries.is_empty() {
+                    println!("No records.");
+                } else {
+                    for (name, records, public) in &entries {
+                        let status = if *public { "[public]" } else { "[private]" };
+                        println!("{} {}:", name, status);
+                        for rec in records {
+                            print_tns_record(rec);
                         }
                     }
                 }
-                Err(e) => {
-                    eprintln!("Failed: {}", e);
-                    std::process::exit(1);
-                }
             }
-        }
+            Err(e) => {
+                eprintln!("Failed: {}", e);
+                std::process::exit(1);
+            }
+        },
         TnsCommand::Resolve { name, zone } => {
             let result = if let Some(z) = zone {
                 // Try as ServiceId first, then as identity label
@@ -594,7 +640,11 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 }
             }
         }
-        TnsCommand::Export { file, yes, identity } => {
+        TnsCommand::Export {
+            file,
+            yes,
+            identity,
+        } => {
             let id = identity.as_deref();
             let entries = match client.tns_list_labels(id).await {
                 Ok(e) => e,
@@ -620,7 +670,11 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
 
             let export: Vec<ZoneEntry> = entries
                 .into_iter()
-                .map(|(label, records, publish)| ZoneEntry { label, records, publish })
+                .map(|(label, records, publish)| ZoneEntry {
+                    label,
+                    records,
+                    publish,
+                })
                 .collect();
 
             let json = serde_json::to_string_pretty(&export).unwrap();
@@ -635,7 +689,11 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 println!("{}", json);
             }
         }
-        TnsCommand::Import { file, yes, identity } => {
+        TnsCommand::Import {
+            file,
+            yes,
+            identity,
+        } => {
             let data = match std::fs::read_to_string(file) {
                 Ok(d) => d,
                 Err(e) => {
@@ -667,7 +725,15 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
 
             let mut ok = 0usize;
             for entry in &entries {
-                match client.tns_set_label(identity.as_deref(), &entry.label, entry.records.clone(), entry.publish).await {
+                match client
+                    .tns_set_label(
+                        identity.as_deref(),
+                        &entry.label,
+                        entry.records.clone(),
+                        entry.publish,
+                    )
+                    .await
+                {
                     Ok(()) => ok += 1,
                     Err(e) => eprintln!("Failed to import '{}': {}", entry.label, e),
                 }
@@ -690,7 +756,10 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
             }
 
             if !yes {
-                eprint!("Remove all {} record(s) from the zone? [N/y] ", entries.len());
+                eprint!(
+                    "Remove all {} record(s) from the zone? [N/y] ",
+                    entries.len()
+                );
                 if !confirm_stdin() {
                     eprintln!("Aborted.");
                     std::process::exit(1);
@@ -756,11 +825,31 @@ fn print_tns_record(rec: &TnsRecord) {
         TnsRecord::Text(s) => println!("  TEXT        {}", s),
         TnsRecord::Alias(s) => println!("  ALIAS       {}", s),
         TnsRecord::ContentRef(h) => println!("  CONTENT-REF {}", hex_encode(h)),
-        TnsRecord::IntroductionPoint { relay_peer_id, kem_algo, kem_pubkey } => {
-            println!("  INTRO-POINT relay={} kem_algo={} kem_pk={}", relay_peer_id, kem_algo, hex_encode(kem_pubkey))
+        TnsRecord::IntroductionPoint {
+            relay_peer_id,
+            kem_algo,
+            kem_pubkey,
+        } => {
+            println!(
+                "  INTRO-POINT relay={} kem_algo={} kem_pk={}",
+                relay_peer_id,
+                kem_algo,
+                hex_encode(kem_pubkey)
+            )
         }
-        TnsRecord::Peer { signing_algo, peer_id, signing_pubkey, signature } => {
-            println!("  PEER        peer={} signing_algo={} pubkey_len={} sig_len={}", peer_id, signing_algo, signing_pubkey.len(), signature.len())
+        TnsRecord::Peer {
+            signing_algo,
+            peer_id,
+            signing_pubkey,
+            signature,
+        } => {
+            println!(
+                "  PEER        peer={} signing_algo={} pubkey_len={} sig_len={}",
+                peer_id,
+                signing_algo,
+                signing_pubkey.len(),
+                signature.len()
+            )
         }
     }
 }
@@ -834,12 +923,31 @@ async fn stdio_bridge(
     }
 }
 
-async fn cmd_connect(cli: &Cli, target: &str, port: u16) {
+fn parse_port_mode(mode: &str) -> PortMode {
+    match mode {
+        "reliable-ordered" | "ro" => PortMode::ReliableOrdered,
+        "reliable-unordered" | "ru" => PortMode::ReliableUnordered,
+        "unreliable-unordered" | "uu" => PortMode::UnreliableUnordered,
+        _ => {
+            eprintln!(
+                "Unknown mode '{}'. Use reliable-ordered, reliable-unordered, or unreliable-unordered.",
+                mode
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_connect(cli: &Cli, target: &str, mode: &str, port: &str) {
     let client = connect_daemon(cli).await;
+    let mode = parse_port_mode(mode);
 
-    eprintln!("Connecting to {} port {}...", target, port);
+    eprintln!(
+        "Connecting to {} mode {:?} port '{}'...",
+        target, mode, port
+    );
 
-    let conn = match client.connect_to(target, port).await {
+    let conn = match client.connect_to(target, mode, port).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Connection failed: {}", e);
@@ -847,15 +955,19 @@ async fn cmd_connect(cli: &Cli, target: &str, port: u16) {
         }
     };
 
-    eprintln!("Connected to {}. Type to send, Ctrl-C to quit.", conn.remote_service_id);
+    eprintln!(
+        "Connected to {}. Type to send, Ctrl-C to quit.",
+        conn.remote_service_id
+    );
     eprintln!();
 
     let mut disconnect_rx = client.subscribe_disconnect();
     stdio_bridge(&conn, &mut disconnect_rx).await;
 }
 
-async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
+async fn cmd_listen(cli: &Cli, identity: &Option<String>, mode: &str, port: &str) {
     let client = connect_daemon(cli).await;
+    let mode = parse_port_mode(mode);
 
     let id_str = identity.as_deref().unwrap_or("default");
     let service_id = match client.resolve_identity(id_str).await {
@@ -866,14 +978,20 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
         }
     };
 
-    let listener = match client.listen(service_id, port, ListenerOptions::default()).await {
+    let listener = match client
+        .listen(service_id, mode, port, ListenerOptions::default())
+        .await
+    {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("Listen failed: {}", e);
             std::process::exit(1);
         }
     };
-    eprintln!("Listening on {} port {}.", service_id, port);
+    eprintln!(
+        "Listening on {} mode {:?} port '{}'.",
+        service_id, mode, port
+    );
     eprintln!("Waiting for connections... (Ctrl-C to quit)");
 
     let connections: Arc<tokio::sync::Mutex<Vec<Arc<tarnet_api::service::Connection>>>> =
@@ -898,7 +1016,8 @@ async fn cmd_listen(cli: &Cli, identity: &Option<String>, port: u16) {
                                 Ok(data) => {
                                     let tag = format!("{}", conn.remote_service_id);
                                     let short = &tag[..tag.len().min(16)];
-                                    let _ = stdout.write_all(format!("[{}] ", short).as_bytes()).await;
+                                    let _ =
+                                        stdout.write_all(format!("[{}] ", short).as_bytes()).await;
                                     let _ = stdout.write_all(&data).await;
                                     let _ = stdout.flush().await;
                                 }
@@ -1069,14 +1188,19 @@ async fn cmd_status(cli: &Cli) {
 
     // Identities
     if !identities.is_empty() {
-        let name_w = identities.iter()
+        let name_w = identities
+            .iter()
             .map(|(l, ..)| l.len())
-            .max().unwrap_or(4)
-            .max(4) + 2; // +2 gutter
+            .max()
+            .unwrap_or(4)
+            .max(4)
+            + 2; // +2 gutter
         println!(
             "  {} {} {} {}",
-            lpad_dim("name", name_w), lpad_dim("privacy", 8),
-            lpad_dim("hops", 6), dim("address"),
+            lpad_dim("name", name_w),
+            lpad_dim("privacy", 8),
+            lpad_dim("hops", 6),
+            dim("address"),
         );
         for (label, sid, privacy, hops, _, _, _) in &identities {
             let badge = match privacy {
@@ -1086,17 +1210,22 @@ async fn cmd_status(cli: &Cli) {
             println!(
                 "  {} {} {:<6} {}",
                 bold(&format!("{:<width$}", label, width = name_w)),
-                badge, hops, dim(&censor_address(&sid.to_string())),
+                badge,
+                hops,
+                dim(&censor_address(&sid.to_string())),
             );
         }
     }
 
     // Peers — grouped by peer, active link on main line, standby summarized
     if !status.peers.is_empty() {
-        let xport_w = status.peers.iter()
+        let xport_w = status
+            .peers
+            .iter()
             .flat_map(|p| p.links.iter())
             .map(|l| l.transport.len())
-            .max().unwrap_or(3)
+            .max()
+            .unwrap_or(3)
             .max(3);
 
         println!();
@@ -1106,33 +1235,63 @@ async fn cmd_status(cli: &Cli) {
 
             // Main line: active link
             if let Some(link) = active {
-                let arrow = if link.direction == "outbound" { "->" } else { "<-" };
+                let arrow = if link.direction == "outbound" {
+                    "->"
+                } else {
+                    "<-"
+                };
                 println!(
                     "  {} {}  {:<w$}  {}  {}",
-                    color("\x1b[36m", arrow), short_peer(&peer.peer_id),
-                    link.transport, format_rtt(link.rtt_us),
+                    color("\x1b[36m", arrow),
+                    short_peer(&peer.peer_id),
+                    link.transport,
+                    format_rtt(link.rtt_us),
                     dim(&format!("idle {}", format_duration(link.idle_secs))),
                     w = xport_w,
                 );
             } else {
                 // No active link (shouldn't happen, but handle gracefully)
-                println!("  {} {}  {}", dim("--"), short_peer(&peer.peer_id), dim("no active link"));
+                println!(
+                    "  {} {}  {}",
+                    dim("--"),
+                    short_peer(&peer.peer_id),
+                    dim("no active link")
+                );
             }
 
             // Standby summary: indented, dim, grouped by transport
             if !standby.is_empty() {
-                let mut by_transport: std::collections::BTreeMap<&str, (usize, usize)> = std::collections::BTreeMap::new();
+                let mut by_transport: std::collections::BTreeMap<&str, (usize, usize)> =
+                    std::collections::BTreeMap::new();
                 for l in &standby {
                     let entry = by_transport.entry(l.transport.as_str()).or_insert((0, 0));
-                    if l.direction == "outbound" { entry.0 += 1; } else { entry.1 += 1; }
+                    if l.direction == "outbound" {
+                        entry.0 += 1;
+                    } else {
+                        entry.1 += 1;
+                    }
                 }
-                let parts: Vec<String> = by_transport.iter().map(|(xport, (out, inp))| {
-                    let mut dirs = Vec::new();
-                    if *out > 0 { dirs.push(format!("{}->", out)); }
-                    if *inp > 0 { dirs.push(format!("<-{}", inp)); }
-                    format!("{} {}", dirs.join(" "), xport)
-                }).collect();
-                println!("  {}", dim(&format!("     + {} standby: {}", standby.len(), parts.join(", "))));
+                let parts: Vec<String> = by_transport
+                    .iter()
+                    .map(|(xport, (out, inp))| {
+                        let mut dirs = Vec::new();
+                        if *out > 0 {
+                            dirs.push(format!("{}->", out));
+                        }
+                        if *inp > 0 {
+                            dirs.push(format!("<-{}", inp));
+                        }
+                        format!("{} {}", dirs.join(" "), xport)
+                    })
+                    .collect();
+                println!(
+                    "  {}",
+                    dim(&format!(
+                        "     + {} standby: {}",
+                        standby.len(),
+                        parts.join(", ")
+                    ))
+                );
             }
         }
     }
@@ -1148,7 +1307,12 @@ async fn cmd_status(cli: &Cli) {
             } else {
                 format!("{} {}", dim("via"), short_peer(next_hop))
             };
-            println!("  {}  {}  {}", short_peer(dest), via, dim(&format!("cost {}", cost)));
+            println!(
+                "  {}  {}  {}",
+                short_peer(dest),
+                via,
+                dim(&format!("cost {}", cost))
+            );
         }
     }
 
@@ -1162,10 +1326,14 @@ async fn cmd_status(cli: &Cli) {
     println!(
         "  {} {} {}  {} {}  {} {}  {} ~{}",
         dim("dht"),
-        status.dht.stored_records, dim(&format!("records / {} keys", status.dht.stored_keys)),
-        dim("kbucket"), status.dht.kbucket_peers,
-        dim("watches"), watches,
-        dim("nse"), status.dht.nse,
+        status.dht.stored_records,
+        dim(&format!("records / {} keys", status.dht.stored_keys)),
+        dim("kbucket"),
+        status.dht.kbucket_peers,
+        dim("watches"),
+        watches,
+        dim("nse"),
+        status.dht.nse,
     );
 
     let c = &status.circuits;
@@ -1175,24 +1343,29 @@ async fn cmd_status(cli: &Cli) {
         (c.relay_endpoints, "end"),
         (c.rendezvous_points, "rdv"),
         (c.intro_points, "intro"),
-    ].iter()
-        .filter(|(n, _)| *n > 0)
-        .map(|(n, l)| format!("{} {}", n, l))
-        .collect();
+    ]
+    .iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, l)| format!("{} {}", n, l))
+    .collect();
     println!(
         "  {} {}",
         dim("circuits"),
-        if parts.is_empty() { dim("none") } else { parts.join("  ") },
+        if parts.is_empty() {
+            dim("none")
+        } else {
+            parts.join("  ")
+        },
     );
 
     // Traffic
     let t = &status.traffic;
     println!();
     print_traffic_header();
-    print_traffic_row("↑",    Some("\x1b[32m"), &t.bytes_up, false);
-    print_traffic_row("↓",    Some("\x1b[34m"), &t.bytes_down, false);
-    print_traffic_row("pkt↑", None,             &t.packets_up, true);
-    print_traffic_row("pkt↓", None,             &t.packets_down, true);
+    print_traffic_row("↑", Some("\x1b[32m"), &t.bytes_up, false);
+    print_traffic_row("↓", Some("\x1b[34m"), &t.bytes_down, false);
+    print_traffic_row("pkt↑", None, &t.packets_up, true);
+    print_traffic_row("pkt↓", None, &t.packets_down, true);
     if t.cells_relayed.total > 0 {
         print_traffic_row("relay", None, &t.cells_relayed, true);
     }
@@ -1206,15 +1379,27 @@ fn use_color() -> bool {
 }
 
 fn bold(s: &str) -> String {
-    if use_color() { format!("\x1b[1m{}\x1b[0m", s) } else { s.to_string() }
+    if use_color() {
+        format!("\x1b[1m{}\x1b[0m", s)
+    } else {
+        s.to_string()
+    }
 }
 
 fn dim(s: &str) -> String {
-    if use_color() { format!("\x1b[2m{}\x1b[0m", s) } else { s.to_string() }
+    if use_color() {
+        format!("\x1b[2m{}\x1b[0m", s)
+    } else {
+        s.to_string()
+    }
 }
 
 fn color(code: &str, s: &str) -> String {
-    if use_color() { format!("{}{}\x1b[0m", code, s) } else { s.to_string() }
+    if use_color() {
+        format!("{}{}\x1b[0m", code, s)
+    } else {
+        s.to_string()
+    }
 }
 
 /// Right-aligned dim text: pad first, then wrap in ANSI.
@@ -1237,7 +1422,7 @@ fn censor_address(s: &str) -> String {
     if s.len() <= 16 {
         return s.to_string();
     }
-    format!("{}...{}", &s[..8], &s[s.len()-4..])
+    format!("{}...{}", &s[..8], &s[s.len() - 4..])
 }
 
 fn format_duration(secs: u64) -> String {
@@ -1305,8 +1490,10 @@ fn print_traffic_header() {
     println!(
         "  {} {} {} {} {}",
         lpad_dim("", LABEL_W),
-        rpad_dim("total", COL), rpad_dim("5m", COL),
-        rpad_dim("1h", COL), rpad_dim("1d", COL),
+        rpad_dim("total", COL),
+        rpad_dim("5m", COL),
+        rpad_dim("1h", COL),
+        rpad_dim("1d", COL),
     );
 }
 
@@ -1380,7 +1567,10 @@ async fn cmd_reload(cli: &Cli) {
 fn parse_dht_hash(hex_str: &str) -> [u8; 64] {
     let bytes = hex_decode(hex_str);
     if bytes.len() != 64 {
-        eprintln!("Invalid hash: expected 128 hex chars, got {}", hex_str.len());
+        eprintln!(
+            "Invalid hash: expected 128 hex chars, got {}",
+            hex_str.len()
+        );
         std::process::exit(1);
     }
     let mut hash = [0u8; 64];
@@ -1401,7 +1591,10 @@ fn parse_service_id(input: &str) -> ServiceId {
 fn parse_peer_id(hex_str: &str) -> PeerId {
     let bytes = hex_decode(hex_str);
     if bytes.len() != 32 {
-        eprintln!("Invalid peer ID: expected 64 hex chars, got {}", hex_str.len());
+        eprintln!(
+            "Invalid peer ID: expected 64 hex chars, got {}",
+            hex_str.len()
+        );
         std::process::exit(1);
     }
     let mut id = [0u8; 32];
@@ -1414,7 +1607,10 @@ fn parse_scheme(s: &str) -> tarnet_api::types::IdentityScheme {
         "ed25519" => tarnet_api::types::IdentityScheme::Ed25519,
         "falcon_ed25519" => tarnet_api::types::IdentityScheme::FalconEd25519,
         other => {
-            eprintln!("Unknown scheme: {}. Use 'falcon_ed25519' or 'ed25519'.", other);
+            eprintln!(
+                "Unknown scheme: {}. Use 'falcon_ed25519' or 'ed25519'.",
+                other
+            );
             std::process::exit(1);
         }
     }
@@ -1425,7 +1621,10 @@ fn parse_privacy(s: &str, intro_points: u8) -> tarnet_api::types::PrivacyLevel {
         "public" => tarnet_api::types::PrivacyLevel::Public,
         "hidden" => tarnet_api::types::PrivacyLevel::Hidden { intro_points },
         other => {
-            eprintln!("Unknown privacy level: {}. Use 'public' or 'hidden'.", other);
+            eprintln!(
+                "Unknown privacy level: {}. Use 'public' or 'hidden'.",
+                other
+            );
             std::process::exit(1);
         }
     }

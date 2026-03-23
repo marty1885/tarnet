@@ -351,11 +351,7 @@ pub fn is_global_addr(addr: &std::net::SocketAddr) -> bool {
             let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
             let is_site_local = (segs[0] & 0xffc0) == 0xfec0;
             let is_ula = (segs[0] & 0xfe00) == 0xfc00;
-            !ip.is_loopback()
-                && !ip.is_unspecified()
-                && !is_link_local
-                && !is_site_local
-                && !is_ula
+            !ip.is_loopback() && !ip.is_unspecified() && !is_link_local && !is_site_local && !is_ula
         }
     }
 }
@@ -438,9 +434,9 @@ impl TransportAddress {
                     Some(format!("[{}]:{}", ip, port))
                 }
             }
-            TransportType::Ws => {
-                std::str::from_utf8(&self.address).ok().map(|s| s.to_string())
-            }
+            TransportType::Ws => std::str::from_utf8(&self.address)
+                .ok()
+                .map(|s| s.to_string()),
             TransportType::WebRtc | TransportType::Unknown(_) => None,
         }
     }
@@ -617,7 +613,10 @@ mod tests {
     #[test]
     fn parse_socket_addr_ipv4() {
         let addr = parse_socket_addr("127.0.0.1:8080").unwrap();
-        assert_eq!(addr, "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap());
+        assert_eq!(
+            addr,
+            "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -633,10 +632,7 @@ mod tests {
             std::net::SocketAddr::V6(v6) => {
                 assert_eq!(v6.scope_id(), 3);
                 assert_eq!(v6.port(), 7946);
-                assert_eq!(
-                    *v6.ip(),
-                    "fe80::1".parse::<std::net::Ipv6Addr>().unwrap()
-                );
+                assert_eq!(*v6.ip(), "fe80::1".parse::<std::net::Ipv6Addr>().unwrap());
             }
             _ => panic!("expected V6"),
         }

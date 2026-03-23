@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use tarnet_api::error::ApiResult;
 use tarnet_api::ipc::*;
-use tarnet_api::service::{Connection, Listener, ListenerOptions, NodeEvent, ServiceApi};
+use tarnet_api::service::{Connection, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi};
 use tarnet_api::types::{DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
 
 /// Per-client connection table: maps conn_id -> Connection.
@@ -68,7 +68,8 @@ async fn register_connection(
     ConnectResp {
         conn_id: client_conn_id,
         remote_service_id,
-        port: conn.port,
+        mode: conn.mode,
+        port: conn.port.clone(),
     }
 }
 
@@ -76,7 +77,7 @@ async fn register_listener(listeners: &ListenerTable, listener: Listener) -> Lis
     let client_listener_id = {
         let mut guard = listeners.lock().await;
         let client_listener_id = allocate_client_listener_id(&guard);
-        guard.insert(client_listener_id, listener);
+        guard.insert(client_listener_id, listener.clone());
         client_listener_id
     };
 
@@ -84,6 +85,7 @@ async fn register_listener(listeners: &ListenerTable, listener: Listener) -> Lis
         listener: Listener {
             id: client_listener_id,
             service_id: listener.service_id,
+            mode: listener.mode,
             port: listener.port,
             options: listener.options,
         },
@@ -91,7 +93,12 @@ async fn register_listener(listeners: &ListenerTable, listener: Listener) -> Lis
 }
 
 async fn close_client_listeners(api: &dyn ServiceApi, listeners: &ListenerTable) {
-    let listeners: Vec<Listener> = listeners.lock().await.drain().map(|(_, listener)| listener).collect();
+    let listeners: Vec<Listener> = listeners
+        .lock()
+        .await
+        .drain()
+        .map(|(_, listener)| listener)
+        .collect();
     for listener in listeners {
         if let Err(e) = api.close_listener(&listener).await {
             log::debug!("Failed to close IPC listener {}: {}", listener.id, e);
@@ -126,7 +133,9 @@ pub async fn run_ipc_server(
                 let client_reload = reload_notify.clone();
                 let client_expose_reload = expose_reload_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_client(stream, client_api, client_reload, client_expose_reload).await {
+                    if let Err(e) =
+                        handle_client(stream, client_api, client_reload, client_expose_reload).await
+                    {
                         log::debug!("IPC client disconnected: {}", e);
                     }
                 });
@@ -199,7 +208,9 @@ async fn handle_client(
                             Ok(v) => v,
                             Err(e) => {
                                 let mut w = writer.lock().await;
-                                let _ = send_frame(&mut *w, &err_response(request_id, &e.to_string())).await;
+                                let _ =
+                                    send_frame(&mut *w, &err_response(request_id, &e.to_string()))
+                                        .await;
                                 continue;
                             }
                         };
@@ -231,10 +242,14 @@ async fn handle_client(
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
                                     reply_rx,
-                                ).await {
+                                )
+                                .await
+                                {
                                     Ok(Ok(Ok(()))) => ok_response(request_id, &[]),
                                     Ok(Ok(Err(e))) => err_response(request_id, &e),
-                                    Ok(Err(_)) => err_response(request_id, "expose reload cancelled"),
+                                    Ok(Err(_)) => {
+                                        err_response(request_id, "expose reload cancelled")
+                                    }
                                     Err(_) => err_response(request_id, "expose reload timed out"),
                                 }
                             } else {
@@ -287,8 +302,10 @@ async fn handle_client(
                         // Handle each request concurrently so one slow DHT lookup
                         // doesn't block quick peer_id queries.
                         tokio::spawn(async move {
-                            let response =
-                                dispatch_request(&*api, method, &payload, request_id, &writer, &conns, &listeners).await;
+                            let response = dispatch_request(
+                                &*api, method, &payload, request_id, &writer, &conns, &listeners,
+                            )
+                            .await;
                             let mut w = writer.lock().await;
                             if let Err(e) = send_frame(&mut *w, &response).await {
                                 log::debug!("Failed to send IPC response: {}", e);
@@ -407,7 +424,10 @@ async fn dispatch_request(
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
             match api.dht_get(&hash, timeout_secs).await {
-                Some(data) => ok_response(request_id, &encode_payload(&serde_bytes::ByteBuf::from(data))),
+                Some(data) => ok_response(
+                    request_id,
+                    &encode_payload(&serde_bytes::ByteBuf::from(data)),
+                ),
                 None => not_found_response(request_id),
             }
         }
@@ -429,7 +449,10 @@ async fn dispatch_request(
             let results = api.dht_get_signed(&hash, timeout_secs).await;
             let entries: Vec<SignedContentEntry> = results
                 .into_iter()
-                .map(|e| SignedContentEntry { signer: e.signer, data: e.data })
+                .map(|e| SignedContentEntry {
+                    signer: e.signer,
+                    data: e.data,
+                })
                 .collect();
             ok_response(request_id, &encode_payload(&entries))
         }
@@ -479,12 +502,19 @@ async fn dispatch_request(
         }
 
         METHOD_TNS_PUBLISH => {
-            let (identity, label, records, ttl): (Option<String>, String, Vec<tarnet_api::service::TnsRecord>, u32) =
-                match decode_payload(payload) {
-                    Ok(v) => v,
-                    Err(e) => return err_response(request_id, &e.to_string()),
-                };
-            match api.tns_publish(identity.as_deref(), &label, records, ttl).await {
+            let (identity, label, records, ttl): (
+                Option<String>,
+                String,
+                Vec<tarnet_api::service::TnsRecord>,
+                u32,
+            ) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api
+                .tns_publish(identity.as_deref(), &label, records, ttl)
+                .await
+            {
                 Ok(()) => ok_response(request_id, &[]),
                 Err(e) => err_response(request_id, &e.to_string()),
             }
@@ -502,12 +532,19 @@ async fn dispatch_request(
         }
 
         METHOD_TNS_SET_LABEL => {
-            let (identity, label, records, publish): (Option<String>, String, Vec<tarnet_api::service::TnsRecord>, bool) =
-                match decode_payload(payload) {
-                    Ok(v) => v,
-                    Err(e) => return err_response(request_id, &e.to_string()),
-                };
-            match api.tns_set_label(identity.as_deref(), &label, records, publish).await {
+            let (identity, label, records, publish): (
+                Option<String>,
+                String,
+                Vec<tarnet_api::service::TnsRecord>,
+                bool,
+            ) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api
+                .tns_set_label(identity.as_deref(), &label, records, publish)
+                .await
+            {
                 Ok(()) => ok_response(request_id, &[]),
                 Err(e) => err_response(request_id, &e.to_string()),
             }
@@ -570,7 +607,10 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.listen(req.service_id, req.port, req.options).await {
+            match api
+                .listen(req.service_id, req.mode, &req.port, req.options)
+                .await
+            {
                 Ok(listener) => {
                     let resp = encode_payload(&register_listener(listeners, listener).await);
                     ok_response(request_id, &resp)
@@ -580,11 +620,11 @@ async fn dispatch_request(
         }
 
         METHOD_CONNECT => {
-            let (sid, port): (ServiceId, u16) = match decode_payload(payload) {
+            let (sid, mode, port): (ServiceId, PortMode, String) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.connect(sid, port).await {
+            match api.connect(sid, mode, &port).await {
                 Ok(conn) => {
                     let resp = encode_payload(&register_connection(conns, conn, writer).await);
                     ok_response(request_id, &resp)
@@ -600,7 +640,7 @@ async fn dispatch_request(
             };
             let listener = {
                 let guard = listeners.lock().await;
-                guard.get(&req.listener_id).copied()
+                guard.get(&req.listener_id).cloned()
             };
             let listener = match listener {
                 Some(listener) => listener,
@@ -616,11 +656,15 @@ async fn dispatch_request(
         }
 
         METHOD_PUBLISH_HIDDEN_SERVICE => {
-            let (sid, count): (ServiceId, u16) = match decode_payload(payload) {
-                Ok(v) => v,
-                Err(e) => return err_response(request_id, &e.to_string()),
-            };
-            match api.listen_hidden(sid, 0, count as usize, ListenerOptions::default()).await {
+            let (sid, mode, port, count): (ServiceId, PortMode, String, u16) =
+                match decode_payload(payload) {
+                    Ok(v) => v,
+                    Err(e) => return err_response(request_id, &e.to_string()),
+                };
+            match api
+                .listen_hidden(sid, mode, &port, count as usize, ListenerOptions::default())
+                .await
+            {
                 Ok(listener) => {
                     let _ = register_listener(listeners, listener).await;
                     ok_response(request_id, &[])
@@ -634,12 +678,16 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.listen_hidden(
-                req.service_id,
-                req.port,
-                req.num_intro_points as usize,
-                req.options,
-            ).await {
+            match api
+                .listen_hidden(
+                    req.service_id,
+                    req.mode,
+                    &req.port,
+                    req.num_intro_points as usize,
+                    req.options,
+                )
+                .await
+            {
                 Ok(listener) => {
                     let resp = encode_payload(&register_listener(listeners, listener).await);
                     ok_response(request_id, &resp)
@@ -660,23 +708,30 @@ async fn dispatch_request(
         }
 
         METHOD_CREATE_IDENTITY => {
-            let (label, privacy, outbound_hops, scheme): (String, PrivacyLevel, u8, IdentityScheme) =
-                match decode_payload(payload) {
-                    Ok(v) => v,
-                    Err(e) => return err_response(request_id, &e.to_string()),
-                };
-            match api.create_identity(&label, privacy, outbound_hops, scheme).await {
+            let (label, privacy, outbound_hops, scheme): (
+                String,
+                PrivacyLevel,
+                u8,
+                IdentityScheme,
+            ) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api
+                .create_identity(&label, privacy, outbound_hops, scheme)
+                .await
+            {
                 Ok(sid) => ok_response(request_id, &encode_payload(&sid)),
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }
 
-        METHOD_LIST_IDENTITIES => {
-            match api.list_identities().await {
-                Ok(entries) => {
-                    let ipc_entries: Vec<IdentityEntry> = entries
-                        .into_iter()
-                        .map(|(label, service_id, privacy, outbound_hops, scheme, signing_algo, kem_algo)| IdentityEntry {
+        METHOD_LIST_IDENTITIES => match api.list_identities().await {
+            Ok(entries) => {
+                let ipc_entries: Vec<IdentityEntry> = entries
+                    .into_iter()
+                    .map(
+                        |(
                             label,
                             service_id,
                             privacy,
@@ -684,13 +739,21 @@ async fn dispatch_request(
                             scheme,
                             signing_algo,
                             kem_algo,
-                        })
-                        .collect();
-                    ok_response(request_id, &encode_payload(&ipc_entries))
-                }
-                Err(e) => err_response(request_id, &e.to_string()),
+                        )| IdentityEntry {
+                            label,
+                            service_id,
+                            privacy,
+                            outbound_hops,
+                            scheme,
+                            signing_algo,
+                            kem_algo,
+                        },
+                    )
+                    .collect();
+                ok_response(request_id, &encode_payload(&ipc_entries))
             }
-        }
+            Err(e) => err_response(request_id, &e.to_string()),
+        },
 
         METHOD_DELETE_IDENTITY => {
             let label: String = match decode_payload(payload) {
@@ -717,19 +780,17 @@ async fn dispatch_request(
             }
         }
 
-        METHOD_SOCKS_ADDR => {
-            match api.socks_addr().await {
-                Ok(addrs) => ok_response(request_id, &encode_payload(&addrs)),
-                Err(e) => err_response(request_id, &e.to_string()),
-            }
-        }
+        METHOD_SOCKS_ADDR => match api.socks_addr().await {
+            Ok(addrs) => ok_response(request_id, &encode_payload(&addrs)),
+            Err(e) => err_response(request_id, &e.to_string()),
+        },
 
         METHOD_CONNECT_TO => {
-            let (target, port): (String, u16) = match decode_payload(payload) {
+            let (target, mode, port): (String, PortMode, String) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api.connect_to(&target, port).await {
+            match api.connect_to(&target, mode, &port).await {
                 Ok(conn) => {
                     let resp = encode_payload(&register_connection(conns, conn, writer).await);
                     ok_response(request_id, &resp)
@@ -781,7 +842,8 @@ mod tests {
                 conn_id,
                 Arc::new(Connection::new(
                     ServiceId::LOCAL,
-                    0,
+                    PortMode::ReliableOrdered,
+                    "test".to_string(),
                     conn_id,
                     tokio::sync::mpsc::channel(1).0,
                     tokio::sync::mpsc::channel(1).1,
@@ -802,7 +864,8 @@ mod tests {
                 Listener {
                     id: listener_id,
                     service_id: ServiceId::LOCAL,
-                    port: 80,
+                    mode: PortMode::ReliableOrdered,
+                    port: "80".to_string(),
                     options: ListenerOptions::default(),
                 },
             );

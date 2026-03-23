@@ -95,6 +95,7 @@ impl Discovery for MultiDiscovery {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| Error::Wire(format!("no discovery can connect to {}", addr))))
+        Err(last_err
+            .unwrap_or_else(|| Error::Wire(format!("no discovery can connect to {}", addr))))
     }
 }

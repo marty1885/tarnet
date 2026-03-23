@@ -5,45 +5,45 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-
 use std::collections::HashSet;
 
 use crate::firewall::{self as firewall, Firewall};
 use crate::governor::{Governor, GovernorConfig, Verdict};
 
+use crate::bootstrap;
 use crate::channel::Channel;
 use crate::circuit::{
-    CircuitAction, CircuitKey, CircuitTable, CongestionWindow, CryptoOp, HopCrypto, HopKey, ReplayWindow,
-    OutboundCircuit, CircuitState as CircuitPhase, RelayCell, RelayCellCommand, CELL_SIZE, CELL_BODY_SIZE, CELL_PAYLOAD_MAX,
-    build_extend_payload, parse_extend_payload, build_extended_payload, parse_extended_payload, EXTENDED_FLAG_REACHED,
-    build_stream_begin_payload, parse_stream_begin_payload,
-    build_introduce_payload, parse_introduce_payload,
-    build_rendezvous_establish_payload, parse_rendezvous_establish_payload,
-    parse_rendezvous_join_payload,
-    build_intro_register_payload, parse_intro_register_payload,
-    derive_hop_keys, relay_cell_digest_for_sendme, SENDME_STALL_TIMEOUT,
+    build_extend_payload, build_extended_payload, build_intro_register_payload,
+    build_introduce_payload, build_rendezvous_establish_payload, build_stream_begin_payload,
+    derive_hop_keys, parse_extend_payload, parse_extended_payload, parse_intro_register_payload,
+    parse_introduce_payload, parse_rendezvous_establish_payload, parse_rendezvous_join_payload,
+    parse_stream_begin_payload, relay_cell_digest_for_sendme, CircuitAction, CircuitKey,
+    CircuitState as CircuitPhase, CircuitTable, CongestionWindow, CryptoOp, HopCrypto, HopKey,
+    OutboundCircuit, RelayCell, RelayCellCommand, ReplayWindow, CELL_BODY_SIZE, CELL_PAYLOAD_MAX,
+    CELL_SIZE, EXTENDED_FLAG_REACHED, SENDME_STALL_TIMEOUT,
 };
-use crate::identity_store::IdentityStore;
-use crate::key_exchange::{KexOffer, kex_accept};
 use crate::dht::{
-    probabilistic_select, random_select, is_k_closest, BloomFilter, DhtRecord, DhtQueryParams,
+    is_k_closest, probabilistic_select, random_select, BloomFilter, DhtQueryParams, DhtRecord,
     DhtStore, DhtWatchTable, KBucketTable, DHT_K,
 };
 use crate::identity::{self, dht_id_from_peer_id, peer_id_from_signing_pubkey, Keypair};
+use crate::identity_store::IdentityStore;
+use crate::key_exchange::{kex_accept, KexOffer};
 use crate::link::PeerLink;
 use crate::peer_transport::LinkTable;
 use crate::pubkey_cache::PubkeyCache;
 use crate::routing::dv;
-use tarnet_api::types::SigningAlgo;
 use crate::routing::RoutingTable;
 use crate::state::{PersistedIdentity, PersistedRecord, StateDb, StorageLimits};
-use crate::bootstrap;
-use crate::transport::Discovery;
 use crate::transport::webrtc::WebRtcConnector;
+use crate::transport::Discovery;
 use crate::tunnel::{Tunnel, TunnelTable};
-use crate::types::{DhtId, Error, LinkId, PeerId, RecordType, Result, ScopedAddress, TransportType};
+use crate::types::{
+    DhtId, Error, LinkId, PeerId, RecordType, Result, ScopedAddress, TransportType,
+};
 use crate::wire::*;
 use tarnet_api::service::{Connection, Listener, ListenerOptions};
+use tarnet_api::types::SigningAlgo;
 
 mod circuit;
 mod dht;
@@ -133,9 +133,7 @@ pub enum ChannelEvent {
         remote_peer: PeerId,
     },
     /// A peer's link went down — all tunnels/channels to that peer are broken.
-    PeerDisconnected {
-        peer_id: PeerId,
-    },
+    PeerDisconnected { peer_id: PeerId },
 }
 
 /// Events flowing through the node's internal event loop.
@@ -307,7 +305,14 @@ pub struct ChannelState {
     pub data_handlers: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
     /// Port listeners: port_hash → sender that receives (peer_id, channel_id, data_rx)
     /// when a new channel opens on that port.
-    pub port_listeners: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>>>>,
+    pub port_listeners: Arc<
+        Mutex<
+            HashMap<
+                [u8; 32],
+                mpsc::UnboundedSender<(PeerId, u32, mpsc::UnboundedReceiver<Vec<u8>>)>,
+            >,
+        >,
+    >,
 }
 
 impl ChannelState {
@@ -444,9 +449,8 @@ fn restore_keypair_from_persisted(entry: &crate::state::PersistedIdentity) -> Ke
             Ok(len) => len,
             Err(_) => panic!("persisted KEM key material too large"),
         };
-        let mut full = Vec::with_capacity(
-            4 + entry.signing_key_material.len() + entry.kem_key_material.len(),
-        );
+        let mut full =
+            Vec::with_capacity(4 + entry.signing_key_material.len() + entry.kem_key_material.len());
         full.extend_from_slice(&signing_len.to_be_bytes());
         full.extend_from_slice(&entry.signing_key_material);
         full.extend_from_slice(&kem_len.to_be_bytes());
@@ -468,22 +472,40 @@ fn restore_keypair_from_persisted(entry: &crate::state::PersistedIdentity) -> Ke
 
 impl Node {
     pub fn new(identity: Keypair) -> Self {
-        Self::build(identity, Vec::new(), Vec::new(), 0, 0, StorageLimits::default(), None)
+        Self::build(
+            identity,
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            StorageLimits::default(),
+            None,
+        )
     }
 
     /// Create a node backed by a persistent `StateDb`.
     /// Loads identities, DHT records, and metadata from the database.
-    pub fn with_db(
-        identity: Keypair,
-        db: Arc<StateDb>,
-        storage_limits: StorageLimits,
-    ) -> Self {
+    pub fn with_db(identity: Keypair, db: Arc<StateDb>, storage_limits: StorageLimits) -> Self {
         let identities = db.load_identities().unwrap_or_default();
         let dht_records = db.load_dht_records().unwrap_or_default();
-        let hello_seq = db.get_metadata("hello_sequence").unwrap_or(None).unwrap_or(0);
-        let sc_seq = db.get_metadata("signed_content_sequence").unwrap_or(None).unwrap_or(0);
+        let hello_seq = db
+            .get_metadata("hello_sequence")
+            .unwrap_or(None)
+            .unwrap_or(0);
+        let sc_seq = db
+            .get_metadata("signed_content_sequence")
+            .unwrap_or(None)
+            .unwrap_or(0);
 
-        Self::build(identity, identities, dht_records, hello_seq, sc_seq, storage_limits, Some(db))
+        Self::build(
+            identity,
+            identities,
+            dht_records,
+            hello_seq,
+            sc_seq,
+            storage_limits,
+            Some(db),
+        )
     }
 
     fn build(
@@ -515,12 +537,15 @@ impl Node {
             }
             IdentityStore::with_default(default_kp, tarnet_api::types::PrivacyLevel::Public, 1)
         } else {
-            let default_entry = identities.iter().find(|i| i.is_default)
+            let default_entry = identities
+                .iter()
+                .find(|i| i.is_default)
                 .or_else(|| identities.first());
             match default_entry {
                 Some(entry) => {
                     let kp = restore_keypair_from_persisted(entry);
-                    let mut store = IdentityStore::with_default(kp, entry.privacy, entry.outbound_hops);
+                    let mut store =
+                        IdentityStore::with_default(kp, entry.privacy, entry.outbound_hops);
                     for id in &identities {
                         if id.is_default || id.label == "default" {
                             continue;
@@ -533,7 +558,11 @@ impl Node {
                 }
                 None => {
                     let default_kp = Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap();
-                    IdentityStore::with_default(default_kp, tarnet_api::types::PrivacyLevel::Public, 1)
+                    IdentityStore::with_default(
+                        default_kp,
+                        tarnet_api::types::PrivacyLevel::Public,
+                        1,
+                    )
                 }
             }
         };
@@ -654,7 +683,6 @@ impl Node {
         self.firewall.lock().await.as_mut().map(f)
     }
 
-
     /// Wrap an [`OutboundCircuit`] with an RAII drop guard so that removing it
     /// from the map automatically triggers async cleanup.
     fn manage_circuit(&self, circuit_id: u32, circuit: OutboundCircuit) -> ManagedCircuit {
@@ -678,7 +706,11 @@ impl Node {
 
     /// Look up a keypair by ServiceId. Returns None if no matching identity exists.
     pub async fn keypair_for_service(&self, sid: &tarnet_api::types::ServiceId) -> Option<Keypair> {
-        self.identity_store.lock().await.keypair_for(sid).map(|kp| Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap())
+        self.identity_store
+            .lock()
+            .await
+            .keypair_for(sid)
+            .map(|kp| Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap())
     }
 
     /// The node's default ServiceId as raw bytes (52 bytes: pubkey + hash).
@@ -699,7 +731,12 @@ impl Node {
     /// Start the node: listen for connections, connect to bootstrap peers, run event loop.
     /// `bootstrap` lists transport URIs (e.g. `tcp://host:port`, `ws://host/path`).
     /// `discovery_addrs` lists discovery URIs (e.g. `mainline:<hex>`) that resolve to transport addresses.
-    pub async fn run(self: Arc<Self>, discovery: Box<dyn Discovery>, bootstrap: Vec<String>, discovery_addrs: Vec<String>) -> Result<()> {
+    pub async fn run(
+        self: Arc<Self>,
+        discovery: Box<dyn Discovery>,
+        bootstrap: Vec<String>,
+        discovery_addrs: Vec<String>,
+    ) -> Result<()> {
         let discovery = Arc::new(discovery);
 
         // Start accepting connections
@@ -803,8 +840,7 @@ impl Node {
                 // Wait for bootstrap to settle before first publish
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 node.maintain_hidden_services().await;
-                let mut interval =
-                    tokio::time::interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
+                let mut interval = tokio::time::interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
                 loop {
                     interval.tick().await;
                     node.maintain_hidden_services().await;
@@ -819,8 +855,7 @@ impl Node {
                 // Wait for bootstrap to settle before first publish
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 node.maintain_peer_records().await;
-                let mut interval =
-                    tokio::time::interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
+                let mut interval = tokio::time::interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
                 loop {
                     interval.tick().await;
                     node.maintain_peer_records().await;
@@ -907,12 +942,15 @@ impl Node {
                     if let Some(addr_str) = addr.to_connect_string() {
                         match discovery.connect(&addr_str).await {
                             Ok(transport) => {
-                                match PeerLink::initiator(transport, &self.identity, Some(peer_id)).await {
+                                match PeerLink::initiator(transport, &self.identity, Some(peer_id))
+                                    .await
+                                {
                                     Ok(link) => {
                                         let link = Arc::new(link);
                                         log::info!(
                                             "Proactive outbound link to {:?} via {}",
-                                            link.remote_peer(), addr_str,
+                                            link.remote_peer(),
+                                            addr_str,
                                         );
                                         let _ = self
                                             .event_tx
@@ -922,14 +960,19 @@ impl Node {
                                     }
                                     Err(e) => {
                                         log::debug!(
-                                            "Proactive handshake to {:?} failed: {}", peer_id, e,
+                                            "Proactive handshake to {:?} failed: {}",
+                                            peer_id,
+                                            e,
                                         );
                                     }
                                 }
                             }
                             Err(e) => {
                                 log::debug!(
-                                    "Proactive connect to {:?} at {} failed: {}", peer_id, addr_str, e,
+                                    "Proactive connect to {:?} at {} failed: {}",
+                                    peer_id,
+                                    addr_str,
+                                    e,
                                 );
                             }
                         }
@@ -965,7 +1008,8 @@ impl Node {
                 let to_send: Vec<(PeerId, Arc<PeerLink>, Vec<u8>)> = {
                     let links = links_ref.lock().await;
                     let table = routing_ref.lock().await;
-                    links.iter()
+                    links
+                        .iter()
                         .map(|(peer_id, link)| {
                             let ad = dv::generate_advertisement(&identity, &table, peer_id);
                             (*peer_id, link.clone(), ad.to_wire().encode())
@@ -982,7 +1026,10 @@ impl Node {
                 routing_ref.lock().await.expire(ROUTE_EXPIRY);
                 let cutoff = Instant::now() - Duration::from_secs(60);
                 probe_seen_ref.lock().await.retain(|_, t| *t > cutoff);
-                probe_reverse_ref.lock().await.retain(|_, (_, t)| *t > cutoff);
+                probe_reverse_ref
+                    .lock()
+                    .await
+                    .retain(|_, (_, t)| *t > cutoff);
             }
         });
 
@@ -1005,7 +1052,9 @@ impl Node {
                 for (peer, link_id) in dead {
                     log::info!(
                         "Link to {:?} (link_id={}) timed out (no recv for {}s), declaring dead",
-                        peer, link_id, KEEPALIVE_DEAD_TIMEOUT.as_secs()
+                        peer,
+                        link_id,
+                        KEEPALIVE_DEAD_TIMEOUT.as_secs()
                     );
                     let _ = ka_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
                 }
@@ -1015,7 +1064,9 @@ impl Node {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_micros() as u64;
-                let ka_msg = KeepaliveMsg { timestamp_us: Some(now_us) };
+                let ka_msg = KeepaliveMsg {
+                    timestamp_us: Some(now_us),
+                };
                 let encoded = ka_msg.to_wire().encode();
                 for (_peer, _link_id, link) in idle {
                     let _ = link.send_message(&encoded).await;
@@ -1057,7 +1108,10 @@ impl Node {
                 cd_ep_cong.lock().await.remove(&ev.circuit_id);
                 cd_ep_send_cong.lock().await.remove(&ev.circuit_id);
                 cd_sendme_notify.lock().await.remove(&ev.circuit_id);
-                cd_relay_queues.lock().await.remove(&(ev.first_hop_circuit_id, ev.first_hop));
+                cd_relay_queues
+                    .lock()
+                    .await
+                    .remove(&(ev.first_hop_circuit_id, ev.first_hop));
 
                 // Handle multipath failover
                 let mut groups = cd_groups.lock().await;
@@ -1316,9 +1370,7 @@ impl Node {
                 let global_addrs = hello_global_addrs.lock().await.clone();
                 let introducers = hello_introducers.lock().await.clone();
                 let mut transports = collect_transport_types(&global_addrs);
-                if hello_webrtc_enabled
-                    && !transports.iter().any(|t| *t == TransportType::WebRtc)
-                {
+                if hello_webrtc_enabled && !transports.iter().any(|t| *t == TransportType::WebRtc) {
                     transports.push(TransportType::WebRtc);
                 }
                 let hello = HelloRecord {
@@ -1484,7 +1536,11 @@ impl Node {
                     }
                     // Resource governor: per-link-peer budgeting.
                     {
-                        let circuits_for_peer = self.circuits.table.lock().await
+                        let circuits_for_peer = self
+                            .circuits
+                            .table
+                            .lock()
+                            .await
                             .circuits_per_peer()
                             .get(&from)
                             .copied()
@@ -1502,8 +1558,10 @@ impl Node {
                         // to guarantee FIFO processing. Without this, spawned tasks
                         // can overtake each other and deliver DATA cells out of order.
                         let circuit_id = u32::from_be_bytes([
-                            msg.payload[0], msg.payload[1],
-                            msg.payload[2], msg.payload[3],
+                            msg.payload[0],
+                            msg.payload[1],
+                            msg.payload[2],
+                            msg.payload[3],
                         ]);
                         let queue_key = (circuit_id, from);
                         let mut queues = self.circuits.relay_queues.lock().await;
@@ -1512,8 +1570,13 @@ impl Node {
                             let node = node_arc.clone();
                             tokio::spawn(async move {
                                 while let Some(payload) = rx.recv().await {
-                                    if let Err(e) = node.handle_circuit_relay(from, &payload).await {
-                                        log::warn!("Error handling circuit relay from {:?}: {}", from, e);
+                                    if let Err(e) = node.handle_circuit_relay(from, &payload).await
+                                    {
+                                        log::warn!(
+                                            "Error handling circuit relay from {:?}: {}",
+                                            from,
+                                            e
+                                        );
                                     }
                                 }
                             });
@@ -1566,7 +1629,9 @@ impl Node {
                     // No evictable link — reject the new connection.
                     log::warn!(
                         "Link limit reached ({}/{}) and no evictable link, rejecting {:?}",
-                        count, limit, peer_id,
+                        count,
+                        limit,
+                        peer_id,
                     );
                     return;
                 }
@@ -1579,13 +1644,16 @@ impl Node {
         // Populate pubkey cache from handshake-authenticated pubkeys.
         {
             use crate::pubkey_cache::CachedPubkey;
-            self.pubkey_cache.lock().await.insert(peer_id, CachedPubkey {
-                signing_algo: link.remote_signing_algo(),
-                signing_pk: link.remote_signing_pubkey().to_vec(),
-                // KEM pubkey not yet available from link — populated from DHT later.
-                kem_algo: tarnet_api::types::KemAlgo::X25519,
-                kem_pk: Vec::new(),
-            });
+            self.pubkey_cache.lock().await.insert(
+                peer_id,
+                CachedPubkey {
+                    signing_algo: link.remote_signing_algo(),
+                    signing_pk: link.remote_signing_pubkey().to_vec(),
+                    // KEM pubkey not yet available from link — populated from DHT later.
+                    kem_algo: tarnet_api::types::KemAlgo::X25519,
+                    kem_pk: Vec::new(),
+                },
+            );
         }
 
         if is_first {
@@ -1623,7 +1691,9 @@ impl Node {
                         }
                     }
                     Err(_) => {
-                        let _ = event_tx.send(NodeEvent::LinkDown(remote, recv_link_id)).await;
+                        let _ = event_tx
+                            .send(NodeEvent::LinkDown(remote, recv_link_id))
+                            .await;
                         break;
                     }
                 }
@@ -1813,7 +1883,11 @@ impl Node {
             MessageType::RouteAdvertisement => {
                 let ad = RouteAdvertisement::from_bytes(&msg.payload)?;
                 let mut table = self.routing_table.lock().await;
-                let changed = dv::process_advertisement(&mut table, &ad, &mut *self.pubkey_cache.lock().await)?;
+                let changed = dv::process_advertisement(
+                    &mut table,
+                    &ad,
+                    &mut *self.pubkey_cache.lock().await,
+                )?;
                 if changed {
                     log::debug!("Routing table updated from {:?}", from);
                     // Triggered update: re-advertise to other neighbors
@@ -1850,7 +1924,12 @@ impl Node {
                             return Ok(());
                         }
                     }
-                    if !identity::verify(algo, &put.signer_pubkey, &put.signable_bytes(), &put.signature) {
+                    if !identity::verify(
+                        algo,
+                        &put.signer_pubkey,
+                        &put.signable_bytes(),
+                        &put.signature,
+                    ) {
                         log::warn!("DHT PUT from {:?}: invalid signature, dropping", from);
                         return Ok(());
                     }
@@ -1892,7 +1971,8 @@ impl Node {
                     put.hop_count = put.hop_count.saturating_add(1);
 
                     let encoded = put.to_wire().encode();
-                    self.dht_forward(&key, old_bloom, put.hop_count, &encoded, from).await;
+                    self.dht_forward(&key, old_bloom, put.hop_count, &encoded, from)
+                        .await;
 
                     // Notify remote watchers via query token routing
                     let watchers = self.dht_watches.lock().await.get_watchers(&put.key);
@@ -1990,7 +2070,8 @@ impl Node {
                     get.hop_count = get.hop_count.saturating_add(1);
 
                     let encoded = get.to_wire().encode();
-                    self.dht_forward(&key, old_bloom, get.hop_count, &encoded, from).await;
+                    self.dht_forward(&key, old_bloom, get.hop_count, &encoded, from)
+                        .await;
                 }
             }
             MessageType::DhtGetResponse => {
@@ -2209,9 +2290,8 @@ impl Node {
             }
             MessageType::RouteProbeFound => {
                 self.handle_route_probe_found(from, &msg.payload).await?;
-            }
-            // Unknown message types are handled by the match's default
-            // (from_u16 returns None, so they never reach this match)
+            } // Unknown message types are handled by the match's default
+              // (from_u16 returns None, so they never reach this match)
         }
         Ok(())
     }
@@ -2263,26 +2343,32 @@ impl Node {
 
         // Link/peer info
         let peer_infos = self.links.lock().await.peer_info_snapshot();
-        let peers: Vec<PeerStatus> = peer_infos.into_iter().map(|pi| {
-            PeerStatus {
+        let peers: Vec<PeerStatus> = peer_infos
+            .into_iter()
+            .map(|pi| PeerStatus {
                 peer_id: pi.peer_id,
-                links: pi.links.into_iter().map(|li| LinkStatus {
-                    link_id: li.link_id,
-                    state: li.state.to_string(),
-                    direction: li.direction.to_string(),
-                    rtt_us: li.rtt_us,
-                    loss_rate: li.loss_rate,
-                    age_secs: li.age_secs,
-                    idle_secs: li.idle_secs,
-                    transport: li.transport.to_string(),
-                }).collect(),
-            }
-        }).collect();
+                links: pi
+                    .links
+                    .into_iter()
+                    .map(|li| LinkStatus {
+                        link_id: li.link_id,
+                        state: li.state.to_string(),
+                        direction: li.direction.to_string(),
+                        rtt_us: li.rtt_us,
+                        loss_rate: li.loss_rate,
+                        age_secs: li.age_secs,
+                        idle_secs: li.idle_secs,
+                        transport: li.transport.to_string(),
+                    })
+                    .collect(),
+            })
+            .collect();
 
         // Routes
         let routes = {
             let table = self.routing_table.lock().await;
-            table.all_destinations()
+            table
+                .all_destinations()
                 .map(|(dest, route)| (*dest, route.next_hop, route.cost))
                 .collect()
         };
@@ -2383,7 +2469,9 @@ impl Node {
 
     /// Update bandwidth rates on an already-running node (e.g. config reload).
     pub async fn update_bandwidth_limits(&self, upload_rate: u64, download_rate: u64) {
-        self.bandwidth.update_rates(upload_rate, download_rate).await;
+        self.bandwidth
+            .update_rates(upload_rate, download_rate)
+            .await;
     }
 
     /// Set the global addresses this node advertises in hello records.
@@ -2464,34 +2552,45 @@ async fn discovery_single_peer(
 
         if let Some(connect_addr) = resolved {
             match discovery.connect(&connect_addr).await {
-                Ok(transport) => {
-                    match PeerLink::initiator(transport, &identity, None).await {
-                        Ok(link) => {
-                            let link = Arc::new(link);
-                            let remote = link.remote_peer();
-                            log::info!("Discovery connected to {:?} via {} (resolved from {})", remote, connect_addr, addr);
-                            let _ = event_tx
-                                .send(NodeEvent::LinkUp(remote, link))
-                                .await;
+                Ok(transport) => match PeerLink::initiator(transport, &identity, None).await {
+                    Ok(link) => {
+                        let link = Arc::new(link);
+                        let remote = link.remote_peer();
+                        log::info!(
+                            "Discovery connected to {:?} via {} (resolved from {})",
+                            remote,
+                            connect_addr,
+                            addr
+                        );
+                        let _ = event_tx.send(NodeEvent::LinkUp(remote, link)).await;
 
-                            backoff = INITIAL_BACKOFF;
+                        backoff = INITIAL_BACKOFF;
 
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                if !links.lock().await.contains_key(&remote) {
-                                    log::info!("Discovery link to {:?} lost, reconnecting...", remote);
-                                    break;
-                                }
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            if !links.lock().await.contains_key(&remote) {
+                                log::info!("Discovery link to {:?} lost, reconnecting...", remote);
+                                break;
                             }
-                            continue;
                         }
-                        Err(e) => {
-                            log::debug!("Discovery handshake to {} (from {}) failed: {}", connect_addr, addr, e);
-                        }
+                        continue;
                     }
-                }
+                    Err(e) => {
+                        log::debug!(
+                            "Discovery handshake to {} (from {}) failed: {}",
+                            connect_addr,
+                            addr,
+                            e
+                        );
+                    }
+                },
                 Err(e) => {
-                    log::debug!("Discovery connect to {} (from {}) failed: {}", connect_addr, addr, e);
+                    log::debug!(
+                        "Discovery connect to {} (from {}) failed: {}",
+                        connect_addr,
+                        addr,
+                        e
+                    );
                 }
             }
         }
@@ -2564,9 +2663,7 @@ async fn bootstrap_single_peer(
                             let link = Arc::new(link);
                             let remote = link.remote_peer();
                             log::info!("Bootstrap connected to {:?} via {}", remote, addr);
-                            let _ = event_tx
-                                .send(NodeEvent::LinkUp(remote, link))
-                                .await;
+                            let _ = event_tx.send(NodeEvent::LinkUp(remote, link)).await;
 
                             backoff = INITIAL_BACKOFF;
                             first_attempt = true;
@@ -2575,7 +2672,10 @@ async fn bootstrap_single_peer(
                             loop {
                                 tokio::time::sleep(Duration::from_secs(5)).await;
                                 if !links.lock().await.contains_key(&remote) {
-                                    log::info!("Bootstrap link to {:?} lost, reconnecting...", remote);
+                                    log::info!(
+                                        "Bootstrap link to {:?} lost, reconnecting...",
+                                        remote
+                                    );
                                     break;
                                 }
                             }
@@ -2683,7 +2783,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!("tarnet-node-pq-{}.sqlite3", nanos));
 
         let original_identity = Keypair::generate();
-        assert_eq!(original_identity.identity.signing_algo(), SigningAlgo::FalconEd25519);
+        assert_eq!(
+            original_identity.identity.signing_algo(),
+            SigningAlgo::FalconEd25519
+        );
         assert_eq!(original_identity.identity.kem_algo(), KemAlgo::MlkemX25519);
 
         let db = Arc::new(StateDb::open(&path).unwrap());
@@ -2694,11 +2797,7 @@ mod tests {
         );
 
         // Re-open from the same DB with a different node identity
-        let restored = Node::with_db(
-            Keypair::generate(),
-            db,
-            StorageLimits::default(),
-        );
+        let restored = Node::with_db(Keypair::generate(), db, StorageLimits::default());
 
         let identities = restored.list_identities().await;
         let default = identities

@@ -4,5 +4,8 @@ pub mod service;
 pub mod types;
 
 pub use error::{ApiError, ApiResult};
-pub use service::{Connection, DhtEntry, Listener, ListenerOptions, ServiceApi};
-pub use types::{DhtId, PeerId, ServiceId, NodeStatus};
+pub use service::{
+    Connection, DataStream, DhtEntry, Listener, ListenerOptions, MessageStream, PortMode,
+    ServiceApi,
+};
+pub use types::{DhtId, NodeStatus, PeerId, ServiceId};

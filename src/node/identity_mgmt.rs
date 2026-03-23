@@ -8,7 +8,8 @@ impl Node {
         outbound_hops: u8,
         scheme: tarnet_api::types::IdentityScheme,
     ) -> Result<tarnet_api::types::ServiceId> {
-        let sid = self.identity_store
+        let sid = self
+            .identity_store
             .lock()
             .await
             .create(label, privacy, outbound_hops, scheme)
@@ -37,9 +38,13 @@ impl Node {
 
         match privacy {
             tarnet_api::types::PrivacyLevel::Hidden { intro_points } => {
-                match self.publish_hidden_service(sid, intro_points as usize).await {
+                match self
+                    .publish_hidden_service(sid, intro_points as usize)
+                    .await
+                {
                     Ok(()) => {
-                        self.hidden.last_publish
+                        self.hidden
+                            .last_publish
                             .lock()
                             .await
                             .insert(sid, Instant::now());
@@ -47,7 +52,8 @@ impl Node {
                     Err(e) => {
                         log::warn!(
                             "Immediate hidden service publish for '{}' failed (will retry): {}",
-                            label, e
+                            label,
+                            e
                         );
                     }
                 }
@@ -56,7 +62,8 @@ impl Node {
                 if let Err(e) = self.publish_peer_record(sid).await {
                     log::warn!(
                         "Immediate peer record publish for '{}' failed (will retry): {}",
-                        label, e
+                        label,
+                        e
                     );
                 }
             }
@@ -66,7 +73,9 @@ impl Node {
     }
 
     /// List all identities: (label, service_id, privacy, outbound_hops, scheme, signing_algo, kem_algo).
-    pub async fn list_identities(&self) -> Vec<(
+    pub async fn list_identities(
+        &self,
+    ) -> Vec<(
         String,
         tarnet_api::types::ServiceId,
         tarnet_api::types::PrivacyLevel,
@@ -88,7 +97,8 @@ impl Node {
         privacy: tarnet_api::types::PrivacyLevel,
         outbound_hops: u8,
     ) -> Result<(tarnet_api::types::PrivacyLevel, u8)> {
-        let (old_privacy, old_hops) = self.identity_store
+        let (old_privacy, old_hops) = self
+            .identity_store
             .lock()
             .await
             .update(label, privacy, outbound_hops)
@@ -116,7 +126,10 @@ impl Node {
         }
 
         // Resolve ServiceId for this identity
-        let sid = self.identity_store.lock().await
+        let sid = self
+            .identity_store
+            .lock()
+            .await
             .get(label)
             .map(|id| id.service_id());
 
@@ -125,10 +138,16 @@ impl Node {
             match (old_privacy, privacy) {
                 // Public → Hidden: publish intro points
                 (PL::Public, PL::Hidden { intro_points }) => {
-                    match self.publish_hidden_service(sid, intro_points as usize).await {
+                    match self
+                        .publish_hidden_service(sid, intro_points as usize)
+                        .await
+                    {
                         Ok(()) => {
-                            self.hidden.last_publish
-                                .lock().await.insert(sid, Instant::now());
+                            self.hidden
+                                .last_publish
+                                .lock()
+                                .await
+                                .insert(sid, Instant::now());
                         }
                         Err(e) => {
                             log::warn!(
@@ -149,19 +168,28 @@ impl Node {
                     }
                 }
                 // Hidden → Hidden with different intro count: rebuild
-                (PL::Hidden { intro_points: old_n }, PL::Hidden { intro_points: new_n })
-                    if old_n != new_n =>
-                {
+                (
+                    PL::Hidden {
+                        intro_points: old_n,
+                    },
+                    PL::Hidden {
+                        intro_points: new_n,
+                    },
+                ) if old_n != new_n => {
                     self.teardown_hidden_service(&sid).await;
                     match self.publish_hidden_service(sid, new_n as usize).await {
                         Ok(()) => {
-                            self.hidden.last_publish
-                                .lock().await.insert(sid, Instant::now());
+                            self.hidden
+                                .last_publish
+                                .lock()
+                                .await
+                                .insert(sid, Instant::now());
                         }
                         Err(e) => {
                             log::warn!(
                                 "Hidden service re-publish for '{}' failed (will retry): {}",
-                                label, e
+                                label,
+                                e
                             );
                         }
                     }
@@ -175,12 +203,12 @@ impl Node {
 
     /// Delete an identity by label.
     /// Tears down hidden services and removes from store + database.
-    pub async fn delete_identity(
-        &self,
-        label: &str,
-    ) -> Result<()> {
+    pub async fn delete_identity(&self, label: &str) -> Result<()> {
         // Get the ServiceId before removing so we can clean up.
-        let sid = self.identity_store.lock().await
+        let sid = self
+            .identity_store
+            .lock()
+            .await
             .get(label)
             .map(|id| id.service_id())
             .ok_or_else(|| Error::Protocol("identity not found".to_string()))?;
@@ -189,7 +217,9 @@ impl Node {
         self.teardown_hidden_service(&sid).await;
 
         // Remove from in-memory store.
-        self.identity_store.lock().await
+        self.identity_store
+            .lock()
+            .await
             .remove(label)
             .map_err(|e| Error::Protocol(e.to_string()))?;
 
@@ -200,7 +230,6 @@ impl Node {
 
         Ok(())
     }
-
 
     pub async fn create_hello_record(&self) -> HelloRecord {
         let global_addrs = self.global_addrs.lock().await.clone();

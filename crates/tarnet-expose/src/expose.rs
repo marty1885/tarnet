@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use serde::Deserialize;
-use tarnet_api::service::{Listener, ListenerOptions, ServiceApi, TnsRecord};
+use tarnet_api::service::{Listener, ListenerOptions, PortMode, ServiceApi, TnsRecord};
 use tarnet_api::types::{PrivacyLevel, ServiceId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -67,10 +67,16 @@ fn validate_subdomain(label: &str) -> Result<(), String> {
         return Err(format!("subdomain '{}' must not contain dots", label));
     }
     if label.starts_with('-') || label.ends_with('-') {
-        return Err(format!("subdomain '{}' must not start or end with a hyphen", label));
+        return Err(format!(
+            "subdomain '{}' must not start or end with a hyphen",
+            label
+        ));
     }
     if label.starts_with('_') {
-        return Err(format!("subdomain '{}' must not start with underscore (reserved)", label));
+        return Err(format!(
+            "subdomain '{}' must not start with underscore (reserved)",
+            label
+        ));
     }
     for ch in label.chars() {
         if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' {
@@ -138,7 +144,11 @@ pub fn load_services(dir: &PathBuf) -> Result<Vec<LoadedService>, String> {
 
         // Validate that we can parse a port.
         if listen_port(&config).is_none() {
-            errors.push(format!("{}: cannot determine listen port from local '{}'", path.display(), config.local));
+            errors.push(format!(
+                "{}: cannot determine listen port from local '{}'",
+                path.display(),
+                config.local
+            ));
             continue;
         }
 
@@ -207,15 +217,29 @@ async fn register_services<S: ServiceApi>(
         let port = match listen_port(&svc.config) {
             Some(p) => p,
             None => {
-                error!("Cannot parse port from '{}' for '{}'", svc.config.local, svc.filename);
+                error!(
+                    "Cannot parse port from '{}' for '{}'",
+                    svc.config.local, svc.filename
+                );
                 continue;
             }
         };
 
-        let listener = match api.listen(sid, port, ListenerOptions::default()).await {
+        let listener = match api
+            .listen(
+                sid,
+                PortMode::ReliableOrdered,
+                &port.to_string(),
+                ListenerOptions::default(),
+            )
+            .await
+        {
             Ok(listener) => listener,
             Err(e) => {
-                error!("Failed to listen on {:?} port {} for '{}': {}", sid, port, svc.filename, e);
+                error!(
+                    "Failed to listen on {:?} port {} for '{}': {}",
+                    sid, port, svc.filename, e
+                );
                 continue;
             }
         };
@@ -224,7 +248,10 @@ async fn register_services<S: ServiceApi>(
             listener,
             service: svc.clone(),
         });
-        info!("Registered service '{}' on {:?} port {}", svc.filename, sid, port);
+        info!(
+            "Registered service '{}' on {:?} port {}",
+            svc.filename, sid, port
+        );
     }
 
     services
@@ -235,10 +262,7 @@ async fn close_services<S: ServiceApi>(api: &S, services: &[RegisteredService]) 
         if let Err(e) = api.close_listener(&service.listener).await {
             warn!(
                 "Failed to close listener on {:?} port {} for '{}': {}",
-                service.service_id,
-                service.listener.port,
-                service.service.filename,
-                e
+                service.service_id, service.listener.port, service.service.filename, e
             );
         }
     }
@@ -333,7 +357,9 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
             // Check for @ conflict: if @ already points elsewhere, refuse.
             match state.api.tns_get_label(None, "@").await {
                 Ok(Some((records, _))) => {
-                    let is_self = records.iter().any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == self_sid));
+                    let is_self = records
+                        .iter()
+                        .any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == self_sid));
                     let has_other = records.iter().any(|r| match r {
                         TnsRecord::Identity(sid) => *sid != self_sid,
                         TnsRecord::Alias(_) | TnsRecord::Zone(_) => true,
@@ -361,7 +387,10 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                 .await
             {
                 Ok(()) => {
-                    info!("Published Identity at apex (@) for identity '{}'", identity_key);
+                    info!(
+                        "Published Identity at apex (@) for identity '{}'",
+                        identity_key
+                    );
                     apex_published.insert(identity_key, true);
                 }
                 Err(e) => error!(
@@ -382,12 +411,18 @@ async fn pipe_tcp<S: ServiceApi>(
     let tcp_stream = match TcpStream::connect(local_addr).await {
         Ok(s) => s,
         Err(e) => {
-            error!("Cannot connect to local {} for '{}': {}", local_addr, service_name, e);
+            error!(
+                "Cannot connect to local {} for '{}': {}",
+                local_addr, service_name, e
+            );
             return;
         }
     };
 
-    info!("Accepted connection for service '{}' -> {}", service_name, local_addr);
+    info!(
+        "Accepted connection for service '{}' -> {}",
+        service_name, local_addr
+    );
 
     let (mut tcp_read, mut tcp_write) = tcp_stream.into_split();
     let conn = Arc::new(conn);
@@ -440,11 +475,17 @@ async fn pipe_udp<S: ServiceApi>(
         }
     };
     if let Err(e) = sock.connect(local_addr).await {
-        error!("Cannot connect UDP to {} for '{}': {}", local_addr, service_name, e);
+        error!(
+            "Cannot connect UDP to {} for '{}': {}",
+            local_addr, service_name, e
+        );
         return;
     }
 
-    info!("Accepted UDP connection for service '{}' -> {}", service_name, local_addr);
+    info!(
+        "Accepted UDP connection for service '{}' -> {}",
+        service_name, local_addr
+    );
 
     let sock = Arc::new(sock);
     let mut buf = vec![0u8; 65535];
@@ -598,7 +639,15 @@ mod tests {
     /// Mock ServiceApi that records which publish paths were taken.
     struct MockApi {
         peer_id: PeerId,
-        identities: Vec<(String, ServiceId, PrivacyLevel, u8, IdentityScheme, SigningAlgo, KemAlgo)>,
+        identities: Vec<(
+            String,
+            ServiceId,
+            PrivacyLevel,
+            u8,
+            IdentityScheme,
+            SigningAlgo,
+            KemAlgo,
+        )>,
         /// Set to true if tns_publish is called with an Identity record containing
         /// our ServiceId for a *hidden* identity.
         hidden_identity_leaked: Arc<AtomicBool>,
@@ -609,7 +658,17 @@ mod tests {
     }
 
     impl MockApi {
-        fn new(identities: Vec<(String, ServiceId, PrivacyLevel, u8, IdentityScheme, SigningAlgo, KemAlgo)>) -> Self {
+        fn new(
+            identities: Vec<(
+                String,
+                ServiceId,
+                PrivacyLevel,
+                u8,
+                IdentityScheme,
+                SigningAlgo,
+                KemAlgo,
+            )>,
+        ) -> Self {
             Self {
                 peer_id: PeerId([0xAA; 32]),
                 identities,
@@ -621,7 +680,8 @@ mod tests {
 
         fn identity_privacy(&self, label: Option<&str>) -> Option<(ServiceId, PrivacyLevel)> {
             let target = label.unwrap_or("default");
-            self.identities.iter()
+            self.identities
+                .iter()
                 .find(|(l, _, _, _, _, _, _)| l == target)
                 .map(|(_, sid, p, _, _, _, _)| (*sid, *p))
         }
@@ -629,45 +689,107 @@ mod tests {
 
     #[async_trait]
     impl ServiceApi for MockApi {
-        fn peer_id(&self) -> PeerId { self.peer_id }
-        async fn default_service_id(&self) -> ServiceId { self.identities[0].1 }
-        async fn resolve_identity(&self, _: &str) -> ApiResult<ServiceId> { Ok(self.identities[0].1) }
-        async fn connect(&self, _: ServiceId, _: u16) -> ApiResult<Connection> { Err(ApiError::NotConnected) }
-        async fn listen(&self, service_id: ServiceId, port: u16, options: ListenerOptions) -> ApiResult<Listener> {
-            Ok(Listener { id: 1, service_id, port, options })
+        fn peer_id(&self) -> PeerId {
+            self.peer_id
         }
-        async fn accept(&self, _: &Listener) -> ApiResult<Connection> { Err(ApiError::NotConnected) }
-        async fn close_listener(&self, _: &Listener) -> ApiResult<()> { Ok(()) }
+        async fn default_service_id(&self) -> ServiceId {
+            self.identities[0].1
+        }
+        async fn resolve_identity(&self, _: &str) -> ApiResult<ServiceId> {
+            Ok(self.identities[0].1)
+        }
+        async fn connect(&self, _: ServiceId, _: PortMode, _: &str) -> ApiResult<Connection> {
+            Err(ApiError::NotConnected)
+        }
+        async fn listen(
+            &self,
+            service_id: ServiceId,
+            mode: PortMode,
+            port: &str,
+            options: ListenerOptions,
+        ) -> ApiResult<Listener> {
+            Ok(Listener {
+                id: 1,
+                service_id,
+                mode,
+                port: port.to_string(),
+                options,
+            })
+        }
+        async fn accept(&self, _: &Listener) -> ApiResult<Connection> {
+            Err(ApiError::NotConnected)
+        }
+        async fn close_listener(&self, _: &Listener) -> ApiResult<()> {
+            Ok(())
+        }
 
-        async fn listen_hidden(&self, service_id: ServiceId, port: u16, _: usize, options: ListenerOptions) -> ApiResult<Listener> {
+        async fn listen_hidden(
+            &self,
+            service_id: ServiceId,
+            mode: PortMode,
+            port: &str,
+            _: usize,
+            options: ListenerOptions,
+        ) -> ApiResult<Listener> {
             self.listen_hidden_called.store(true, Ordering::SeqCst);
-            Ok(Listener { id: 1, service_id, port, options })
+            Ok(Listener {
+                id: 1,
+                service_id,
+                mode,
+                port: port.to_string(),
+                options,
+            })
         }
 
-        async fn dht_put(&self, _: &[u8]) -> DhtId { DhtId([0; 64]) }
-        async fn dht_get(&self, _: &DhtId, _: u32) -> Option<Vec<u8>> { None }
-        async fn dht_put_signed(&self, _: &[u8], _: u32) -> DhtId { DhtId([0; 64]) }
-        async fn dht_get_signed(&self, _: &DhtId, _: u32) -> Vec<DhtEntry> { vec![] }
-        async fn lookup_hello(&self, _: &PeerId, _: u32) -> Option<HelloInfo> { None }
+        async fn dht_put(&self, _: &[u8]) -> DhtId {
+            DhtId([0; 64])
+        }
+        async fn dht_get(&self, _: &DhtId, _: u32) -> Option<Vec<u8>> {
+            None
+        }
+        async fn dht_put_signed(&self, _: &[u8], _: u32) -> DhtId {
+            DhtId([0; 64])
+        }
+        async fn dht_get_signed(&self, _: &DhtId, _: u32) -> Vec<DhtEntry> {
+            vec![]
+        }
+        async fn lookup_hello(&self, _: &PeerId, _: u32) -> Option<HelloInfo> {
+            None
+        }
         async fn dht_watch(&self, _: &DhtId, _: u32) {}
         async fn dht_unwatch(&self, _: &DhtId) {}
-        async fn connected_peers(&self) -> Vec<PeerId> { vec![] }
-        async fn routing_entries(&self) -> Vec<(PeerId, PeerId, u32)> { vec![] }
+        async fn connected_peers(&self) -> Vec<PeerId> {
+            vec![]
+        }
+        async fn routing_entries(&self) -> Vec<(PeerId, PeerId, u32)> {
+            vec![]
+        }
         async fn node_status(&self) -> tarnet_api::types::NodeStatus {
             tarnet_api::types::NodeStatus {
-                peer_id: self.peer_id, uptime_secs: 0,
-                peers: vec![], routes: vec![],
+                peer_id: self.peer_id,
+                uptime_secs: 0,
+                peers: vec![],
+                routes: vec![],
                 dht: tarnet_api::types::DhtStatus {
-                    stored_keys: 0, stored_records: 0, kbucket_peers: 0,
-                    local_watches: 0, remote_watches: 0, nse: 0,
+                    stored_keys: 0,
+                    stored_records: 0,
+                    kbucket_peers: 0,
+                    local_watches: 0,
+                    remote_watches: 0,
+                    nse: 0,
                 },
                 circuits: tarnet_api::types::CircuitStatus {
-                    relay_forwards: 0, relay_endpoints: 0, outbound_circuits: 0,
-                    rendezvous_points: 0, intro_points: 0,
+                    relay_forwards: 0,
+                    relay_endpoints: 0,
+                    outbound_circuits: 0,
+                    rendezvous_points: 0,
+                    intro_points: 0,
                 },
                 traffic: tarnet_api::types::TrafficStatus {
-                    bytes_up: Default::default(), bytes_down: Default::default(),
-                    packets_up: Default::default(), packets_down: Default::default(),
+                    bytes_up: Default::default(),
+                    bytes_down: Default::default(),
+                    packets_up: Default::default(),
+                    packets_down: Default::default(),
                     cells_relayed: Default::default(),
                 },
             }
@@ -709,31 +831,91 @@ mod tests {
         async fn tns_resolve_name(&self, _: &str) -> ApiResult<TnsResolution> {
             Ok(TnsResolution::NotFound)
         }
-        async fn tns_set_label(&self, _: Option<&str>, _: &str, _: Vec<TnsRecord>, _: bool) -> ApiResult<()> { Ok(()) }
-        async fn tns_get_label(&self, _: Option<&str>, _: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> { Ok(None) }
-        async fn tns_remove_label(&self, _: Option<&str>, _: &str) -> ApiResult<()> { Ok(()) }
-        async fn tns_list_labels(&self, _: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> { Ok(vec![]) }
+        async fn tns_set_label(
+            &self,
+            _: Option<&str>,
+            _: &str,
+            _: Vec<TnsRecord>,
+            _: bool,
+        ) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn tns_get_label(
+            &self,
+            _: Option<&str>,
+            _: &str,
+        ) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
+            Ok(None)
+        }
+        async fn tns_remove_label(&self, _: Option<&str>, _: &str) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn tns_list_labels(
+            &self,
+            _: Option<&str>,
+        ) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
+            Ok(vec![])
+        }
 
-        async fn create_identity(&self, _: &str, _: PrivacyLevel, _: u8, _: IdentityScheme) -> ApiResult<ServiceId> {
+        async fn create_identity(
+            &self,
+            _: &str,
+            _: PrivacyLevel,
+            _: u8,
+            _: IdentityScheme,
+        ) -> ApiResult<ServiceId> {
             Ok(self.identities[0].1)
         }
-        async fn list_identities(&self) -> ApiResult<Vec<(String, ServiceId, PrivacyLevel, u8, IdentityScheme, SigningAlgo, KemAlgo)>> {
+        async fn list_identities(
+            &self,
+        ) -> ApiResult<
+            Vec<(
+                String,
+                ServiceId,
+                PrivacyLevel,
+                u8,
+                IdentityScheme,
+                SigningAlgo,
+                KemAlgo,
+            )>,
+        > {
             Ok(self.identities.clone())
         }
-        async fn delete_identity(&self, _: &str) -> ApiResult<()> { Ok(()) }
-        async fn update_identity(&self, _: &str, _: PrivacyLevel, _: u8) -> ApiResult<(PrivacyLevel, u8)> {
+        async fn delete_identity(&self, _: &str) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn update_identity(
+            &self,
+            _: &str,
+            _: PrivacyLevel,
+            _: u8,
+        ) -> ApiResult<(PrivacyLevel, u8)> {
             Ok((PrivacyLevel::Public, 1))
         }
 
-        async fn socks_addr(&self) -> ApiResult<Vec<std::net::SocketAddr>> { Ok(vec![]) }
-        async fn connect_to(&self, _: &str, _: u16) -> ApiResult<Connection> { Err(ApiError::NotConnected) }
+        async fn socks_addr(&self) -> ApiResult<Vec<std::net::SocketAddr>> {
+            Ok(vec![])
+        }
+        async fn connect_to(&self, _: &str, _: PortMode, _: &str) -> ApiResult<Connection> {
+            Err(ApiError::NotConnected)
+        }
 
-        async fn send_data(&self, _: &PeerId, _: &[u8]) -> ApiResult<()> { Ok(()) }
-        async fn create_tunnel(&self, _: PeerId) -> ApiResult<PeerId> { Err(ApiError::NotConnected) }
-        async fn send_tunnel_data(&self, _: &PeerId, _: &[u8]) -> ApiResult<()> { Ok(()) }
+        async fn send_data(&self, _: &PeerId, _: &[u8]) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn create_tunnel(&self, _: PeerId) -> ApiResult<PeerId> {
+            Err(ApiError::NotConnected)
+        }
+        async fn send_tunnel_data(&self, _: &PeerId, _: &[u8]) -> ApiResult<()> {
+            Ok(())
+        }
     }
 
-    fn make_service(filename: &str, identity: Option<&str>, subdomain: Option<&str>) -> LoadedService {
+    fn make_service(
+        filename: &str,
+        identity: Option<&str>,
+        subdomain: Option<&str>,
+    ) -> LoadedService {
         LoadedService {
             filename: filename.to_string(),
             config: ServiceConfig {
@@ -764,9 +946,15 @@ mod tests {
     #[tokio::test]
     async fn hidden_identity_skipped_by_expose() {
         let hidden_sid = ServiceId::from_signing_pubkey(&[0x01; 32]);
-        let api = Arc::new(MockApi::new(vec![
-            ("hidden-blog".into(), hidden_sid, PrivacyLevel::Hidden { intro_points: 3 }, 2, IdentityScheme::Ed25519, SigningAlgo::Ed25519, KemAlgo::X25519),
-        ]));
+        let api = Arc::new(MockApi::new(vec![(
+            "hidden-blog".into(),
+            hidden_sid,
+            PrivacyLevel::Hidden { intro_points: 3 },
+            2,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
 
         let svc = make_service("myblog", Some("hidden-blog"), None);
         let state = make_publish_state(api.clone(), vec![svc]).await;
@@ -790,9 +978,15 @@ mod tests {
     #[tokio::test]
     async fn public_identity_publishes_at_apex() {
         let public_sid = ServiceId::from_signing_pubkey(&[0x02; 32]);
-        let api = Arc::new(MockApi::new(vec![
-            ("default".into(), public_sid, PrivacyLevel::Public, 1, IdentityScheme::Ed25519, SigningAlgo::Ed25519, KemAlgo::X25519),
-        ]));
+        let api = Arc::new(MockApi::new(vec![(
+            "default".into(),
+            public_sid,
+            PrivacyLevel::Public,
+            1,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
 
         let svc = make_service("mysite", None, None);
         let state = make_publish_state(api.clone(), vec![svc]).await;
@@ -812,9 +1006,15 @@ mod tests {
     #[tokio::test]
     async fn public_identity_publishes_at_subdomain() {
         let public_sid = ServiceId::from_signing_pubkey(&[0x02; 32]);
-        let api = Arc::new(MockApi::new(vec![
-            ("default".into(), public_sid, PrivacyLevel::Public, 1, IdentityScheme::Ed25519, SigningAlgo::Ed25519, KemAlgo::X25519),
-        ]));
+        let api = Arc::new(MockApi::new(vec![(
+            "default".into(),
+            public_sid,
+            PrivacyLevel::Public,
+            1,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
 
         let svc = make_service("blog", None, Some("blog"));
         let state = make_publish_state(api.clone(), vec![svc]).await;
@@ -829,8 +1029,24 @@ mod tests {
         let public_sid = ServiceId::from_signing_pubkey(&[0x10; 32]);
         let hidden_sid = ServiceId::from_signing_pubkey(&[0x20; 32]);
         let api = Arc::new(MockApi::new(vec![
-            ("default".into(), public_sid, PrivacyLevel::Public, 1, IdentityScheme::Ed25519, SigningAlgo::Ed25519, KemAlgo::X25519),
-            ("secret".into(), hidden_sid, PrivacyLevel::Hidden { intro_points: 2 }, 3, IdentityScheme::Ed25519, SigningAlgo::Ed25519, KemAlgo::X25519),
+            (
+                "default".into(),
+                public_sid,
+                PrivacyLevel::Public,
+                1,
+                IdentityScheme::Ed25519,
+                SigningAlgo::Ed25519,
+                KemAlgo::X25519,
+            ),
+            (
+                "secret".into(),
+                hidden_sid,
+                PrivacyLevel::Hidden { intro_points: 2 },
+                3,
+                IdentityScheme::Ed25519,
+                SigningAlgo::Ed25519,
+                KemAlgo::X25519,
+            ),
         ]));
 
         let svcs = vec![
@@ -852,9 +1068,15 @@ mod tests {
     #[tokio::test]
     async fn unpublished_service_does_nothing() {
         let sid = ServiceId::from_signing_pubkey(&[0x30; 32]);
-        let api = Arc::new(MockApi::new(vec![
-            ("default".into(), sid, PrivacyLevel::Public, 1, IdentityScheme::Ed25519, SigningAlgo::Ed25519, KemAlgo::X25519),
-        ]));
+        let api = Arc::new(MockApi::new(vec![(
+            "default".into(),
+            sid,
+            PrivacyLevel::Public,
+            1,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
 
         let mut svc = make_service("nopub", None, None);
         svc.config.publish = false;
@@ -923,7 +1145,10 @@ mod tests {
         assert!(validate_subdomain("has.dot").is_err(), "dots");
         assert!(validate_subdomain("-leading").is_err(), "leading hyphen");
         assert!(validate_subdomain("trailing-").is_err(), "trailing hyphen");
-        assert!(validate_subdomain("_internal").is_err(), "leading underscore");
+        assert!(
+            validate_subdomain("_internal").is_err(),
+            "leading underscore"
+        );
         assert!(validate_subdomain("UPPER").is_err(), "uppercase");
         assert!(validate_subdomain("spa ce").is_err(), "space");
         let long = "a".repeat(64);

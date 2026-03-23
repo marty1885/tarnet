@@ -18,11 +18,7 @@ const PROBE_MAX_ATTEMPTS: usize = 5;
 
 impl Node {
     /// Handle an incoming RouteProbe message.
-    pub(super) async fn handle_route_probe(
-        &self,
-        from: PeerId,
-        payload: &[u8],
-    ) -> Result<()> {
+    pub(super) async fn handle_route_probe(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let probe = RouteProbeMsg::from_bytes(payload)?;
 
         // Duplicate suppression: drop if we've seen this nonce.
@@ -136,7 +132,12 @@ impl Node {
         }
 
         // Not ours — forward along reverse path.
-        let next = self.probe_reverse.lock().await.get(&found.nonce).map(|(p, _)| *p);
+        let next = self
+            .probe_reverse
+            .lock()
+            .await
+            .get(&found.nonce)
+            .map(|(p, _)| *p);
         if let Some(next_peer) = next {
             let forwarded = RouteProbeFoundMsg {
                 nonce: found.nonce,
@@ -153,6 +154,13 @@ impl Node {
     /// Initiate a route probe for `target`. Uses expanding ring search.
     /// Returns the cost if found, or None if all attempts failed.
     pub async fn route_probe(&self, target: PeerId) -> Option<u16> {
+        let cutoff = Instant::now() - PROBE_NONCE_EXPIRY;
+        self.probe_seen.lock().await.retain(|_, t| *t > cutoff);
+        self.probe_reverse
+            .lock()
+            .await
+            .retain(|_, (_, t)| *t > cutoff);
+
         let mut ttl = PROBE_INITIAL_TTL;
 
         for _attempt in 0..PROBE_MAX_ATTEMPTS {
@@ -179,10 +187,8 @@ impl Node {
 
             // Send to all neighbors (expanding ring — all directions).
             let links = self.links.lock().await;
-            let peers: Vec<(PeerId, Arc<PeerLink>)> = links
-                .iter()
-                .map(|(p, l)| (*p, l.clone()))
-                .collect();
+            let peers: Vec<(PeerId, Arc<PeerLink>)> =
+                links.iter().map(|(p, l)| (*p, l.clone())).collect();
             drop(links);
 
             for (peer, link) in &peers {
@@ -212,12 +218,5 @@ impl Node {
         }
 
         None
-    }
-
-    /// Expire stale probe state (called periodically).
-    pub(super) async fn expire_probe_state(&self) {
-        let cutoff = Instant::now() - PROBE_NONCE_EXPIRY;
-        self.probe_seen.lock().await.retain(|_, t| *t > cutoff);
-        self.probe_reverse.lock().await.retain(|_, (_, t)| *t > cutoff);
     }
 }

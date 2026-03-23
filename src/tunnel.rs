@@ -43,7 +43,13 @@ impl Tunnel {
 
         let cipher = XChaCha20Poly1305::new((&self.enc_key).into());
         let ciphertext = cipher
-            .encrypt((&nonce).into(), Payload { msg: plaintext, aad: b"" })
+            .encrypt(
+                (&nonce).into(),
+                Payload {
+                    msg: plaintext,
+                    aad: b"",
+                },
+            )
             .expect("AEAD encryption should not fail");
 
         let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
@@ -62,7 +68,13 @@ impl Tunnel {
 
         let cipher = XChaCha20Poly1305::new((&self.dec_key).into());
         cipher
-            .decrypt(nonce.into(), Payload { msg: ciphertext_with_tag, aad: b"" })
+            .decrypt(
+                nonce.into(),
+                Payload {
+                    msg: ciphertext_with_tag,
+                    aad: b"",
+                },
+            )
             .map_err(|_| Error::Crypto("tunnel AEAD decryption failed".into()))
     }
 }

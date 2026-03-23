@@ -137,8 +137,7 @@ impl RoutingTable {
             });
         } else {
             // Replace worst route if new one is better
-            if let Some((worst_idx, worst)) =
-                routes.iter().enumerate().max_by_key(|(_, r)| r.cost)
+            if let Some((worst_idx, worst)) = routes.iter().enumerate().max_by_key(|(_, r)| r.cost)
             {
                 if cost < worst.cost {
                     routes[worst_idx] = Route {
@@ -403,7 +402,12 @@ mod tests {
         let mut rt = RoutingTable::with_capacity(pid(0), 100, 200);
         // Peer 1: nodes to the left (25 of them)
         for i in 1..=25u8 {
-            rt.update_with_source(PeerId([i; 32]), pid(1), i as u32, RouteSource::Advertisement);
+            rt.update_with_source(
+                PeerId([i; 32]),
+                pid(1),
+                i as u32,
+                RouteSource::Advertisement,
+            );
         }
         // Peer 2: nodes to the right (25 of them)
         for i in 26..=50u8 {

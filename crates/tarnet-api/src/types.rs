@@ -1,7 +1,7 @@
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Identity scheme identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -100,8 +100,7 @@ impl KemAlgo {
         match (my, peer) {
             (Self::X25519, Self::X25519) => Self::X25519,
             (Self::MlkemX25519, Self::MlkemX25519) => Self::MlkemX25519,
-            (Self::MlkemX25519, Self::X25519)
-            | (Self::X25519, Self::MlkemX25519) => Self::X25519,
+            (Self::MlkemX25519, Self::X25519) | (Self::X25519, Self::MlkemX25519) => Self::X25519,
             // Future variants: add explicit arms here.
             // The compiler will enforce exhaustiveness.
         }
@@ -355,8 +354,8 @@ impl<'de> Deserialize<'de> for DhtId {
 
 /// Serde helper for `[u8; 64]` fields that aren't wrapped in DhtId.
 pub mod serde_byte_array_64 {
-    use serde::{Deserializer, Serializer};
     use serde::de::{self, Visitor};
+    use serde::{Deserializer, Serializer};
     use std::fmt;
 
     pub fn serialize<S: Serializer>(data: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
@@ -579,8 +578,14 @@ mod tests {
 
     #[test]
     fn identity_scheme_roundtrip() {
-        assert_eq!(IdentityScheme::from_u8(0x01).unwrap(), IdentityScheme::Ed25519);
-        assert_eq!(IdentityScheme::from_u8(0x02).unwrap(), IdentityScheme::FalconEd25519);
+        assert_eq!(
+            IdentityScheme::from_u8(0x01).unwrap(),
+            IdentityScheme::Ed25519
+        );
+        assert_eq!(
+            IdentityScheme::from_u8(0x02).unwrap(),
+            IdentityScheme::FalconEd25519
+        );
     }
 
     #[test]
@@ -637,7 +642,10 @@ mod tests {
     #[test]
     fn signing_algo_roundtrip() {
         assert_eq!(SigningAlgo::from_u8(0x01).unwrap(), SigningAlgo::Ed25519);
-        assert_eq!(SigningAlgo::from_u8(0x02).unwrap(), SigningAlgo::FalconEd25519);
+        assert_eq!(
+            SigningAlgo::from_u8(0x02).unwrap(),
+            SigningAlgo::FalconEd25519
+        );
     }
 
     #[test]

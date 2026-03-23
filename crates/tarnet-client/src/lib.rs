@@ -27,10 +27,12 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::ipc::*;
 use tarnet_api::service::{
-    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, ServiceApi, TnsRecord,
-    TnsResolution,
+    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi,
+    TnsRecord, TnsResolution,
 };
-use tarnet_api::types::{DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo};
+use tarnet_api::types::{
+    DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo,
+};
 
 /// Per-connection data channel: conn_id -> sender.
 type ConnDataMap = Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>;
@@ -43,16 +45,25 @@ fn default_node_status() -> tarnet_api::types::NodeStatus {
         peers: Vec::new(),
         routes: Vec::new(),
         dht: tarnet_api::types::DhtStatus {
-            stored_keys: 0, stored_records: 0, kbucket_peers: 0,
-            local_watches: 0, remote_watches: 0, nse: 0,
+            stored_keys: 0,
+            stored_records: 0,
+            kbucket_peers: 0,
+            local_watches: 0,
+            remote_watches: 0,
+            nse: 0,
         },
         circuits: tarnet_api::types::CircuitStatus {
-            relay_forwards: 0, relay_endpoints: 0, outbound_circuits: 0,
-            rendezvous_points: 0, intro_points: 0,
+            relay_forwards: 0,
+            relay_endpoints: 0,
+            outbound_circuits: 0,
+            rendezvous_points: 0,
+            intro_points: 0,
         },
         traffic: tarnet_api::types::TrafficStatus {
-            bytes_up: Default::default(), bytes_down: Default::default(),
-            packets_up: Default::default(), packets_down: Default::default(),
+            bytes_up: Default::default(),
+            bytes_down: Default::default(),
+            packets_up: Default::default(),
+            packets_down: Default::default(),
             cells_relayed: Default::default(),
         },
     }
@@ -224,7 +235,8 @@ impl IpcServiceApi {
         &self,
         conn_id: u32,
         remote_service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: String,
     ) -> ApiResult<Connection> {
         let (data_tx, data_rx) = mpsc::channel(256);
         self.conn_data.lock().await.insert(conn_id, data_tx);
@@ -259,6 +271,7 @@ impl IpcServiceApi {
 
         Ok(Connection::new(
             remote_service_id,
+            mode,
             port,
             conn_id,
             app_tx,
@@ -318,25 +331,28 @@ impl ServiceApi for IpcServiceApi {
     async fn connect(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
     ) -> ApiResult<Connection> {
-        let payload = encode_payload(&(service_id, port));
+        let payload = encode_payload(&(service_id, mode, port.to_string()));
         let (status, resp) = self.request(METHOD_CONNECT, &payload).await?;
         Self::check_status(status, &resp)?;
         let r: ConnectResp = decode_payload(&resp)?;
-        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.port)
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.mode, r.port)
             .await
     }
 
     async fn listen(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         options: ListenerOptions,
     ) -> ApiResult<Listener> {
         let payload = encode_payload(&ListenReq {
             service_id,
-            port,
+            mode,
+            port: port.to_string(),
             options,
         });
         let (status, resp) = self.request(METHOD_LISTEN, &payload).await?;
@@ -358,7 +374,7 @@ impl ServiceApi for IpcServiceApi {
             .await?;
         Self::check_status(status, &resp)?;
         let r: ConnectResp = decode_payload(&resp)?;
-        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.port)
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.mode, r.port)
             .await
     }
 
@@ -371,13 +387,15 @@ impl ServiceApi for IpcServiceApi {
     async fn listen_hidden(
         &self,
         service_id: ServiceId,
-        port: u16,
+        mode: PortMode,
+        port: &str,
         num_intro_points: usize,
         options: ListenerOptions,
     ) -> ApiResult<Listener> {
         let payload = encode_payload(&ListenHiddenReq {
             service_id,
-            port,
+            mode,
+            port: port.to_string(),
             num_intro_points: num_intro_points as u16,
             options,
         });
@@ -397,11 +415,7 @@ impl ServiceApi for IpcServiceApi {
         decode_payload(&resp).unwrap()
     }
 
-    async fn dht_get(
-        &self,
-        key: &DhtId,
-        timeout_secs: u32,
-    ) -> Option<Vec<u8>> {
+    async fn dht_get(&self, key: &DhtId, timeout_secs: u32) -> Option<Vec<u8>> {
         let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
         let (status, resp) = self
@@ -417,28 +431,17 @@ impl ServiceApi for IpcServiceApi {
 
     // ── DHT: signed content ──
 
-    async fn dht_put_signed(
-        &self,
-        value: &[u8],
-        ttl_secs: u32,
-    ) -> DhtId {
+    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> DhtId {
         let req = DhtPutSignedReq {
             ttl_secs,
             value: value.to_vec(),
         };
         let payload = encode_payload(&req);
-        let (_, resp) = self
-            .request(METHOD_DHT_PUT_SIGNED, &payload)
-            .await
-            .unwrap();
+        let (_, resp) = self.request(METHOD_DHT_PUT_SIGNED, &payload).await.unwrap();
         decode_payload(&resp).unwrap()
     }
 
-    async fn dht_get_signed(
-        &self,
-        key: &DhtId,
-        timeout_secs: u32,
-    ) -> Vec<DhtEntry> {
+    async fn dht_get_signed(&self, key: &DhtId, timeout_secs: u32) -> Vec<DhtEntry> {
         let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
         let (status, resp) = match self
@@ -457,7 +460,10 @@ impl ServiceApi for IpcServiceApi {
         };
         entries
             .into_iter()
-            .map(|e| DhtEntry { signer: e.signer, data: e.data })
+            .map(|e| DhtEntry {
+                signer: e.signer,
+                data: e.data,
+            })
             .collect()
     }
 
@@ -553,11 +559,7 @@ impl ServiceApi for IpcServiceApi {
         Self::check_status(status, &resp)
     }
 
-    async fn tns_resolve(
-        &self,
-        zone: ServiceId,
-        name: &str,
-    ) -> ApiResult<TnsResolution> {
+    async fn tns_resolve(&self, zone: ServiceId, name: &str) -> ApiResult<TnsResolution> {
         let payload = encode_payload(&(zone, name.to_string()));
         let (status, resp) = self.request(METHOD_TNS_RESOLVE, &payload).await?;
         Self::check_status(status, &resp)?;
@@ -571,14 +573,24 @@ impl ServiceApi for IpcServiceApi {
         decode_payload(&resp)
     }
 
-    async fn tns_set_label(&self, identity: Option<&str>, label: &str, records: Vec<TnsRecord>, publish: bool) -> ApiResult<()> {
+    async fn tns_set_label(
+        &self,
+        identity: Option<&str>,
+        label: &str,
+        records: Vec<TnsRecord>,
+        publish: bool,
+    ) -> ApiResult<()> {
         let id_str: Option<String> = identity.map(|s| s.to_string());
         let payload = encode_payload(&(id_str, label.to_string(), records, publish));
         let (status, resp) = self.request(METHOD_TNS_SET_LABEL, &payload).await?;
         Self::check_status(status, &resp)
     }
 
-    async fn tns_get_label(&self, identity: Option<&str>, label: &str) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
+    async fn tns_get_label(
+        &self,
+        identity: Option<&str>,
+        label: &str,
+    ) -> ApiResult<Option<(Vec<TnsRecord>, bool)>> {
         let id_str: Option<String> = identity.map(|s| s.to_string());
         let payload = encode_payload(&(id_str, label.to_string()));
         let (status, resp) = self.request(METHOD_TNS_GET_LABEL, &payload).await?;
@@ -596,7 +608,10 @@ impl ServiceApi for IpcServiceApi {
         Self::check_status(status, &resp)
     }
 
-    async fn tns_list_labels(&self, identity: Option<&str>) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
+    async fn tns_list_labels(
+        &self,
+        identity: Option<&str>,
+    ) -> ApiResult<Vec<(String, Vec<TnsRecord>, bool)>> {
         let id_str: Option<String> = identity.map(|s| s.to_string());
         let payload = encode_payload(&id_str);
         let (status, resp) = self.request(METHOD_TNS_LIST_LABELS, &payload).await?;
@@ -621,13 +636,33 @@ impl ServiceApi for IpcServiceApi {
 
     async fn list_identities(
         &self,
-    ) -> ApiResult<Vec<(String, ServiceId, PrivacyLevel, u8, IdentityScheme, SigningAlgo, KemAlgo)>> {
+    ) -> ApiResult<
+        Vec<(
+            String,
+            ServiceId,
+            PrivacyLevel,
+            u8,
+            IdentityScheme,
+            SigningAlgo,
+            KemAlgo,
+        )>,
+    > {
         let (status, resp) = self.request(METHOD_LIST_IDENTITIES, &[]).await?;
         Self::check_status(status, &resp)?;
         let entries: Vec<IdentityEntry> = decode_payload(&resp)?;
         Ok(entries
             .into_iter()
-            .map(|e| (e.label, e.service_id, e.privacy, e.outbound_hops, e.scheme, e.signing_algo, e.kem_algo))
+            .map(|e| {
+                (
+                    e.label,
+                    e.service_id,
+                    e.privacy,
+                    e.outbound_hops,
+                    e.scheme,
+                    e.signing_algo,
+                    e.kem_algo,
+                )
+            })
             .collect())
     }
 
@@ -660,12 +695,12 @@ impl ServiceApi for IpcServiceApi {
 
     // ── Unified connect ──
 
-    async fn connect_to(&self, target: &str, port: u16) -> ApiResult<Connection> {
-        let payload = encode_payload(&(target.to_string(), port));
+    async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection> {
+        let payload = encode_payload(&(target.to_string(), mode, port.to_string()));
         let (status, resp) = self.request(METHOD_CONNECT_TO, &payload).await?;
         Self::check_status(status, &resp)?;
         let r: ConnectResp = decode_payload(&resp)?;
-        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.port)
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.mode, r.port)
             .await
     }
 

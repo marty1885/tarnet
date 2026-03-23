@@ -13,8 +13,8 @@ use sha2::Sha512;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 use crate::types::{DhtId, PeerId};
-use tarnet_api::types::{IdentityScheme, KemAlgo, SigningAlgo};
 use tarnet_api::types::ServiceId;
+use tarnet_api::types::{IdentityScheme, KemAlgo, SigningAlgo};
 
 // ---------------------------------------------------------------------------
 // SigningKeypair
@@ -122,25 +122,21 @@ impl SigningKeypair {
                 ed_seed.copy_from_slice(&data[1..33]);
                 let ed_sk = SigningKey::from_bytes(&ed_seed);
 
-                let sk_len =
-                    u16::from_be_bytes([data[33], data[34]]) as usize;
+                let sk_len = u16::from_be_bytes([data[33], data[34]]) as usize;
                 if data.len() < 35 + sk_len + 2 {
                     return Err("falcon_ed25519 signing key truncated");
                 }
-                let falcon_sk =
-                    falcon512::SecretKey::from_bytes(&data[35..35 + sk_len])
-                        .map_err(|_| "invalid falcon secret key")?;
+                let falcon_sk = falcon512::SecretKey::from_bytes(&data[35..35 + sk_len])
+                    .map_err(|_| "invalid falcon secret key")?;
 
                 let pk_off = 35 + sk_len;
-                let pk_len =
-                    u16::from_be_bytes([data[pk_off], data[pk_off + 1]]) as usize;
+                let pk_len = u16::from_be_bytes([data[pk_off], data[pk_off + 1]]) as usize;
                 if data.len() < pk_off + 2 + pk_len {
                     return Err("falcon_ed25519 public key truncated");
                 }
-                let falcon_pk = falcon512::PublicKey::from_bytes(
-                    &data[pk_off + 2..pk_off + 2 + pk_len],
-                )
-                .map_err(|_| "invalid falcon public key")?;
+                let falcon_pk =
+                    falcon512::PublicKey::from_bytes(&data[pk_off + 2..pk_off + 2 + pk_len])
+                        .map_err(|_| "invalid falcon public key")?;
 
                 Ok(Self {
                     inner: SigningInner::FalconEd25519 {
@@ -159,9 +155,7 @@ impl SigningKeypair {
     /// FalconEd25519: `ed25519_sig(64) || falcon_sig(variable, ~690)`.
     pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
         match &self.inner {
-            SigningInner::Ed25519 { signing_key } => {
-                signing_key.sign(msg).to_bytes().to_vec()
-            }
+            SigningInner::Ed25519 { signing_key } => signing_key.sign(msg).to_bytes().to_vec(),
             SigningInner::FalconEd25519 {
                 ed_sk, falcon_sk, ..
             } => {
@@ -342,15 +336,13 @@ impl KemKeypair {
                 let mlkem_sk = kyber768::SecretKey::from_bytes(&data[3..3 + sk_len])
                     .map_err(|_| "invalid ML-KEM secret key")?;
                 let pk_off = 3 + sk_len;
-                let pk_len =
-                    u16::from_be_bytes([data[pk_off], data[pk_off + 1]]) as usize;
+                let pk_len = u16::from_be_bytes([data[pk_off], data[pk_off + 1]]) as usize;
                 if data.len() < pk_off + 2 + pk_len {
                     return Err("mlkem_x25519 public key truncated");
                 }
-                let mlkem_pk = kyber768::PublicKey::from_bytes(
-                    &data[pk_off + 2..pk_off + 2 + pk_len],
-                )
-                .map_err(|_| "invalid ML-KEM public key")?;
+                let mlkem_pk =
+                    kyber768::PublicKey::from_bytes(&data[pk_off + 2..pk_off + 2 + pk_len])
+                        .map_err(|_| "invalid ML-KEM public key")?;
                 Ok(Self {
                     inner: KemInner::MlkemX25519 {
                         x_secret,
@@ -370,9 +362,7 @@ impl KemKeypair {
         match &self.inner {
             KemInner::X25519 { secret } => X25519Public::from(secret).to_bytes().to_vec(),
             KemInner::MlkemX25519 {
-                x_secret,
-                mlkem_pk,
-                ..
+                x_secret, mlkem_pk, ..
             } => {
                 let x_pk = X25519Public::from(x_secret).to_bytes();
                 let mpk = mlkem_pk.as_bytes();
@@ -389,7 +379,10 @@ impl KemKeypair {
     /// X25519: ephemeral DH. Returns (shared_secret, ephemeral_pubkey).
     /// MlkemX25519: `shared_secret = blake3::derive_key("tarnet kem", x25519_ss || mlkem_ss)`.
     ///   Ciphertext = `x25519_eph_pk(32) || mlkem_ct(1088)` = 1120 bytes.
-    pub fn encapsulate_to(remote_pk: &[u8], algo: KemAlgo) -> Result<([u8; 32], Vec<u8>), &'static str> {
+    pub fn encapsulate_to(
+        remote_pk: &[u8],
+        algo: KemAlgo,
+    ) -> Result<([u8; 32], Vec<u8>), &'static str> {
         match algo {
             KemAlgo::X25519 => {
                 if remote_pk.len() < 32 {
@@ -592,9 +585,7 @@ impl IdentityKeypair {
     pub fn scheme(&self) -> IdentityScheme {
         match (self.signing_algo(), self.kem_algo()) {
             (SigningAlgo::Ed25519, KemAlgo::X25519) => IdentityScheme::Ed25519,
-            (SigningAlgo::FalconEd25519, KemAlgo::MlkemX25519) => {
-                IdentityScheme::FalconEd25519
-            }
+            (SigningAlgo::FalconEd25519, KemAlgo::MlkemX25519) => IdentityScheme::FalconEd25519,
             (signing, kem) => panic!("unsupported identity scheme combination: {signing}/{kem}"),
         }
     }
@@ -642,9 +633,7 @@ impl Keypair {
         Self {
             identity: IdentityKeypair::generate(match (signing_algo, kem_algo) {
                 (SigningAlgo::Ed25519, KemAlgo::X25519) => IdentityScheme::Ed25519,
-                (SigningAlgo::FalconEd25519, KemAlgo::MlkemX25519) => {
-                    IdentityScheme::FalconEd25519
-                }
+                (SigningAlgo::FalconEd25519, KemAlgo::MlkemX25519) => IdentityScheme::FalconEd25519,
                 _ => panic!("unsupported identity scheme combination"),
             }),
         }
@@ -802,7 +791,13 @@ pub fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool 
 /// Verify using a PeerId and cached public key info.
 /// This is the main verification path — callers look up the pubkey from
 /// the pubkey cache or inline TLV, then call this.
-pub fn verify_with_pubkey(algo: SigningAlgo, pubkey: &[u8], peer_id: &PeerId, msg: &[u8], sig: &[u8]) -> bool {
+pub fn verify_with_pubkey(
+    algo: SigningAlgo,
+    pubkey: &[u8],
+    peer_id: &PeerId,
+    msg: &[u8],
+    sig: &[u8],
+) -> bool {
     // Verify that the pubkey actually corresponds to this PeerId
     let expected = peer_id_from_signing_pubkey(pubkey);
     if expected != *peer_id {
@@ -947,7 +942,10 @@ mod tests {
         let bytes = kp.to_bytes();
         let kp2 = IdentityKeypair::from_bytes(&bytes).unwrap();
         assert_eq!(kp.peer_id(), kp2.peer_id());
-        assert_eq!(kp.signing.signing_pubkey_bytes(), kp2.signing.signing_pubkey_bytes());
+        assert_eq!(
+            kp.signing.signing_pubkey_bytes(),
+            kp2.signing.signing_pubkey_bytes()
+        );
     }
 
     #[test]
@@ -994,11 +992,23 @@ mod tests {
         let pubkey = kp.signing.signing_pubkey_bytes();
         let pid = kp.peer_id();
 
-        assert!(verify_with_pubkey(SigningAlgo::Ed25519, &pubkey, &pid, msg, &sig));
+        assert!(verify_with_pubkey(
+            SigningAlgo::Ed25519,
+            &pubkey,
+            &pid,
+            msg,
+            &sig
+        ));
 
         // Wrong PeerId should fail
         let wrong_pid = PeerId([0xFF; 32]);
-        assert!(!verify_with_pubkey(SigningAlgo::Ed25519, &pubkey, &wrong_pid, msg, &sig));
+        assert!(!verify_with_pubkey(
+            SigningAlgo::Ed25519,
+            &pubkey,
+            &wrong_pid,
+            msg,
+            &sig
+        ));
     }
 
     #[test]

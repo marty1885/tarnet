@@ -15,8 +15,8 @@ pub struct BandwidthLimiter {
 
 struct BucketState {
     tokens: f64,
-    rate: f64,   // bytes/sec, 0 = unlimited
-    burst: f64,  // max token accumulation
+    rate: f64,  // bytes/sec, 0 = unlimited
+    burst: f64, // max token accumulation
     last_refill: tokio::time::Instant,
 }
 
@@ -257,7 +257,11 @@ mod tests {
         // Next chunk should take ~1 second
         limiter.acquire_upload(10_000).await;
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() >= 900, "expected ~1s delay, got {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() >= 900,
+            "expected ~1s delay, got {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -274,7 +278,11 @@ mod tests {
         // Should now throttle on the next call
         limiter.acquire_upload(10_000).await;
         let elapsed = start.elapsed();
-        assert!(elapsed.as_millis() >= 900, "expected ~1s delay, got {:?}", elapsed);
+        assert!(
+            elapsed.as_millis() >= 900,
+            "expected ~1s delay, got {:?}",
+            elapsed
+        );
     }
 
     #[tokio::test]
@@ -289,6 +297,9 @@ mod tests {
         // Should be instant now
         let start = tokio::time::Instant::now();
         limiter.acquire_upload(1_000_000).await;
-        assert!(start.elapsed().as_millis() < 50, "should be instant after switching to unlimited");
+        assert!(
+            start.elapsed().as_millis() < 50,
+            "should be instant after switching to unlimited"
+        );
     }
 }

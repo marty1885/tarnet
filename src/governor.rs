@@ -479,10 +479,7 @@ mod tests {
             );
         }
         // Now blocked — even non-circuit messages are shed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::DhtGet, 0),
-            Verdict::Shed,
-        );
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, 0), Verdict::Shed,);
         // But essential messages are still shed when blocked (block is hard).
         assert_eq!(
             gov.evaluate(&peer, MessageType::Keepalive, 0),
@@ -507,10 +504,7 @@ mod tests {
         gov.evaluate(&peer, MessageType::CircuitCreate, 0);
 
         // Non-essential shed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::DhtGet, 0),
-            Verdict::Shed,
-        );
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, 0), Verdict::Shed,);
         // Essential allowed.
         assert_eq!(
             gov.evaluate(&peer, MessageType::Keepalive, 0),
@@ -550,10 +544,7 @@ mod tests {
         gov.drain_reports();
 
         // Peer should be throttled now — non-essential shed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::DhtGet, 0),
-            Verdict::Shed,
-        );
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, 0), Verdict::Shed,);
     }
 
     #[test]

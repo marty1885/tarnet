@@ -105,7 +105,8 @@ impl Node {
                 let circuit_id = msg.circuit_id;
                 drop(table);
 
-                self.handle_endpoint_relay_cell(from, circuit_id, cell_data).await
+                self.handle_endpoint_relay_cell(from, circuit_id, cell_data)
+                    .await
             }
             None => {
                 drop(table);
@@ -125,7 +126,8 @@ impl Node {
                         let digest_key = circuit.hop_keys.last().unwrap().backward_digest;
                         drop(circuits);
 
-                        let body: &[u8; CELL_BODY_SIZE] = cell[..CELL_BODY_SIZE].try_into().unwrap();
+                        let body: &[u8; CELL_BODY_SIZE] =
+                            cell[..CELL_BODY_SIZE].try_into().unwrap();
                         if let Ok(relay_cell) = RelayCell::from_cell(body, &digest_key) {
                             if relay_cell.command == RelayCellCommand::Extended {
                                 // This is an EXTENDED reply during circuit construction.
@@ -223,11 +225,8 @@ impl Node {
                             if relay_cell.command == RelayCellCommand::Introduce {
                                 // INTRODUCE forwarded to us (the hidden service) through our
                                 // intro point circuit.
-                                self.handle_introduce_at_service(
-                                    msg.circuit_id,
-                                    &relay_cell.data,
-                                )
-                                .await;
+                                self.handle_introduce_at_service(msg.circuit_id, &relay_cell.data)
+                                    .await;
                                 return Ok(());
                             }
                             if relay_cell.command == RelayCellCommand::Padding {
@@ -284,7 +283,9 @@ impl Node {
             from_peer: from,
         };
         let digest_key = match table.lookup(&key) {
-            Some(CircuitAction::Endpoint { crypto: Some(c), .. }) => c.digest_key,
+            Some(CircuitAction::Endpoint {
+                crypto: Some(c), ..
+            }) => c.digest_key,
             _ => {
                 log::debug!("No endpoint crypto for circuit_id={}", circuit_id);
                 return Ok(());
@@ -296,7 +297,11 @@ impl Node {
         let relay_cell = match RelayCell::from_cell(body, &digest_key) {
             Ok(rc) => rc,
             Err(e) => {
-                log::warn!("Relay cell parse failed at endpoint circuit_id={}: {}", circuit_id, e);
+                log::warn!(
+                    "Relay cell parse failed at endpoint circuit_id={}: {}",
+                    circuit_id,
+                    e
+                );
                 return Ok(());
             }
         };
@@ -320,9 +325,7 @@ impl Node {
                             return Ok(());
                         }
                         // Compute digest of this cell for authenticated SENDME
-                        let digest = crate::circuit::relay_cell_digest_for_sendme(
-                            &relay_cell.data,
-                        );
+                        let digest = crate::circuit::relay_cell_digest_for_sendme(&relay_cell.data);
                         cw.on_deliver(digest)
                     } else {
                         false
@@ -398,13 +401,8 @@ impl Node {
             }
             RelayCellCommand::Padding => {
                 // Echo padding back to the initiator for circuit keepalive.
-                self.send_endpoint_relay_cell(
-                    from,
-                    circuit_id,
-                    RelayCellCommand::Padding,
-                    &[],
-                )
-                .await
+                self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::Padding, &[])
+                    .await
             }
             _ => {
                 log::debug!(
@@ -429,7 +427,15 @@ impl Node {
             .await
             .ok_or_else(|| Error::Protocol("no backward keys for circuit".into()))?;
 
-        let encoded = encrypt_backward_cell(bwd_key, bwd_digest, nonce_prefix, nonce, circuit_id, command, data);
+        let encoded = encrypt_backward_cell(
+            bwd_key,
+            bwd_digest,
+            nonce_prefix,
+            nonce,
+            circuit_id,
+            command,
+            data,
+        );
         self.send_to_peer(&from, &encoded).await
     }
 
@@ -444,7 +450,7 @@ impl Node {
         circuit_id: u32,
         payload: &[u8],
     ) -> Result<()> {
-        let (service_id, port) = parse_stream_begin_payload(payload)?;
+        let (service_id, mode, port) = parse_stream_begin_payload(payload)?;
 
         // Idempotent: if we already set up a stream on this circuit,
         // just re-send StreamConnected (the first one may have been dropped).
@@ -457,26 +463,26 @@ impl Node {
                     circuit_id,
                 );
                 self.send_endpoint_relay_cell(
-                    from, circuit_id,
+                    from,
+                    circuit_id,
                     RelayCellCommand::StreamConnected,
                     &[],
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
         }
 
-        if !self.has_matching_listener(service_id, port).await {
+        if !self.has_matching_listener(service_id, mode, &port).await {
             log::debug!(
-                "STREAM_BEGIN rejected: not listening on {:?} port {}",
+                "STREAM_BEGIN rejected: not listening on {:?} mode {:?} port {}",
                 service_id,
+                mode,
                 port,
             );
             // Send StreamRefused back to the initiator.
-            self.send_endpoint_relay_cell(
-                from, circuit_id,
-                RelayCellCommand::StreamRefused,
-                &[],
-            ).await?;
+            self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::StreamRefused, &[])
+                .await?;
             return Ok(());
         }
 
@@ -488,8 +494,12 @@ impl Node {
                 drop(owners);
                 log::warn!("STREAM_BEGIN rejected: global stream limit reached");
                 self.send_endpoint_relay_cell(
-                    from, circuit_id, RelayCellCommand::StreamRefused, &[],
-                ).await?;
+                    from,
+                    circuit_id,
+                    RelayCellCommand::StreamRefused,
+                    &[],
+                )
+                .await?;
                 return Ok(());
             }
             // Per-peer limit.
@@ -498,18 +508,25 @@ impl Node {
                 drop(owners);
                 log::warn!(
                     "STREAM_BEGIN rejected: peer {:?} at stream limit ({}/{})",
-                    from, peer_count, super::MAX_STREAMS_PER_PEER,
+                    from,
+                    peer_count,
+                    super::MAX_STREAMS_PER_PEER,
                 );
                 self.send_endpoint_relay_cell(
-                    from, circuit_id, RelayCellCommand::StreamRefused, &[],
-                ).await?;
+                    from,
+                    circuit_id,
+                    RelayCellCommand::StreamRefused,
+                    &[],
+                )
+                .await?;
                 return Ok(());
             }
         }
 
         log::info!(
-            "Incoming connection: {:?} port {} on circuit_id={}",
+            "Incoming connection: {:?} mode {:?} port {} on circuit_id={}",
             service_id,
+            mode,
             port,
             circuit_id
         );
@@ -519,17 +536,20 @@ impl Node {
         let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
 
         // Register the circuit_tx so incoming DATA cells are forwarded to the connection.
-        self.endpoints.data_txs
+        self.endpoints
+            .data_txs
             .lock()
             .await
             .insert(circuit_id, circuit_tx);
         // Track ownership for per-peer stream limiting.
-        self.endpoints.stream_owners
+        self.endpoints
+            .stream_owners
             .lock()
             .await
             .insert(circuit_id, from);
         // Initialize endpoint-side receive window for flow control.
-        self.endpoints.recv_congestion
+        self.endpoints
+            .recv_congestion
             .lock()
             .await
             .insert(circuit_id, CongestionWindow::new());
@@ -538,7 +558,8 @@ impl Node {
         // At the endpoint, we send backward relay cells: encrypt with our backward key
         // and send to the upstream peer.
         let send_notify = Arc::new(tokio::sync::Notify::new());
-        self.endpoints.send_congestion
+        self.endpoints
+            .send_congestion
             .lock()
             .await
             .insert(circuit_id, (CongestionWindow::new(), send_notify.clone()));
@@ -550,10 +571,8 @@ impl Node {
             let mut rx = circuit_rx;
             while let Some(data) = rx.recv().await {
                 // Chunk data into relay-cell-sized pieces.
-                let chunks: Vec<Vec<u8>> = data
-                    .chunks(CELL_PAYLOAD_MAX)
-                    .map(|c| c.to_vec())
-                    .collect();
+                let chunks: Vec<Vec<u8>> =
+                    data.chunks(CELL_PAYLOAD_MAX).map(|c| c.to_vec()).collect();
 
                 let mut broken = false;
                 for chunk in chunks {
@@ -599,12 +618,20 @@ impl Node {
 
                     let (bwd_key, bwd_digest, nonce_prefix, nonce) = match bwd_info {
                         Some(info) => info,
-                        None => { broken = true; break; }
+                        None => {
+                            broken = true;
+                            break;
+                        }
                     };
 
                     let encoded = encrypt_backward_cell(
-                        bwd_key, bwd_digest, nonce_prefix, nonce, circuit_id,
-                        RelayCellCommand::Data, &chunk,
+                        bwd_key,
+                        bwd_digest,
+                        nonce_prefix,
+                        nonce,
+                        circuit_id,
+                        RelayCellCommand::Data,
+                        &chunk,
                     );
                     let links_guard = links.lock().await;
                     if let Some(link) = links_guard.get(&from) {
@@ -619,14 +646,13 @@ impl Node {
 
         // Build the Connection and route it to the matching listener.
         let conn = tarnet_api::service::Connection::new(
-            service_id,
-            port,
-            circuit_id,
-            app_tx,
-            app_rx,
+            service_id, mode, port, circuit_id, app_tx, app_rx,
         );
 
-        let dispatch = self.dispatch_incoming_connection(service_id, port, conn).await;
+        let port_name = conn.port.clone();
+        let dispatch = self
+            .dispatch_incoming_connection(service_id, mode, &port_name, conn)
+            .await;
         if !matches!(dispatch, ListenerDispatch::Enqueued) {
             let reason = match dispatch {
                 ListenerDispatch::NoListener => "listener disappeared before enqueue",
@@ -639,23 +665,29 @@ impl Node {
                 circuit_id
             );
             self.endpoints.data_txs.lock().await.remove(&circuit_id);
-            self.endpoints.stream_owners.lock().await.remove(&circuit_id);
-            self.endpoints.recv_congestion.lock().await.remove(&circuit_id);
-            self.endpoints.send_congestion.lock().await.remove(&circuit_id);
-            self.send_endpoint_relay_cell(
-                from, circuit_id,
-                RelayCellCommand::StreamRefused,
-                &[],
-            ).await?;
+            self.endpoints
+                .stream_owners
+                .lock()
+                .await
+                .remove(&circuit_id);
+            self.endpoints
+                .recv_congestion
+                .lock()
+                .await
+                .remove(&circuit_id);
+            self.endpoints
+                .send_congestion
+                .lock()
+                .await
+                .remove(&circuit_id);
+            self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::StreamRefused, &[])
+                .await?;
             return Ok(());
         }
 
         // Send StreamConnected back to the initiator.
-        self.send_endpoint_relay_cell(
-            from, circuit_id,
-            RelayCellCommand::StreamConnected,
-            &[],
-        ).await?;
+        self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::StreamConnected, &[])
+            .await?;
 
         Ok(())
     }
@@ -670,8 +702,7 @@ impl Node {
         inbound_circuit_id: u32,
         extend_data: &[u8],
     ) -> Result<()> {
-        let (kem_algo, initiator_ephemeral, destination) =
-            parse_extend_payload(extend_data)?;
+        let (kem_algo, initiator_ephemeral, destination) = parse_extend_payload(extend_data)?;
 
         // DV routing: if destination is our direct neighbor, extend there (reached).
         // Otherwise, look up our routing table for the best next_hop.
@@ -690,24 +721,35 @@ impl Node {
                         if links.contains_key(&nh) {
                             (nh, false)
                         } else {
-                            log::warn!("EXTEND: next_hop {:?} for destination {:?} has no link", nh, destination);
+                            log::warn!(
+                                "EXTEND: next_hop {:?} for destination {:?} has no link",
+                                nh,
+                                destination
+                            );
                             self.send_endpoint_relay_cell(
                                 from,
                                 inbound_circuit_id,
                                 RelayCellCommand::Extended,
                                 &[],
-                            ).await.ok();
+                            )
+                            .await
+                            .ok();
                             return Ok(());
                         }
                     }
                     None => {
-                        log::warn!("EXTEND: no route to {:?}, sending error EXTENDED back", destination);
+                        log::warn!(
+                            "EXTEND: no route to {:?}, sending error EXTENDED back",
+                            destination
+                        );
                         self.send_endpoint_relay_cell(
                             from,
                             inbound_circuit_id,
                             RelayCellCommand::Extended,
                             &[],
-                        ).await.ok();
+                        )
+                        .await
+                        .ok();
                         return Ok(());
                     }
                 }
@@ -717,7 +759,10 @@ impl Node {
         let next_hop = target;
         let we_initiated_next = {
             let links = self.links.lock().await;
-            links.get(&next_hop).map(|l| l.is_initiator()).unwrap_or(true)
+            links
+                .get(&next_hop)
+                .map(|l| l.is_initiator())
+                .unwrap_or(true)
         };
 
         // Get the existing Endpoint crypto (our layer's crypto from hop 1 setup).
@@ -736,7 +781,12 @@ impl Node {
 
         // Allocate outbound circuit ID for the new leg.
         let outbound_id = table.alloc_id(we_initiated_next, |id| {
-            table.lookup(&CircuitKey { circuit_id: id, from_peer: next_hop }).is_some()
+            table
+                .lookup(&CircuitKey {
+                    circuit_id: id,
+                    from_peer: next_hop,
+                })
+                .is_some()
         });
 
         // Build backward crypto for the Forward entry.
@@ -744,13 +794,14 @@ impl Node {
         // the cell trailer — no per-relay counter needed.
         let bwd_crypto = {
             let map = self.circuits.hop_backward_keys.lock().await;
-            map.get(&(inbound_circuit_id, from)).map(|&(key, digest_key, nonce_prefix, _)| HopCrypto {
-                key,
-                digest_key,
-                nonce_prefix,
-                op: CryptoOp::Encrypt,
-                replay: ReplayWindow::new(),
-            })
+            map.get(&(inbound_circuit_id, from))
+                .map(|&(key, digest_key, nonce_prefix, _)| HopCrypto {
+                    key,
+                    digest_key,
+                    nonce_prefix,
+                    op: CryptoOp::Encrypt,
+                    replay: ReplayWindow::new(),
+                })
         };
 
         // Change Endpoint → Forward (keep existing decrypt crypto for forward direction)
@@ -779,7 +830,8 @@ impl Node {
 
         // Remember this pending extend so when CircuitCreated arrives from next_hop,
         // we can route the EXTENDED reply back.
-        self.circuits.relay_extend_pending
+        self.circuits
+            .relay_extend_pending
             .lock()
             .await
             .insert(outbound_id, (from, inbound_circuit_id, reached));
@@ -846,8 +898,14 @@ impl Node {
 
         // Store backward crypto keying material for later EXTEND handling.
         // We need this when converting Endpoint → Forward.
-        self.store_hop_backward_crypto(msg.circuit_id, from, hop_keys.backward_key, hop_keys.backward_digest, hop_keys.nonce_prefix)
-            .await;
+        self.store_hop_backward_crypto(
+            msg.circuit_id,
+            from,
+            hop_keys.backward_key,
+            hop_keys.backward_digest,
+            hop_keys.nonce_prefix,
+        )
+        .await;
 
         // Reply with CircuitCreated containing the KEM ciphertext (TLV format).
         let reply = CircuitCreatedMsg {
@@ -868,7 +926,8 @@ impl Node {
 
         // Check if this is for a relay extend we're forwarding.
         let relay_pending = self
-            .circuits.relay_extend_pending
+            .circuits
+            .relay_extend_pending
             .lock()
             .await
             .remove(&msg.circuit_id);
@@ -969,33 +1028,36 @@ impl Node {
         }
 
         // Clean up connection state.
-        self.endpoints.data_txs
+        self.endpoints.data_txs.lock().await.remove(&msg.circuit_id);
+        self.endpoints
+            .stream_owners
             .lock()
             .await
             .remove(&msg.circuit_id);
-        self.endpoints.stream_owners
+        self.endpoints
+            .recv_congestion
             .lock()
             .await
             .remove(&msg.circuit_id);
-        self.endpoints.recv_congestion
+        self.endpoints
+            .send_congestion
             .lock()
             .await
             .remove(&msg.circuit_id);
-        self.endpoints.send_congestion
+        self.circuits
+            .sendme_notify
             .lock()
             .await
             .remove(&msg.circuit_id);
-        self.circuits.sendme_notify
-            .lock()
-            .await
-            .remove(&msg.circuit_id);
-        self.circuits.hop_backward_keys
+        self.circuits
+            .hop_backward_keys
             .lock()
             .await
             .remove(&(msg.circuit_id, from));
         // Remove the per-circuit relay queue (drops the sender, which
         // causes the processing task to exit on next recv()).
-        self.circuits.relay_queues
+        self.circuits
+            .relay_queues
             .lock()
             .await
             .remove(&(msg.circuit_id, from));
@@ -1018,7 +1080,8 @@ impl Node {
             service_id,
             circuit_id,
         );
-        self.hidden.intro_registrations
+        self.hidden
+            .intro_registrations
             .lock()
             .await
             .insert(circuit_id, (service_id.clone(), from));
@@ -1031,7 +1094,8 @@ impl Node {
         };
         // Send backward relay cell
         let bwd_info = self.get_hop_backward_crypto(circuit_id, from).await;
-        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) =
+            bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = reply.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1052,12 +1116,7 @@ impl Node {
     }
 
     /// Handle INTRODUCE at an intro point: forward the INTRODUCE data to the registered service.
-    async fn handle_introduce(
-        &self,
-        from: PeerId,
-        circuit_id: u32,
-        payload: &[u8],
-    ) -> Result<()> {
+    async fn handle_introduce(&self, from: PeerId, circuit_id: u32, payload: &[u8]) -> Result<()> {
         log::info!(
             "Introduce received at intro point on circuit_id={}",
             circuit_id,
@@ -1086,7 +1145,8 @@ impl Node {
         let bwd_info = self
             .get_hop_backward_crypto(service_circuit_id, service_from)
             .await;
-        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) =
+            bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = intro_cell.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1114,7 +1174,8 @@ impl Node {
             data: vec![],
         };
         let bwd_info = self.get_hop_backward_crypto(circuit_id, from).await;
-        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) =
+            bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = ack.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1221,7 +1282,8 @@ impl Node {
         let bwd_info = self
             .get_hop_backward_crypto(client_circuit_id, client_from)
             .await;
-        let (bwd_key, bwd_digest, nonce_prefix, nonce) = bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
+        let (bwd_key, bwd_digest, nonce_prefix, nonce) =
+            bwd_info.unwrap_or(([0u8; 32], [0u8; 32], [0u8; 16], 0));
         let body = joined.to_cell(&bwd_digest);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
@@ -1250,10 +1312,10 @@ impl Node {
         bwd_digest: [u8; 32],
         nonce_prefix: [u8; 16],
     ) {
-        self.circuits.hop_backward_keys
-            .lock()
-            .await
-            .insert((circuit_id, from_peer), (bwd_key, bwd_digest, nonce_prefix, 0));
+        self.circuits.hop_backward_keys.lock().await.insert(
+            (circuit_id, from_peer),
+            (bwd_key, bwd_digest, nonce_prefix, 0),
+        );
     }
 
     /// Get backward crypto keys for a circuit hop, returning and incrementing the nonce.
@@ -1276,11 +1338,18 @@ impl Node {
 
         let we_initiated = {
             let links = self.links.lock().await;
-            links.get(&first_hop).map(|l| l.is_initiator()).unwrap_or(true)
+            links
+                .get(&first_hop)
+                .map(|l| l.is_initiator())
+                .unwrap_or(true)
         };
         let circuit_id = {
             let oc = self.circuits.outbound.lock().await;
-            self.circuits.table.lock().await.alloc_id(we_initiated, |id| oc.contains_key(&id))
+            self.circuits
+                .table
+                .lock()
+                .await
+                .alloc_id(we_initiated, |id| oc.contains_key(&id))
         };
 
         log::debug!(
@@ -1303,7 +1372,8 @@ impl Node {
 
         // Register pending extend before sending
         let (tx, rx) = oneshot::channel();
-        self.circuits.pending_extends
+        self.circuits
+            .pending_extends
             .lock()
             .await
             .insert(circuit_id, tx);
@@ -1333,16 +1403,18 @@ impl Node {
                 first_hop_circuit_id: circuit_id,
                 first_hop,
                 hop_keys: hop_keys.clone(),
-                state: CircuitPhase::Extending {
-                    hops_built: 1,
-                },
+                state: CircuitPhase::Extending { hops_built: 1 },
                 waypoints: waypoints.clone(),
                 congestion: CongestionWindow::new(),
                 last_activity: Instant::now(),
                 forward_nonce: 0,
             };
             let managed = self.manage_circuit(circuit_id, circuit);
-            self.circuits.outbound.lock().await.insert(circuit_id, managed);
+            self.circuits
+                .outbound
+                .lock()
+                .await
+                .insert(circuit_id, managed);
         }
 
         // --- Route toward each waypoint via DV ---
@@ -1356,11 +1428,8 @@ impl Node {
             for extend_count in 0..MAX_EXTENDS_PER_WAYPOINT {
                 let kex = KexOffer::new(kem_algo);
 
-                let extend_data = build_extend_payload(
-                    kex.algo_byte(),
-                    &kex.pubkey_bytes(),
-                    &waypoint,
-                );
+                let extend_data =
+                    build_extend_payload(kex.algo_byte(), &kex.pubkey_bytes(), &waypoint);
 
                 let extend_cell = RelayCell {
                     command: RelayCellCommand::Extend,
@@ -1388,7 +1457,8 @@ impl Node {
 
                 // Register for the backward EXTENDED cell
                 let (tx, rx) = oneshot::channel();
-                self.circuits.pending_extends
+                self.circuits
+                    .pending_extends
                     .lock()
                     .await
                     .insert(circuit_id, tx);
@@ -1400,7 +1470,8 @@ impl Node {
 
                 if reply.is_empty() {
                     return Err(Error::Protocol(format!(
-                        "extend failed: relay has no route to {:?}", waypoint
+                        "extend failed: relay has no route to {:?}",
+                        waypoint
                     )));
                 }
 
@@ -1414,15 +1485,15 @@ impl Node {
                     let circuit = circuits.get_mut(&circuit_id).unwrap();
                     circuit.hop_keys.push(new_hop_key);
                     let hops = circuit.hop_keys.len();
-                    circuit.state = CircuitPhase::Extending {
-                        hops_built: hops,
-                    };
+                    circuit.state = CircuitPhase::Extending { hops_built: hops };
                     hops
                 };
 
                 log::debug!(
                     "Circuit hop {} established (waypoint {:?}, reached={})",
-                    hops_built, waypoint, reached
+                    hops_built,
+                    waypoint,
+                    reached
                 );
 
                 if reached {
@@ -1431,7 +1502,8 @@ impl Node {
 
                 if extend_count == MAX_EXTENDS_PER_WAYPOINT - 1 {
                     return Err(Error::Protocol(format!(
-                        "waypoint {:?} too far (>{} hops)", waypoint, MAX_EXTENDS_PER_WAYPOINT
+                        "waypoint {:?} too far (>{} hops)",
+                        waypoint, MAX_EXTENDS_PER_WAYPOINT
                     )));
                 }
             }
@@ -1456,11 +1528,7 @@ impl Node {
 
     /// Send a DATA relay cell through an established outbound circuit.
     /// Blocks if the congestion window is full (waits for SENDME from endpoint).
-    pub async fn send_circuit_data(
-        &self,
-        circuit_id: u32,
-        data: &[u8],
-    ) -> Result<()> {
+    pub async fn send_circuit_data(&self, circuit_id: u32, data: &[u8]) -> Result<()> {
         // Wait until the congestion window allows sending.
         loop {
             let can_send = {
@@ -1571,13 +1639,8 @@ impl Node {
         let primary_id = node_arc.build_circuit(first_hop, waypoints.clone()).await?;
 
         // Register the circuit group
-        let group = crate::multipath::CircuitGroup::new(
-            *dest,
-            mode,
-            primary_id,
-            first_hop,
-            waypoints,
-        );
+        let group =
+            crate::multipath::CircuitGroup::new(*dest, mode, primary_id, first_hop, waypoints);
         node_arc.circuits.groups.lock().await.insert(group);
 
         // Try to build a backup circuit through a different first hop
@@ -1606,11 +1669,15 @@ impl Node {
 
             if let Some(alt_first_hop) = alt_hops.first() {
                 let backup_waypoints = vec![dest_copy];
-                match node.build_circuit(*alt_first_hop, backup_waypoints.clone()).await {
+                match node
+                    .build_circuit(*alt_first_hop, backup_waypoints.clone())
+                    .await
+                {
                     Ok(backup_id) => {
                         let mut groups = node.circuits.groups.lock().await;
                         if let Some(group) = groups.get_mut(&dest_copy) {
-                            let disjoint = group.add_backup(backup_id, *alt_first_hop, backup_waypoints);
+                            let disjoint =
+                                group.add_backup(backup_id, *alt_first_hop, backup_waypoints);
                             log::info!(
                                 "Built backup circuit {} for {:?} (node-disjoint: {})",
                                 backup_id,
@@ -1624,7 +1691,10 @@ impl Node {
                     }
                 }
             } else {
-                log::debug!("No alternative first hop for backup circuit to {:?}", dest_copy);
+                log::debug!(
+                    "No alternative first hop for backup circuit to {:?}",
+                    dest_copy
+                );
             }
         });
 
@@ -1642,7 +1712,8 @@ impl Node {
     pub async fn circuit_connect(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         dest_peer: Option<PeerId>,
         source_identity: Option<tarnet_api::types::ServiceId>,
     ) -> Result<tarnet_api::service::Connection> {
@@ -1652,20 +1723,38 @@ impl Node {
         //    should be connecting to a remote node.
         {
             let is_local_service = self.keypair_for_service(&service_id).await.is_some();
-            let local = is_local_service && self.has_matching_listener(service_id, port).await;
+            let local =
+                is_local_service && self.has_matching_listener(service_id, mode, port).await;
             if local {
-                log::info!("circuit_connect: loopback to local listener {:?} port {}", service_id, port);
+                log::info!(
+                    "circuit_connect: loopback to local listener {:?} mode {:?} port {}",
+                    service_id,
+                    mode,
+                    port
+                );
                 let (client_tx, server_rx) = mpsc::channel::<Vec<u8>>(256);
                 let (server_tx, client_rx) = mpsc::channel::<Vec<u8>>(256);
                 let conn_id = {
                     let oc = self.circuits.outbound.lock().await;
-                    self.circuits.table.lock().await.alloc_id(true, |id| oc.contains_key(&id))
+                    self.circuits
+                        .table
+                        .lock()
+                        .await
+                        .alloc_id(true, |id| oc.contains_key(&id))
                 };
 
                 let server_conn = tarnet_api::service::Connection::new(
-                    service_id, port, conn_id, server_tx, client_rx,
+                    service_id,
+                    mode,
+                    port.to_string(),
+                    conn_id,
+                    server_tx,
+                    client_rx,
                 );
-                match self.dispatch_incoming_connection(service_id, port, server_conn).await {
+                match self
+                    .dispatch_incoming_connection(service_id, mode, port, server_conn)
+                    .await
+                {
                     ListenerDispatch::Enqueued => {}
                     ListenerDispatch::NoListener => {
                         return Err(Error::Protocol("no listener for local service".into()));
@@ -1677,13 +1766,24 @@ impl Node {
 
                 // Return client-side Connection
                 return Ok(tarnet_api::service::Connection::new(
-                    service_id, port, conn_id, client_tx, server_rx,
+                    service_id,
+                    mode,
+                    port.to_string(),
+                    conn_id,
+                    client_tx,
+                    server_rx,
                 ));
             }
         }
 
         let connected = self.connected_peers().await;
-        log::info!("circuit_connect: service={:?} port={} connected_peers={}", service_id, port, connected.len());
+        log::info!(
+            "circuit_connect: service={:?} mode={:?} port={} connected_peers={}",
+            service_id,
+            mode,
+            port,
+            connected.len()
+        );
 
         // Look up outbound_hops for the source identity.
         let min_hops = if let Some(src_sid) = &source_identity {
@@ -1698,7 +1798,10 @@ impl Node {
         // 1. Explicit peer hint — build circuit via DV routing.
         if let Some(dest_peer) = dest_peer {
             log::info!("circuit_connect: trying explicit peer hint {:?}", dest_peer);
-            if let Some(conn) = self.try_connect_to_peer(service_id, port, &dest_peer, min_hops, &connected).await {
+            if let Some(conn) = self
+                .try_connect_to_peer(service_id, mode, port, &dest_peer, min_hops, &connected)
+                .await
+            {
                 return Ok(conn);
             }
         }
@@ -1710,12 +1813,24 @@ impl Node {
         if let crate::tns::TnsResolution::Records(records) = &peer_resolution {
             for record in records {
                 if let Ok(dest_peer) = crate::tns::verify_peer_record(record, &service_id) {
-                    log::info!("circuit_connect: TNS peer record resolved {:?} → {:?}", service_id, dest_peer);
-                    if let Some(conn) = self.try_connect_to_peer(service_id, port, &dest_peer, min_hops, &connected).await {
+                    log::info!(
+                        "circuit_connect: TNS peer record resolved {:?} → {:?}",
+                        service_id,
+                        dest_peer
+                    );
+                    if let Some(conn) = self
+                        .try_connect_to_peer(
+                            service_id, mode, port, &dest_peer, min_hops, &connected,
+                        )
+                        .await
+                    {
                         return Ok(conn);
                     }
                 } else {
-                    log::warn!("circuit_connect: TNS peer record for {:?} failed verification, ignoring", service_id);
+                    log::warn!(
+                        "circuit_connect: TNS peer record for {:?} failed verification, ignoring",
+                        service_id
+                    );
                 }
             }
         }
@@ -1737,7 +1852,7 @@ impl Node {
 
             if !intro_points.is_empty() {
                 return self
-                    .connect_via_rendezvous(service_id, port, &intro_points)
+                    .connect_via_rendezvous(service_id, mode, port, &intro_points)
                     .await;
             }
         }
@@ -1752,39 +1867,61 @@ impl Node {
     async fn try_connect_to_peer(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         dest_peer: &PeerId,
         min_hops: usize,
         connected: &[PeerId],
     ) -> Option<tarnet_api::service::Connection> {
-        let (waypoints, mut first_hops) = self.plan_circuit_path(dest_peer, min_hops, connected).await;
+        let (waypoints, mut first_hops) =
+            self.plan_circuit_path(dest_peer, min_hops, connected).await;
 
         // If no first hops found (destination beyond DV horizon), try a route probe.
         // The probe walks the network and caches the route on success.
         if first_hops.is_empty() {
-            log::info!("try_connect_to_peer: no route to {:?}, starting route probe", dest_peer);
+            log::info!(
+                "try_connect_to_peer: no route to {:?}, starting route probe",
+                dest_peer
+            );
             if let Some(_cost) = self.route_probe(*dest_peer).await {
-                log::info!("try_connect_to_peer: route probe found {:?}, re-planning", dest_peer);
+                log::info!(
+                    "try_connect_to_peer: route probe found {:?}, re-planning",
+                    dest_peer
+                );
                 let (new_waypoints, new_first_hops) =
                     self.plan_circuit_path(dest_peer, min_hops, connected).await;
                 // Use the freshly discovered route.
                 first_hops = new_first_hops;
                 // Re-plan may give different waypoints too.
-                return self.try_build_with_hops(service_id, port, dest_peer, &new_waypoints, &first_hops).await;
+                return self
+                    .try_build_with_hops(
+                        service_id,
+                        mode,
+                        port,
+                        dest_peer,
+                        &new_waypoints,
+                        &first_hops,
+                    )
+                    .await;
             } else {
-                log::info!("try_connect_to_peer: route probe for {:?} failed", dest_peer);
+                log::info!(
+                    "try_connect_to_peer: route probe for {:?} failed",
+                    dest_peer
+                );
                 return None;
             }
         }
 
-        self.try_build_with_hops(service_id, port, dest_peer, &waypoints, &first_hops).await
+        self.try_build_with_hops(service_id, mode, port, dest_peer, &waypoints, &first_hops)
+            .await
     }
 
     /// Try each first_hop candidate to build a circuit and establish a connection.
     async fn try_build_with_hops(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         dest_peer: &PeerId,
         waypoints: &[PeerId],
         first_hops: &[PeerId],
@@ -1792,16 +1929,27 @@ impl Node {
         for first_hop in first_hops {
             match self.build_circuit(*first_hop, waypoints.to_vec()).await {
                 Ok(circuit_id) => {
-                    match self.setup_circuit_connection(service_id, port, circuit_id).await {
+                    match self
+                        .setup_circuit_connection(service_id, mode, port, circuit_id)
+                        .await
+                    {
                         Ok(conn) => return Some(conn),
                         Err(e) => {
-                            log::info!("circuit_connect: StreamBegin to {:?} failed: {}", dest_peer, e);
+                            log::info!(
+                                "circuit_connect: StreamBegin to {:?} failed: {}",
+                                dest_peer,
+                                e
+                            );
                             let _ = self.destroy_circuit(circuit_id).await;
                         }
                     }
                 }
                 Err(e) => {
-                    log::info!("circuit_connect: build_circuit to {:?} failed: {}", dest_peer, e);
+                    log::info!(
+                        "circuit_connect: build_circuit to {:?} failed: {}",
+                        dest_peer,
+                        e
+                    );
                 }
             }
         }
@@ -1830,7 +1978,8 @@ impl Node {
             vec![*dest]
         } else {
             // Pick (min_hops - 1) random intermediate waypoints from known peers.
-            let mut candidates: Vec<PeerId> = rt.all_destinations()
+            let mut candidates: Vec<PeerId> = rt
+                .all_destinations()
                 .map(|(p, _)| *p)
                 .filter(|p| *p != *dest && *p != self.peer_id())
                 .collect();
@@ -1858,9 +2007,8 @@ impl Node {
             vec![target]
         } else {
             let hops = rt.lookup_multi(&target, 3);
-            let mut result: Vec<PeerId> = hops.into_iter()
-                .filter(|h| connected.contains(h))
-                .collect();
+            let mut result: Vec<PeerId> =
+                hops.into_iter().filter(|h| connected.contains(h)).collect();
             if result.is_empty() {
                 // Fallback: try routing to dest directly
                 if connected.contains(dest) {
@@ -1875,7 +2023,8 @@ impl Node {
                     if let Some(peer) = candidates.first() {
                         log::debug!(
                             "plan_circuit_path: no route to {:?}, using random first hop {:?}",
-                            target, peer,
+                            target,
+                            peer,
                         );
                         result.push(*peer);
                     }
@@ -1896,19 +2045,21 @@ impl Node {
     async fn setup_circuit_connection(
         &self,
         service_id: tarnet_api::types::ServiceId,
-        port: u16,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
         circuit_id: u32,
     ) -> Result<tarnet_api::service::Connection> {
         const MAX_STREAM_RETRIES: u32 = 5;
         const INITIAL_TIMEOUT_MS: u64 = 1000;
 
-        let stream_begin_payload = build_stream_begin_payload(&service_id, port);
+        let stream_begin_payload = build_stream_begin_payload(&service_id, mode, port);
         let mut timeout_ms = INITIAL_TIMEOUT_MS;
 
         for attempt in 0..=MAX_STREAM_RETRIES {
             // Register a fresh pending connect each attempt.
             let (connect_tx, connect_rx) = oneshot::channel::<bool>();
-            self.endpoints.pending_connects
+            self.endpoints
+                .pending_connects
                 .lock()
                 .await
                 .insert(circuit_id, connect_tx);
@@ -1936,13 +2087,12 @@ impl Node {
             }
 
             // Wait for StreamConnected or StreamRefused.
-            match tokio::time::timeout(
-                Duration::from_millis(timeout_ms),
-                connect_rx,
-            ).await {
-                Ok(Ok(true)) => break,  // accepted
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), connect_rx).await {
+                Ok(Ok(true)) => break, // accepted
                 Ok(Ok(false)) => {
-                    return Err(Error::Protocol("stream refused: remote is not listening on this ServiceId/port".into()));
+                    return Err(Error::Protocol(
+                        "stream refused: remote is not listening on this ServiceId/port".into(),
+                    ));
                 }
                 Ok(Err(_)) => {
                     return Err(Error::Protocol("stream connect channel dropped".into()));
@@ -1950,18 +2100,27 @@ impl Node {
                 Err(_) => {
                     // Timeout — retransmit with exponential backoff + jitter.
                     if attempt == MAX_STREAM_RETRIES {
-                        self.endpoints.pending_connects.lock().await.remove(&circuit_id);
-                        return Err(Error::Protocol("stream connect timeout after retries".into()));
+                        self.endpoints
+                            .pending_connects
+                            .lock()
+                            .await
+                            .remove(&circuit_id);
+                        return Err(Error::Protocol(
+                            "stream connect timeout after retries".into(),
+                        ));
                     }
                     log::debug!(
                         "StreamBegin timeout on circuit {} (attempt {}/{}), retrying",
-                        circuit_id, attempt + 1, MAX_STREAM_RETRIES,
+                        circuit_id,
+                        attempt + 1,
+                        MAX_STREAM_RETRIES,
                     );
                     // Exponential backoff: 1s, 2s, 4s, 8s, 16s
                     timeout_ms *= 2;
                     // Add jitter: ±25% of current timeout
                     let jitter = (timeout_ms / 4) as i64;
-                    let jitter_val = (rand::random::<u64>() % (jitter as u64 * 2 + 1)) as i64 - jitter;
+                    let jitter_val =
+                        (rand::random::<u64>() % (jitter as u64 * 2 + 1)) as i64 - jitter;
                     timeout_ms = (timeout_ms as i64 + jitter_val).max(500) as u64;
                 }
             }
@@ -1972,7 +2131,8 @@ impl Node {
         let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
 
         // Store the sender so incoming DATA cells can be forwarded to the app.
-        self.endpoints.data_txs
+        self.endpoints
+            .data_txs
             .lock()
             .await
             .insert(circuit_id, circuit_tx);
@@ -1981,7 +2141,8 @@ impl Node {
         // Read first_hop from the circuit on each send so multipath failover
         // (which replaces the circuit) is transparent to this task.
         let sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuits.sendme_notify
+        self.circuits
+            .sendme_notify
             .lock()
             .await
             .insert(circuit_id, sendme_notify.clone());
@@ -1992,10 +2153,8 @@ impl Node {
             let mut rx = circuit_rx;
             while let Some(data) = rx.recv().await {
                 // Chunk data into relay-cell-sized pieces.
-                let chunks: Vec<Vec<u8>> = data
-                    .chunks(CELL_PAYLOAD_MAX)
-                    .map(|c| c.to_vec())
-                    .collect();
+                let chunks: Vec<Vec<u8>> =
+                    data.chunks(CELL_PAYLOAD_MAX).map(|c| c.to_vec()).collect();
 
                 let mut broken = false;
                 for chunk in chunks {
@@ -2051,15 +2210,17 @@ impl Node {
 
         let conn = tarnet_api::service::Connection::new(
             service_id,
-            port,
+            mode,
+            port.to_string(),
             circuit_id,
             app_tx,
             app_rx,
         );
 
         log::info!(
-            "Connected to {:?} port {} via circuit {}",
+            "Connected to {:?} mode {:?} port {} via circuit {}",
             service_id,
+            mode,
             port,
             circuit_id
         );

@@ -61,7 +61,13 @@ pub struct CircuitGroup {
 
 impl CircuitGroup {
     /// Create a new group with a primary circuit.
-    pub fn new(destination: PeerId, mode: PathMode, primary_circuit_id: u32, first_hop: PeerId, path: Vec<PeerId>) -> Self {
+    pub fn new(
+        destination: PeerId,
+        mode: PathMode,
+        primary_circuit_id: u32,
+        first_hop: PeerId,
+        path: Vec<PeerId>,
+    ) -> Self {
         Self {
             destination,
             mode,
@@ -114,7 +120,11 @@ impl CircuitGroup {
     /// Remove a circuit from the group (e.g., when destroyed).
     /// Returns the role it had, or None if not found.
     pub fn remove_circuit(&mut self, circuit_id: u32) -> Option<CircuitRole> {
-        if let Some(pos) = self.circuits.iter().position(|c| c.circuit_id == circuit_id) {
+        if let Some(pos) = self
+            .circuits
+            .iter()
+            .position(|c| c.circuit_id == circuit_id)
+        {
             let removed = self.circuits.remove(pos);
             Some(removed.role)
         } else {
@@ -126,7 +136,11 @@ impl CircuitGroup {
     /// or None if no backups exist.
     pub fn promote_backup(&mut self) -> Option<u32> {
         // Find the first backup
-        if let Some(backup) = self.circuits.iter_mut().find(|c| c.role == CircuitRole::Backup) {
+        if let Some(backup) = self
+            .circuits
+            .iter_mut()
+            .find(|c| c.role == CircuitRole::Backup)
+        {
             backup.role = CircuitRole::Primary;
             Some(backup.circuit_id)
         } else {
@@ -145,7 +159,11 @@ impl CircuitGroup {
     /// Check if a path is node-disjoint from the primary circuit.
     /// Ignores the destination itself (which must be shared).
     fn is_node_disjoint(&self, candidate_path: &[PeerId]) -> bool {
-        if let Some(primary) = self.circuits.iter().find(|c| c.role == CircuitRole::Primary) {
+        if let Some(primary) = self
+            .circuits
+            .iter()
+            .find(|c| c.role == CircuitRole::Primary)
+        {
             // Intermediate nodes are all except the last (destination).
             let primary_intermediates: std::collections::HashSet<_> = primary
                 .path
@@ -247,7 +265,8 @@ mod tests {
 
     #[test]
     fn basic_group_lifecycle() {
-        let mut group = CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
+        let mut group =
+            CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
         assert_eq!(group.primary(), Some(1));
         assert!(group.backups().is_empty());
         assert!(!group.has_backup());
@@ -269,14 +288,26 @@ mod tests {
     #[test]
     fn node_disjointness_detection() {
         // Primary: pid(2) → pid(5) → pid(10)
-        let mut group = CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(5), pid(10)]);
+        let mut group = CircuitGroup::new(
+            pid(10),
+            PathMode::Routed,
+            1,
+            pid(2),
+            vec![pid(2), pid(5), pid(10)],
+        );
 
         // Backup shares pid(5) — NOT disjoint
         let disjoint = group.add_backup(2, pid(3), vec![pid(3), pid(5), pid(10)]);
         assert!(!disjoint);
 
         // Backup through pid(6) — disjoint
-        let mut group2 = CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(5), pid(10)]);
+        let mut group2 = CircuitGroup::new(
+            pid(10),
+            PathMode::Routed,
+            1,
+            pid(2),
+            vec![pid(2), pid(5), pid(10)],
+        );
         let disjoint = group2.add_backup(3, pid(3), vec![pid(3), pid(6), pid(10)]);
         assert!(disjoint);
     }
@@ -284,7 +315,8 @@ mod tests {
     #[test]
     fn group_table_find_by_circuit() {
         let mut table = CircuitGroupTable::new();
-        let mut group = CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
+        let mut group =
+            CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
         group.add_backup(2, pid(3), vec![pid(3), pid(10)]);
         table.insert(group);
 
@@ -295,7 +327,8 @@ mod tests {
 
     #[test]
     fn no_primary_after_all_dead() {
-        let mut group = CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
+        let mut group =
+            CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
         let (_, new) = group.handle_primary_death(1);
         assert_eq!(new, None);
         assert!(group.is_empty());
@@ -303,7 +336,8 @@ mod tests {
 
     #[test]
     fn used_first_hops() {
-        let mut group = CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
+        let mut group =
+            CircuitGroup::new(pid(10), PathMode::Routed, 1, pid(2), vec![pid(2), pid(10)]);
         group.add_backup(2, pid(3), vec![pid(3), pid(10)]);
         let hops = group.used_first_hops();
         assert_eq!(hops.len(), 2);

@@ -62,7 +62,10 @@ async fn main() {
     let run_node = node.clone();
     let bootstrap = connect_addrs.clone();
     tokio::spawn(async move {
-        run_node.run(Box::new(discovery), bootstrap, vec![]).await.ok();
+        run_node
+            .run(Box::new(discovery), bootstrap, vec![])
+            .await
+            .ok();
     });
 
     // Wait for bootstrap connections and route propagation

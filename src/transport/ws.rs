@@ -136,7 +136,8 @@ impl WsDiscovery {
                                 Err(e) => {
                                     log::debug!(
                                         "WebSocket upgrade failed from {}: {}",
-                                        peer_addr, e
+                                        peer_addr,
+                                        e
                                     );
                                 }
                             }
@@ -167,10 +168,7 @@ impl WsDiscovery {
 }
 
 /// Perform WebSocket upgrade with path validation.
-async fn ws_accept(
-    stream: TcpStream,
-    expected_path: &str,
-) -> Result<WebSocketStream<TcpStream>> {
+async fn ws_accept(stream: TcpStream, expected_path: &str) -> Result<WebSocketStream<TcpStream>> {
     let expected = expected_path.to_string();
     tokio_tungstenite::accept_hdr_async(
         stream,
