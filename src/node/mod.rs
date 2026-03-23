@@ -871,6 +871,14 @@ impl Node {
     async fn try_webrtc_upgrades(&self, cooldown: &mut HashMap<PeerId, Instant>) {
         let cooldown_duration = Duration::from_secs(300); // 5 minutes
 
+        // Don't try to upgrade if we already have enough outbound links.
+        if self.max_outbound > 0 {
+            let outbound_count = self.links.lock().await.outbound_count();
+            if outbound_count >= self.max_outbound {
+                return;
+            }
+        }
+
         // Collect peers with cost > 1 (relay-only)
         let candidates: Vec<PeerId> = {
             let table = self.routing_table.lock().await;
@@ -906,6 +914,12 @@ impl Node {
                         log::debug!("WebRTC upgrade to {:?} failed: {}", peer_id, e);
                     }
                 }
+            } else {
+                // No hello record locally — request it via DHT so the next
+                // cycle can check transport capabilities and attempt upgrade.
+                log::debug!("Requesting hello for relay-only peer {:?}", peer_id);
+                cooldown.insert(peer_id, Instant::now());
+                let _ = self.request_hello(&peer_id).await;
             }
         }
     }
