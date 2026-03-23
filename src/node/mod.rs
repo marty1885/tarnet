@@ -519,7 +519,7 @@ impl Node {
     ) -> Self {
         let peer_id = identity.peer_id();
         let identity_store = if identities.is_empty() {
-            let default_kp = Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap();
+            let default_kp = Keypair::generate_with_scheme(identity.scheme());
             // Persist default identity on first run
             if let Some(ref db) = db {
                 let pi = PersistedIdentity {
@@ -557,7 +557,7 @@ impl Node {
                     store
                 }
                 None => {
-                    let default_kp = Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap();
+                    let default_kp = Keypair::generate_with_scheme(identity.scheme());
                     IdentityStore::with_default(
                         default_kp,
                         tarnet_api::types::PrivacyLevel::Public,

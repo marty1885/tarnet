@@ -174,23 +174,23 @@ impl StateDb {
 
     pub fn get_metadata(&self, key: &str) -> Result<Option<u64>> {
         let conn = self.lock()?;
-        conn.query_row(
-            "SELECT value FROM metadata WHERE key = ?1",
-            params![key],
-            |row| row.get::<_, u64>(0),
-        )
-        .optional()
-        .map_err(sqlite_err)
+        let mut stmt = conn
+            .prepare_cached("SELECT value FROM metadata WHERE key = ?1")
+            .map_err(sqlite_err)?;
+        stmt.query_row(params![key], |row| row.get::<_, u64>(0))
+            .optional()
+            .map_err(sqlite_err)
     }
 
     pub fn set_metadata(&self, key: &str, value: u64) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO metadata(key, value) VALUES(?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![key, value],
-        )
-        .map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO metadata(key, value) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .map_err(sqlite_err)?;
+        stmt.execute(params![key, value]).map_err(sqlite_err)?;
         Ok(())
     }
 
@@ -199,7 +199,7 @@ impl StateDb {
     pub fn load_identities(&self) -> Result<Vec<PersistedIdentity>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT label, identity_scheme, signing_key_material, kem_key_material,
                         signing_algo, kem_algo, privacy_type, privacy_param,
                         outbound_hops, is_default
@@ -241,42 +241,46 @@ impl StateDb {
             PrivacyLevel::Hidden { intro_points } => (1, intro_points),
         };
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO identities(label, identity_scheme, signing_key_material, kem_key_material,
-                                    signing_algo, kem_algo, privacy_type, privacy_param,
-                                    outbound_hops, is_default)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(label) DO UPDATE SET
-                 identity_scheme = excluded.identity_scheme,
-                 signing_key_material = excluded.signing_key_material,
-                 kem_key_material = excluded.kem_key_material,
-                 signing_algo = excluded.signing_algo,
-                 kem_algo = excluded.kem_algo,
-                 privacy_type = excluded.privacy_type,
-                 privacy_param = excluded.privacy_param,
-                 outbound_hops = excluded.outbound_hops,
-                 is_default = excluded.is_default",
-            params![
-                id.label,
-                id.scheme,
-                &id.signing_key_material,
-                &id.kem_key_material,
-                id.signing_algo,
-                id.kem_algo,
-                privacy_type,
-                privacy_param,
-                id.outbound_hops,
-                id.is_default,
-            ],
-        )
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO identities(label, identity_scheme, signing_key_material, kem_key_material,
+                                        signing_algo, kem_algo, privacy_type, privacy_param,
+                                        outbound_hops, is_default)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(label) DO UPDATE SET
+                     identity_scheme = excluded.identity_scheme,
+                     signing_key_material = excluded.signing_key_material,
+                     kem_key_material = excluded.kem_key_material,
+                     signing_algo = excluded.signing_algo,
+                     kem_algo = excluded.kem_algo,
+                     privacy_type = excluded.privacy_type,
+                     privacy_param = excluded.privacy_param,
+                     outbound_hops = excluded.outbound_hops,
+                     is_default = excluded.is_default",
+            )
+            .map_err(sqlite_err)?;
+        stmt.execute(params![
+            id.label,
+            id.scheme,
+            &id.signing_key_material,
+            &id.kem_key_material,
+            id.signing_algo,
+            id.kem_algo,
+            privacy_type,
+            privacy_param,
+            id.outbound_hops,
+            id.is_default,
+        ])
         .map_err(sqlite_err)?;
         Ok(())
     }
 
     pub fn delete_identity(&self, label: &str) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute("DELETE FROM identities WHERE label = ?1", params![label])
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM identities WHERE label = ?1")
             .map_err(sqlite_err)?;
+        stmt.execute(params![label]).map_err(sqlite_err)?;
         Ok(())
     }
 
@@ -285,7 +289,7 @@ impl StateDb {
     pub fn load_dht_records(&self) -> Result<Vec<PersistedRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT key, signer, record_type, sequence, ttl_secs, value,
                         signature, signer_algo, signer_pubkey
                  FROM dht_records",
@@ -314,41 +318,42 @@ impl StateDb {
 
     pub fn upsert_dht_record(&self, record: &PersistedRecord) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO dht_records(key, signer, record_type, sequence, ttl_secs, value,
-                                     signature, signer_algo, signer_pubkey)
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(key, signer) DO UPDATE SET
-                 record_type = excluded.record_type,
-                 sequence = excluded.sequence,
-                 ttl_secs = excluded.ttl_secs,
-                 value = excluded.value,
-                 signature = excluded.signature,
-                 signer_algo = excluded.signer_algo,
-                 signer_pubkey = excluded.signer_pubkey",
-            params![
-                &record.key[..],
-                &record.signer[..],
-                record.record_type,
-                record.sequence,
-                record.ttl_secs,
-                &record.value,
-                &record.signature,
-                record.signer_algo,
-                &record.signer_pubkey,
-            ],
-        )
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO dht_records(key, signer, record_type, sequence, ttl_secs, value,
+                                         signature, signer_algo, signer_pubkey)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(key, signer) DO UPDATE SET
+                     record_type = excluded.record_type,
+                     sequence = excluded.sequence,
+                     ttl_secs = excluded.ttl_secs,
+                     value = excluded.value,
+                     signature = excluded.signature,
+                     signer_algo = excluded.signer_algo,
+                     signer_pubkey = excluded.signer_pubkey",
+            )
+            .map_err(sqlite_err)?;
+        stmt.execute(params![
+            &record.key[..],
+            &record.signer[..],
+            record.record_type,
+            record.sequence,
+            record.ttl_secs,
+            &record.value,
+            &record.signature,
+            record.signer_algo,
+            &record.signer_pubkey,
+        ])
         .map_err(sqlite_err)?;
         Ok(())
     }
 
     pub fn delete_dht_record(&self, key: &[u8; 64], signer: &[u8; 32]) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM dht_records WHERE key = ?1 AND signer = ?2",
-            params![&key[..], &signer[..]],
-        )
-        .map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM dht_records WHERE key = ?1 AND signer = ?2")
+            .map_err(sqlite_err)?;
+        stmt.execute(params![&key[..], &signer[..]]).map_err(sqlite_err)?;
         Ok(())
     }
 
@@ -364,23 +369,27 @@ impl StateDb {
         let conn = self.lock()?;
         conn.execute_batch("BEGIN").map_err(sqlite_err)?;
         let result = (|| {
-            conn.execute(
+            conn.prepare_cached(
                 "INSERT INTO tns_labels(identity, label, publish) VALUES(?1, ?2, ?3)
                  ON CONFLICT(identity, label) DO UPDATE SET publish = excluded.publish",
-                params![identity, label, publish as i32],
             )
+            .map_err(sqlite_err)?
+            .execute(params![identity, label, publish as i32])
             .map_err(sqlite_err)?;
-            conn.execute(
+            conn.prepare_cached(
                 "DELETE FROM tns_records WHERE identity = ?1 AND label = ?2",
-                params![identity, label],
             )
+            .map_err(sqlite_err)?
+            .execute(params![identity, label])
             .map_err(sqlite_err)?;
-            for rec_bytes in records {
-                conn.execute(
+            let mut ins = conn
+                .prepare_cached(
                     "INSERT INTO tns_records(identity, label, record) VALUES(?1, ?2, ?3)",
-                    params![identity, label, rec_bytes],
                 )
                 .map_err(sqlite_err)?;
+            for rec_bytes in records {
+                ins.execute(params![identity, label, rec_bytes])
+                    .map_err(sqlite_err)?;
             }
             Ok(())
         })();
@@ -394,23 +403,25 @@ impl StateDb {
 
     pub fn label_get(&self, identity: &str, label: &str) -> Result<Option<(Vec<Vec<u8>>, bool)>> {
         let conn = self.lock()?;
-        let publish: Option<bool> = conn
-            .query_row(
-                "SELECT publish FROM tns_labels WHERE identity = ?1 AND label = ?2",
-                params![identity, label],
-                |row| {
-                    let v: i32 = row.get(0)?;
-                    Ok(v != 0)
-                },
-            )
+        let publish: Option<bool> = {
+            let mut stmt = conn
+                .prepare_cached(
+                    "SELECT publish FROM tns_labels WHERE identity = ?1 AND label = ?2",
+                )
+                .map_err(sqlite_err)?;
+            stmt.query_row(params![identity, label], |row| {
+                let v: i32 = row.get(0)?;
+                Ok(v != 0)
+            })
             .optional()
-            .map_err(sqlite_err)?;
+            .map_err(sqlite_err)?
+        };
         let publish = match publish {
             Some(p) => p,
             None => return Ok(None),
         };
         let mut stmt = conn
-            .prepare("SELECT record FROM tns_records WHERE identity = ?1 AND label = ?2")
+            .prepare_cached("SELECT record FROM tns_records WHERE identity = ?1 AND label = ?2")
             .map_err(sqlite_err)?;
         let rows = stmt
             .query_map(params![identity, label], |row| row.get::<_, Vec<u8>>(0))
@@ -423,18 +434,17 @@ impl StateDb {
 
     pub fn label_remove(&self, identity: &str, label: &str) -> Result<()> {
         let conn = self.lock()?;
-        conn.execute(
-            "DELETE FROM tns_labels WHERE identity = ?1 AND label = ?2",
-            params![identity, label],
-        )
-        .map_err(sqlite_err)?;
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM tns_labels WHERE identity = ?1 AND label = ?2")
+            .map_err(sqlite_err)?;
+        stmt.execute(params![identity, label]).map_err(sqlite_err)?;
         Ok(())
     }
 
     pub fn label_list(&self, identity: &str) -> Result<Vec<(String, Vec<Vec<u8>>, bool)>> {
         let conn = self.lock()?;
         let mut stmt = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT l.label, l.publish, r.record
                  FROM tns_labels l
                  LEFT JOIN tns_records r ON r.identity = l.identity AND r.label = l.label
