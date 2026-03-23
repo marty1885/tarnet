@@ -239,7 +239,8 @@ impl fmt::Debug for ServiceId {
         } else if self.is_local() {
             write!(f, "ServiceId(LOCAL)")
         } else {
-            write!(f, "ServiceId({})", hex(&self.0[..8]))
+            let full = encode_base32(&self.0);
+            write!(f, "ServiceId({}..)", &full[..8])
         }
     }
 }
