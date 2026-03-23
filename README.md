@@ -1,18 +1,19 @@
 # tarnet
 
-An overlay network reimagining how the internet should be and does not assume the internet exists. "The internet if NAT was never invented, and stronger idententies"
+A peer-to-peer overlay network that doesn't assume the internet exists.
 
 Early, experimental software. Not audited.
 
-## Features
+## What you get
 
-* Cryptographic and flat address space
-* Idententies decoupled from machine ID
-* Decentralized name resoulution and zone delegation
-* Reverse proxy to expose TCP/UDP services to Tarnet
-* Multipath connections to tolorate unstable intermideate nodes
-* All traffic end to end and hop to hop encrypted
-* NAT punching support via WebRTC
+- **Cryptographic identities** - flat address space derived from public keys, decoupled from machine or network identity
+- **Onion-routed circuits** - configurable privacy per identity, from direct connections to multi-hop hidden services
+- **Name system (TNS)** - decentralised name resolution with zone delegation, private by default
+- **Message-based channels** - four delivery modes (reliable ordered, reliable unordered, unreliable unordered, sequenced datagram) with multipath failover
+- **Service exposure** - reverse proxy local TCP/UDP services onto the network
+- **Tarify** - route any application through tarnet transparently (like torify)
+- **NAT traversal** - WebRTC and STUN support
+- **Works offline** - runs on a LAN, air-gapped network, or the internet. If two separate networks gain a node in common, they merge
 
 ## Building
 
@@ -30,10 +31,10 @@ Start a node:
 tarnetd
 ```
 
-On first run it generates machine and default identity key, listens on `0.0.0.0:7946`, and starts a SOCKS5 proxy on `127.0.0.1:1080`. Then `tarnet status` to check if things are working as expected:
+On first run it generates a default identity, listens on `0.0.0.0:7946`, and starts a SOCKS5 proxy on `127.0.0.1:1080`.
 
 ```plaintext
-❯ tarnet status
+$ tarnet status
 tarnetd up 40m0s peer b34a658630bb740f
   name      privacy  hops   address
   default   public   1      6D36JJHJ...KFP0
@@ -54,29 +55,26 @@ tarnetd up 40m0s peer b34a658630bb740f
     pkt↓      626       68      626      626
 ```
 
-A default idententity is creatred. `tarnet identity list` to view avaliable identities.
+The ServiceId is your address on the network. Listen on it, connect to it. Ports are arbitrary strings.
 
 ```plaintext
-❯ tarnet identity list
-default
-  ServiceId:     Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0
-  Scheme:        falcon_ed25519
-  Signing:       falcon_ed25519
-  KEM:           mlkem_x25519
-  Privacy:       Public
-  Outbound hops: 1
-```
-
-In Tarnet, the service id associated with the identity is the equlivant of an IP addresse that can be listened on and connected to. Ports are arbitrary strings. 
-
-```plaintext
-❯ tarnet listen default
+$ tarnet listen default
 Listening on Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0 port 'tarnet-echo'.
 Waiting for connections... (Ctrl-C to quit)
 [+] Connection from 6D36JJHJ9W3W0CYSZB8ME7RG1C12V78G9255AJMXBYFJ2KMTKFP0
-
-(in another terminal, or a different machine)
-❯ tarnet connect Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0
-Connecting to Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0 port 'tarnet-echo'...
-Connected to Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0. Type to send, Ctrl-C to quit.
 ```
+
+```plaintext
+$ tarnet connect Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0
+Connecting to Y5W91FTBT93YMEZ7ZNKZ4AKCJQPSCHDJPV6CQ7K8XJGMJBBK21X0 port 'tarnet-echo'...
+Connected. Type to send, Ctrl-C to quit.
+```
+
+Or use TNS names and existing applications:
+
+```plaintext
+$ tarnet tns set alice zone <alice-service-id>
+$ tarnet tarify ssh alice
+```
+
+See the [tutorial](docs/tutorial/) for the full guide.

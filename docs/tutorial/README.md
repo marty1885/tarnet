@@ -1,6 +1,8 @@
 # Tarnet Tutorial
 
-Tarnet is a peer-to-peer overlay network with onion routing, post-quantum cryptography, and a built-in name system. This tutorial covers how to use it. Internal workings are explained only where they affect how you use something.
+Tarnet is a peer-to-peer network you can build from scratch. Any two machines with a link between them form a tarnet. Add more nodes in any topology and the routing handles the rest. Every node gets cryptographic identities, onion-routed circuits, a name system, and a distributed hash table - no central infrastructure required.
+
+This tutorial covers how to use it. Internal workings are explained only where they affect how you use something.
 
 ## Contents
 

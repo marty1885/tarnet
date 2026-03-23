@@ -35,7 +35,7 @@ tarnet tarify ssh alice
 
 This is the tarnet equivalent of `torify`. The wrapped application sees normal TCP/UDP sockets - the interception is invisible to it.
 
-Use `--identity` to select which identity's TNS zone is used for name resolution and which identity's circuits are used for connections:
+Use `--identity` to control which identity you appear as. This selects the TNS zone for name resolution, the circuits used for connections, and the identity the remote side sees you as:
 
 ```plaintext
 tarnet tarify --identity work curl http://internal-server/
