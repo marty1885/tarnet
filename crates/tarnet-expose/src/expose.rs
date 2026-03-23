@@ -225,10 +225,16 @@ async fn register_services<S: ServiceApi>(
             }
         };
 
+        let mode = if svc.config.protocol == "udp" {
+            PortMode::UnreliableUnordered
+        } else {
+            PortMode::ReliableOrdered
+        };
+
         let listener = match api
             .listen(
                 sid,
-                PortMode::ReliableOrdered,
+                mode,
                 &port.to_string(),
                 ListenerOptions::default(),
             )

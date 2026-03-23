@@ -14,9 +14,17 @@ const REP_SUCCESS: u8 = 0x00;
 const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_COMMAND_NOT_SUPPORTED: u8 = 0x07;
 
-/// Parsed SOCKS5 CONNECT request.
+/// SOCKS5 command types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SocksCommand {
+    Connect,
+    UdpAssociate,
+}
+
+/// Parsed SOCKS5 request (CONNECT or UDP ASSOCIATE).
 #[derive(Debug)]
 pub struct ConnectRequest {
+    pub command: SocksCommand,
     pub hostname: String,
     pub port: u16,
     /// Identity label carried via SOCKS5 username/password auth.
@@ -103,14 +111,17 @@ pub async fn server_handshake(stream: &mut TcpStream) -> io::Result<ConnectReque
     let _rsv = stream.read_u8().await?;
     let atyp = stream.read_u8().await?;
 
-    if cmd != 0x01 {
-        // Not CONNECT — send command not supported
-        send_reply(stream, REP_COMMAND_NOT_SUPPORTED).await?;
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "only CONNECT supported",
-        ));
-    }
+    let command = match cmd {
+        0x01 => SocksCommand::Connect,
+        0x03 => SocksCommand::UdpAssociate,
+        _ => {
+            send_reply(stream, REP_COMMAND_NOT_SUPPORTED).await?;
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported SOCKS5 command",
+            ));
+        }
+    };
 
     let hostname = match atyp {
         ATYP_DOMAIN => {
@@ -138,6 +149,7 @@ pub async fn server_handshake(stream: &mut TcpStream) -> io::Result<ConnectReque
     let port = stream.read_u16().await?;
 
     Ok(ConnectRequest {
+        command,
         hostname,
         port,
         identity,
@@ -153,6 +165,28 @@ pub async fn send_reply(stream: &mut TcpStream, reply: u8) -> io::Result<()> {
 
 pub async fn send_success(stream: &mut TcpStream) -> io::Result<()> {
     send_reply(stream, REP_SUCCESS).await
+}
+
+/// Send a SOCKS5 success reply with a specific bound address (for UDP ASSOCIATE).
+pub async fn send_success_with_addr(
+    stream: &mut TcpStream,
+    addr: std::net::SocketAddr,
+) -> io::Result<()> {
+    let mut response = Vec::with_capacity(10);
+    response.extend_from_slice(&[0x05, REP_SUCCESS, 0x00]);
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            response.push(0x01); // ATYP IPv4
+            response.extend_from_slice(&v4.ip().octets());
+            response.extend_from_slice(&v4.port().to_be_bytes());
+        }
+        std::net::SocketAddr::V6(v6) => {
+            response.push(0x04); // ATYP IPv6
+            response.extend_from_slice(&v6.ip().octets());
+            response.extend_from_slice(&v6.port().to_be_bytes());
+        }
+    }
+    stream.write_all(&response).await
 }
 
 pub async fn send_host_unreachable(stream: &mut TcpStream) -> io::Result<()> {

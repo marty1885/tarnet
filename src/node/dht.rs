@@ -259,6 +259,7 @@ impl Node {
     pub async fn dht_put_signed_content(&self, value: &[u8], ttl_secs: u32) -> [u8; 64] {
         let inner_hash: [u8; 64] = blake3_hash_64(value);
         let (key, blob) = crate::dht::content_address_put(value);
+        let encrypted = crate::dht::signed_record_encrypt(&key, &blob);
 
         let mut seq = self.signed_content_sequence.lock().await;
         *seq += 1;
@@ -275,7 +276,7 @@ impl Node {
             sequence,
             signer,
             ttl: ttl_secs,
-            value: blob.clone(),
+            value: encrypted.clone(),
             signature: Vec::new(),
             signer_algo: self.identity.identity.signing.algo() as u8,
             signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
@@ -292,7 +293,7 @@ impl Node {
             signer,
             signer_algo: put.signer_algo,
             signer_pubkey: put.signer_pubkey.clone(),
-            value: blob,
+            value: encrypted,
             ttl: Duration::from_secs(ttl_secs as u64),
             stored_at: std::time::Instant::now(),
             signature: put.signature.clone(),
@@ -352,7 +353,11 @@ impl Node {
             if record.record_type != RecordType::SignedContent {
                 continue;
             }
-            if let Ok(plaintext) = crate::dht::content_address_get(inner_hash, &record.value) {
+            let inner_blob = match crate::dht::signed_record_decrypt(&key, &record.value) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            if let Ok(plaintext) = crate::dht::content_address_get(inner_hash, &inner_blob) {
                 results.push((PeerId(record.signer), plaintext));
             }
         }
@@ -398,7 +403,8 @@ impl Node {
 
     /// Store signed content at an arbitrary DHT key (not content-addressed).
     /// The caller provides the signing keypair (zone key), the DHT key, the
-    /// already-encrypted value, and a TTL.
+    /// already-encrypted value, and a TTL.  The value is further encrypted
+    /// with the DHT key so storage nodes cannot read it.
     pub async fn dht_put_signed_at_key(
         &self,
         signer_keypair: &crate::identity::Keypair,
@@ -406,6 +412,8 @@ impl Node {
         value: &[u8],
         ttl_secs: u32,
     ) -> Result<()> {
+        let encrypted = crate::dht::signed_record_encrypt(&key, value);
+
         let mut seq = self.signed_content_sequence.lock().await;
         *seq += 1;
         let sequence = *seq;
@@ -421,7 +429,7 @@ impl Node {
             sequence,
             signer,
             ttl: ttl_secs,
-            value: value.to_vec(),
+            value: encrypted.clone(),
             signature: Vec::new(),
             signer_algo: signer_keypair.identity.signing.algo() as u8,
             signer_pubkey: signer_keypair.identity.signing.signing_pubkey_bytes(),
@@ -438,7 +446,7 @@ impl Node {
             signer,
             signer_algo: put.signer_algo,
             signer_pubkey: put.signer_pubkey.clone(),
-            value: value.to_vec(),
+            value: encrypted,
             ttl: Duration::from_secs(ttl_secs as u64),
             stored_at: std::time::Instant::now(),
             signature: put.signature.clone(),

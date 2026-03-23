@@ -1,6 +1,6 @@
 # tarnet
 
-An overlay network reimagining how the internet should be and does not assume the internet exists. 
+An overlay network reimagining how the internet should be and does not assume the internet exists. "The internet if NAT was never invented, and stronger idententies"
 
 Early, experimental software. Not audited.
 

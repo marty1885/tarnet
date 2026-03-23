@@ -890,6 +890,57 @@ pub fn identity_address_key(peer_id: &PeerId) -> DhtId {
     dht_id_from_peer_id(peer_id)
 }
 
+/// Encrypt the value of a signed or hello DHT record so that storage nodes
+/// cannot read the content.  The encryption key is derived from the DHT
+/// lookup key (which the querier already knows).
+///
+/// Layout of the returned blob: `nonce (24 bytes) || ciphertext+tag`.
+pub fn signed_record_encrypt(dht_key: &DhtId, value: &[u8]) -> Vec<u8> {
+    let enc_key: [u8; 32] = *blake3::hash(dht_key.as_bytes()).as_bytes();
+
+    let mut nonce = [0u8; 24];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    let cipher = XChaCha20Poly1305::new((&enc_key).into());
+    let ciphertext = cipher
+        .encrypt(
+            (&nonce).into(),
+            Payload {
+                msg: value,
+                aad: b"",
+            },
+        )
+        .expect("AEAD encryption should not fail");
+
+    let mut blob = Vec::with_capacity(24 + ciphertext.len());
+    blob.extend_from_slice(&nonce);
+    blob.extend_from_slice(&ciphertext);
+    blob
+}
+
+/// Decrypt the value of a signed or hello DHT record using the DHT lookup key.
+pub fn signed_record_decrypt(dht_key: &DhtId, blob: &[u8]) -> Result<Vec<u8>> {
+    if blob.len() < 24 + 16 {
+        return Err(crate::types::Error::Wire(
+            "signed record blob too short".into(),
+        ));
+    }
+    let nonce = &blob[..24];
+    let ciphertext_with_tag = &blob[24..];
+
+    let enc_key: [u8; 32] = *blake3::hash(dht_key.as_bytes()).as_bytes();
+    let cipher = XChaCha20Poly1305::new((&enc_key).into());
+    cipher
+        .decrypt(
+            nonce.into(),
+            Payload {
+                msg: ciphertext_with_tag,
+                aad: b"",
+            },
+        )
+        .map_err(|_| crate::types::Error::Crypto("signed record AEAD decryption failed".into()))
+}
+
 /// Verify an identity-addressed record (Ed25519-signed hello).
 /// TODO(pq-migration): identity::verify now requires (algo, pubkey, msg, sig).
 /// PeerId is a hash, not a raw pubkey. Verification with the full pubkey
@@ -1591,5 +1642,30 @@ mod tests {
         assert!(hop_phase > 0, "random walk phase must not wrap to 0");
         let nse = 2u64.saturating_pow(l2nse.round().min(63.0) as u32);
         assert!(nse > 0, "nse display must not overflow to 0");
+    }
+
+    #[test]
+    fn signed_record_encrypt_roundtrip() {
+        let dht_key = DhtId([0xAB; 64]);
+        let plaintext = b"hello record payload";
+        let blob = signed_record_encrypt(&dht_key, plaintext);
+        // blob should be nonce(24) + ciphertext + tag(16)
+        assert!(blob.len() >= 24 + 16 + plaintext.len());
+        let decrypted = signed_record_decrypt(&dht_key, &blob).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn signed_record_wrong_key_fails() {
+        let dht_key = DhtId([0xAB; 64]);
+        let wrong_key = DhtId([0xCD; 64]);
+        let blob = signed_record_encrypt(&dht_key, b"secret");
+        assert!(signed_record_decrypt(&wrong_key, &blob).is_err());
+    }
+
+    #[test]
+    fn signed_record_short_blob_fails() {
+        let dht_key = DhtId([0xAB; 64]);
+        assert!(signed_record_decrypt(&dht_key, &[0u8; 10]).is_err());
     }
 }

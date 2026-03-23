@@ -1411,7 +1411,7 @@ impl Node {
                 };
 
                 let key = crate::dht::identity_address_key(&peer_id);
-                let value = hello.to_bytes();
+                let value = crate::dht::signed_record_encrypt(&key, &hello.to_bytes());
                 let mut seq = hello_seq.lock().await;
                 *seq += 1;
                 let sequence = *seq;
@@ -1747,7 +1747,7 @@ impl Node {
         {
             let hello = self.create_hello_record().await;
             let key = crate::dht::identity_address_key(&self.peer_id());
-            let value = hello.to_bytes();
+            let value = crate::dht::signed_record_encrypt(&key, &hello.to_bytes());
             let mut seq = self.hello_sequence.lock().await;
             *seq += 1;
             let sequence = *seq;

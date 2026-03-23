@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/tarnet-api", "crates/tarnetd", "crates/tarnet-client", "crates/tarnet-cli", "crates/tarnet-stream", "crates/tarnet-socks", "crates/tarnet-expose"]
+members = [".", "crates/tarnet-api", "crates/tarnetd", "crates/tarnet-client", "crates/tarnet-cli", "crates/tarnet-socks", "crates/tarnet-expose"]
 default-members = ["crates/tarnetd", "crates/tarnet-cli", "crates/tarnet-socks", "crates/tarnet-expose"]
 
 [package]

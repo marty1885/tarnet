@@ -175,6 +175,9 @@ enum TnsCommand {
         /// Resolve from a specific zone (ServiceId or identity label)
         #[arg(long)]
         zone: Option<String>,
+        /// Identity to start resolution from (label or ServiceId; defaults to default identity)
+        #[arg(long)]
+        identity: Option<String>,
     },
     /// Export all zone records to a JSON file
     Export {
@@ -614,9 +617,13 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                 std::process::exit(1);
             }
         },
-        TnsCommand::Resolve { name, zone } => {
+        TnsCommand::Resolve {
+            name,
+            zone,
+            identity,
+        } => {
             let result = if let Some(z) = zone {
-                // Try as ServiceId first, then as identity label
+                // --zone takes precedence: try as ServiceId first, then as identity label
                 let sid = if let Ok(sid) = tarnet_api::types::ServiceId::parse(z) {
                     sid
                 } else {
@@ -626,6 +633,16 @@ async fn cmd_tns(cli: &Cli, cmd: &TnsCommand) {
                             eprintln!("Unknown zone '{}': {}", z, e);
                             std::process::exit(1);
                         }
+                    }
+                };
+                client.tns_resolve(sid, name).await
+            } else if let Some(id_label) = identity {
+                // --identity: resolve from that identity's zone
+                let sid = match client.resolve_identity(&id_label).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Unknown identity '{}': {}", id_label, e);
+                        std::process::exit(1);
                     }
                 };
                 client.tns_resolve(sid, name).await

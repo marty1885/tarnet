@@ -695,7 +695,11 @@ async fn try_decrypt_local(
                 continue;
             }
         }
-        if let Ok(records) = decrypt_record_set(zone, label, &record.value) {
+        let inner_value = match crate::dht::signed_record_decrypt(dht_key, &record.value) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Ok(records) = decrypt_record_set(zone, label, &inner_value) {
             if !records.is_empty() {
                 let remaining = record.ttl.saturating_sub(record.stored_at.elapsed());
                 return Some((records, remaining));

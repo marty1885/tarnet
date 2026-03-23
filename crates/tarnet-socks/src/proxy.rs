@@ -4,7 +4,7 @@ use std::sync::Arc;
 use log::{debug, error, info, warn};
 use tarnet_api::service::{PortMode, ServiceApi, TnsRecord, TnsResolution};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use crate::socks5;
@@ -107,32 +107,43 @@ async fn handle_client<S: ServiceApi + 'static>(
     mut stream: TcpStream,
 ) -> std::io::Result<()> {
     let req = socks5::server_handshake(&mut stream).await?;
-    debug!("CONNECT request: {}:{}", req.hostname, req.port);
 
-    let identity = req.identity.clone();
-    let route = resolve_route(&state, &req.hostname, req.port, identity.as_deref()).await;
+    match req.command {
+        socks5::SocksCommand::Connect => {
+            debug!("CONNECT request: {}:{}", req.hostname, req.port);
+            let identity = req.identity.clone();
+            let route =
+                resolve_route(&state, &req.hostname, req.port, identity.as_deref()).await;
 
-    match route {
-        Route::Tarnet {
-            service_id,
-            service_name,
-            port,
-        } => {
-            handle_tarnet_route(
-                state,
-                stream,
-                service_id,
-                &service_name,
-                port,
-                identity.as_deref(),
-            )
-            .await
+            match route {
+                Route::Tarnet {
+                    service_id,
+                    service_name,
+                    port,
+                } => {
+                    handle_tarnet_route(
+                        state,
+                        stream,
+                        service_id,
+                        &service_name,
+                        port,
+                        identity.as_deref(),
+                    )
+                    .await
+                }
+                Route::Clearnet { host, port } => {
+                    handle_clearnet_route(stream, &host, port).await
+                }
+                Route::Refused => {
+                    warn!("Refusing connection to {}:{}", req.hostname, req.port);
+                    socks5::send_host_unreachable(&mut stream).await?;
+                    Ok(())
+                }
+            }
         }
-        Route::Clearnet { host, port } => handle_clearnet_route(stream, &host, port).await,
-        Route::Refused => {
-            warn!("Refusing connection to {}:{}", req.hostname, req.port);
-            socks5::send_host_unreachable(&mut stream).await?;
-            Ok(())
+        socks5::SocksCommand::UdpAssociate => {
+            debug!("UDP ASSOCIATE request: {}:{}", req.hostname, req.port);
+            handle_udp_associate(state, stream, &req).await
         }
     }
 }
@@ -320,6 +331,368 @@ async fn handle_clearnet_route(
     }
 
     Ok(())
+}
+
+/// Handle a SOCKS5 UDP ASSOCIATE request.
+///
+/// Binds a local UDP relay socket, tells the client about it, then relays
+/// datagrams between the UDP socket and a tarnet UnreliableUnordered channel.
+/// The association lives until the TCP control connection drops.
+async fn handle_udp_associate<S: ServiceApi + 'static>(
+    state: Arc<ProxyState<S>>,
+    mut stream: TcpStream,
+    req: &socks5::ConnectRequest,
+) -> std::io::Result<()> {
+    // Bind a local UDP socket on the same interface as the TCP control connection.
+    // Use port 0 to let the OS pick an available port.
+    let local_tcp_addr = stream.local_addr()?;
+    let udp_bind_addr = SocketAddr::new(local_tcp_addr.ip(), 0);
+    let udp_socket = UdpSocket::bind(udp_bind_addr).await?;
+    let udp_local_addr = udp_socket.local_addr()?;
+
+    debug!("UDP relay socket bound on {}", udp_local_addr);
+
+    // Tell the client the address of our UDP relay socket.
+    socks5::send_success_with_addr(&mut stream, udp_local_addr).await?;
+
+    let udp_socket = Arc::new(udp_socket);
+
+    // The client address for the UDP relay. Per RFC 1928, the client sends
+    // datagrams from the address specified in the request (or any address if
+    // 0.0.0.0:0). We track the actual client address from the first datagram.
+    let client_addr: Arc<tokio::sync::Mutex<Option<SocketAddr>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    // Channel to signal shutdown when the TCP control connection drops.
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+
+    // Monitor the TCP control connection — when it closes, shut everything down.
+    let tcp_monitor = tokio::spawn(async move {
+        let mut buf = [0u8; 1];
+        // read will return Ok(0) or Err when the client disconnects.
+        let _ = stream.read(&mut buf).await;
+        debug!("UDP ASSOCIATE TCP control connection closed");
+        drop(shutdown_tx);
+    });
+
+    // Channel for parsed datagrams from the UDP socket to the relay logic.
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<(String, u16, Vec<u8>)>(64);
+
+    // Task: receive datagrams from the UDP socket and parse the SOCKS5 UDP header.
+    let udp_recv = udp_socket.clone();
+    let client_addr_recv = client_addr.clone();
+    let recv_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, peer) = match udp_recv.recv_from(&mut buf).await {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!("UDP recv_from error: {}", e);
+                    break;
+                }
+            };
+
+            // Track the client address from the first datagram.
+            {
+                let mut addr = client_addr_recv.lock().await;
+                if addr.is_none() {
+                    *addr = Some(peer);
+                }
+            }
+
+            // Parse the SOCKS5 UDP request header.
+            // RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR(variable) + DST.PORT(2) + DATA
+            if n < 4 {
+                debug!("UDP datagram too short ({} bytes), dropping", n);
+                continue;
+            }
+
+            let frag = buf[2];
+            if frag != 0 {
+                // Drop fragmented packets — no fragmentation support.
+                debug!("Dropping fragmented UDP packet (frag={})", frag);
+                continue;
+            }
+
+            let atyp = buf[3];
+            let (hostname, port, data_offset) = match parse_udp_addr(&buf[..n], atyp) {
+                Some(r) => r,
+                None => {
+                    debug!("Failed to parse UDP SOCKS5 address header");
+                    continue;
+                }
+            };
+
+            let data = buf[data_offset..n].to_vec();
+            if inbound_tx.send((hostname, port, data)).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Process datagrams: resolve route once per (hostname, port) pair, relay to tarnet.
+    // For simplicity, we resolve on the first datagram and keep the connection for the
+    // lifetime of the association.
+    let identity = req.identity.clone();
+    let udp_send = udp_socket.clone();
+    let client_addr_send = client_addr.clone();
+
+    let relay_task = tokio::spawn(async move {
+        // Wait for the first datagram to know where to connect.
+        let (hostname, port, first_payload) = match inbound_rx.recv().await {
+            Some(v) => v,
+            None => return,
+        };
+
+        let route = resolve_route(&state, &hostname, port, identity.as_deref()).await;
+
+        match route {
+            Route::Tarnet {
+                service_id,
+                service_name,
+                port,
+                ..
+            } => {
+                info!(
+                    "UDP Tarnet route to {} service={} port={}",
+                    service_id, service_name, port
+                );
+
+                // Resolve source identity for connect_as.
+                let source_sid = if let Some(ref id_label) = identity {
+                    state.api.resolve_identity(id_label).await.ok()
+                } else {
+                    None
+                };
+
+                let port_name = port.to_string();
+                let conn = match state
+                    .api
+                    .connect_as(
+                        service_id,
+                        PortMode::UnreliableUnordered,
+                        &port_name,
+                        source_sid,
+                    )
+                    .await
+                {
+                    Ok(c) => Arc::new(c),
+                    Err(e) => {
+                        error!("Failed to connect UDP to {}: {}", service_id, e);
+                        return;
+                    }
+                };
+
+                // Send the first datagram.
+                if let Err(e) = conn.send(&first_payload).await {
+                    error!("Failed to send first UDP datagram: {}", e);
+                    return;
+                }
+
+                // Forward client -> tarnet.
+                let conn_up = conn.clone();
+                let upload = tokio::spawn(async move {
+                    while let Some((_host, _port, data)) = inbound_rx.recv().await {
+                        if conn_up.send(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Forward tarnet -> client.
+                let download = tokio::spawn(async move {
+                    loop {
+                        let payload = match conn.recv().await {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+
+                        let addr = {
+                            let guard = client_addr_send.lock().await;
+                            match *guard {
+                                Some(a) => a,
+                                None => continue,
+                            }
+                        };
+
+                        // Build the SOCKS5 UDP response header.
+                        let header =
+                            build_udp_header(&hostname, port);
+                        let mut packet = Vec::with_capacity(header.len() + payload.len());
+                        packet.extend_from_slice(&header);
+                        packet.extend_from_slice(&payload);
+
+                        if let Err(e) = udp_send.send_to(&packet, addr).await {
+                            debug!("UDP send_to error: {}", e);
+                            break;
+                        }
+                    }
+                });
+
+                tokio::select! {
+                    _ = upload => {}
+                    _ = download => {}
+                    _ = shutdown_rx.recv() => {
+                        debug!("UDP ASSOCIATE shutting down (TCP control closed)");
+                    }
+                }
+            }
+            Route::Clearnet { host, port } => {
+                info!("UDP clearnet relay to {}:{}", host, port);
+
+                // Resolve destination address.
+                let dest_addr = match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+                    Ok(mut addrs) => match addrs.next() {
+                        Some(a) => a,
+                        None => {
+                            error!("No addresses for {}:{}", host, port);
+                            return;
+                        }
+                    },
+                    Err(e) => {
+                        error!("DNS lookup failed for {}:{}: {}", host, port, e);
+                        return;
+                    }
+                };
+
+                // Bind a second UDP socket for clearnet forwarding.
+                let clearnet_udp = match UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        error!("Failed to bind clearnet UDP socket: {}", e);
+                        return;
+                    }
+                };
+
+                // Send the first datagram.
+                if let Err(e) = clearnet_udp.send_to(&first_payload, dest_addr).await {
+                    error!("Failed to send first UDP datagram to clearnet: {}", e);
+                    return;
+                }
+
+                // Forward client -> clearnet.
+                let clearnet_up = clearnet_udp.clone();
+                let upload = tokio::spawn(async move {
+                    while let Some((_host, _port, data)) = inbound_rx.recv().await {
+                        if clearnet_up.send_to(&data, dest_addr).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Forward clearnet -> client.
+                let download = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65535];
+                    loop {
+                        let (n, _peer) = match clearnet_udp.recv_from(&mut buf).await {
+                            Ok(r) => r,
+                            Err(e) => {
+                                debug!("Clearnet UDP recv error: {}", e);
+                                break;
+                            }
+                        };
+
+                        let addr = {
+                            let guard = client_addr_send.lock().await;
+                            match *guard {
+                                Some(a) => a,
+                                None => continue,
+                            }
+                        };
+
+                        let header = build_udp_header(&host, port);
+                        let mut packet = Vec::with_capacity(header.len() + n);
+                        packet.extend_from_slice(&header);
+                        packet.extend_from_slice(&buf[..n]);
+
+                        if let Err(e) = udp_send.send_to(&packet, addr).await {
+                            debug!("UDP send_to client error: {}", e);
+                            break;
+                        }
+                    }
+                });
+
+                tokio::select! {
+                    _ = upload => {}
+                    _ = download => {}
+                    _ = shutdown_rx.recv() => {
+                        debug!("UDP ASSOCIATE shutting down (TCP control closed)");
+                    }
+                }
+            }
+            Route::Refused => {
+                warn!("Refusing UDP association to {}:{}", hostname, port);
+            }
+        }
+    });
+
+    let _ = tokio::join!(tcp_monitor, recv_task, relay_task);
+    Ok(())
+}
+
+/// Parse the address portion of a SOCKS5 UDP request header.
+/// Returns (hostname, port, data_offset) or None on failure.
+fn parse_udp_addr(buf: &[u8], atyp: u8) -> Option<(String, u16, usize)> {
+    match atyp {
+        0x01 => {
+            // IPv4: 4 bytes addr + 2 bytes port, starting at offset 4
+            if buf.len() < 10 {
+                return None;
+            }
+            let hostname = format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]);
+            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            Some((hostname, port, 10))
+        }
+        0x03 => {
+            // Domain name: 1 byte length + domain + 2 bytes port
+            if buf.len() < 5 {
+                return None;
+            }
+            let len = buf[4] as usize;
+            if buf.len() < 5 + len + 2 {
+                return None;
+            }
+            let hostname = String::from_utf8(buf[5..5 + len].to_vec()).ok()?;
+            let port = u16::from_be_bytes([buf[5 + len], buf[5 + len + 1]]);
+            Some((hostname, port, 5 + len + 2))
+        }
+        0x04 => {
+            // IPv6: 16 bytes addr + 2 bytes port
+            if buf.len() < 22 {
+                return None;
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[4..20]);
+            let addr = std::net::Ipv6Addr::from(octets);
+            let hostname = addr.to_string();
+            let port = u16::from_be_bytes([buf[20], buf[21]]);
+            Some((hostname, port, 22))
+        }
+        _ => None,
+    }
+}
+
+/// Build a SOCKS5 UDP response header: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT.
+fn build_udp_header(hostname: &str, port: u16) -> Vec<u8> {
+    let mut header = Vec::new();
+    // RSV + FRAG
+    header.extend_from_slice(&[0x00, 0x00, 0x00]);
+
+    // Try to parse as IPv4 first, then IPv6, fall back to domain.
+    if let Ok(v4) = hostname.parse::<std::net::Ipv4Addr>() {
+        header.push(0x01);
+        header.extend_from_slice(&v4.octets());
+    } else if let Ok(v6) = hostname.parse::<std::net::Ipv6Addr>() {
+        header.push(0x04);
+        header.extend_from_slice(&v6.octets());
+    } else {
+        header.push(0x03);
+        header.push(hostname.len() as u8);
+        header.extend_from_slice(hostname.as_bytes());
+    }
+
+    header.extend_from_slice(&port.to_be_bytes());
+    header
 }
 
 /// Extract the first label from a dot-separated hostname.

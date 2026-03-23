@@ -254,7 +254,7 @@ impl Node {
     pub async fn publish_hello(&self) {
         let hello = self.create_hello_record().await;
         let key = crate::dht::identity_address_key(&self.peer_id());
-        let value = hello.to_bytes();
+        let value = crate::dht::signed_record_encrypt(&key, &hello.to_bytes());
 
         let mut seq = self.hello_sequence.lock().await;
         *seq += 1;
@@ -325,7 +325,11 @@ impl Node {
             if record.signer != *peer_id.as_bytes() {
                 continue;
             }
-            if let Ok(hello) = HelloRecord::from_bytes(&record.value) {
+            let plaintext = match crate::dht::signed_record_decrypt(&key, &record.value) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Ok(hello) = HelloRecord::from_bytes(&plaintext) {
                 return Some(hello);
             }
         }
