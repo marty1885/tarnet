@@ -2582,6 +2582,7 @@ dependencies = [
  "sha1_smol",
  "sha2 0.10.9",
  "tarnet-api",
+ "tarnet-client",
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",

@@ -37,6 +37,9 @@ libc = "0.2"
 mainline = { version = "6", optional = true }
 sha1_smol = { version = "1", optional = true }
 
+[dev-dependencies]
+tarnet-client = { path = "crates/tarnet-client" }
+
 [features]
 default = ["mainline-bootstrap"]
 mainline-bootstrap = ["mainline", "sha1_smol"]

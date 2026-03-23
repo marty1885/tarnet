@@ -1,101 +1,57 @@
-/// Echo server: runs a tarnet node that echoes back any data message it receives.
+/// Echo server: listens on the default identity and echoes back messages.
+///
+/// Requires a running `tarnetd`. The server prints its ServiceId on startup.
 ///
 /// Usage:
-///   cargo run --example echo_server [-- --listen <addr> --connect <peer>]
-///
-/// The server prints its peer ID on startup. Clients use this ID to address
-/// messages through the overlay — they don't need a direct connection.
-///
-/// Example 3-node setup (server ← relay ← client):
-///
-///   Terminal 1 (relay / bootstrap node):
-///     cargo run -- run --listen 127.0.0.1:7946
-///
-///   Terminal 2 (server, connects to relay):
-///     cargo run --example echo_server -- --listen 127.0.0.1:7001 --connect 127.0.0.1:7946
-///
-///   Terminal 3 (client, connects to relay — messages route through overlay):
-///     cargo run --example echo_client -- --connect 127.0.0.1:7946 --peer <server_peer_id>
+///   cargo run --example echo_server
 use std::sync::Arc;
 
-use tarnet::identity::Keypair;
-use tarnet::node::Node;
-use tarnet::transport::tcp::TcpDiscovery;
+use tarnet_api::service::{ListenerOptions, PortMode, ServiceApi};
+use tarnet_client::IpcServiceApi;
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-    let args: Vec<String> = std::env::args().collect();
-    let listen_addr = get_flag(&args, "--listen").unwrap_or("127.0.0.1:7001".into());
-    let connect_addrs = get_all_flags(&args, "--connect");
-
-    let identity = load_identity("echo_server.key");
-    println!("Echo server peer ID: {}", identity.peer_id());
-
-    let node = Arc::new(Node::new(identity));
-    let discovery = TcpDiscovery::bind(&[listen_addr])
+    let client = IpcServiceApi::connect_default()
         .await
-        .expect("failed to bind");
-    println!("Listening on {:?}", discovery.local_addrs());
+        .expect("failed to connect to tarnetd — is it running?");
 
-    // Take the app receiver before starting the event loop
-    let mut app_rx = node.take_app_receiver().await.unwrap();
-    let echo_node = node.clone();
+    let identities = client.list_identities().await.expect("failed to list identities");
+    let (_, service_id, ..) = &identities[0];
+    println!("Echo server: {}", service_id);
 
-    // Echo handler: receives data, sends it back to the origin
-    tokio::spawn(async move {
-        while let Some((origin, data)) = app_rx.recv().await {
-            let text = String::from_utf8_lossy(&data);
-            println!("  echo {:?}: {}", origin, text);
-            if let Err(e) = echo_node.send_data(&origin, &data).await {
-                eprintln!("  echo send failed: {}", e);
-            }
-        }
-    });
-
-    // Run the node (accepts connections, connects to bootstrap, runs event loop)
-    node.run(Box::new(discovery), connect_addrs, vec![])
+    let listener = client
+        .listen(*service_id, PortMode::ReliableOrdered, "echo", ListenerOptions::default())
         .await
-        .ok();
-}
+        .expect("failed to listen");
 
-fn get_flag(args: &[String], flag: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == flag)
-        .and_then(|i| args.get(i + 1).cloned())
-}
+    println!("Listening on port 'echo'. Ctrl-C to quit.");
 
-fn get_all_flags(args: &[String], flag: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == flag {
-            if let Some(val) = args.get(i + 1) {
-                result.push(val.clone());
-                i += 1;
+    let client = Arc::new(client);
+    loop {
+        let conn = match client.accept(&listener).await {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("accept error: {}", e);
+                continue;
             }
-        }
-        i += 1;
-    }
-    result
-}
+        };
 
-fn load_identity(path: &str) -> Keypair {
-    if let Ok(bytes) = std::fs::read(path) {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            #[allow(deprecated)]
-            {
-                return Keypair::from_bytes(key);
+        println!("[+] Connection from {}", conn.remote_service_id);
+
+        tokio::spawn(async move {
+            loop {
+                match conn.recv().await {
+                    Ok(data) => {
+                        let text = String::from_utf8_lossy(&data);
+                        println!("  echo: {}", text);
+                        if conn.send(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
             }
-        }
-        if let Ok(kp) = Keypair::from_full_bytes(&bytes) {
-            return kp;
-        }
+            println!("[-] Disconnected");
+        });
     }
-    let kp = Keypair::generate();
-    std::fs::write(path, kp.to_full_bytes()).ok();
-    kp
 }
