@@ -355,7 +355,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
             }
 
             // Check for @ conflict: if @ already points elsewhere, refuse.
-            match state.api.tns_get_label(None, "@").await {
+            match state.api.tns_get_label(identity_label, "@").await {
                 Ok(Some((records, _))) => {
                     let is_self = records
                         .iter()

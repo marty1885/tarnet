@@ -540,6 +540,31 @@ async fn resolve_inner(
         }
 
         if is_terminal {
+            // If the terminal label is a Zone delegation, auto-follow into
+            // that zone and look up "@" (the apex).  This lets petnames like
+            // `lacia.self` resolve to lacia's Identity record published at @
+            // by expose, mirroring how DNS follows NS delegations to find
+            // apex A records.
+            if let Some(zone_sid) = records.iter().find_map(|r| match r {
+                TnsRecord::Zone(sid) => Some(*sid),
+                _ => None,
+            }) {
+                if current_depth >= MAX_DELEGATION_DEPTH {
+                    return TnsResolution::Error(
+                        "max delegation/redirect depth exceeded".into(),
+                    );
+                }
+                let is_local = zone_sid == *local_zone;
+                match fetch_records(node, &zone_sid, "@", is_local).await {
+                    Ok(apex) if !apex.is_empty() => {
+                        return TnsResolution::Records(apex);
+                    }
+                    _ => {
+                        // No apex records — return the Zone records as-is.
+                        return TnsResolution::Records(records);
+                    }
+                }
+            }
             return TnsResolution::Records(records);
         }
 
