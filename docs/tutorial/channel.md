@@ -1,6 +1,8 @@
 # Channels
 
-Channels are the individual streams multiplexed over a tarnet connection. Each channel is addressed by a port name and a delivery mode. The mode controls reliability and ordering guarantees, and is negotiated when the connection is established.
+Channels are multiplexed message streams over a tarnet connection. Each channel is addressed by a port name and a delivery mode. The mode controls reliability and ordering guarantees, and is negotiated when the connection is established.
+
+Tarnet delivers discrete messages, not byte streams. Each send is received as a complete message on the other side, preserving boundaries - more like UDP datagrams or WebSocket frames than TCP. The delivery mode controls what happens to those messages in transit.
 
 ## Modes
 
