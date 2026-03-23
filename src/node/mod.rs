@@ -925,8 +925,8 @@ impl Node {
     }
 
     /// Proactively fill outbound link slots by connecting to known peers.
-    /// Picks candidates from the k-bucket that we don't already have a link to,
-    /// looks up their Hello record for connectable addresses, and tries to connect.
+    /// Draws candidates from both the k-bucket and the routing table (for
+    /// relay-only peers whose Hello records advertise connectable addresses).
     async fn try_fill_outbound_links(&self, discovery: &Arc<Box<dyn Discovery>>) {
         let outbound_count = self.links.lock().await.outbound_count();
         if self.max_outbound > 0 && outbound_count >= self.max_outbound {
@@ -938,16 +938,26 @@ impl Node {
             return; // unlimited — don't proactively fill
         };
 
-        // Gather k-bucket peers we don't have direct links to
+        // Gather candidates: k-bucket peers + relay-only routing table peers
         let candidates: Vec<PeerId> = {
             let kb = self.kbucket.lock().await;
+            let table = self.routing_table.lock().await;
             let links = self.links.lock().await;
-            kb.all_peers()
-                .into_iter()
-                .map(|(pid, _)| pid)
-                .filter(|pid| !links.contains_key(pid))
-                .take(slots)
-                .collect()
+            let mut seen = HashSet::new();
+            let mut result = Vec::new();
+            // K-bucket peers first (already had DHT interaction)
+            for (pid, _) in kb.all_peers() {
+                if !links.contains_key(&pid) && seen.insert(pid) {
+                    result.push(pid);
+                }
+            }
+            // Relay-only peers from routing table
+            for (pid, route) in table.all_destinations() {
+                if route.cost > 1 && !links.contains_key(pid) && seen.insert(*pid) {
+                    result.push(*pid);
+                }
+            }
+            result.into_iter().take(slots).collect()
         };
 
         for peer_id in candidates {
@@ -992,6 +1002,10 @@ impl Node {
                         }
                     }
                 }
+            } else {
+                // No hello record locally — request via DHT for next cycle.
+                log::debug!("Requesting hello for routed peer {:?}", peer_id);
+                let _ = self.request_hello(&peer_id).await;
             }
         }
     }

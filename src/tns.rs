@@ -1168,14 +1168,14 @@ mod tests {
         // "server" → look up "server" in node's own zone → Identity record
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let identity = Keypair::generate();
-            let identity2 = Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap();
-            let node = Node::new(identity);
+            let node = Node::new(Keypair::generate());
+            let default_sid = node.default_service_id().await;
+            let default_kp = node.keypair_for_service(&default_sid).await.unwrap();
             let target = ServiceId::from_signing_pubkey(&[0xAA; 32]);
 
             publish(
                 &node,
-                &identity2,
+                &default_kp,
                 "server",
                 &[TnsRecord::Identity(target)],
                 600,
@@ -1199,16 +1199,16 @@ mod tests {
         // then "www" in zone Z → Identity record
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let identity = Keypair::generate();
-            let identity2 = Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap();
-            let node = Node::new(identity);
+            let node = Node::new(Keypair::generate());
+            let default_sid = node.default_service_id().await;
+            let default_kp = node.keypair_for_service(&default_sid).await.unwrap();
             let zone = Keypair::generate();
             let target = ServiceId::from_signing_pubkey(&[0xAA; 32]);
 
             // Publish "tom" as Zone in our own zone
             publish(
                 &node,
-                &identity2,
+                &default_kp,
                 "tom",
                 &[TnsRecord::Zone(zone.identity.service_id())],
                 600,
@@ -1238,16 +1238,16 @@ mod tests {
         // zone B "service" → Identity
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let identity = Keypair::generate();
-            let identity2 = Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap();
-            let node = Node::new(identity);
+            let node = Node::new(Keypair::generate());
+            let default_sid = node.default_service_id().await;
+            let default_kp = node.keypair_for_service(&default_sid).await.unwrap();
             let zone_a = Keypair::generate();
             let zone_b = Keypair::generate();
 
             // "tom" in own zone → Zone to zone A
             publish(
                 &node,
-                &identity2,
+                &default_kp,
                 "tom",
                 &[TnsRecord::Zone(zone_a.identity.service_id())],
                 600,

@@ -1127,15 +1127,18 @@ async fn cross_algo_connect_pq_to_classic() {
         .await
         .unwrap();
 
+    // Use C's default identity (from identity store) — this is what
+    // handle_introduce_at_service uses, not the transport identity.
+    let service_id_c = c.node.default_service_id().await;
+    let default_kp_c = c.node.keypair_for_service(&service_id_c).await.unwrap();
+
     // Publish C's service via TNS on A's store (simulate propagation)
-    let zone_kp_c = Keypair::from_full_bytes(&c.node.identity.to_full_bytes()).unwrap();
-    let service_id_c = c.node.identity.identity.service_id();
     let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
         relay_peer_id: b.node.peer_id(),
-        kem_algo: c.node.identity.identity.kem_algo() as u8,
-        kem_pubkey: c.node.identity.identity.kem.kem_pubkey_bytes(),
+        kem_algo: default_kp_c.identity.kem_algo() as u8,
+        kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*a.node, &zone_kp_c, "intro", &intro_records, 600)
+    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records, 600)
         .await
         .unwrap();
 
@@ -1158,8 +1161,8 @@ async fn cross_algo_connect_pq_to_classic() {
     });
 
     // A (PQ) connects to C (classic) via rendezvous
-    let kem_algo = c.node.identity.identity.kem_algo() as u8;
-    let kem_pubkey = c.node.identity.identity.kem.kem_pubkey_bytes();
+    let kem_algo = default_kp_c.identity.kem_algo() as u8;
+    let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
     let intro_points = vec![(b.node.peer_id(), kem_algo, kem_pubkey)];
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
@@ -1212,15 +1215,18 @@ async fn cross_algo_connect_classic_to_pq() {
         .await
         .unwrap();
 
+    // Use C's default identity (from identity store) — this is what
+    // handle_introduce_at_service uses, not the transport identity.
+    let service_id_c = c.node.default_service_id().await;
+    let default_kp_c = c.node.keypair_for_service(&service_id_c).await.unwrap();
+
     // Publish C's service via TNS on A's store
-    let zone_kp_c = Keypair::from_full_bytes(&c.node.identity.to_full_bytes()).unwrap();
-    let service_id_c = c.node.identity.identity.service_id();
     let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
         relay_peer_id: b.node.peer_id(),
-        kem_algo: c.node.identity.identity.kem_algo() as u8,
-        kem_pubkey: c.node.identity.identity.kem.kem_pubkey_bytes(),
+        kem_algo: default_kp_c.identity.kem_algo() as u8,
+        kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*a.node, &zone_kp_c, "intro", &intro_records, 600)
+    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records, 600)
         .await
         .unwrap();
 
@@ -1241,8 +1247,8 @@ async fn cross_algo_connect_classic_to_pq() {
     });
 
     // A (classic) connects to C (PQ) via rendezvous
-    let kem_algo = c.node.identity.identity.kem_algo() as u8;
-    let kem_pubkey = c.node.identity.identity.kem.kem_pubkey_bytes();
+    let kem_algo = default_kp_c.identity.kem_algo() as u8;
+    let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
     let intro_points = vec![(b.node.peer_id(), kem_algo, kem_pubkey)];
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),

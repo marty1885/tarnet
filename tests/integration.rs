@@ -1128,7 +1128,6 @@ async fn hidden_service_rendezvous() {
     let node_c = Arc::new(Node::new(Keypair::generate()));
 
     let _pid_c = node_c.peer_id();
-    let service_id_c = node_c.identity.identity.service_id();
 
     // Start B (relay/intro/rendezvous)
     let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
@@ -1156,6 +1155,11 @@ async fn hidden_service_rendezvous() {
         node_b.connected_peers().await.contains(&node_c.peer_id()),
         "B should be connected to C"
     );
+
+    // Use C's default identity (from identity store) — this is what
+    // handle_introduce_at_service uses, not the transport identity.
+    let service_id_c = node_c.default_service_id().await;
+    let default_kp_c = node_c.keypair_for_service(&service_id_c).await.unwrap();
 
     // C registers as listener and publishes hidden service
     let listener_c = node_c
@@ -1190,14 +1194,12 @@ async fn hidden_service_rendezvous() {
 
     // Publish C's intro records on A's local DHT store
     // (simulating TNS resolution propagation).
-    let zone_kp_c =
-        tarnet::identity::Keypair::from_full_bytes(&node_c.identity.to_full_bytes()).unwrap();
     let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
         relay_peer_id: node_b.peer_id(),
-        kem_algo: node_c.identity.identity.kem_algo() as u8,
-        kem_pubkey: node_c.identity.identity.kem.kem_pubkey_bytes(),
+        kem_algo: default_kp_c.identity.kem_algo() as u8,
+        kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*node_a, &zone_kp_c, "intro", &intro_records, 600)
+    tarnet::tns::publish(&*node_a, &default_kp_c, "intro", &intro_records, 600)
         .await
         .unwrap();
 
@@ -1230,8 +1232,8 @@ async fn hidden_service_rendezvous() {
 
     // A connects to C directly via the rendezvous protocol,
     // bypassing circuit_connect's direct-route attempts.
-    let kem_algo = node_c.identity.identity.kem_algo() as u8;
-    let kem_pubkey = node_c.identity.identity.kem.kem_pubkey_bytes();
+    let kem_algo = default_kp_c.identity.kem_algo() as u8;
+    let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
     let intro_points = vec![(node_b.peer_id(), kem_algo, kem_pubkey)];
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
