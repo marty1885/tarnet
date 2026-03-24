@@ -4,6 +4,8 @@
 
 Unlike `tarnetd`, the simulator runs all nodes in one process and uses an in-process transport by default. That avoids file-descriptor limits and lets you exercise topologies with hundreds or thousands of nodes on one machine.
 
+It also supports a strict multi-host mode. In that mode, each worker simulates one country-sized topology locally, exported IX nodes bind direct TCP listeners, and the coordinator only handles control-plane orchestration and final result aggregation. The coordinator is never a data-plane relay.
+
 ## What It Simulates
 
 The simulator generates a geography-shaped network with:
@@ -79,6 +81,65 @@ cargo run -p tarnet-topsim -- \
   --svg /tmp/topology.svg
 ```
 
+## Federated Runs
+
+Federated mode is coordinator-driven. The coordinator owns the full run configuration, including how much work each worker gets. Workers only need a `worker_id` and the coordinator address.
+
+Coordinator example:
+
+```toml
+bind_addr = "0.0.0.0:40100"
+probes = 32
+settle_secs = 15
+parallel_tests = 8
+svg = "/tmp/federated-topology.svg"
+
+[[workers]]
+worker_id = "node0"
+country = "node0"
+nodes = 500
+seed = 1
+
+[[workers]]
+worker_id = "node1"
+country = "node1"
+nodes = 1500
+seed = 2
+advertise_host = "192.168.88.139"
+```
+
+Start the coordinator:
+
+```bash
+cargo run -p tarnet-topsim -- coordinator --run /path/to/run.toml
+```
+
+Start a worker:
+
+```bash
+cargo run -p tarnet-topsim -- worker \
+  --worker-id isla \
+  --coordinator 192.168.88.10:40100
+```
+
+By default, the coordinator uses the worker's observed control-connection source IP as the advertised data-plane IP for exported border listeners. If that is wrong for your LAN, set `advertise_host` for that worker in the coordinator config.
+
+Federated startup is strict:
+
+1. All configured workers must register.
+2. All workers must prepare their local country topology and export IX listeners.
+3. The coordinator computes cross-country IX links and arms every worker.
+4. The coordinator advances every phase with a barrier and settle pause.
+5. Workers report inventories and probe results back to the coordinator.
+6. The coordinator writes the merged SVG and final summary.
+
+Cross-country links use both IX backbone links and sparse border-city links. The coordinator builds:
+
+- multiple direct IX-to-IX backbone links when both countries export enough IX nodes
+- sparse border-city-to-border-city links between the cities facing each other
+
+That gives neighboring countries more realistic regional crossings instead of one narrow national border.
+
 ## Probe Execution
 
 After the settle window, the simulator picks probe pairs from:
@@ -93,7 +154,7 @@ It then calls the real `route_probe()` path on live nodes. Probe progress is pri
 probe 17/50: 140 -> 892 ok cost=7 in 842ms
 ```
 
-At the end it prints total success rate, average probe cost, average probe latency, and category-by-category success rates.
+At the end it prints total success rate, median probe cost, median probe latency, and category-by-category success rates.
 
 ## Reading The Link Numbers
 

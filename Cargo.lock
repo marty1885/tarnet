@@ -2662,8 +2662,11 @@ dependencies = [
  "env_logger",
  "log",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
  "tarnet",
  "tokio",
+ "toml",
 ]
 
 [[package]]

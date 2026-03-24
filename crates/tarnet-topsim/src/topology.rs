@@ -4,8 +4,9 @@ use std::io::Write;
 use std::path::Path;
 
 use rand::prelude::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
     InternetExchange,
     CityDistributor,
@@ -60,7 +61,7 @@ impl fmt::Display for NodeKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodePlan {
     pub id: usize,
     pub kind: NodeKind,
@@ -71,7 +72,7 @@ pub struct NodePlan {
     pub household: Option<usize>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TopologyStats {
     pub households: usize,
     pub residential_shortcuts: usize,
@@ -80,6 +81,7 @@ pub struct TopologyStats {
     pub repeater_spurs: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopologyPlan {
     pub nodes: Vec<NodePlan>,
     pub expected_links: usize,
@@ -140,14 +142,14 @@ impl TopologyPlan {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbePair {
     pub src: usize,
     pub dst: usize,
     pub label: &'static str,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProbeRender {
     pub src: usize,
     pub dst: usize,
@@ -155,6 +157,7 @@ pub struct ProbeRender {
     pub label: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SvgSummary {
     pub nodes: usize,
     pub seed: u64,
@@ -235,7 +238,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
         0
     };
 
-    let world_radius = 340_000.0 + city_count as f64 * 65_000.0;
+    let world_radius = 420_000.0 + city_count as f64 * 82_000.0;
     let ix_radius = world_radius * 0.18;
     let city_radius = world_radius * 0.74;
 
@@ -263,8 +266,8 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
     for city_idx in 0..city_count {
         let angle = std::f64::consts::TAU * (city_idx as f64) / city_count as f64;
         let pos = (
-            city_radius * angle.cos() + rng.gen_range(-60_000.0..60_000.0),
-            city_radius * angle.sin() + rng.gen_range(-60_000.0..60_000.0),
+            city_radius * angle.cos() + rng.gen_range(-95_000.0..95_000.0),
+            city_radius * angle.sin() + rng.gen_range(-95_000.0..95_000.0),
         );
         let primary_ix = ix_ids[city_idx % ix_ids.len()];
         let mut bootstrap = vec![primary_ix];
@@ -289,7 +292,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
     for city_idx in 0..city_count {
         for regional_slot in 0..regionals_per_city {
             let city_node = city_ids[city_idx];
-            let pos = jitter(nodes[city_node].pos, 22_000.0, &mut rng);
+            let pos = jitter(nodes[city_node].pos, 42_000.0, &mut rng);
             let regional_id = add_node(
                 NodeKind::RegionalDistributor,
                 pos,
@@ -302,7 +305,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
             regional_ids_by_city[city_idx].push(regional_id);
 
             for local_slot in 0..locals_per_regional {
-                let local_pos = jitter(pos, 8_000.0, &mut rng);
+                let local_pos = jitter(pos, 18_000.0, &mut rng);
                 let mut bootstrap = vec![regional_id];
                 if regional_ids_by_city[city_idx].len() > 1 && rng.gen_bool(0.25) {
                     let alt = regional_ids_by_city[city_idx]
@@ -337,7 +340,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
         let city = nodes[local_id].city;
         let gateway_id = add_node(
             NodeKind::Gateway,
-            jitter(nodes[local_id].pos, 900.0, &mut rng),
+            jitter(nodes[local_id].pos, 2_100.0, &mut rng),
             vec![local_id],
             city,
             Some(local_id),
@@ -356,7 +359,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
         for _ in 0..extra_devices {
             add_node(
                 NodeKind::Device,
-                jitter(nodes[gateway_id].pos, 90.0, &mut rng),
+                jitter(nodes[gateway_id].pos, 260.0, &mut rng),
                 vec![gateway_id],
                 city,
                 Some(local_id),
@@ -380,7 +383,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
         let city = nodes[local_id].city;
         let gateway_id = add_node(
             NodeKind::Gateway,
-            jitter(nodes[local_id].pos, 900.0, &mut rng),
+            jitter(nodes[local_id].pos, 2_100.0, &mut rng),
             vec![local_id],
             city,
             Some(local_id),
@@ -395,7 +398,7 @@ pub fn generate(target_nodes: usize, seed: u64) -> TopologyPlan {
         for _ in 0..extra_devices {
             add_node(
                 NodeKind::Device,
-                jitter(nodes[gateway_id].pos, 90.0, &mut rng),
+                jitter(nodes[gateway_id].pos, 260.0, &mut rng),
                 vec![gateway_id],
                 city,
                 Some(local_id),
@@ -753,8 +756,8 @@ pub fn write_svg(
     let (min_x, min_y, max_x, max_y) = bounding_box(plan);
     let width = (max_x - min_x).max(1.0);
     let height = (max_y - min_y).max(1.0);
-    let pad = 90.0;
-    let canvas_w = 2400.0;
+    let pad = 110.0;
+    let canvas_w = 3000.0;
     let scale = (canvas_w - pad * 2.0) / width.max(height);
     let canvas_h = height * scale + pad * 2.0;
 
@@ -1071,15 +1074,15 @@ fn relax_layout(nodes: &mut [NodePlan], iterations: usize) {
 
     let (min_x, min_y, max_x, max_y) = bounding_box_from_nodes(nodes);
     let world = (max_x - min_x).max(max_y - min_y).max(1.0);
-    let repel_radius = world * 0.09;
+    let repel_radius = world * 0.13;
     let repel_sq = repel_radius * repel_radius;
-    let spring_rest = world * 0.028;
-    let spring_k = 0.015;
-    let repel_k = world * 0.04;
+    let spring_rest = world * 0.038;
+    let spring_k = 0.012;
+    let repel_k = world * 0.075;
 
     for step in 0..iterations {
         let cooling = 1.0 - (step as f64 / iterations as f64) * 0.82;
-        let max_step = world * 0.0045 * cooling;
+        let max_step = world * 0.0075 * cooling;
         let mut forces = vec![(0.0f64, 0.0f64); nodes.len()];
         let cell_size = repel_radius.max(1.0);
         let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
