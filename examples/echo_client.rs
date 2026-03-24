@@ -4,6 +4,8 @@
 ///
 /// Usage:
 ///   cargo run --example echo_client -- <service-id or tns-name>
+use std::sync::Arc;
+
 use tarnet_api::service::{PortMode, ServiceApi};
 use tarnet_client::IpcServiceApi;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -21,17 +23,20 @@ async fn main() {
 
     println!("Connecting to {} ...", target);
 
-    let conn = client
-        .connect_to(&target, PortMode::ReliableOrdered, "echo")
-        .await
-        .expect("failed to connect");
+    let conn = Arc::new(
+        client
+            .connect_to(&target, PortMode::ReliableOrdered, "echo")
+            .await
+            .expect("failed to connect"),
+    );
 
     println!("Connected. Type a message and press Enter. Ctrl-C to quit.");
 
     // Print incoming messages
+    let recv_conn = conn.clone();
     tokio::spawn(async move {
         loop {
-            match conn.recv().await {
+            match recv_conn.recv().await {
                 Ok(data) => println!("  < {}", String::from_utf8_lossy(&data)),
                 Err(_) => {
                     eprintln!("Disconnected.");
@@ -48,11 +53,7 @@ async fn main() {
         if line.is_empty() {
             continue;
         }
-        if client
-            .connect_to(&target, PortMode::ReliableOrdered, "echo")
-            .await
-            .is_err()
-        {
+        if conn.send(line.as_bytes()).await.is_err() {
             eprintln!("Connection lost.");
             break;
         }
