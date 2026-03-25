@@ -430,6 +430,9 @@ pub struct Node {
     mainline_enabled: bool,
     /// Optional stateful firewall for inbound message filtering.
     firewall: Mutex<Option<Firewall>>,
+    /// Fast check: true when a firewall is configured.  Avoids locking the
+    /// firewall mutex on every inbound message when no firewall is set.
+    firewall_enabled: std::sync::atomic::AtomicBool,
     /// Resource governor: per-link-peer budgeting, strike system, circuit rate limiting.
     /// Always-on core infrastructure (unlike the optional firewall).
     governor: Mutex<Governor>,
@@ -638,6 +641,7 @@ impl Node {
             #[cfg(feature = "mainline-bootstrap")]
             mainline_enabled: false,
             firewall: Mutex::new(None),
+            firewall_enabled: std::sync::atomic::AtomicBool::new(false),
             governor: Mutex::new(Governor::new(GovernorConfig::default())),
             stats: Arc::new(crate::stats::StatsRegistry::new()),
             bandwidth: Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0)),
@@ -686,11 +690,13 @@ impl Node {
     /// Install a firewall.  Replaces any previously installed firewall.
     pub async fn set_firewall(&self, fw: Firewall) {
         *self.firewall.lock().await = Some(fw);
+        self.firewall_enabled.store(true, Ordering::Relaxed);
     }
 
     /// Remove the firewall (accept-all).
     pub async fn clear_firewall(&self) {
         *self.firewall.lock().await = None;
+        self.firewall_enabled.store(false, Ordering::Relaxed);
     }
 
     /// Access the firewall for live rule manipulation.
@@ -1625,7 +1631,8 @@ impl Node {
                 }
                 NodeEvent::Message(from, msg_link_id, msg) => {
                     // Stateful firewall: evaluate inbound message.
-                    {
+                    // Skip lock entirely when no firewall is configured (common case).
+                    if self.firewall_enabled.load(Ordering::Relaxed) {
                         let mut fw_guard = self.firewall.lock().await;
                         if let Some(fw) = fw_guard.as_mut() {
                             if matches!(fw.evaluate(&from, &msg), firewall::Action::Drop) {
@@ -1635,15 +1642,8 @@ impl Node {
                     }
                     // Resource governor: per-link-peer budgeting.
                     {
-                        let circuits_for_peer = self
-                            .circuits
-                            .table
-                            .lock()
-                            .await
-                            .circuits_per_peer()
-                            .get(&from)
-                            .copied()
-                            .unwrap_or(0);
+                        let circuits_for_peer =
+                            self.circuits.table.lock().await.circuits_for_peer(&from);
                         let mut gov = self.governor.lock().await;
                         if gov.evaluate(&from, msg.msg_type, circuits_for_peer) == Verdict::Shed {
                             continue;

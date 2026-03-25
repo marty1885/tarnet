@@ -294,6 +294,23 @@ impl CircuitTable {
         }
         counts
     }
+
+    /// Count circuit entries involving a single peer (as from_peer or next_hop).
+    /// O(entries) but avoids allocating a HashMap — use on the hot message path.
+    pub fn circuits_for_peer(&self, peer: &PeerId) -> usize {
+        let mut count = 0;
+        for (key, action) in &self.entries {
+            if key.from_peer == *peer {
+                count += 1;
+            }
+            if let CircuitAction::Forward { next_hop, .. } = action {
+                if next_hop == peer {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }
 
 // ---------------------------------------------------------------------------
