@@ -21,6 +21,9 @@ pub struct RunConfig {
     pub svg: Option<String>,
     #[serde(default)]
     pub dot: Option<String>,
+    /// SVG layers: comma-separated (links, missing-links, extra-links, probes, failed-probes, all, errors).
+    #[serde(default = "default_svg_layers")]
+    pub svg_layers: String,
     pub workers: Vec<RunWorkerConfig>,
 }
 
@@ -204,6 +207,10 @@ pub fn default_prepare_timeout_secs() -> u64 {
 
 pub fn default_seed() -> u64 {
     1
+}
+
+fn default_svg_layers() -> String {
+    "all".to_string()
 }
 
 pub fn phase_name(phase: Phase) -> &'static str {

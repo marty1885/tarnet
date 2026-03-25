@@ -61,11 +61,8 @@ impl Node {
             let (fh, cid, cell) = circuit.send_relay_cell(&establish_cell);
             drop(circuits);
 
-            let msg = CircuitRelayMsg {
-                circuit_id: cid,
-                data: cell.to_vec(),
-            };
-            self.send_to_peer(&fh, &msg.to_wire().encode()).await?;
+            let encoded = encode_circuit_relay_cell(cid, &cell);
+            self.send_to_peer(&fh, &encoded).await?;
         }
 
         // Build circuit to an intro point
@@ -111,11 +108,8 @@ impl Node {
             let (fh, cid, cell) = circuit.send_relay_cell(&introduce_cell);
             drop(circuits);
 
-            let msg = CircuitRelayMsg {
-                circuit_id: cid,
-                data: cell.to_vec(),
-            };
-            self.send_to_peer(&fh, &msg.to_wire().encode()).await?;
+            let encoded = encode_circuit_relay_cell(cid, &cell);
+            self.send_to_peer(&fh, &encoded).await?;
         }
         // Wait for IntroduceAck
         let _ack = tokio::time::timeout(Duration::from_secs(10), ack_rx)
@@ -198,13 +192,10 @@ impl Node {
                     circuit.congestion.on_send();
                     drop(circuits);
 
-                    let msg = CircuitRelayMsg {
-                        circuit_id: cid,
-                        data: cell.to_vec(),
-                    };
+                    let encoded = encode_circuit_relay_cell(cid, &cell);
                     let links = node_links.lock().await;
                     if let Some(link) = links.get(&first_hop) {
-                        let _ = link.send_message(&msg.to_wire().encode()).await;
+                        let _ = link.send_message(&encoded).await;
                     }
                 } else {
                     break;
@@ -392,11 +383,8 @@ impl Node {
                 let (fh, cid, cell) = circuit.send_relay_cell(&register_cell);
                 drop(circuits);
 
-                let msg = CircuitRelayMsg {
-                    circuit_id: cid,
-                    data: cell.to_vec(),
-                };
-                self.send_to_peer(&fh, &msg.to_wire().encode()).await?;
+                let encoded = encode_circuit_relay_cell(cid, &cell);
+                self.send_to_peer(&fh, &encoded).await?;
             }
 
             // Wait for IntroRegistered
@@ -680,11 +668,8 @@ impl Node {
                 let (fh, cid, cell) = circuit.send_relay_cell(&join_cell);
                 drop(circuits);
 
-                let msg = CircuitRelayMsg {
-                    circuit_id: cid,
-                    data: cell.to_vec(),
-                };
-                if let Err(e) = self.send_to_peer(&fh, &msg.to_wire().encode()).await {
+                let encoded = encode_circuit_relay_cell(cid, &cell);
+                if let Err(e) = self.send_to_peer(&fh, &encoded).await {
                     log::debug!("Failed to send RendezvousJoin: {}", e);
                     return;
                 }
@@ -763,13 +748,10 @@ impl Node {
                     circuit.congestion.on_send();
                     drop(circuits);
 
-                    let msg = CircuitRelayMsg {
-                        circuit_id: cid,
-                        data: cell.to_vec(),
-                    };
+                    let encoded = encode_circuit_relay_cell(cid, &cell);
                     let links = node_links.lock().await;
                     if let Some(link) = links.get(&first_hop) {
-                        let _ = link.send_message(&msg.to_wire().encode()).await;
+                        let _ = link.send_message(&encoded).await;
                     }
                 } else {
                     break;

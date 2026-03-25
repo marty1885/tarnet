@@ -237,11 +237,19 @@ impl CircuitTable {
     }
 
     /// Remove all entries involving a given peer (link went down).
-    pub fn remove_peer(&mut self, peer: &PeerId) {
+    /// Returns the circuit IDs that were removed, paired with the from_peer
+    /// that keyed each entry, so callers can clean up associated state.
+    pub fn remove_peer(&mut self, peer: &PeerId) -> Vec<(u32, PeerId)> {
+        let mut removed = Vec::new();
         self.entries.retain(|k, v| {
-            k.from_peer != *peer
-                && !matches!(v, CircuitAction::Forward { next_hop, .. } if next_hop == peer)
+            let keep = k.from_peer != *peer
+                && !matches!(v, CircuitAction::Forward { next_hop, .. } if next_hop == peer);
+            if !keep {
+                removed.push((k.circuit_id, k.from_peer));
+            }
+            keep
         });
+        removed
     }
 
     /// Number of active circuit entries.
@@ -464,29 +472,38 @@ pub struct RelayCell {
     pub data: Vec<u8>,
 }
 
+/// Serialize relay cell fields directly into a fixed-size cell body with digest.
+/// Avoids constructing a RelayCell struct and the Vec<u8> allocation for data.
+pub fn write_cell_body(
+    command: RelayCellCommand,
+    stream_id: u16,
+    data: &[u8],
+    digest_key: &[u8; 32],
+) -> [u8; CELL_BODY_SIZE] {
+    assert!(
+        data.len() <= CELL_PAYLOAD_MAX,
+        "relay cell data ({} bytes) exceeds CELL_PAYLOAD_MAX ({} bytes) — caller must chunk",
+        data.len(),
+        CELL_PAYLOAD_MAX,
+    );
+    let mut cell = [0u8; CELL_BODY_SIZE];
+    let len = data.len();
+    cell[0] = command as u8;
+    cell[1..3].copy_from_slice(&stream_id.to_be_bytes());
+    cell[3..5].copy_from_slice(&(len as u16).to_be_bytes());
+
+    let digest = relay_cell_digest(digest_key, &cell[..5], &data[..len]);
+    cell[5..5 + DIGEST_SIZE].copy_from_slice(&digest);
+
+    cell[5 + DIGEST_SIZE..5 + DIGEST_SIZE + len].copy_from_slice(&data[..len]);
+    cell
+}
+
 impl RelayCell {
     /// Serialize into a fixed-size cell body with digest, ready for onion wrapping.
     /// `digest_key` is the endpoint's forward digest key.
     pub fn to_cell(&self, digest_key: &[u8; 32]) -> [u8; CELL_BODY_SIZE] {
-        assert!(
-            self.data.len() <= CELL_PAYLOAD_MAX,
-            "relay cell data ({} bytes) exceeds CELL_PAYLOAD_MAX ({} bytes) — caller must chunk",
-            self.data.len(),
-            CELL_PAYLOAD_MAX,
-        );
-        let mut cell = [0u8; CELL_BODY_SIZE];
-        let len = self.data.len();
-        cell[0] = self.command as u8;
-        cell[1..3].copy_from_slice(&self.stream_id.to_be_bytes());
-        cell[3..5].copy_from_slice(&(len as u16).to_be_bytes());
-
-        // Compute digest over (command || stream_id || length || payload)
-        let digest = relay_cell_digest(digest_key, &cell[..5], &self.data[..len]);
-        cell[5..5 + DIGEST_SIZE].copy_from_slice(&digest);
-
-        cell[5 + DIGEST_SIZE..5 + DIGEST_SIZE + len].copy_from_slice(&self.data[..len]);
-        // Remaining bytes are zero padding.
-        cell
+        write_cell_body(self.command, self.stream_id, &self.data, digest_key)
     }
 
     /// Parse a fully-decrypted cell body and verify its digest.
@@ -700,6 +717,26 @@ impl OutboundCircuit {
     ) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
         let last = self.hop_keys.len() - 1;
         self.send_to_hop(relay_cell, last)
+    }
+
+    /// Send a DATA cell through this circuit without constructing a RelayCell.
+    /// Avoids a Vec<u8> allocation for the data payload on the hot path.
+    pub fn send_data_cell(
+        &mut self,
+        data: &[u8],
+    ) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
+        let last = self.hop_keys.len() - 1;
+        let digest_key = self.hop_keys[last].forward_digest;
+        let body = write_cell_body(RelayCellCommand::Data, 0, data, &digest_key);
+        let mut cell = [0u8; CELL_SIZE];
+        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
+        let nonce = self.forward_nonce;
+        self.forward_nonce += 1;
+        set_cell_nonce(&mut cell, nonce);
+        for hop in self.hop_keys[..=last].iter().rev() {
+            hop.encrypt_forward(&mut cell);
+        }
+        (self.first_hop, self.first_hop_circuit_id, cell)
     }
 
     /// Receive and decrypt a relay cell from this circuit.

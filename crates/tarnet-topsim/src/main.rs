@@ -62,6 +62,12 @@ struct LocalCli {
     list_links: bool,
     #[arg(short, long)]
     verbose: bool,
+    /// SVG layers to render (comma-separated).
+    /// Layers: links, missing-links, extra-links, probes, failed-probes.
+    /// Shorthands: all (default), errors (missing-links + failed-probes).
+    /// Example: --svg-layers errors,links
+    #[arg(long, default_value = "all")]
+    svg_layers: String,
 }
 
 #[derive(Args, Debug)]
@@ -70,6 +76,11 @@ struct CoordinatorCli {
     run: PathBuf,
     #[arg(short, long)]
     verbose: bool,
+    /// SVG layers to render (comma-separated).
+    /// Layers: links, missing-links, extra-links, probes, failed-probes.
+    /// Shorthands: all (default), errors (missing-links + failed-probes).
+    #[arg(long, default_value = "all")]
+    svg_layers: String,
 }
 
 #[derive(Args, Debug)]
@@ -121,6 +132,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_local(cli: LocalCli) -> Result<(), Box<dyn std::error::Error>> {
     let plan = topology::generate(cli.nodes, cli.seed);
+    let svg_layers = topology::SvgLayers::parse(&cli.svg_layers)
+        .map_err(|e| format!("--svg-layers: {}", e))?;
     sim::print_topology_summary(&plan, cli.nodes, cli.seed, cli.settle_secs, cli.probes);
 
     let mut runtime =
@@ -180,6 +193,7 @@ async fn run_local(cli: LocalCli) -> Result<(), Box<dyn std::error::Error>> {
     );
     let outcomes = run_local_probes(&runtime, pairs, cli.parallel_tests).await;
     sim::print_probe_summary(&outcomes);
+
     write_outputs(
         &runtime.plan,
         &actual_links,
@@ -191,6 +205,7 @@ async fn run_local(cli: LocalCli) -> Result<(), Box<dyn std::error::Error>> {
         cli.parallel_tests,
         cli.dot.as_deref(),
         cli.svg.as_deref(),
+        &svg_layers,
     )?;
     Ok(())
 }
@@ -322,6 +337,10 @@ async fn run_worker(cli: WorkerCli) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_coordinator(cli: CoordinatorCli) -> Result<(), Box<dyn std::error::Error>> {
     let run: RunConfig = load_toml(&cli.run)?;
+    // CLI --svg-layers overrides config; if CLI is default "all", use config value.
+    let layers_spec = if cli.svg_layers == "all" { &run.svg_layers } else { &cli.svg_layers };
+    let svg_layers = topology::SvgLayers::parse(layers_spec)
+        .map_err(|e| format!("svg_layers: {}", e))?;
     let run_id = run
         .run_id
         .clone()
@@ -503,7 +522,7 @@ async fn run_coordinator(cli: CoordinatorCli) -> Result<(), Box<dyn std::error::
         .collect::<Vec<_>>();
     print_global_probe_summary(&all_results);
     print_merged_link_summary(&merged.plan, &per_node_counts, &actual_links);
-    write_global_outputs(&run, &merged.plan, &actual_links, &all_results)?;
+    write_global_outputs(&run, &merged.plan, &actual_links, &all_results, &svg_layers)?;
     for conn in workers.values() {
         send_message(&conn.writer, &CoordinatorToWorker::Complete).await?;
     }
@@ -981,6 +1000,7 @@ fn write_outputs(
     parallel_tests: usize,
     dot: Option<&Path>,
     svg: Option<&Path>,
+    svg_layers: &topology::SvgLayers,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dot_path) = dot {
         topology::write_dot(
@@ -1036,7 +1056,7 @@ fn write_outputs(
             median_probe_ms,
             median_probe_cost,
         };
-        topology::write_svg(svg_path, plan, actual_links, &probe_render, &summary)?;
+        topology::write_svg(svg_path, plan, actual_links, &probe_render, &summary, svg_layers)?;
         println!("wrote {}", svg_path.display());
     }
     Ok(())
@@ -1047,6 +1067,7 @@ fn write_global_outputs(
     plan: &TopologyPlan,
     actual_links: &BTreeSet<(usize, usize)>,
     results: &[ProbeResultMsg],
+    svg_layers: &topology::SvgLayers,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let probes = results
         .iter()
@@ -1107,7 +1128,7 @@ fn write_global_outputs(
             median_probe_ms,
             median_probe_cost: median_cost,
         };
-        topology::write_svg(Path::new(svg), plan, actual_links, &probes, &summary)?;
+        topology::write_svg(Path::new(svg), plan, actual_links, &probes, &summary, svg_layers)?;
         println!("wrote {}", svg);
     }
     Ok(())

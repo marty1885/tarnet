@@ -649,9 +649,30 @@ pub fn sample_probe_pairs(plan: &TopologyPlan, count: usize, seed: u64) -> Vec<P
         .filter(|members| members.len() >= 2)
         .collect();
 
-    let local_target = count / 4;
-    let neighborhood_target = count / 4;
-    let metro_target = count / 4;
+    // Build per-city edge node groups for cross-city sampling.
+    // In federated runs, each worker has distinct city IDs after offset, so
+    // pairs drawn from different cities naturally cross worker boundaries.
+    let city_edge_groups: Vec<(usize, Vec<usize>)> = cities
+        .iter()
+        .map(|(&city_id, members)| {
+            let edges: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&id| plan.nodes[id].kind.is_edge())
+                .collect();
+            (city_id, edges)
+        })
+        .filter(|(_, edges)| !edges.is_empty())
+        .collect();
+    let has_multiple_cities = city_edge_groups.len() >= 2;
+
+    // Allocate budget: if multiple cities exist (federated), reserve a tier
+    // for cross-city probes; otherwise give all to the existing tiers.
+    let cross_city_target = if has_multiple_cities { count / 5 } else { 0 };
+    let remaining = count - cross_city_target;
+    let local_target = remaining / 4;
+    let neighborhood_target = remaining / 4;
+    let metro_target = remaining / 4;
 
     sample_group_pairs(
         &mut rng,
@@ -677,6 +698,22 @@ pub fn sample_probe_pairs(plan: &TopologyPlan, count: usize, seed: u64) -> Vec<P
         &mut seen,
         &mut pairs,
     );
+
+    // Cross-city probes: pick src and dst from different cities to ensure
+    // inter-worker routing is covered in federated topologies.
+    if has_multiple_cities {
+        let mut cross_attempts = 0;
+        while pairs.len() < local_target + neighborhood_target + metro_target + cross_city_target
+            && cross_attempts < cross_city_target * 10
+        {
+            cross_attempts += 1;
+            let i = rng.gen_range(0..city_edge_groups.len());
+            let j = (i + rng.gen_range(1..city_edge_groups.len())) % city_edge_groups.len();
+            let src = city_edge_groups[i].1[rng.gen_range(0..city_edge_groups[i].1.len())];
+            let dst = city_edge_groups[j].1[rng.gen_range(0..city_edge_groups[j].1.len())];
+            push_unique_pair(src, dst, "cross-city", &mut seen, &mut pairs);
+        }
+    }
 
     while pairs.len() < count && edge_nodes.len() >= 2 {
         let src = edge_nodes[rng.gen_range(0..edge_nodes.len())];
@@ -745,12 +782,49 @@ pub fn write_dot(
     Ok(())
 }
 
+/// Which layers to include in the SVG output.
+#[derive(Debug, Clone)]
+pub struct SvgLayers {
+    pub links: bool,
+    pub missing_links: bool,
+    pub extra_links: bool,
+    pub probes: bool,
+    pub failed_probes: bool,
+}
+
+impl SvgLayers {
+    pub fn all() -> Self {
+        Self { links: true, missing_links: true, extra_links: true, probes: true, failed_probes: true }
+    }
+
+    /// Parse a comma-separated layer spec.
+    /// Individual layers: links, missing-links, extra-links, probes, failed-probes
+    /// Shorthands: all (everything), errors (missing-links + failed-probes)
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        let mut layers = Self { links: false, missing_links: false, extra_links: false, probes: false, failed_probes: false };
+        for token in spec.split(',').map(str::trim) {
+            match token {
+                "all" => return Ok(Self::all()),
+                "errors" => { layers.missing_links = true; layers.failed_probes = true; }
+                "links" => layers.links = true,
+                "missing-links" => layers.missing_links = true,
+                "extra-links" => layers.extra_links = true,
+                "probes" => layers.probes = true,
+                "failed-probes" => layers.failed_probes = true,
+                other => return Err(format!("unknown svg layer '{}'; expected: all, errors, links, missing-links, extra-links, probes, failed-probes", other)),
+            }
+        }
+        Ok(layers)
+    }
+}
+
 pub fn write_svg(
     path: &Path,
     plan: &TopologyPlan,
     actual_links: &BTreeSet<(usize, usize)>,
     probes: &[ProbeRender],
     summary: &SvgSummary,
+    layers: &SvgLayers,
 ) -> std::io::Result<()> {
     let mut file = std::fs::File::create(path)?;
     let (min_x, min_y, max_x, max_y) = bounding_box(plan);
@@ -777,9 +851,16 @@ pub fn write_svg(
 
     let planned_edges = planned_edges(plan);
     for &(a, b) in &planned_edges {
+        let established = actual_links.contains(&(a, b));
+        if established && !layers.links {
+            continue;
+        }
+        if !established && !layers.missing_links {
+            continue;
+        }
         let pa = plan.nodes[a].pos;
         let pb = plan.nodes[b].pos;
-        let (stroke, dash, width) = if actual_links.contains(&(a, b)) {
+        let (stroke, dash, width) = if established {
             ("#3ddc97", "", 2.2)
         } else {
             ("#ff5d73", " stroke-dasharray=\"8 7\"", 2.4)
@@ -797,23 +878,32 @@ pub fn write_svg(
         )?;
     }
 
-    for &(a, b) in actual_links {
-        if planned_edges.contains(&(a, b)) {
-            continue;
+    // Unexpected direct links (not in plan but established)
+    if layers.extra_links {
+        for &(a, b) in actual_links {
+            if planned_edges.contains(&(a, b)) {
+                continue;
+            }
+            let pa = plan.nodes[a].pos;
+            let pb = plan.nodes[b].pos;
+            writeln!(
+                file,
+                "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#8aa1b5\" stroke-width=\"1.5\" stroke-dasharray=\"3 6\" opacity=\"0.45\"/>",
+                tx(pa.0),
+                ty(pa.1),
+                tx(pb.0),
+                ty(pb.1),
+            )?;
         }
-        let pa = plan.nodes[a].pos;
-        let pb = plan.nodes[b].pos;
-        writeln!(
-            file,
-            "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"#8aa1b5\" stroke-width=\"1.5\" stroke-dasharray=\"3 6\" opacity=\"0.45\"/>",
-            tx(pa.0),
-            ty(pa.1),
-            tx(pb.0),
-            ty(pb.1),
-        )?;
     }
 
     for probe in probes {
+        if probe.ok && !layers.probes {
+            continue;
+        }
+        if !probe.ok && !layers.failed_probes {
+            continue;
+        }
         let pa = plan.nodes[probe.src].pos;
         let pb = plan.nodes[probe.dst].pos;
         let stroke = if probe.ok { "#59a5ff" } else { "#ff335f" };

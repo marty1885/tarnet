@@ -11,12 +11,7 @@ fn encrypt_backward_cell(
     command: RelayCellCommand,
     data: &[u8],
 ) -> Vec<u8> {
-    let relay_cell = RelayCell {
-        command,
-        stream_id: 0,
-        data: data.to_vec(),
-    };
-    let body = relay_cell.to_cell(&bwd_digest);
+    let body = write_cell_body(command, 0, data, &bwd_digest);
     let mut cell = [0u8; CELL_SIZE];
     cell[..CELL_BODY_SIZE].copy_from_slice(&body);
     cell[CELL_BODY_SIZE..CELL_BODY_SIZE + 8].copy_from_slice(&nonce.to_le_bytes());
@@ -29,21 +24,24 @@ fn encrypt_backward_cell(
     };
     crypto.process_cell(&mut cell);
 
-    let msg = CircuitRelayMsg {
-        circuit_id,
-        data: cell.to_vec(),
-    };
-    msg.to_wire().encode()
+    encode_circuit_relay_cell(circuit_id, &cell)
 }
 
 impl Node {
     // ── Circuit message handlers ──
 
     /// Handle an incoming CircuitRelay cell: look up forwarding table, rewrite circuit_id, forward.
+    /// `payload` is the raw wire payload: circuit_id(4 BE) || cell_data.
+    /// We parse circuit_id and borrow cell_data directly to avoid allocating a Vec.
     pub(super) async fn handle_circuit_relay(&self, from: PeerId, payload: &[u8]) -> Result<()> {
-        let msg = CircuitRelayMsg::from_bytes(payload)?;
+        if payload.len() < 4 {
+            return Err(Error::Wire("CircuitRelay too short".into()));
+        }
+        let circuit_id = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let cell_data = &payload[4..];
+
         let key = CircuitKey {
-            circuit_id: msg.circuit_id,
+            circuit_id,
             from_peer: from,
         };
 
@@ -68,16 +66,16 @@ impl Node {
                 // during onion wrapping, so only the outermost layer's MAC is
                 // ever verifiable.  Link-layer integrity protects the hop.
                 let encoded = if let Some(ref mut hop_crypto) = crypto {
-                    if msg.data.len() == CELL_SIZE {
+                    if cell_data.len() == CELL_SIZE {
                         let mut cell = [0u8; CELL_SIZE];
-                        cell.copy_from_slice(&msg.data);
+                        cell.copy_from_slice(cell_data);
                         hop_crypto.process_cell(&mut cell);
                         encode_circuit_relay_cell(next_id, &cell)
                     } else {
-                        encode_circuit_relay_cell(next_id, &msg.data)
+                        encode_circuit_relay_cell(next_id, cell_data)
                     }
                 } else {
-                    encode_circuit_relay_cell(next_id, &msg.data)
+                    encode_circuit_relay_cell(next_id, cell_data)
                 };
                 drop(table);
 
@@ -86,26 +84,26 @@ impl Node {
             }
             Some(CircuitAction::Endpoint { crypto, .. }) => {
                 // Apply onion layer decryption if present.
-                let cell_data = if let Some(ref mut hop_crypto) = crypto {
-                    if msg.data.len() == CELL_SIZE {
-                        let mut cell = [0u8; CELL_SIZE];
-                        cell.copy_from_slice(&msg.data);
+                // Decrypt into a stack buffer to avoid a heap allocation.
+                let mut cell_buf = [0u8; CELL_SIZE];
+                let decrypted: &[u8] = if let Some(ref mut hop_crypto) = crypto {
+                    if cell_data.len() == CELL_SIZE {
+                        cell_buf.copy_from_slice(cell_data);
                         // In multi-hop circuits, the cell-level MAC is only
                         // valid for the outermost layer (already verified by the
                         // first relay). The relay cell's internal digest provides
                         // integrity at the endpoint, so we don't bail on MAC failure.
-                        hop_crypto.process_cell(&mut cell);
-                        cell.to_vec()
+                        hop_crypto.process_cell(&mut cell_buf);
+                        &cell_buf
                     } else {
-                        msg.data
+                        cell_data
                     }
                 } else {
-                    msg.data
+                    cell_data
                 };
-                let circuit_id = msg.circuit_id;
                 drop(table);
 
-                self.handle_endpoint_relay_cell(from, circuit_id, cell_data)
+                self.handle_endpoint_relay_cell(from, circuit_id, decrypted)
                     .await
             }
             None => {
@@ -113,13 +111,13 @@ impl Node {
 
                 // Check if this is a backward cell for an outbound circuit we initiated.
                 let mut circuits = self.circuits.outbound.lock().await;
-                if let Some(circuit) = circuits.get_mut(&msg.circuit_id) {
-                    if from == circuit.first_hop && msg.data.len() == CELL_SIZE {
+                if let Some(circuit) = circuits.get_mut(&circuit_id) {
+                    if from == circuit.first_hop && cell_data.len() == CELL_SIZE {
                         // Update circuit liveness on any backward cell
                         circuit.last_activity = Instant::now();
 
                         let mut cell = [0u8; CELL_SIZE];
-                        cell.copy_from_slice(&msg.data);
+                        cell.copy_from_slice(cell_data);
                         circuit.unwrap_backward(&mut cell);
 
                         // Try to parse as a relay cell using the last hop's backward MAC.
@@ -132,7 +130,7 @@ impl Node {
                             if relay_cell.command == RelayCellCommand::Extended {
                                 // This is an EXTENDED reply during circuit construction.
                                 let mut pending = self.circuits.pending_extends.lock().await;
-                                if let Some(tx) = pending.remove(&msg.circuit_id) {
+                                if let Some(tx) = pending.remove(&circuit_id) {
                                     let _ = tx.send(relay_cell.data);
                                 }
                                 return Ok(());
@@ -140,11 +138,11 @@ impl Node {
                             if relay_cell.command == RelayCellCommand::Sendme {
                                 // Endpoint sent us a SENDME — open our send window.
                                 let mut circuits = self.circuits.outbound.lock().await;
-                                if let Some(circuit) = circuits.get_mut(&msg.circuit_id) {
+                                if let Some(circuit) = circuits.get_mut(&circuit_id) {
                                     circuit.congestion.on_sendme();
                                     log::trace!(
                                         "Circuit {} SENDME received: cwnd={}, inflight={}",
-                                        msg.circuit_id,
+                                        circuit_id,
                                         circuit.congestion.cwnd,
                                         circuit.congestion.inflight
                                     );
@@ -152,7 +150,7 @@ impl Node {
                                 drop(circuits);
                                 // Wake the send task if it's waiting on the window.
                                 let notifies = self.circuits.sendme_notify.lock().await;
-                                if let Some(notify) = notifies.get(&msg.circuit_id) {
+                                if let Some(notify) = notifies.get(&circuit_id) {
                                     notify.notify_one();
                                 }
                                 return Ok(());
@@ -161,11 +159,11 @@ impl Node {
                                 // Track receive-side flow control and send SENDME if needed.
                                 let should_sendme = {
                                     let mut circuits = self.circuits.outbound.lock().await;
-                                    if let Some(circuit) = circuits.get_mut(&msg.circuit_id) {
+                                    if let Some(circuit) = circuits.get_mut(&circuit_id) {
                                         if !circuit.congestion.can_receive() {
                                             log::warn!(
                                                 "Circuit {} initiator receive window exhausted, dropping backward DATA",
-                                                msg.circuit_id
+                                                circuit_id
                                             );
                                             return Ok(());
                                         }
@@ -179,7 +177,7 @@ impl Node {
                                 // Deliver backward DATA BEFORE sending SENDME to
                                 // avoid out-of-order delivery (spawned task race).
                                 let txs = self.endpoints.data_txs.lock().await;
-                                if let Some(tx) = txs.get(&msg.circuit_id) {
+                                if let Some(tx) = txs.get(&circuit_id) {
                                     let _ = tx.send(relay_cell.data).await;
                                 }
                                 drop(txs);
@@ -187,7 +185,7 @@ impl Node {
                                 if should_sendme {
                                     for _ in 0..2 {
                                         self.send_circuit_data_cmd(
-                                            msg.circuit_id,
+                                            circuit_id,
                                             RelayCellCommand::Sendme,
                                             &[],
                                         )
@@ -198,14 +196,14 @@ impl Node {
                             }
                             if relay_cell.command == RelayCellCommand::StreamConnected {
                                 let mut pending = self.endpoints.pending_connects.lock().await;
-                                if let Some(tx) = pending.remove(&msg.circuit_id) {
+                                if let Some(tx) = pending.remove(&circuit_id) {
                                     let _ = tx.send(true);
                                 }
                                 return Ok(());
                             }
                             if relay_cell.command == RelayCellCommand::StreamRefused {
                                 let mut pending = self.endpoints.pending_connects.lock().await;
-                                if let Some(tx) = pending.remove(&msg.circuit_id) {
+                                if let Some(tx) = pending.remove(&circuit_id) {
                                     let _ = tx.send(false);
                                 }
                                 return Ok(());
@@ -217,7 +215,7 @@ impl Node {
                             {
                                 // Deliver via pending_circuit_extends (reusing the same mechanism)
                                 let mut pending = self.circuits.pending_extends.lock().await;
-                                if let Some(tx) = pending.remove(&msg.circuit_id) {
+                                if let Some(tx) = pending.remove(&circuit_id) {
                                     let _ = tx.send(relay_cell.data);
                                 }
                                 return Ok(());
@@ -225,7 +223,7 @@ impl Node {
                             if relay_cell.command == RelayCellCommand::Introduce {
                                 // INTRODUCE forwarded to us (the hidden service) through our
                                 // intro point circuit.
-                                self.handle_introduce_at_service(msg.circuit_id, &relay_cell.data)
+                                self.handle_introduce_at_service(circuit_id, &relay_cell.data)
                                     .await;
                                 return Ok(());
                             }
@@ -235,14 +233,14 @@ impl Node {
                             }
                             log::debug!(
                                 "Backward relay cell: circuit_id={}, cmd={:?}",
-                                msg.circuit_id,
+                                circuit_id,
                                 relay_cell.command
                             );
                             return Ok(());
                         } else {
                             log::warn!(
                                 "Backward relay cell parse failed circuit={}",
-                                msg.circuit_id,
+                                circuit_id,
                             );
                         }
                     } else {
@@ -252,7 +250,7 @@ impl Node {
 
                 log::debug!(
                     "Unknown circuit_id {} from {:?}, dropping",
-                    msg.circuit_id,
+                    circuit_id,
                     from
                 );
                 Ok(())
@@ -265,7 +263,7 @@ impl Node {
         &self,
         from: PeerId,
         circuit_id: u32,
-        cell_data: Vec<u8>,
+        cell_data: &[u8],
     ) -> Result<()> {
         if cell_data.len() != CELL_SIZE {
             log::debug!(
@@ -570,12 +568,14 @@ impl Node {
         tokio::spawn(async move {
             let mut rx = circuit_rx;
             while let Some(data) = rx.recv().await {
-                // Chunk data into relay-cell-sized pieces.
-                let chunks: Vec<Vec<u8>> =
-                    data.chunks(CELL_PAYLOAD_MAX).map(|c| c.to_vec()).collect();
-
+                // Process chunks inline — no intermediate Vec<Vec<u8>> needed.
                 let mut broken = false;
-                for chunk in chunks {
+                let num_chunks = (data.len() + CELL_PAYLOAD_MAX - 1) / CELL_PAYLOAD_MAX.max(1);
+                for i in 0..num_chunks {
+                    let start = i * CELL_PAYLOAD_MAX;
+                    let end = (start + CELL_PAYLOAD_MAX).min(data.len());
+                    let chunk = &data[start..end];
+
                     // Wait until the congestion window allows sending.
                     loop {
                         let can_send = {
@@ -631,7 +631,7 @@ impl Node {
                         nonce,
                         circuit_id,
                         RelayCellCommand::Data,
-                        &chunk,
+                        chunk,
                     );
                     let links_guard = links.lock().await;
                     if let Some(link) = links_guard.get(&from) {
@@ -834,7 +834,7 @@ impl Node {
             .relay_extend_pending
             .lock()
             .await
-            .insert(outbound_id, (from, inbound_circuit_id, reached));
+            .insert(outbound_id, (from, inbound_circuit_id, reached, Instant::now()));
 
         // Send CircuitCreate to next_hop with algo + initiator's ephemeral pubkey.
         let mut create_payload = Vec::with_capacity(1 + initiator_ephemeral.len());
@@ -932,7 +932,7 @@ impl Node {
             .await
             .remove(&msg.circuit_id);
 
-        if let Some((inbound_from, inbound_circuit_id, reached)) = relay_pending {
+        if let Some((inbound_from, inbound_circuit_id, reached, _created)) = relay_pending {
             // We're a relay that forwarded a CREATE on behalf of an EXTEND.
             // Wrap the CircuitCreated reply as an EXTENDED relay cell and send
             // it back through the inbound circuit.
@@ -973,12 +973,9 @@ impl Node {
                 crypto.process_cell(&mut cell);
             }
 
-            let fwd = CircuitRelayMsg {
-                circuit_id: inbound_circuit_id,
-                data: cell.to_vec(),
-            };
+            let encoded = encode_circuit_relay_cell(inbound_circuit_id, &cell);
             return self
-                .send_to_peer(&inbound_from, &fwd.to_wire().encode())
+                .send_to_peer(&inbound_from, &encoded)
                 .await;
         }
 
@@ -1061,6 +1058,18 @@ impl Node {
             .lock()
             .await
             .remove(&(msg.circuit_id, from));
+        // Clean up intro point registration if this circuit was an intro point.
+        self.hidden
+            .intro_registrations
+            .lock()
+            .await
+            .remove(&msg.circuit_id);
+        // Clean up rendezvous entries where this circuit was a participant.
+        self.hidden.rendezvous.lock().await.retain(|_, entry| {
+            !(entry.client_circuit_id == msg.circuit_id && entry.client_from == from)
+                && !(entry.service_circuit_id == Some(msg.circuit_id)
+                    && entry.service_from == Some(from))
+        });
 
         Ok(())
     }
@@ -1108,11 +1117,8 @@ impl Node {
             replay: ReplayWindow::new(),
         };
         crypto.process_cell(&mut cell);
-        let msg = CircuitRelayMsg {
-            circuit_id,
-            data: cell.to_vec(),
-        };
-        self.send_to_peer(&from, &msg.to_wire().encode()).await
+        let encoded = encode_circuit_relay_cell(circuit_id, &cell);
+        self.send_to_peer(&from, &encoded).await
     }
 
     /// Handle INTRODUCE at an intro point: forward the INTRODUCE data to the registered service.
@@ -1159,12 +1165,9 @@ impl Node {
             replay: ReplayWindow::new(),
         };
         crypto.process_cell(&mut cell);
-        let fwd_msg = CircuitRelayMsg {
-            circuit_id: service_circuit_id,
-            data: cell.to_vec(),
-        };
+        let encoded = encode_circuit_relay_cell(service_circuit_id, &cell);
         let _ = self
-            .send_to_peer(&service_from, &fwd_msg.to_wire().encode())
+            .send_to_peer(&service_from, &encoded)
             .await;
 
         // Send IntroduceAck back to the client
@@ -1188,11 +1191,8 @@ impl Node {
             replay: ReplayWindow::new(),
         };
         crypto.process_cell(&mut cell);
-        let msg = CircuitRelayMsg {
-            circuit_id,
-            data: cell.to_vec(),
-        };
-        self.send_to_peer(&from, &msg.to_wire().encode()).await
+        let encoded = encode_circuit_relay_cell(circuit_id, &cell);
+        self.send_to_peer(&from, &encoded).await
     }
 
     /// Handle RENDEZVOUS_ESTABLISH: client registers a cookie at the rendezvous point.
@@ -1213,6 +1213,7 @@ impl Node {
             client_from: from,
             service_circuit_id: None,
             service_from: None,
+            created_at: Instant::now(),
         };
         self.hidden.rendezvous.lock().await.insert(cookie, entry);
         Ok(())
@@ -1296,11 +1297,8 @@ impl Node {
             replay: ReplayWindow::new(),
         };
         crypto.process_cell(&mut cell);
-        let msg = CircuitRelayMsg {
-            circuit_id: client_circuit_id,
-            data: cell.to_vec(),
-        };
-        self.send_to_peer(&client_from, &msg.to_wire().encode())
+        let encoded = encode_circuit_relay_cell(client_circuit_id, &cell);
+        self.send_to_peer(&client_from, &encoded)
             .await
     }
 
@@ -1447,11 +1445,8 @@ impl Node {
 
                     drop(circuits);
 
-                    let relay_msg = CircuitRelayMsg {
-                        circuit_id: cid,
-                        data: cell_bytes.to_vec(),
-                    };
-                    self.send_to_peer(&first_hop_send, &relay_msg.to_wire().encode())
+                    let encoded = encode_circuit_relay_cell(cid, &cell_bytes);
+                    self.send_to_peer(&first_hop_send, &encoded)
                         .await?;
                 }
 
@@ -1463,10 +1458,17 @@ impl Node {
                     .await
                     .insert(circuit_id, tx);
 
-                let reply = tokio::time::timeout(Duration::from_millis(1500), rx)
-                    .await
-                    .map_err(|_| Error::Protocol("circuit extend timed out".into()))?
-                    .map_err(|_| Error::Protocol("circuit extend channel dropped".into()))?;
+                let reply = match tokio::time::timeout(Duration::from_millis(1500), rx).await {
+                    Ok(Ok(data)) => data,
+                    Ok(Err(_)) => {
+                        self.circuits.pending_extends.lock().await.remove(&circuit_id);
+                        return Err(Error::Protocol("circuit extend channel dropped".into()));
+                    }
+                    Err(_) => {
+                        self.circuits.pending_extends.lock().await.remove(&circuit_id);
+                        return Err(Error::Protocol("circuit extend timed out".into()));
+                    }
+                };
 
                 if reply.is_empty() {
                     return Err(Error::Protocol(format!(
@@ -1566,21 +1568,12 @@ impl Node {
             .get_mut(&circuit_id)
             .ok_or_else(|| Error::Protocol("no such outbound circuit".into()))?;
 
-        let relay_cell = RelayCell {
-            command: RelayCellCommand::Data,
-            stream_id: 0,
-            data: data.to_vec(),
-        };
-
-        let (first_hop, cid, cell) = circuit.send_relay_cell(&relay_cell);
+        let (first_hop, cid, cell) = circuit.send_data_cell(data);
         circuit.congestion.on_send();
         drop(circuits);
 
-        let msg = CircuitRelayMsg {
-            circuit_id: cid,
-            data: cell.to_vec(),
-        };
-        self.send_to_peer(&first_hop, &msg.to_wire().encode()).await
+        let encoded = encode_circuit_relay_cell(cid, &cell);
+        self.send_to_peer(&first_hop, &encoded).await
     }
 
     /// Send an arbitrary relay cell command through an outbound circuit (e.g. SENDME).
@@ -1605,11 +1598,8 @@ impl Node {
         let (first_hop, cid, cell) = circuit.send_relay_cell(&relay_cell);
         drop(circuits);
 
-        let msg = CircuitRelayMsg {
-            circuit_id: cid,
-            data: cell.to_vec(),
-        };
-        self.send_to_peer(&first_hop, &msg.to_wire().encode()).await
+        let encoded = encode_circuit_relay_cell(cid, &cell);
+        self.send_to_peer(&first_hop, &encoded).await
     }
 
     /// Destroy an outbound circuit.
@@ -2079,11 +2069,8 @@ impl Node {
                 let (fh, cid, cell) = circuit.send_relay_cell(&stream_begin);
                 drop(circuits);
 
-                let msg = CircuitRelayMsg {
-                    circuit_id: cid,
-                    data: cell.to_vec(),
-                };
-                self.send_to_peer(&fh, &msg.to_wire().encode()).await?;
+                let encoded = encode_circuit_relay_cell(cid, &cell);
+                self.send_to_peer(&fh, &encoded).await?;
             }
 
             // Wait for StreamConnected or StreamRefused.
@@ -2152,12 +2139,14 @@ impl Node {
         tokio::spawn(async move {
             let mut rx = circuit_rx;
             while let Some(data) = rx.recv().await {
-                // Chunk data into relay-cell-sized pieces.
-                let chunks: Vec<Vec<u8>> =
-                    data.chunks(CELL_PAYLOAD_MAX).map(|c| c.to_vec()).collect();
-
+                // Process chunks inline — no intermediate Vec<Vec<u8>> needed.
                 let mut broken = false;
-                for chunk in chunks {
+                let num_chunks = (data.len() + CELL_PAYLOAD_MAX - 1) / CELL_PAYLOAD_MAX.max(1);
+                for i in 0..num_chunks {
+                    let start = i * CELL_PAYLOAD_MAX;
+                    let end = (start + CELL_PAYLOAD_MAX).min(data.len());
+                    let chunk = &data[start..end];
+
                     // Wait until congestion window allows sending.
                     loop {
                         let can_send = {
@@ -2180,22 +2169,14 @@ impl Node {
 
                     let mut circuits = node_circuits.lock().await;
                     if let Some(circuit) = circuits.get_mut(&circuit_id) {
-                        let relay_cell = RelayCell {
-                            command: RelayCellCommand::Data,
-                            stream_id: 0,
-                            data: chunk,
-                        };
-                        let (first_hop, cid, cell) = circuit.send_relay_cell(&relay_cell);
+                        let (first_hop, cid, cell) = circuit.send_data_cell(chunk);
                         circuit.congestion.on_send();
                         drop(circuits);
 
-                        let msg = CircuitRelayMsg {
-                            circuit_id: cid,
-                            data: cell.to_vec(),
-                        };
+                        let encoded = encode_circuit_relay_cell(cid, &cell);
                         let links = node_links.lock().await;
                         if let Some(link) = links.get(&first_hop) {
-                            let _ = link.send_message(&msg.to_wire().encode()).await;
+                            let _ = link.send_message(&encoded).await;
                         }
                     } else {
                         broken = true;

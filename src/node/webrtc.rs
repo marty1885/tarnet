@@ -88,6 +88,7 @@ impl Node {
         let identity = self.identity.clone();
         let channel_data_handlers = self.channel_state.data_handlers.clone();
         let channels = self.channel_state.channels.clone();
+        let retransmit_notify = self.channel_state.retransmit_notify.clone();
         let tunnel_table = self.tunnel_table.clone();
         let links = self.links.clone();
         let routing_table = self.routing_table.clone();
@@ -102,6 +103,7 @@ impl Node {
                 let identity = identity.clone();
                 let channel_data_handlers = channel_data_handlers.clone();
                 let channels = channels.clone();
+                let retransmit_notify = retransmit_notify.clone();
                 let tunnel_table = tunnel_table.clone();
                 let links = links.clone();
                 let routing_table = routing_table.clone();
@@ -152,6 +154,7 @@ impl Node {
                                     &tunnel_table,
                                     &links,
                                     &routing_table,
+                                    &retransmit_notify,
                                     peer_id,
                                     channel_id,
                                     &answer_msg,
@@ -167,6 +170,7 @@ impl Node {
                                 let tunnel_table2 = tunnel_table.clone();
                                 let links2 = links.clone();
                                 let routing_table2 = routing_table.clone();
+                                let retransmit_notify2 = retransmit_notify.clone();
                                 tokio::spawn(async move {
                                     while let Some(candidate) = ice_rx.recv().await {
                                         let mut ice_msg = Vec::with_capacity(1 + candidate.len());
@@ -177,6 +181,7 @@ impl Node {
                                             &tunnel_table2,
                                             &links2,
                                             &routing_table2,
+                                            &retransmit_notify2,
                                             peer_id,
                                             channel_id,
                                             &ice_msg,
@@ -297,6 +302,7 @@ impl Node {
 
         // Spawn ICE trickle sender (our candidates → channel)
         let channels = self.channel_state.channels.clone();
+        let retransmit_notify = self.channel_state.retransmit_notify.clone();
         let tunnel_table = self.tunnel_table.clone();
         let links = self.links.clone();
         let routing_table = self.routing_table.clone();
@@ -311,6 +317,7 @@ impl Node {
                     &tunnel_table,
                     &links,
                     &routing_table,
+                    &retransmit_notify,
                     my_peer_id,
                     channel_id,
                     &ice_msg,
@@ -402,19 +409,24 @@ async fn send_on_channel(
     tunnel_table: &Arc<Mutex<TunnelTable>>,
     links: &Arc<Mutex<LinkTable>>,
     routing_table: &Arc<Mutex<RoutingTable>>,
+    retransmit_notify: &Arc<tokio::sync::Notify>,
     our_peer_id: PeerId,
     channel_id: u32,
     data: &[u8],
 ) -> Result<()> {
-    let (dest, sends) = {
+    let (dest, sends, is_reliable) = {
         let mut chs = channels.lock().await;
         let (remote, ch) = chs
             .get_mut(&channel_id)
             .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
         let dest = *remote;
+        let reliable = ch.reliable;
         let sends = ch.prepare_send(data.to_vec());
-        (dest, sends)
+        (dest, sends, reliable)
     };
+    if is_reliable {
+        retransmit_notify.notify_one();
+    }
     for (seq, payload) in sends {
         let msg = ChannelDataMsg {
             channel_id,

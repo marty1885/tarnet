@@ -20,7 +20,7 @@ use crate::circuit::{
     parse_stream_begin_payload, relay_cell_digest_for_sendme, CircuitAction, CircuitKey,
     CircuitState as CircuitPhase, CircuitTable, CongestionWindow, CryptoOp, HopCrypto, HopKey,
     OutboundCircuit, RelayCell, RelayCellCommand, ReplayWindow, CELL_BODY_SIZE, CELL_PAYLOAD_MAX,
-    CELL_SIZE, EXTENDED_FLAG_REACHED, SENDME_STALL_TIMEOUT,
+    CELL_SIZE, EXTENDED_FLAG_REACHED, SENDME_STALL_TIMEOUT, write_cell_body,
 };
 use crate::dht::{
     is_k_closest, probabilistic_select, random_select, BloomFilter, DhtQueryParams, DhtRecord,
@@ -54,11 +54,25 @@ mod tunnel;
 mod webrtc;
 
 const ROUTE_AD_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Create an interval that starts after a random jitter of `0..period/2`,
+/// then ticks at `period`.  Desynchronizes periodic timers across nodes.
+fn jittered_interval(period: Duration) -> tokio::time::Interval {
+    use rand::Rng;
+    let jitter = rand::thread_rng().gen_range(Duration::ZERO..period / 2);
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + jitter,
+        period,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
+}
 const ROUTE_EXPIRY: Duration = Duration::from_secs(120);
 const DHT_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const REPLICATION_INTERVAL: Duration = Duration::from_secs(300);
-/// How often to check for retransmissions and dead channels.
-const RETRANSMIT_CHECK_INTERVAL: Duration = Duration::from_millis(250);
+/// Safety-net fallback for the retransmit task: maximum sleep when there are
+/// no unacked packets or when no notify arrives.  Replaces the old 250ms poll.
+const RETRANSMIT_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
 /// How long query token → previous_hop mappings live.
 const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
 /// Maximum timestamp drift allowed for tunnel key exchange (seconds).
@@ -184,6 +198,7 @@ pub(crate) struct RendezvousEntry {
     client_from: PeerId,
     service_circuit_id: Option<u32>,
     service_from: Option<PeerId>,
+    created_at: Instant,
 }
 
 /// Circuit-related state grouped together.
@@ -200,7 +215,7 @@ pub struct CircuitState {
     /// Pending relay extends: outbound_circuit_id → (inbound_from, inbound_circuit_id).
     /// When a relay sends CircuitCreate on behalf of an EXTEND, this maps the outbound
     /// circuit_id to the inbound circuit so the CircuitCreated reply can be routed back.
-    pub relay_extend_pending: Arc<Mutex<HashMap<u32, (PeerId, u32, bool)>>>,
+    pub relay_extend_pending: Arc<Mutex<HashMap<u32, (PeerId, u32, bool, Instant)>>>,
     /// Backward crypto keying material for circuit hops.
     /// Key: (circuit_id, from_peer) → (backward_key, backward_digest, nonce).
     /// Stored at CREATE time, used when converting Endpoint → Forward on EXTEND.
@@ -313,6 +328,9 @@ pub struct ChannelState {
             >,
         >,
     >,
+    /// Wakes the retransmit task when a reliable send occurs so it can
+    /// recalculate the next retransmit deadline instead of polling.
+    pub retransmit_notify: Arc<tokio::sync::Notify>,
 }
 
 impl ChannelState {
@@ -321,6 +339,7 @@ impl ChannelState {
             channels: Arc::new(Mutex::new(HashMap::new())),
             data_handlers: Arc::new(Mutex::new(HashMap::new())),
             port_listeners: Arc::new(Mutex::new(HashMap::new())),
+            retransmit_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 }
@@ -361,7 +380,7 @@ pub struct Node {
     hello_sequence: Arc<Mutex<u64>>,
     /// Pending key exchanges: initiator_nonce → (KEM offer, completion notifier, destination peer)
     pending_key_exchanges:
-        Arc<Mutex<HashMap<[u8; 32], (KexOffer, oneshot::Sender<PeerId>, PeerId)>>>,
+        Arc<Mutex<HashMap<[u8; 32], (KexOffer, oneshot::Sender<PeerId>, PeerId, Instant)>>>,
     /// Notifies app when an incoming tunnel is established (peer_id)
     tunnel_notify_tx: mpsc::Sender<PeerId>,
     tunnel_notify_rx: Mutex<Option<mpsc::Receiver<PeerId>>>,
@@ -808,7 +827,7 @@ impl Node {
             let node = self.clone();
             tokio::spawn(async move {
                 let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
-                let mut interval = tokio::time::interval(Duration::from_secs(30));
+                let mut interval = jittered_interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
                     node.try_webrtc_upgrades(&mut cooldown).await;
@@ -824,7 +843,7 @@ impl Node {
             tokio::spawn(async move {
                 // Wait for initial bootstrap to settle
                 tokio::time::sleep(Duration::from_secs(30)).await;
-                let mut interval = tokio::time::interval(Duration::from_secs(60));
+                let mut interval = jittered_interval(Duration::from_secs(60));
                 loop {
                     interval.tick().await;
                     node.try_fill_outbound_links(&disc).await;
@@ -840,7 +859,7 @@ impl Node {
                 // Wait for bootstrap to settle before first publish
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 node.maintain_hidden_services().await;
-                let mut interval = tokio::time::interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
+                let mut interval = jittered_interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
                 loop {
                     interval.tick().await;
                     node.maintain_hidden_services().await;
@@ -855,7 +874,7 @@ impl Node {
                 // Wait for bootstrap to settle before first publish
                 tokio::time::sleep(Duration::from_secs(15)).await;
                 node.maintain_peer_records().await;
-                let mut interval = tokio::time::interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
+                let mut interval = jittered_interval(HIDDEN_SERVICE_MAINTAIN_INTERVAL);
                 loop {
                     interval.tick().await;
                     node.maintain_peer_records().await;
@@ -1026,7 +1045,7 @@ impl Node {
         let probe_seen_ref = self.probe_seen.clone();
         let probe_reverse_ref = self.probe_reverse.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(ROUTE_AD_INTERVAL);
+            let mut interval = jittered_interval(ROUTE_AD_INTERVAL);
             loop {
                 interval.tick().await;
 
@@ -1065,7 +1084,7 @@ impl Node {
         let ka_links = self.links.clone();
         let ka_event_tx = self.event_tx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(KEEPALIVE_CHECK_INTERVAL);
+            let mut interval = jittered_interval(KEEPALIVE_CHECK_INTERVAL);
             loop {
                 interval.tick().await;
                 let links = ka_links.lock().await;
@@ -1171,7 +1190,7 @@ impl Node {
         let ck_circuits = self.circuits.outbound.clone();
         let ck_links = self.links.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(CIRCUIT_KEEPALIVE_INTERVAL);
+            let mut interval = jittered_interval(CIRCUIT_KEEPALIVE_INTERVAL);
             loop {
                 interval.tick().await;
                 let now = Instant::now();
@@ -1215,13 +1234,10 @@ impl Node {
                         let (first_hop, relay_cid, cell) = circuit.send_relay_cell(&padding_cell);
                         drop(circuits);
 
-                        let msg = CircuitRelayMsg {
-                            circuit_id: relay_cid,
-                            data: cell.to_vec(),
-                        };
+                        let encoded = encode_circuit_relay_cell(relay_cid, &cell);
                         let links = ck_links.lock().await;
                         if let Some(link) = links.get(&first_hop) {
-                            let _ = link.send_message(&msg.to_wire().encode()).await;
+                            let _ = link.send_message(&encoded).await;
                         }
                     }
                 }
@@ -1231,7 +1247,7 @@ impl Node {
         // Periodic governor tick: decay strikes, update pressure, drain reports.
         let gov_ref = node_arc.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(crate::governor::GOVERNOR_TICK_INTERVAL);
+            let mut interval = jittered_interval(crate::governor::GOVERNOR_TICK_INTERVAL);
             loop {
                 interval.tick().await;
                 let ct_len = gov_ref.circuits.table.lock().await.len();
@@ -1239,19 +1255,22 @@ impl Node {
             }
         });
 
-        // Periodic DHT expiry
+        // Periodic DHT expiry and stale state cleanup
         let dht_ref = self.dht_store.clone();
         let watches_ref = self.dht_watches.clone();
         let tokens_ref = self.query_tokens.clone();
         let nonces_ref = self.seen_nonces.clone();
+        let relay_ext_ref = self.circuits.relay_extend_pending.clone();
+        let pke_ref = self.pending_key_exchanges.clone();
+        let rend_ref = self.hidden.rendezvous.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(DHT_EXPIRY_INTERVAL);
+            let mut interval = jittered_interval(DHT_EXPIRY_INTERVAL);
             loop {
                 interval.tick().await;
                 dht_ref.lock().await.expire();
                 watches_ref.lock().await.expire();
-                // Expire stale query token mappings
                 let now = Instant::now();
+                // Expire stale query token mappings
                 tokens_ref
                     .lock()
                     .await
@@ -1265,20 +1284,72 @@ impl Node {
                         break;
                     }
                 }
+                drop(nonces);
+                // Expire stale relay extend pending entries (10s — well beyond
+                // the 1.5s circuit extend timeout at the initiator).
+                relay_ext_ref.lock().await.retain(|_, (_, _, _, created)| {
+                    now.duration_since(*created) < Duration::from_secs(10)
+                });
+                // Expire stale pending key exchanges (30s timeout).
+                pke_ref.lock().await.retain(|_, (_, _, _, created)| {
+                    now.duration_since(*created) < Duration::from_secs(30)
+                });
+                // Expire stale rendezvous entries (60s timeout for incomplete,
+                // 5 minutes for completed — circuits may outlive the rendezvous).
+                rend_ref.lock().await.retain(|_, entry| {
+                    let age = now.duration_since(entry.created_at);
+                    if entry.service_from.is_none() {
+                        // Incomplete rendezvous — service never joined
+                        age < Duration::from_secs(60)
+                    } else {
+                        // Completed rendezvous — keep longer for circuit lifetime
+                        age < Duration::from_secs(300)
+                    }
+                });
             }
         });
 
-        // Periodic retransmit check and dead channel detection
+        // Demand-driven retransmit and dead channel detection.
+        // Instead of polling every 250ms, we sleep until the earliest retransmit
+        // deadline across all channels.  A Notify wakes us when a new reliable
+        // send occurs (which may set an earlier deadline).  A safety-net fallback
+        // caps the sleep at RETRANSMIT_SAFETY_INTERVAL so a missed notify only
+        // adds a few seconds of delay, not infinite stall.
         let retransmit_channels = self.channel_state.channels.clone();
         let retransmit_tunnel_table = self.tunnel_table.clone();
         let retransmit_links = self.links.clone();
         let retransmit_routing = self.routing_table.clone();
         let retransmit_identity = self.identity.clone();
         let retransmit_event_tx = self.channel_event_tx.clone();
+        let retransmit_notify = self.channel_state.retransmit_notify.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(RETRANSMIT_CHECK_INTERVAL);
             loop {
-                interval.tick().await;
+                // Compute the next deadline across all channels.
+                let deadline = {
+                    let channels = retransmit_channels.lock().await;
+                    channels
+                        .values()
+                        .filter_map(|(_, ch)| ch.next_retransmit_at())
+                        .min()
+                };
+
+                // Sleep until deadline, notify, or safety-net fallback.
+                match deadline {
+                    Some(at) => {
+                        let delay = at.saturating_duration_since(Instant::now());
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = retransmit_notify.notified() => {}
+                        }
+                    }
+                    None => {
+                        // No unacked data — wait for a send or safety fallback.
+                        tokio::select! {
+                            _ = tokio::time::sleep(RETRANSMIT_SAFETY_INTERVAL) => {}
+                            _ = retransmit_notify.notified() => {}
+                        }
+                    }
+                }
 
                 // Collect retransmit work and dead channels under the channels lock,
                 // then release it before doing I/O.
@@ -1889,8 +1960,33 @@ impl Node {
             self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
-            // Clean up all circuits involving this peer
-            self.circuits.table.lock().await.remove_peer(&peer_id);
+            // Clean up all circuits involving this peer.
+            // remove_peer returns the (circuit_id, from_peer) pairs that were removed
+            // so we can clean up associated per-circuit state.
+            let removed = self.circuits.table.lock().await.remove_peer(&peer_id);
+            {
+                let mut queues = self.circuits.relay_queues.lock().await;
+                let mut bwd_keys = self.circuits.hop_backward_keys.lock().await;
+                let mut intro_reg = self.hidden.intro_registrations.lock().await;
+                let mut data_txs = self.endpoints.data_txs.lock().await;
+                let mut stream_owners = self.endpoints.stream_owners.lock().await;
+                let mut recv_cw = self.endpoints.recv_congestion.lock().await;
+                let mut send_cw = self.endpoints.send_congestion.lock().await;
+                for (cid, from) in &removed {
+                    queues.remove(&(*cid, *from));
+                    bwd_keys.remove(&(*cid, *from));
+                    intro_reg.remove(cid);
+                    data_txs.remove(cid);
+                    stream_owners.remove(cid);
+                    recv_cw.remove(cid);
+                    send_cw.remove(cid);
+                }
+            }
+            // Clean up rendezvous entries where the disconnected peer was a participant.
+            self.hidden.rendezvous.lock().await.retain(|_, entry| {
+                entry.client_from != peer_id
+                    && entry.service_from.map_or(true, |p| p != peer_id)
+            });
             // Notify application that this peer is gone
             let _ = self
                 .channel_event_tx

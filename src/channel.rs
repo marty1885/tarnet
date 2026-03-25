@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
+use rand::Rng;
+
 use crate::wire;
 
 /// Maximum number of selective ACK entries to include in an ACK message.
@@ -313,8 +315,17 @@ impl Channel {
             }
         }
         if !due.is_empty() {
-            // Exponential backoff
-            state.rto_ms = (state.rto_ms * 2).min(MAX_RTO_MS);
+            // Exponential backoff with jitter (±25%) to desynchronize
+            // retransmits across channels/nodes that hit the same loss event.
+            let base = state.rto_ms * 2;
+            let jitter_range = base / 4;
+            let jittered = if jitter_range > 0 {
+                let offset = rand::thread_rng().gen_range(0..=jitter_range * 2);
+                base - jitter_range + offset
+            } else {
+                base
+            };
+            state.rto_ms = jittered.min(MAX_RTO_MS);
             // Reset send times for retransmitted packets
             for &(seq, _) in &due {
                 state.send_times.insert(seq, now);
@@ -344,6 +355,21 @@ impl Channel {
             state.created_at
         };
         now.duration_since(reference) >= timeout
+    }
+
+    /// Returns the earliest instant at which a retransmit will be due,
+    /// or `None` if there are no unacked packets.
+    pub fn next_retransmit_at(&self) -> Option<Instant> {
+        let state = self.state.reliable_state()?;
+        if state.send_buf.is_empty() {
+            return None;
+        }
+        let rto = Duration::from_millis(state.rto_ms);
+        state
+            .send_times
+            .values()
+            .map(|&sent_at| sent_at + rto)
+            .min()
     }
 
     /// Drain ready data (for application consumption).

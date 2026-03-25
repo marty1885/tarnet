@@ -95,7 +95,7 @@ impl Node {
         let kr = TunnelKeyResponseMsg::from_bytes(payload)?;
 
         // Look up pending exchange by our initiator nonce
-        if let Some((kex, notifier, dest)) = self
+        if let Some((kex, notifier, dest, _created)) = self
             .pending_key_exchanges
             .lock()
             .await
@@ -433,7 +433,7 @@ impl Node {
         self.pending_key_exchanges
             .lock()
             .await
-            .insert(nonce, (kex, tx, dest));
+            .insert(nonce, (kex, tx, dest, Instant::now()));
 
         self.route_message(&dest, &msg.to_wire().encode()).await?;
 
@@ -580,15 +580,19 @@ impl Node {
     /// Send data through a reliable channel.  The channel handles
     /// sequencing, ACKs, and retransmission automatically.
     pub async fn channel_send(&self, channel_id: u32, data: &[u8]) -> Result<()> {
-        let (dest, sends) = {
+        let (dest, sends, is_reliable) = {
             let mut channels = self.channel_state.channels.lock().await;
             let (remote, ch) = channels
                 .get_mut(&channel_id)
                 .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
             let dest = *remote;
+            let reliable = ch.reliable;
             let sends = ch.prepare_send(data.to_vec());
-            (dest, sends)
+            (dest, sends, reliable)
         };
+        if is_reliable {
+            self.channel_state.retransmit_notify.notify_one();
+        }
         for (seq, payload) in sends {
             let msg = ChannelDataMsg {
                 channel_id,
