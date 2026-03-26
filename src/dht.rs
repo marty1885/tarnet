@@ -941,14 +941,6 @@ pub fn signed_record_decrypt(dht_key: &DhtId, blob: &[u8]) -> Result<Vec<u8>> {
         .map_err(|_| crate::types::Error::Crypto("signed record AEAD decryption failed".into()))
 }
 
-/// Verify an identity-addressed record (Ed25519-signed hello).
-/// TODO(pq-migration): identity::verify now requires (algo, pubkey, msg, sig).
-/// PeerId is a hash, not a raw pubkey. Verification with the full pubkey
-/// will be handled in node.rs once the pubkey is available from the cache.
-pub fn verify_identity_record(_peer_id: &PeerId, _value: &[u8], _signature: &[u8]) -> bool {
-    // TODO: needs pubkey + algo to verify; stubbed until node.rs wires this up
-    false
-}
 
 #[cfg(test)]
 mod tests {
@@ -1015,16 +1007,6 @@ mod tests {
         assert_eq!(store.records.len(), 0);
     }
 
-    #[test]
-    fn identity_record_verify() {
-        // TODO(pq-migration): verify_identity_record is stubbed (needs pubkey + algo).
-        // Once node.rs wires up pubkey-based verification, re-enable this test.
-        let kp = Keypair::generate();
-        let hello = b"hello record data";
-        let sig = kp.sign(hello);
-        // Currently returns false because verification needs the full pubkey, not just PeerId.
-        assert!(!verify_identity_record(&kp.peer_id(), hello, &sig));
-    }
 
     #[test]
     fn hello_higher_sequence_replaces() {

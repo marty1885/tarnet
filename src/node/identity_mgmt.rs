@@ -32,7 +32,9 @@ impl Node {
                     is_default: label == "default",
                 };
                 drop(is);
-                let _ = db.save_identity(&pi);
+                if let Err(e) = db.save_identity(&pi) {
+                    log::error!("Failed to persist new identity '{}' to disk: {}", label, e);
+                }
             }
         }
 
@@ -121,7 +123,9 @@ impl Node {
                     is_default: label == "default",
                 };
                 drop(is);
-                let _ = db.save_identity(&pi);
+                if let Err(e) = db.save_identity(&pi) {
+                    log::error!("Failed to persist updated identity '{}' to disk: {}", label, e);
+                }
             }
         }
 
@@ -225,7 +229,9 @@ impl Node {
 
         // Remove from database.
         if let Some(db) = &self.db {
-            let _ = db.delete_identity(label);
+            if let Err(e) = db.delete_identity(label) {
+                log::error!("Failed to delete identity '{}' from disk: {}", label, e);
+            }
         }
 
         Ok(())

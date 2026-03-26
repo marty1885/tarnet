@@ -1468,7 +1468,7 @@ impl Node {
         tokio::spawn(async move {
             // Wait a bit for initial links to establish
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let mut interval = tokio::time::interval(HELLO_PUBLISH_INTERVAL);
+            let mut interval = jittered_interval(HELLO_PUBLISH_INTERVAL);
             loop {
                 interval.tick().await;
                 let peer_id = hello_identity.peer_id();
@@ -1566,7 +1566,7 @@ impl Node {
         let repl_links = self.links.clone();
         let repl_identity = self.identity.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(REPLICATION_INTERVAL);
+            let mut interval = jittered_interval(REPLICATION_INTERVAL);
             loop {
                 interval.tick().await;
                 let store = repl_dht.lock().await;
@@ -2719,7 +2719,10 @@ async fn discovery_single_peer(
             }
         }
 
-        tokio::time::sleep(backoff).await;
+        use rand::Rng;
+        let jitter = backoff / 4;
+        let jittered = backoff + rand::thread_rng().gen_range(Duration::ZERO..=jitter * 2) - jitter;
+        tokio::time::sleep(jittered).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }
@@ -2825,7 +2828,10 @@ async fn bootstrap_single_peer(
         }
 
         first_attempt = false;
-        tokio::time::sleep(backoff).await;
+        use rand::Rng;
+        let jitter = backoff / 4;
+        let jittered = backoff + rand::thread_rng().gen_range(Duration::ZERO..=jitter * 2) - jitter;
+        tokio::time::sleep(jittered).await;
         backoff = (backoff * 2).min(MAX_BACKOFF);
     }
 }

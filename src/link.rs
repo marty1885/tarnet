@@ -2,7 +2,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -31,6 +31,8 @@ const REPLAY_WINDOW: u64 = 128;
 pub const REKEY_INTERVAL: u64 = 65536;
 /// Maximum allowed timestamp drift in seconds.
 const MAX_TIMESTAMP_DRIFT: u64 = 300;
+/// Maximum time allowed for the entire handshake (hello + auth + confirm).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Session keys for bidirectional encrypted communication.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -234,6 +236,16 @@ impl PeerLink {
         identity: &Keypair,
         expected_peer: Option<PeerId>,
     ) -> Result<Self> {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::initiator_inner(transport, identity, expected_peer))
+            .await
+            .map_err(|_| Error::Wire("handshake timed out".into()))?
+    }
+
+    async fn initiator_inner(
+        transport: Box<dyn Transport>,
+        identity: &Keypair,
+        expected_peer: Option<PeerId>,
+    ) -> Result<Self> {
         let mut rng = rand::rngs::OsRng;
         let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
         let eph_public = X25519Public::from(&eph_secret);
@@ -426,6 +438,12 @@ impl PeerLink {
 
     /// Perform handshake as the responder (the side that called accept).
     pub async fn responder(transport: Box<dyn Transport>, identity: &Keypair) -> Result<Self> {
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::responder_inner(transport, identity))
+            .await
+            .map_err(|_| Error::Wire("handshake timed out".into()))?
+    }
+
+    async fn responder_inner(transport: Box<dyn Transport>, identity: &Keypair) -> Result<Self> {
         let mut rng = rand::rngs::OsRng;
         let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
         let eph_public = X25519Public::from(&eph_secret);

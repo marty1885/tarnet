@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -9,6 +9,13 @@ use crate::wire;
 const MAX_SELECTIVE_ACKS: usize = 32;
 
 const DEFAULT_WINDOW_SIZE: u32 = 32;
+
+/// Maximum out-of-order packets buffered on the receive side.
+/// Caps memory usage from peers sending wildly out-of-order sequences.
+const MAX_RECV_BUF: usize = 128;
+
+/// Maximum retransmit batch per call to avoid burst storms after outages.
+const MAX_RETRANSMIT_BATCH: usize = 8;
 
 /// Wrapping-safe sequence comparison: true if `a` is strictly after `b`
 /// in the circular u32 sequence space (within a 2^31 window).
@@ -81,19 +88,21 @@ struct ReliableState {
     last_ack_at: Instant,
     /// When this channel was created (for death detection before first ACK).
     created_at: Instant,
-    // Receiver
+    // Receiver — ordered mode: full reorder buffer
     recv_next: u32,
     recv_buf: BTreeMap<u32, Vec<u8>>,
+    // Receiver — unordered mode: lightweight seen-set (no payload stored)
+    recv_seen: HashSet<u32>,
     // Delivered data ready for the application
     recv_ready: VecDeque<Vec<u8>>,
 }
 
 impl ReliableState {
-    fn new() -> Self {
+    fn with_window(window: u32) -> Self {
         let now = Instant::now();
         Self {
             send_seq: 0,
-            send_window: DEFAULT_WINDOW_SIZE,
+            send_window: window,
             send_buf: BTreeMap::new(),
             send_times: BTreeMap::new(),
             rto_ms: INITIAL_RTO_MS,
@@ -101,6 +110,7 @@ impl ReliableState {
             created_at: now,
             recv_next: 0,
             recv_buf: BTreeMap::new(),
+            recv_seen: HashSet::new(),
             recv_ready: VecDeque::new(),
         }
     }
@@ -125,11 +135,16 @@ impl ChannelState {
 impl Channel {
     /// Create a new channel with independent reliable/ordered flags.
     pub fn new(channel_id: u32, port: [u8; 32], reliable: bool, ordered: bool) -> Self {
+        Self::with_window(channel_id, port, reliable, ordered, DEFAULT_WINDOW_SIZE)
+    }
+
+    /// Create a channel with a custom send window size.
+    pub fn with_window(channel_id: u32, port: [u8; 32], reliable: bool, ordered: bool, window: u32) -> Self {
         let state = match (reliable, ordered) {
             (false, false) => ChannelState::RawDatagram,
             (false, true) => ChannelState::SequencedDatagram(SequencedState::new()),
-            (true, false) => ChannelState::ReliableUnordered(ReliableState::new()),
-            (true, true) => ChannelState::ReliableOrdered(ReliableState::new()),
+            (true, false) => ChannelState::ReliableUnordered(ReliableState::with_window(window)),
+            (true, true) => ChannelState::ReliableOrdered(ReliableState::with_window(window)),
         };
         Self {
             channel_id,
@@ -188,19 +203,19 @@ impl Channel {
                     // Next expected — deliver and advance
                     state.recv_ready.push_back(data);
                     state.recv_next = state.recv_next.wrapping_add(1);
-                    // Drain any buffered contiguous seqs
-                    while state.recv_buf.contains_key(&state.recv_next) {
-                        state.recv_buf.remove(&state.recv_next);
+                    // Advance past any seen seqs
+                    while state.recv_seen.remove(&state.recv_next) {
                         state.recv_next = state.recv_next.wrapping_add(1);
                     }
                 } else if seq_after(sequence, state.recv_next)
-                    && !state.recv_buf.contains_key(&sequence)
+                    && !state.recv_seen.contains(&sequence)
+                    && state.recv_seen.len() < MAX_RECV_BUF
                 {
                     // Out-of-order, not yet seen — deliver and mark
                     state.recv_ready.push_back(data);
-                    state.recv_buf.insert(sequence, Vec::new());
+                    state.recv_seen.insert(sequence);
                 }
-                // else: duplicate or old, ignore
+                // else: duplicate, old, or recv buffer full — drop
                 state.recv_ready.drain(..).collect()
             }
             ChannelState::ReliableOrdered(state) => {
@@ -213,11 +228,13 @@ impl Channel {
                         state.recv_ready.push_back(buffered);
                         state.recv_next = state.recv_next.wrapping_add(1);
                     }
-                } else if seq_after(sequence, state.recv_next) {
+                } else if seq_after(sequence, state.recv_next)
+                    && state.recv_buf.len() < MAX_RECV_BUF
+                {
                     // Out-of-order: buffer it (idempotent on duplicates)
                     state.recv_buf.entry(sequence).or_insert(data);
                 }
-                // else: duplicate or old, ignore
+                // else: duplicate, old, or recv buffer full — drop
                 state.recv_ready.drain(..).collect()
             }
         }
@@ -226,15 +243,27 @@ impl Channel {
     /// Generate an ACK message for the current receive state.
     /// Returns None for unreliable channels.
     pub fn generate_ack(&self) -> Option<(u32, Vec<u32>)> {
-        self.state.reliable_state().map(|state| {
-            let selective: Vec<u32> = state
-                .recv_buf
-                .keys()
-                .copied()
-                .take(MAX_SELECTIVE_ACKS)
-                .collect();
-            (state.recv_next, selective)
-        })
+        match &self.state {
+            ChannelState::ReliableUnordered(state) => {
+                let selective: Vec<u32> = state
+                    .recv_seen
+                    .iter()
+                    .copied()
+                    .take(MAX_SELECTIVE_ACKS)
+                    .collect();
+                Some((state.recv_next, selective))
+            }
+            ChannelState::ReliableOrdered(state) => {
+                let selective: Vec<u32> = state
+                    .recv_buf
+                    .keys()
+                    .copied()
+                    .take(MAX_SELECTIVE_ACKS)
+                    .collect();
+                Some((state.recv_next, selective))
+            }
+            _ => None,
+        }
     }
 
     /// Process a received ACK. Returns sequence numbers that were acknowledged
@@ -308,6 +337,9 @@ impl Channel {
         let rto = Duration::from_millis(state.rto_ms);
         let mut due = Vec::new();
         for (&seq, data) in &state.send_buf {
+            if due.len() >= MAX_RETRANSMIT_BATCH {
+                break;
+            }
             if let Some(&sent_at) = state.send_times.get(&seq) {
                 if now.duration_since(sent_at) >= rto {
                     due.push((seq, data.clone()));
