@@ -295,6 +295,11 @@ impl LinkTable {
             .filter_map(|(pid, pt)| pt.active_link().map(|link| (pid, link)))
     }
 
+    /// True when no peers are connected at all.
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
     /// Check if we have any link to a peer.
     pub fn contains_key(&self, peer: &PeerId) -> bool {
         self.peers

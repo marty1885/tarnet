@@ -451,6 +451,12 @@ pub struct Node {
     probe_seen: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
     /// Pending route probes: target → list of completion notifiers.
     pending_probes: Arc<Mutex<HashMap<PeerId, Vec<oneshot::Sender<u16>>>>>,
+    /// Discovery handle for reconnection. Set by `run()`.
+    discovery: Arc<Mutex<Option<Arc<Box<dyn Discovery>>>>>,
+    /// Bootstrap addresses for isolation recovery. Set by `run()`.
+    bootstrap_addrs: Arc<Mutex<Vec<String>>>,
+    /// Guard to prevent multiple isolation recovery tasks from running.
+    isolation_recovery_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Restore a Keypair from persisted identity data.
@@ -650,6 +656,9 @@ impl Node {
             probe_reverse: Arc::new(Mutex::new(HashMap::new())),
             probe_seen: Arc::new(Mutex::new(HashMap::new())),
             pending_probes: Arc::new(Mutex::new(HashMap::new())),
+            discovery: Arc::new(Mutex::new(None)),
+            bootstrap_addrs: Arc::new(Mutex::new(Vec::new())),
+            isolation_recovery_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -763,6 +772,8 @@ impl Node {
         discovery_addrs: Vec<String>,
     ) -> Result<()> {
         let discovery = Arc::new(discovery);
+        *self.discovery.lock().await = Some(discovery.clone());
+        *self.bootstrap_addrs.lock().await = bootstrap.clone();
 
         // Start accepting connections
         let disc_accept = discovery.clone();
@@ -1993,6 +2004,176 @@ impl Node {
                 .send(ChannelEvent::PeerDisconnected { peer_id })
                 .await;
         }
+
+        // If we have zero links remaining, enter isolation recovery mode.
+        // Try bootstrap peers + cached Hello addresses with exp backoff capped at 15min.
+        if self.links.lock().await.is_empty() {
+            self.spawn_isolation_recovery();
+        }
+    }
+
+    /// Spawn isolation recovery: when we have zero links, aggressively try to
+    /// reconnect using bootstrap peers and cached Hello addresses.
+    /// Exponential backoff from 5s to 15min, loops forever until a link is established.
+    fn spawn_isolation_recovery(&self) {
+        // Prevent multiple recovery tasks from stacking up.
+        if self
+            .isolation_recovery_active
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+
+        log::warn!("Node isolated (zero links), starting isolation recovery");
+
+        let discovery = self.discovery.clone();
+        let links = self.links.clone();
+        let identity = self.identity.clone();
+        let event_tx = self.event_tx.clone();
+        let bootstrap_addrs = self.bootstrap_addrs.clone();
+        let kbucket = self.kbucket.clone();
+        let dht_store = self.dht_store.clone();
+        let active_flag = self.isolation_recovery_active.clone();
+
+        tokio::spawn(async move {
+            const BASE_DELAY: Duration = Duration::from_secs(5);
+            const MAX_DELAY: Duration = Duration::from_secs(900); // 15 minutes
+
+            let mut backoff = BASE_DELAY;
+
+            // First attempt is immediate (no delay).
+            let mut first = true;
+
+            loop {
+                if !first {
+                    // Jitter: ±25% of backoff to avoid thundering herd
+                    let jitter_range = backoff / 4;
+                    let jitter = Duration::from_millis(
+                        rand::Rng::gen_range(&mut rand::thread_rng(), 0..=jitter_range.as_millis() as u64 * 2),
+                    );
+                    let delay = backoff - jitter_range + jitter;
+                    tokio::time::sleep(delay).await;
+                }
+                first = false;
+
+                // Check if we're still isolated.
+                if !links.lock().await.is_empty() {
+                    log::info!("Isolation recovery: link established, stopping");
+                    active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+
+                let disc = match discovery.lock().await.clone() {
+                    Some(d) => d,
+                    None => {
+                        active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                        return;
+                    }
+                };
+
+                // Gather seed addresses: bootstrap peers first, then cached Hellos.
+                let mut seed_addrs: Vec<String> = Vec::new();
+
+                // Bootstrap peers (always available, highest priority).
+                for addr in bootstrap_addrs.lock().await.iter() {
+                    if let Some(connect_addr) = resolve_bootstrap_addr(addr) {
+                        seed_addrs.push(connect_addr);
+                    }
+                }
+
+                // Cached Hello addresses from kbucket peers.
+                let kb_peers: Vec<PeerId> = kbucket
+                    .lock()
+                    .await
+                    .all_peers()
+                    .into_iter()
+                    .map(|(pid, _)| pid)
+                    .collect();
+
+                for pid in &kb_peers {
+                    let key = crate::dht::identity_address_key(pid);
+                    let store = dht_store.lock().await;
+                    for record in store.get(&key) {
+                        if record.record_type != crate::types::RecordType::Hello {
+                            continue;
+                        }
+                        if record.signer != *pid.as_bytes() {
+                            continue;
+                        }
+                        if let Ok(plaintext) =
+                            crate::dht::signed_record_decrypt(&key, &record.value)
+                        {
+                            if let Ok(hello) = HelloRecord::from_bytes(&plaintext) {
+                                for addr in &hello.global_addresses {
+                                    if let Some(s) = addr.to_connect_string() {
+                                        if !seed_addrs.contains(&s) {
+                                            seed_addrs.push(s);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if seed_addrs.is_empty() {
+                    log::warn!("Isolation recovery: no seed addresses available");
+                    backoff = (backoff * 2).min(MAX_DELAY);
+                    continue;
+                }
+
+                log::info!(
+                    "Isolation recovery: trying {} seed addresses (backoff={}s)",
+                    seed_addrs.len(),
+                    backoff.as_secs(),
+                );
+
+                let mut connected = false;
+                for addr_str in &seed_addrs {
+                    match disc.connect(addr_str).await {
+                        Ok(transport) => {
+                            match PeerLink::initiator(transport, &identity, None).await {
+                                Ok(link) => {
+                                    let link = Arc::new(link);
+                                    log::info!(
+                                        "Isolation recovery: connected to {:?} via {}",
+                                        link.remote_peer(),
+                                        addr_str,
+                                    );
+                                    let _ = event_tx
+                                        .send(NodeEvent::LinkUp(link.remote_peer(), link))
+                                        .await;
+                                    connected = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    log::debug!(
+                                        "Isolation recovery: handshake to {} failed: {}",
+                                        addr_str,
+                                        e,
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!(
+                                "Isolation recovery: connect to {} failed: {}",
+                                addr_str,
+                                e,
+                            );
+                        }
+                    }
+                }
+
+                if connected {
+                    log::info!("Isolation recovery: reconnected, stopping");
+                    active_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+
+                backoff = (backoff * 2).min(MAX_DELAY);
+            }
+        });
     }
 
     async fn handle_message(&self, from: PeerId, msg: WireMessage) -> Result<()> {
