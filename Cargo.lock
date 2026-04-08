@@ -2581,6 +2581,7 @@ dependencies = [
  "serde_json",
  "sha1_smol",
  "sha2 0.10.9",
+ "subtle",
  "tarnet-api",
  "tarnet-client",
  "thiserror 2.0.18",

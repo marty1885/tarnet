@@ -13,6 +13,7 @@ use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 
 use crate::crypto::{kdf, mac_16};
 use crate::types::{Error, PeerId, Result};
@@ -538,7 +539,7 @@ impl RelayCell {
         let payload = &cell[5 + DIGEST_SIZE..5 + DIGEST_SIZE + length];
 
         let expected = relay_cell_digest(digest_key, &cell[..5], payload);
-        if stored_digest != expected {
+        if stored_digest.ct_eq(&expected).unwrap_u8() == 0 {
             return Err(Error::Crypto("relay cell digest mismatch".into()));
         }
 

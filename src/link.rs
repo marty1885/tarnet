@@ -2,6 +2,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 
@@ -406,7 +407,12 @@ impl PeerLink {
         let wire = WireMessage::decode(&buf[..n])?;
         let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, false);
-        if peer_confirm.confirm_hash != expected_peer_confirm {
+        if peer_confirm
+            .confirm_hash
+            .ct_eq(&expected_peer_confirm)
+            .unwrap_u8()
+            == 0
+        {
             return Err(Error::Crypto("key confirmation failed".into()));
         }
 
@@ -592,7 +598,12 @@ impl PeerLink {
         let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
 
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, true);
-        if peer_confirm.confirm_hash != expected_peer_confirm {
+        if peer_confirm
+            .confirm_hash
+            .ct_eq(&expected_peer_confirm)
+            .unwrap_u8()
+            == 0
+        {
             return Err(Error::Crypto("key confirmation failed".into()));
         }
 

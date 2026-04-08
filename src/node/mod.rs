@@ -2221,13 +2221,15 @@ impl Node {
                     );
                     let algo = SigningAlgo::from_u8(put.signer_algo)
                         .map_err(|e| Error::Protocol(format!("unknown signer algo: {}", e)))?;
-                    if !put.signer_pubkey.is_empty() {
-                        // Verify that the signer pubkey matches the claimed signer PeerId
-                        let expected_peer = peer_id_from_signing_pubkey(&put.signer_pubkey);
-                        if expected_peer != PeerId(put.signer) {
-                            log::warn!("DHT PUT from {:?}: signer pubkey does not match signer PeerId, dropping", from);
-                            return Ok(());
-                        }
+                    if put.signer_pubkey.is_empty() {
+                        log::warn!("DHT PUT from {:?}: signed record missing signer pubkey, dropping", from);
+                        return Ok(());
+                    }
+                    // Verify that the signer pubkey matches the claimed signer PeerId
+                    let expected_peer = peer_id_from_signing_pubkey(&put.signer_pubkey);
+                    if expected_peer != PeerId(put.signer) {
+                        log::warn!("DHT PUT from {:?}: signer pubkey does not match signer PeerId, dropping", from);
+                        return Ok(());
                     }
                     if !identity::verify(
                         algo,
