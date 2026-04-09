@@ -41,7 +41,7 @@ impl Node {
         if targets.is_empty() {
             for (peer_id, link) in links.iter() {
                 if *peer_id != from && !bloom.contains(peer_id) {
-                    let _ = link.send_message(encoded).await;
+                    let _ = link.send_deferred(encoded).await;
                 }
             }
         } else {
@@ -50,7 +50,7 @@ impl Node {
                     && (!bloom.contains(pid) || is_k_closest(pid, key, &all_peers, DHT_K))
                 {
                     if let Some(link) = links.get(pid) {
-                        let _ = link.send_message(encoded).await;
+                        let _ = link.send_deferred(encoded).await;
                     }
                 }
             }

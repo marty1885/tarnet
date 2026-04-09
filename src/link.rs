@@ -24,6 +24,16 @@ use tarnet_api::types::{KemAlgo, SigningAlgo};
 /// via missing SENDMEs.
 const OUTBOUND_QUEUE_SIZE: usize = 4096;
 
+/// Minimum size for all link-layer frames after padding.
+/// Matches a CircuitRelay message: HEADER(5) + circuit_id(4) + CELL_SIZE(1424) = 1433.
+/// All smaller messages are padded to this size before encryption so an observer
+/// cannot classify messages by ciphertext length.
+const LINK_PAD_SIZE: usize = 1433;
+
+/// Maximum time a deferred (non-critical) message waits before being flushed,
+/// even if no high-priority message arrives to piggyback on.
+const DEFERRED_FLUSH_MS: u64 = 30;
+
 const TAG_SIZE: usize = 16;
 const SEQ_SIZE: usize = 8;
 /// Sliding window size for replay detection.
@@ -212,6 +222,8 @@ pub struct PeerLink {
     transport: Arc<dyn Transport>,
     crypto: tokio::sync::Mutex<LinkCrypto>,
     outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Non-critical messages coalesced with the next high-priority send.
+    deferred_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     remote_peer: PeerId,
     remote_signing_algo: SigningAlgo,
     remote_signing_pubkey: Vec<u8>,
@@ -423,11 +435,12 @@ impl PeerLink {
         );
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
-        let (outbound_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
+        let (outbound_tx, deferred_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
         Ok(Self {
             transport,
             crypto: tokio::sync::Mutex::new(crypto),
             outbound_tx,
+            deferred_tx,
             remote_peer,
             remote_signing_algo,
             remote_signing_pubkey: peer_hello.signing_pubkey,
@@ -619,11 +632,12 @@ impl PeerLink {
         );
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
-        let (outbound_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
+        let (outbound_tx, deferred_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
         Ok(Self {
             transport,
             crypto: tokio::sync::Mutex::new(crypto),
             outbound_tx,
+            deferred_tx,
             remote_peer,
             remote_signing_algo,
             remote_signing_pubkey: peer_hello.signing_pubkey,
@@ -679,41 +693,135 @@ impl PeerLink {
     }
 
     /// Spawn the background drain task that writes queued cells to the transport.
+    ///
+    /// Returns (high_priority_tx, deferred_tx, join_handle).
+    /// High-priority messages are sent immediately.  Deferred messages are held
+    /// for up to [`DEFERRED_FLUSH_MS`] and piggyback on the next high-priority
+    /// send, reducing the number of distinctly-timed frames on the wire.
     fn spawn_drain(
         transport: Arc<dyn Transport>,
         remote: PeerId,
     ) -> (
         tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::sync::mpsc::Sender<Vec<u8>>,
         tokio::task::JoinHandle<()>,
     ) {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
+        let (def_tx, mut def_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
+
         let task = tokio::spawn(async move {
-            while let Some(data) = rx.recv().await {
-                if let Err(e) = transport.send(&data).await {
-                    log::debug!("link drain to {:?}: {}", remote, e);
-                    break;
+            /// Flush all pending deferred messages.
+            async fn flush_deferred(
+                def_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
+                transport: &Arc<dyn Transport>,
+                remote: PeerId,
+            ) -> bool {
+                while let Ok(data) = def_rx.try_recv() {
+                    if let Err(e) = transport.send(&data).await {
+                        log::debug!("link drain (deferred) to {:?}: {}", remote, e);
+                        return false;
+                    }
+                }
+                true
+            }
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    // High-priority: send immediately, then piggyback deferred.
+                    msg = rx.recv() => {
+                        let Some(data) = msg else { break };
+                        if let Err(e) = transport.send(&data).await {
+                            log::debug!("link drain to {:?}: {}", remote, e);
+                            break;
+                        }
+                        if !flush_deferred(&mut def_rx, &transport, remote).await {
+                            break;
+                        }
+                    }
+
+                    // Deferred: wait briefly for a high-priority message to coalesce with.
+                    msg = def_rx.recv() => {
+                        let Some(data) = msg else { break };
+                        // Short sleep — if a circuit cell arrives during this window it
+                        // will be handled by the biased high-priority branch above and
+                        // then flush_deferred drains the rest.
+                        let jitter = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(0..DEFERRED_FLUSH_MS)
+                        };
+                        tokio::time::sleep(Duration::from_millis(
+                            DEFERRED_FLUSH_MS + jitter,
+                        )).await;
+
+                        // After the wait, send the deferred message plus any others
+                        // that queued up in the meantime.
+                        if let Err(e) = transport.send(&data).await {
+                            log::debug!("link drain (deferred) to {:?}: {}", remote, e);
+                            break;
+                        }
+                        if !flush_deferred(&mut def_rx, &transport, remote).await {
+                            break;
+                        }
+                    }
                 }
             }
         });
-        (tx, task)
+        (tx, def_tx, task)
     }
 
-    /// Send an encrypted message over the bulk (data) queue.
-    ///
-    /// If the queue is full (peer is congested), the cell is silently
-    /// dropped — end-to-end flow control handles recovery.
-    pub async fn send_message(&self, data: &[u8]) -> Result<()> {
-        let encrypted = self.crypto.lock().await.encrypt(data);
-        match self.outbound_tx.try_send(encrypted) {
+    /// Pad a wire message to [`LINK_PAD_SIZE`] so all link-layer frames are
+    /// the same ciphertext length, preventing message-type classification by size.
+    fn pad(data: &[u8]) -> Vec<u8> {
+        if data.len() >= LINK_PAD_SIZE {
+            return data.to_vec();
+        }
+        let mut padded = Vec::with_capacity(LINK_PAD_SIZE);
+        padded.extend_from_slice(data);
+        padded.resize(LINK_PAD_SIZE, 0);
+        padded
+    }
+
+    /// Encrypt and enqueue a message (pad → encrypt → channel).
+    fn encrypt_and_enqueue(
+        crypto: &mut LinkCrypto,
+        tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        data: &[u8],
+        remote: PeerId,
+    ) -> Result<()> {
+        let padded = Self::pad(data);
+        let encrypted = crypto.encrypt(&padded);
+        match tx.try_send(encrypted) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                log::trace!("outbound queue full to {:?}, dropping", self.remote_peer);
+                log::trace!("outbound queue full to {:?}, dropping", remote);
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 Err(Error::Wire("link closed".into()))
             }
         }
+    }
+
+    /// Send an encrypted message over the high-priority (data) queue.
+    ///
+    /// Messages are padded to [`LINK_PAD_SIZE`] before encryption.
+    /// If the queue is full (peer is congested), the cell is silently
+    /// dropped — end-to-end flow control handles recovery.
+    pub async fn send_message(&self, data: &[u8]) -> Result<()> {
+        let mut crypto = self.crypto.lock().await;
+        Self::encrypt_and_enqueue(&mut crypto, &self.outbound_tx, data, self.remote_peer)
+    }
+
+    /// Send a non-critical message via the deferred queue.
+    ///
+    /// The drain task holds deferred messages for up to [`DEFERRED_FLUSH_MS`]
+    /// and flushes them alongside the next high-priority message, reducing the
+    /// number of distinctly-timed link-layer frames an observer can see.
+    pub async fn send_deferred(&self, data: &[u8]) -> Result<()> {
+        let mut crypto = self.crypto.lock().await;
+        Self::encrypt_and_enqueue(&mut crypto, &self.deferred_tx, data, self.remote_peer)
     }
 
     /// Receive and decrypt a message from the link.

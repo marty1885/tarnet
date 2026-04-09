@@ -1081,7 +1081,7 @@ impl Node {
                         .collect()
                 };
                 for (peer_id, link, msg) in to_send {
-                    if let Err(e) = link.send_message(&msg).await {
+                    if let Err(e) = link.send_deferred(&msg).await {
                         log::warn!("Failed to send route ad to {:?}: {}", peer_id, e);
                     }
                 }
@@ -1133,7 +1133,7 @@ impl Node {
                 };
                 let encoded = ka_msg.to_wire().encode();
                 for (_peer, _link_id, link) in idle {
-                    let _ = link.send_message(&encoded).await;
+                    let _ = link.send_deferred(&encoded).await;
                 }
             }
         });
@@ -1552,18 +1552,18 @@ impl Node {
                 if targets.is_empty() {
                     // Fallback: send to all neighbors
                     for (_, link) in links.iter() {
-                        let _ = link.send_message(&encoded).await;
+                        let _ = link.send_deferred(&encoded).await;
                     }
                 } else {
                     for (pid, _) in &targets {
                         if let Some(link) = links.get(pid) {
-                            let _ = link.send_message(&encoded).await;
+                            let _ = link.send_deferred(&encoded).await;
                         }
                     }
                     // Also send to direct neighbors not in selected set
                     for (pid, link) in links.iter() {
                         if !targets.iter().any(|(p, _)| p == pid) {
-                            let _ = link.send_message(&encoded).await;
+                            let _ = link.send_deferred(&encoded).await;
                         }
                     }
                 }
@@ -1622,7 +1622,7 @@ impl Node {
                     let links = repl_links.lock().await;
                     for (pid, _) in &closest {
                         if let Some(link) = links.get(pid) {
-                            let _ = link.send_message(&encoded).await;
+                            let _ = link.send_deferred(&encoded).await;
                         }
                     }
                 }
@@ -1816,7 +1816,7 @@ impl Node {
             let ad = dv::generate_advertisement(&self.identity, &table, &peer_id);
             let link = self.links.lock().await.get(&peer_id).cloned();
             if let Some(link) = link {
-                if let Err(e) = link.send_message(&ad.to_wire().encode()).await {
+                if let Err(e) = link.send_deferred(&ad.to_wire().encode()).await {
                     log::warn!("Failed to send initial route ad to {:?}: {}", peer_id, e);
                 }
             }
@@ -1852,7 +1852,7 @@ impl Node {
             };
             put.signature = self.identity.sign(&put.signable_bytes());
             if let Some(link) = self.links.lock().await.get(&peer_id) {
-                let _ = link.send_message(&put.to_wire().encode()).await;
+                let _ = link.send_deferred(&put.to_wire().encode()).await;
             }
         }
 
@@ -1876,7 +1876,7 @@ impl Node {
                         hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
                         bloom: [0u8; 256],
                     };
-                    let _ = link.send_message(&put.to_wire().encode()).await;
+                    let _ = link.send_deferred(&put.to_wire().encode()).await;
                 }
             }
         }
@@ -1900,7 +1900,7 @@ impl Node {
                             query_token: token,
                             expiration_secs: 300,
                         };
-                        let _ = link.send_message(&watch.to_wire().encode()).await;
+                        let _ = link.send_deferred(&watch.to_wire().encode()).await;
                     }
                 }
             }
@@ -2293,7 +2293,7 @@ impl Node {
                                 };
                                 let notify_encoded = notify.to_wire().encode();
                                 if let Some(link) = links.get(&via_peer) {
-                                    let _ = link.send_message(&notify_encoded).await;
+                                    let _ = link.send_deferred(&notify_encoded).await;
                                 }
                             }
                         }
@@ -2357,7 +2357,7 @@ impl Node {
                         records: response_records,
                     };
                     // Send response back toward the requester via previous hop
-                    self.send_to_peer(&from, &response.to_wire().encode())
+                    self.send_to_peer_deferred(&from, &response.to_wire().encode())
                         .await?;
                 }
 
@@ -2437,7 +2437,7 @@ impl Node {
                         log::debug!("DhtGetResponse arrived for our query");
                     } else {
                         // Forward response back toward originator
-                        self.send_to_peer(&prev, &resp.to_wire().encode()).await?;
+                        self.send_to_peer_deferred(&prev, &resp.to_wire().encode()).await?;
                     }
                 } else {
                     log::debug!("DhtGetResponse with unknown query_token, storing locally only");
@@ -2454,7 +2454,7 @@ impl Node {
                     key: find.key,
                     peers: closest,
                 };
-                self.send_to_peer(&from, &response.to_wire().encode())
+                self.send_to_peer_deferred(&from, &response.to_wire().encode())
                     .await?;
             }
             MessageType::DhtFindClosestResponse => {
@@ -2503,7 +2503,7 @@ impl Node {
                     // This is a ping — echo it back as a pong (no timestamp = pong)
                     let pong = KeepaliveMsg { timestamp_us: None };
                     if let Some(link) = self.links.lock().await.get(&from).cloned() {
-                        let _ = link.send_message(&pong.to_wire().encode()).await;
+                        let _ = link.send_deferred(&pong.to_wire().encode()).await;
                     }
                     // Also compute RTT if we have a reasonable timestamp
                     let now_us = SystemTime::now()
@@ -2574,7 +2574,7 @@ impl Node {
                         .get(&notify.query_token)
                         .map(|(peer, _)| *peer);
                     if let Some(prev) = prev_hop {
-                        self.send_to_peer(&prev, &notify.to_wire().encode()).await?;
+                        self.send_to_peer_deferred(&prev, &notify.to_wire().encode()).await?;
                     } else {
                         log::debug!("DhtWatchNotify with unknown query_token, dropping");
                     }
@@ -2612,7 +2612,7 @@ impl Node {
                 continue;
             }
             let ad = dv::generate_advertisement(&self.identity, &table, peer_id);
-            if let Err(e) = link.send_message(&ad.to_wire().encode()).await {
+            if let Err(e) = link.send_deferred(&ad.to_wire().encode()).await {
                 log::warn!("Failed triggered update to {:?}: {}", peer_id, e);
             }
         }
@@ -2626,6 +2626,19 @@ impl Node {
             .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
         self.stats.record_send(peer, data.len() as u64);
         link.send_message(data).await
+    }
+
+    /// Send a non-critical message via the deferred (coalescing) queue.
+    /// The link drain task holds these briefly and flushes them alongside
+    /// the next high-priority send.
+    async fn send_to_peer_deferred(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
+        self.bandwidth.acquire_upload(data.len()).await;
+        let links = self.links.lock().await;
+        let link = links
+            .get(peer)
+            .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
+        self.stats.record_send(peer, data.len() as u64);
+        link.send_deferred(data).await
     }
 
     /// Get the list of connected peers.

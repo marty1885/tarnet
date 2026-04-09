@@ -43,7 +43,7 @@ impl Node {
                 target: probe.target,
                 cost: 0,
             };
-            self.send_to_peer(&from, &reply.to_wire().encode()).await?;
+            self.send_to_peer_deferred(&from, &reply.to_wire().encode()).await?;
             return Ok(());
         }
 
@@ -62,7 +62,7 @@ impl Node {
                 target: probe.target,
                 cost: cost.min(u16::MAX as u32) as u16,
             };
-            self.send_to_peer(&from, &reply.to_wire().encode()).await?;
+            self.send_to_peer_deferred(&from, &reply.to_wire().encode()).await?;
             return Ok(());
         }
 
@@ -95,7 +95,7 @@ impl Node {
             ttl: capped_ttl - 1,
             hops: probe.hops.saturating_add(1),
         };
-        self.send_to_peer(&forward_to, &forwarded.to_wire().encode())
+        self.send_to_peer_deferred(&forward_to, &forwarded.to_wire().encode())
             .await?;
 
         Ok(())
@@ -144,7 +144,7 @@ impl Node {
                 target: found.target,
                 cost: found.cost.saturating_add(1),
             };
-            self.send_to_peer(&next_peer, &forwarded.to_wire().encode())
+            self.send_to_peer_deferred(&next_peer, &forwarded.to_wire().encode())
                 .await?;
         }
 

@@ -307,7 +307,7 @@ impl Node {
         let encoded = put.to_wire().encode();
         let links = self.links.lock().await;
         for (peer_id, link) in links.iter() {
-            if let Err(e) = link.send_message(&encoded).await {
+            if let Err(e) = link.send_deferred(&encoded).await {
                 log::warn!("Failed to send hello PUT to {:?}: {}", peer_id, e);
             }
         }
@@ -368,7 +368,7 @@ impl Node {
         // Send to all direct neighbors (multipath)
         let links = self.links.lock().await;
         for (peer_id, link) in links.iter() {
-            if let Err(e) = link.send_message(&encoded).await {
+            if let Err(e) = link.send_deferred(&encoded).await {
                 log::warn!("Failed to send DHT GET to {:?}: {}", peer_id, e);
             }
         }
