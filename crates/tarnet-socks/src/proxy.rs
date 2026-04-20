@@ -241,22 +241,40 @@ async fn handle_tarnet_route<S: ServiceApi + 'static>(
         None
     };
 
-    let port_name = port.to_string();
+    // Try the service name (hostname first label) as the port name first.
+    // Subdomain services register using their subdomain as the port name,
+    // so e.g. "nina" in "nina.service-directory" maps to port "nina".
+    // Fall back to the numeric URL port for apex services.
     let conn = match state
         .api
         .connect_as(
             service_id,
             PortMode::ReliableOrdered,
-            &port_name,
+            service_name,
             source_sid,
         )
         .await
     {
         Ok(c) => c,
-        Err(e) => {
-            error!("Failed to connect to {}: {}", service_id, e);
-            socks5::send_host_unreachable(&mut stream).await?;
-            return Ok(());
+        Err(_) => {
+            let port_name = port.to_string();
+            match state
+                .api
+                .connect_as(
+                    service_id,
+                    PortMode::ReliableOrdered,
+                    &port_name,
+                    source_sid,
+                )
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Failed to connect to {}: {}", service_id, e);
+                    socks5::send_host_unreachable(&mut stream).await?;
+                    return Ok(());
+                }
+            }
         }
     };
 

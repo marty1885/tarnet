@@ -214,14 +214,23 @@ async fn register_services<S: ServiceApi>(
             }
         };
 
-        let port = match listen_port(&svc.config) {
-            Some(p) => p,
-            None => {
-                error!(
-                    "Cannot parse port from '{}' for '{}'",
-                    svc.config.local, svc.filename
-                );
-                continue;
+        // When a service has a subdomain, use the subdomain as the tarnet
+        // port name so that multiple subdomain services under the same
+        // identity don't collide.  Without this, both "nina" and "blog"
+        // would register on the same numeric port and only the last one
+        // would receive connections.
+        let port_name = if let Some(ref subdomain) = svc.config.subdomain {
+            subdomain.clone()
+        } else {
+            match listen_port(&svc.config) {
+                Some(p) => p.to_string(),
+                None => {
+                    error!(
+                        "Cannot parse port from '{}' for '{}'",
+                        svc.config.local, svc.filename
+                    );
+                    continue;
+                }
             }
         };
 
@@ -235,7 +244,7 @@ async fn register_services<S: ServiceApi>(
             .listen(
                 sid,
                 mode,
-                &port.to_string(),
+                &port_name,
                 ListenerOptions::default(),
             )
             .await
@@ -244,7 +253,7 @@ async fn register_services<S: ServiceApi>(
             Err(e) => {
                 error!(
                     "Failed to listen on {:?} port {} for '{}': {}",
-                    sid, port, svc.filename, e
+                    sid, port_name, svc.filename, e
                 );
                 continue;
             }
@@ -256,7 +265,7 @@ async fn register_services<S: ServiceApi>(
         });
         info!(
             "Registered service '{}' on {:?} port {}",
-            svc.filename, sid, port
+            svc.filename, sid, port_name
         );
     }
 
