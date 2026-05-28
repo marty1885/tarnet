@@ -389,33 +389,52 @@ impl RekeyMsg {
     }
 }
 
-/// Keepalive: optional timestamp (u64 BE, microseconds since link epoch) for RTT measurement.
-/// Empty payload is valid (pure keepalive). With timestamp, the receiver echoes it back.
+/// Heartbeat / keepalive. Doubles as cover traffic: the wire format always
+/// carries random padding so size-based traffic analysis can't trivially tell
+/// heartbeats from real protocol messages.
+///
+/// Format: flags(u8) || [timestamp_us(u64 BE) if flags & 1] || padding(rest)
+///   - flags bit 0: 1 = has timestamp (ping), 0 = no timestamp (pong)
+///   - padding: random bytes, ignored on receive
 #[derive(Debug, Clone)]
 pub struct KeepaliveMsg {
     /// If Some, this is a ping with a timestamp. The receiver should echo it back.
-    /// If None, this is a pong (echo response) or a simple keepalive.
+    /// If None, this is a pong (echo response).
     pub timestamp_us: Option<u64>,
+    /// Random padding bytes. Set by sender; receiver discards.
+    pub padding: Vec<u8>,
 }
 
 impl KeepaliveMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
-        match self.timestamp_us {
-            Some(ts) => ts.to_be_bytes().to_vec(),
-            None => Vec::new(),
+        let mut out = Vec::with_capacity(1 + 8 + self.padding.len());
+        let flags: u8 = if self.timestamp_us.is_some() { 1 } else { 0 };
+        out.push(flags);
+        if let Some(ts) = self.timestamp_us {
+            out.extend_from_slice(&ts.to_be_bytes());
         }
+        out.extend_from_slice(&self.padding);
+        out
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() >= 8 {
-            let mut r = Reader::new(data);
-            let ts = r.read_u64()?;
-            Ok(Self {
-                timestamp_us: Some(ts),
-            })
-        } else {
-            Ok(Self { timestamp_us: None })
+        if data.is_empty() {
+            return Ok(Self {
+                timestamp_us: None,
+                padding: Vec::new(),
+            });
         }
+        let mut r = Reader::new(data);
+        let flags = r.read_u8()?;
+        let timestamp_us = if flags & 1 != 0 {
+            Some(r.read_u64()?)
+        } else {
+            None
+        };
+        Ok(Self {
+            timestamp_us,
+            padding: Vec::new(),
+        })
     }
 
     pub fn to_wire(&self) -> WireMessage {

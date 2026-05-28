@@ -28,6 +28,7 @@ pub struct Route {
     pub next_hop: PeerId,
     pub cost: u32,
     pub last_updated: Instant,
+    pub source: RouteSource,
 }
 
 /// Routing table: maps destination PeerId to top-k routes.
@@ -103,7 +104,7 @@ impl RoutingTable {
 
         // Fast path: destination already in table (update-in-place, no eviction needed).
         if let Some(routes) = self.routes.get_mut(&dest) {
-            return Self::update_routes_vec(routes, next_hop, cost);
+            return Self::update_routes_vec(routes, next_hop, cost, source);
         }
 
         // New destination — may need eviction if table is full.
@@ -115,25 +116,49 @@ impl RoutingTable {
 
         // Insert new destination.
         let routes = self.routes.entry(dest).or_default();
-        Self::update_routes_vec(routes, next_hop, cost);
+        Self::update_routes_vec(routes, next_hop, cost, source);
         true
+    }
+
+    /// Refresh `last_updated` on the direct-neighbor route to `peer` (if present).
+    /// Called from the heartbeat task — as long as the link is alive, the route
+    /// should never look stale to `expire()`.
+    pub fn refresh_neighbor(&mut self, peer: &PeerId) {
+        if let Some(routes) = self.routes.get_mut(peer) {
+            if let Some(r) = routes.iter_mut().find(|r| r.next_hop == *peer) {
+                r.last_updated = Instant::now();
+            }
+        }
     }
 
     /// Update the route vec for an existing or freshly-inserted destination.
     /// Returns true if anything changed.
-    fn update_routes_vec(routes: &mut Vec<Route>, next_hop: PeerId, cost: u32) -> bool {
+    fn update_routes_vec(
+        routes: &mut Vec<Route>,
+        next_hop: PeerId,
+        cost: u32,
+        source: RouteSource,
+    ) -> bool {
         if let Some(existing) = routes.iter_mut().find(|r| r.next_hop == next_hop) {
             if existing.cost == cost {
                 existing.last_updated = Instant::now();
+                // A Local re-add of an existing Advertisement route upgrades it to Local.
+                if source == RouteSource::Local {
+                    existing.source = RouteSource::Local;
+                }
                 return false;
             }
             existing.cost = cost;
             existing.last_updated = Instant::now();
+            if source == RouteSource::Local {
+                existing.source = RouteSource::Local;
+            }
         } else if routes.len() < MAX_ROUTES_PER_DEST {
             routes.push(Route {
                 next_hop,
                 cost,
                 last_updated: Instant::now(),
+                source,
             });
         } else {
             // Replace worst route if new one is better
@@ -144,6 +169,7 @@ impl RoutingTable {
                         next_hop,
                         cost,
                         last_updated: Instant::now(),
+                        source,
                     };
                 } else {
                     return false;
@@ -259,11 +285,14 @@ impl RoutingTable {
             .collect()
     }
 
-    /// Expire routes older than the given duration.
+    /// Expire DV-learned routes older than `max_age`. Local-source routes
+    /// (direct neighbors, route-probe results) are owned by their respective
+    /// subsystems and never expire on a timer — they go away through
+    /// `remove_next_hop` when the link dies.
     pub fn expire(&mut self, max_age: std::time::Duration) {
         let cutoff = Instant::now() - max_age;
         self.routes.retain(|_, routes| {
-            routes.retain(|r| r.last_updated > cutoff);
+            routes.retain(|r| r.source == RouteSource::Local || r.last_updated > cutoff);
             !routes.is_empty()
         });
     }
@@ -419,5 +448,36 @@ mod tests {
             );
         }
         assert_eq!(rt.len(), 50); // all fit, no eviction
+    }
+
+    #[test]
+    fn local_routes_survive_expire() {
+        // Direct-neighbor routes are owned by the link layer and must not
+        // be expired by the DV freshness timer, even if their last_updated
+        // is well past the cutoff.
+        let mut rt = RoutingTable::new(pid(0));
+        rt.add_neighbor(pid(1));
+        rt.update_with_source(pid(2), pid(1), 2, RouteSource::Advertisement);
+        assert!(rt.lookup(&pid(1)).is_some());
+        assert!(rt.lookup(&pid(2)).is_some());
+
+        // Expire with a cutoff in the future — every route is "older" than the cutoff.
+        rt.expire(std::time::Duration::ZERO);
+
+        // Local direct neighbor must survive.
+        assert!(rt.lookup(&pid(1)).is_some());
+        // Advertisement-sourced route must not.
+        assert!(rt.lookup(&pid(2)).is_none());
+    }
+
+    #[test]
+    fn refresh_neighbor_touches_last_updated() {
+        let mut rt = RoutingTable::new(pid(0));
+        rt.add_neighbor(pid(1));
+        let before = rt.lookup(&pid(1)).unwrap().last_updated;
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        rt.refresh_neighbor(&pid(1));
+        let after = rt.lookup(&pid(1)).unwrap().last_updated;
+        assert!(after > before);
     }
 }

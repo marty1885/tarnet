@@ -81,12 +81,25 @@ const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const KEY_EXCHANGE_MAX_DRIFT: u64 = 60;
 /// How long seen nonces are cached for replay protection.
 const NONCE_CACHE_TTL: Duration = Duration::from_secs(120);
-/// How often to run the link keepalive check.
-const KEEPALIVE_CHECK_INTERVAL: Duration = Duration::from_secs(15);
-/// Send a keepalive if no message received on a link within this duration.
-const KEEPALIVE_IDLE_THRESHOLD: Duration = Duration::from_secs(60);
-/// Declare a link dead if no message received within this duration.
+/// How often the heartbeat / liveness scheduler wakes up. The per-link
+/// send cadence is a Poisson process clamped to [HEARTBEAT_MIN, HEARTBEAT_MAX]
+/// (currently 10s / 60s), so ticking faster than HEARTBEAT_MIN never fires
+/// anything — pure overhead. Ticking much slower than that starts
+/// quantising the Poisson draws into visible buckets, which would defeat
+/// the cover-traffic timing properties. The link-floor is the natural
+/// choice; if HEARTBEAT_MIN changes, this should follow.
+const HEARTBEAT_TICK: Duration = crate::peer_transport::HEARTBEAT_MIN;
+/// Declare a link dead if no message received within this duration. With
+/// heartbeats arriving on average every ~60s (clamped to [20s, 120s]), this
+/// gives ~3 expected beats per window — enough that 3 consecutive natural
+/// losses on a live link are very unlikely (false-positive rate ≈ p^3).
+/// Note: circuits have their own faster liveness loop
+/// (CIRCUIT_DEAD_TIMEOUT = 90s), so this isn't on the user-visible path.
 const KEEPALIVE_DEAD_TIMEOUT: Duration = Duration::from_secs(180);
+/// Maximum random padding bytes added to each heartbeat. The padding size
+/// is drawn uniformly from [0, this] so heartbeat packets don't form a
+/// fingerprintable fixed-size class on the wire.
+const HEARTBEAT_MAX_PADDING: usize = 256;
 /// How often to check circuit liveness.
 const CIRCUIT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Send circuit padding if no activity within this duration.
@@ -1141,22 +1154,28 @@ impl Node {
             }
         });
 
-        // Periodic link keepalive: send keepalive on idle links, kill dead links
-        let ka_links = self.links.clone();
-        let ka_event_tx = self.event_tx.clone();
+        // Per-link heartbeat / cover-traffic / liveness task. Every tick:
+        //   1. Fire LinkDown for any link that hasn't received in DEAD_TIMEOUT.
+        //   2. For each link whose Poisson-scheduled next-fire has elapsed,
+        //      send a heartbeat with random padding (so heartbeats aren't a
+        //      fixed-size class on the wire), and refresh the direct-neighbor
+        //      route's last_updated so the DV expirer never wipes a live
+        //      neighbor's direct route.
+        let hb_links = self.links.clone();
+        let hb_event_tx = self.event_tx.clone();
+        let hb_routing = self.routing_table.clone();
         tokio::spawn(async move {
-            let mut interval = jittered_interval(KEEPALIVE_CHECK_INTERVAL);
+            let mut interval = jittered_interval(HEARTBEAT_TICK);
             loop {
                 interval.tick().await;
-                let links = ka_links.lock().await;
 
-                // Check for dead links first
-                let dead = links.dead_links(KEEPALIVE_DEAD_TIMEOUT);
-                // Get idle links that need keepalive
-                let idle = links.idle_links(KEEPALIVE_IDLE_THRESHOLD);
-                drop(links);
+                let (dead, due) = {
+                    let mut links = hb_links.lock().await;
+                    let dead = links.dead_links(KEEPALIVE_DEAD_TIMEOUT);
+                    let due = links.heartbeat_due();
+                    (dead, due)
+                };
 
-                // Fire LinkDown for dead links
                 for (peer, link_id) in dead {
                     log::info!(
                         "Link to {:?} (link_id={}) timed out (no recv for {}s), declaring dead",
@@ -1164,19 +1183,39 @@ impl Node {
                         link_id,
                         KEEPALIVE_DEAD_TIMEOUT.as_secs()
                     );
-                    let _ = ka_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
+                    let _ = hb_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
                 }
 
-                // Send keepalive on idle links (that aren't dead)
+                if due.is_empty() {
+                    continue;
+                }
+
+                // Refresh direct-neighbor route freshness for every peer we're
+                // about to heartbeat. Cheap and idempotent.
+                {
+                    let mut rt = hb_routing.lock().await;
+                    for (peer, _, _) in &due {
+                        rt.refresh_neighbor(peer);
+                    }
+                }
+
                 let now_us = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_micros() as u64;
-                let ka_msg = KeepaliveMsg {
-                    timestamp_us: Some(now_us),
-                };
-                let encoded = ka_msg.to_wire().encode();
-                for (_peer, _link_id, link) in idle {
+                for (_peer, _link_id, link) in due {
+                    use rand::RngCore;
+                    let pad_len = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(0..=HEARTBEAT_MAX_PADDING)
+                    };
+                    let mut padding = vec![0u8; pad_len];
+                    rand::thread_rng().fill_bytes(&mut padding);
+                    let ka_msg = KeepaliveMsg {
+                        timestamp_us: Some(now_us),
+                        padding,
+                    };
+                    let encoded = ka_msg.to_wire().encode();
                     let _ = link.send_deferred(&encoded).await;
                 }
             }
@@ -2545,7 +2584,19 @@ impl Node {
                 let ka = KeepaliveMsg::from_bytes(&msg.payload)?;
                 if let Some(ts) = ka.timestamp_us {
                     // This is a ping — echo it back as a pong (no timestamp = pong)
-                    let pong = KeepaliveMsg { timestamp_us: None };
+                    // Pong: random padding so pongs aren't a distinguishable
+                    // fixed-size response either.
+                    use rand::RngCore;
+                    let pad_len = {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(0..=HEARTBEAT_MAX_PADDING)
+                    };
+                    let mut padding = vec![0u8; pad_len];
+                    rand::thread_rng().fill_bytes(&mut padding);
+                    let pong = KeepaliveMsg {
+                        timestamp_us: None,
+                        padding,
+                    };
                     if let Some(link) = self.links.lock().await.get(&from).cloned() {
                         let _ = link.send_deferred(&pong.to_wire().encode()).await;
                     }

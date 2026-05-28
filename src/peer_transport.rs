@@ -55,6 +55,39 @@ struct ScoredLink {
     evictable: bool,
     /// When this link was created (for age-based eviction scoring).
     created_at: Instant,
+    /// When the next heartbeat / cover-traffic packet should fire on this
+    /// link. Drawn from a Poisson process so an observer can't distinguish
+    /// heartbeats from real traffic by timing alone.
+    next_heartbeat_at: Instant,
+}
+
+/// Heartbeat scheduling parameters. Mean interval ~60s, clamped to
+/// [HEARTBEAT_MIN, HEARTBEAT_MAX] so a draw is always in a sane range.
+///
+/// This is well below `node::KEEPALIVE_DEAD_TIMEOUT` so a healthy link sees
+/// ~3 heartbeats per dead-timeout window — enough that the probability of
+/// 3 consecutive losses on a genuinely live link is small.
+pub const HEARTBEAT_MEAN: Duration = Duration::from_secs(60);
+pub const HEARTBEAT_MIN: Duration = Duration::from_secs(20);
+pub const HEARTBEAT_MAX: Duration = Duration::from_secs(120);
+
+/// Draw the next heartbeat delay from an exponential distribution clamped to
+/// [HEARTBEAT_MIN, HEARTBEAT_MAX].
+fn next_heartbeat_delay() -> Duration {
+    use rand::Rng;
+    // Inverse-CDF: -mean * ln(1 - U) for U in (0, 1).
+    let u: f64 = rand::thread_rng().gen_range(0.0_f64..1.0_f64);
+    // Guard against u=0 (would yield ln(1)=0, fine) and u→1 (ln(0)=-inf).
+    let u = u.min(0.999_999);
+    let secs = -(HEARTBEAT_MEAN.as_secs_f64()) * (1.0 - u).ln();
+    let d = Duration::from_secs_f64(secs);
+    if d < HEARTBEAT_MIN {
+        HEARTBEAT_MIN
+    } else if d > HEARTBEAT_MAX {
+        HEARTBEAT_MAX
+    } else {
+        d
+    }
 }
 
 /// Manages multiple links to a single peer with scored failover.
@@ -93,6 +126,7 @@ impl PeerTransport {
                 is_outbound,
                 evictable: true,
                 created_at: Instant::now(),
+                next_heartbeat_at: Instant::now() + next_heartbeat_delay(),
             },
         );
 
@@ -149,14 +183,19 @@ impl PeerTransport {
             .collect()
     }
 
-    /// Return link IDs that have been idle (no recv) for longer than `idle_threshold`.
-    fn idle_links(&self, idle_threshold: Duration) -> Vec<(LinkId, Arc<PeerLink>)> {
-        let cutoff = Instant::now() - idle_threshold;
-        self.links
-            .iter()
-            .filter(|(_, sl)| sl.last_recv < cutoff)
-            .map(|(&id, sl)| (id, sl.link.clone()))
-            .collect()
+    /// Return links whose next heartbeat is due, bumping their schedule to a
+    /// fresh draw from the Poisson process. Drains all currently-due links in
+    /// one shot; callers should send a heartbeat on each.
+    fn heartbeat_due(&mut self) -> Vec<(LinkId, Arc<PeerLink>)> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (&id, sl) in self.links.iter_mut() {
+            if sl.next_heartbeat_at <= now {
+                sl.next_heartbeat_at = now + next_heartbeat_delay();
+                out.push((id, sl.link.clone()));
+            }
+        }
+        out
     }
 
     /// True when no links remain (triggers full peer removal).
@@ -350,11 +389,12 @@ impl LinkTable {
         result
     }
 
-    /// Return all idle links (no recv within threshold) with their PeerLink handles for sending keepalives.
-    pub fn idle_links(&self, idle_threshold: Duration) -> Vec<(PeerId, LinkId, Arc<PeerLink>)> {
+    /// Drain all links whose next heartbeat is due. Each returned link gets
+    /// its next-fire time rescheduled to a fresh exponential draw.
+    pub fn heartbeat_due(&mut self) -> Vec<(PeerId, LinkId, Arc<PeerLink>)> {
         let mut result = Vec::new();
-        for (&peer, pt) in &self.peers {
-            for (id, link) in pt.idle_links(idle_threshold) {
+        for (&peer, pt) in self.peers.iter_mut() {
+            for (id, link) in pt.heartbeat_due() {
                 result.push((peer, id, link));
             }
         }
