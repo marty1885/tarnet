@@ -13,6 +13,7 @@ pub mod link;
 pub mod multipath;
 pub mod node;
 pub mod peer_transport;
+pub mod pool;
 pub mod pubkey_cache;
 pub mod routing;
 pub mod state;

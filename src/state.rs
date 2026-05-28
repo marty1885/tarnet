@@ -161,6 +161,11 @@ impl StateDb {
                  label TEXT NOT NULL,
                  record BLOB NOT NULL,
                  FOREIGN KEY (identity, label) REFERENCES tns_labels(identity, label) ON DELETE CASCADE
+             );
+             CREATE TABLE IF NOT EXISTS pools (
+                 name TEXT PRIMARY KEY,
+                 kind INTEGER NOT NULL,
+                 key BLOB NOT NULL
              );",
         )
         .map_err(sqlite_err)?;
@@ -281,6 +286,52 @@ impl StateDb {
             .prepare_cached("DELETE FROM identities WHERE label = ?1")
             .map_err(sqlite_err)?;
         stmt.execute(params![label]).map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    // ── Pools (virtual cluster membership) ──
+
+    /// Load all joined pools as (name, kind_tag, key_blob). kind_tag 0 = Closed.
+    pub fn load_pools(&self) -> Result<Vec<(String, u8, Vec<u8>)>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached("SELECT name, kind, key FROM pools")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as u8,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(sqlite_err)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(sqlite_err)?);
+        }
+        Ok(out)
+    }
+
+    pub fn save_pool(&self, name: &str, kind: u8, key: &[u8]) -> Result<()> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "INSERT INTO pools(name, kind, key) VALUES(?1, ?2, ?3)
+                 ON CONFLICT(name) DO UPDATE SET kind = excluded.kind, key = excluded.key",
+            )
+            .map_err(sqlite_err)?;
+        stmt.execute(params![name, kind as i64, key])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn delete_pool(&self, name: &str) -> Result<()> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM pools WHERE name = ?1")
+            .map_err(sqlite_err)?;
+        stmt.execute(params![name]).map_err(sqlite_err)?;
         Ok(())
     }
 

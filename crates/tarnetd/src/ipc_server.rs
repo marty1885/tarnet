@@ -799,6 +799,87 @@ async fn dispatch_request(
             }
         }
 
+        METHOD_POOL_JOIN => {
+            let (name, kind): (String, tarnet_api::service::PoolKind) = match decode_payload(payload)
+            {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.pool_join(&name, kind).await {
+                Ok(root) => ok_response(request_id, &encode_payload(&root)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_POOL_LEAVE => {
+            let name: String = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.pool_leave(&name).await {
+                Ok(()) => ok_response(request_id, &[]),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_POOL_LIST => match api.pool_list().await {
+            Ok(list) => ok_response(request_id, &encode_payload(&list)),
+            Err(e) => err_response(request_id, &e.to_string()),
+        },
+
+        METHOD_POOL_REGISTER => {
+            let (pool, service, identity, port, opts): (
+                String,
+                String,
+                Option<String>,
+                String,
+                tarnet_api::service::PoolRegisterOptions,
+            ) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api
+                .pool_register(&pool, &service, identity.as_deref(), &port, opts)
+                .await
+            {
+                Ok(claim) => ok_response(request_id, &encode_payload(&claim)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_POOL_WITHDRAW => {
+            let claim: tarnet_api::service::PoolClaim = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.pool_withdraw(claim).await {
+                Ok(()) => ok_response(request_id, &[]),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_POOL_RESOLVE => {
+            let (pool, service, timeout): (String, String, u32) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.pool_resolve(&pool, &service, timeout).await {
+                Ok(endpoints) => ok_response(request_id, &encode_payload(&endpoints)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_POOL_CATALOG => {
+            let (pool, timeout): (String, u32) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.pool_catalog(&pool, timeout).await {
+                Ok(names) => ok_response(request_id, &encode_payload(&names)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
         _ => err_response(request_id, &format!("unknown method: 0x{:04x}", method)),
     }
 }

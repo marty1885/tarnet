@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use serde::Deserialize;
-use tarnet_api::service::{Listener, ListenerOptions, PortMode, ServiceApi, TnsRecord};
+use tarnet_api::service::{
+    Listener, ListenerOptions, PoolClaim, PoolRegisterOptions, PortMode, ServiceApi, TnsRecord,
+};
 use tarnet_api::types::{PrivacyLevel, ServiceId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -27,6 +29,15 @@ pub struct ServiceConfig {
     /// at the identity's zone apex (@) and reached by name + port.
     /// If set, the service is published as `<subdomain>.<identity>`.
     pub subdomain: Option<String>,
+    /// Optional pool (virtual cluster) to advertise this service into, by local name.
+    /// When set, the daemon publishes this node as an endpoint for `service` in the pool
+    /// and keeps the lease refreshed. Independent of `publish` (a service can be both).
+    pub pool: Option<String>,
+    /// Pool service label to advertise under. Defaults to the config filename stem.
+    pub service: Option<String>,
+    /// Weighted round-robin weight for this endpoint (default 1).
+    #[serde(default)]
+    pub weight: Option<u16>,
 }
 
 /// A loaded service config paired with its source filename (stem, no extension).
@@ -52,6 +63,8 @@ struct RegisteredService {
     service_id: ServiceId,
     listener: Listener,
     service: LoadedService,
+    /// Set when this service was also advertised into a pool; used to withdraw on shutdown.
+    pool_claim: Option<PoolClaim>,
 }
 
 /// Validate a subdomain label: must be non-empty, no dots, only lowercase
@@ -214,12 +227,18 @@ async fn register_services<S: ServiceApi>(
             }
         };
 
-        // When a service has a subdomain, use the subdomain as the tarnet
-        // port name so that multiple subdomain services under the same
-        // identity don't collide.  Without this, both "nina" and "blog"
-        // would register on the same numeric port and only the last one
-        // would receive connections.
-        let port_name = if let Some(ref subdomain) = svc.config.subdomain {
+        // The tarnet-facing port name. For a pool service, use the pool service
+        // label so inbound pool tunnels land on this listener. Otherwise use the
+        // subdomain (so multiple subdomain services don't collide), else the
+        // numeric port.
+        let pool_service = svc
+            .config
+            .pool
+            .as_ref()
+            .map(|_| svc.config.service.clone().unwrap_or_else(|| svc.filename.clone()));
+        let port_name = if let Some(ref service) = pool_service {
+            service.clone()
+        } else if let Some(ref subdomain) = svc.config.subdomain {
             subdomain.clone()
         } else {
             match listen_port(&svc.config) {
@@ -258,10 +277,48 @@ async fn register_services<S: ServiceApi>(
                 continue;
             }
         };
+        // Advertise into a pool if configured (independent of TNS publish).
+        let pool_claim = if let Some(ref pool) = svc.config.pool {
+            let service = pool_service.as_deref().unwrap_or(&svc.filename);
+            let opts = PoolRegisterOptions {
+                weight: svc.config.weight.unwrap_or(1),
+                meta: Vec::new(),
+                ..Default::default()
+            };
+            match api
+                .pool_register(
+                    pool,
+                    service,
+                    svc.config.identity.as_deref(),
+                    &port_name,
+                    opts,
+                )
+                .await
+            {
+                Ok(claim) => {
+                    info!(
+                        "Registered '{}' as endpoint '{}' in pool '{}'",
+                        svc.filename, service, pool
+                    );
+                    Some(claim)
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to register '{}' in pool '{}': {}",
+                        svc.filename, pool, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         services.push(RegisteredService {
             service_id: sid,
             listener,
             service: svc.clone(),
+            pool_claim,
         });
         info!(
             "Registered service '{}' on {:?} port {}",
@@ -274,6 +331,15 @@ async fn register_services<S: ServiceApi>(
 
 async fn close_services<S: ServiceApi>(api: &S, services: &[RegisteredService]) {
     for service in services {
+        // Withdraw any pool claim first (publishes a tombstone so consumers drop it now).
+        if let Some(claim) = &service.pool_claim {
+            if let Err(e) = api.pool_withdraw(claim.clone()).await {
+                warn!(
+                    "Failed to withdraw pool claim for '{}': {}",
+                    service.service.filename, e
+                );
+            }
+        }
         if let Err(e) = api.close_listener(&service.listener).await {
             warn!(
                 "Failed to close listener on {:?} port {} for '{}': {}",
@@ -924,6 +990,44 @@ mod tests {
         async fn send_tunnel_data(&self, _: &PeerId, _: &[u8]) -> ApiResult<()> {
             Ok(())
         }
+
+        async fn pool_join(
+            &self,
+            _: &str,
+            _: tarnet_api::service::PoolKind,
+        ) -> ApiResult<ServiceId> {
+            Err(ApiError::NotConnected)
+        }
+        async fn pool_leave(&self, _: &str) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn pool_list(&self) -> ApiResult<Vec<(String, ServiceId)>> {
+            Ok(vec![])
+        }
+        async fn pool_register(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: &str,
+            _: tarnet_api::service::PoolRegisterOptions,
+        ) -> ApiResult<tarnet_api::service::PoolClaim> {
+            Err(ApiError::NotConnected)
+        }
+        async fn pool_withdraw(&self, _: tarnet_api::service::PoolClaim) -> ApiResult<()> {
+            Ok(())
+        }
+        async fn pool_resolve(
+            &self,
+            _: &str,
+            _: &str,
+            _: u32,
+        ) -> ApiResult<Vec<tarnet_api::service::PoolEndpoint>> {
+            Ok(vec![])
+        }
+        async fn pool_catalog(&self, _: &str, _: u32) -> ApiResult<Vec<String>> {
+            Ok(vec![])
+        }
     }
 
     fn make_service(
@@ -940,6 +1044,9 @@ mod tests {
                 publish: true,
                 identity: identity.map(|s| s.to_string()),
                 subdomain: subdomain.map(|s| s.to_string()),
+                pool: None,
+                service: None,
+                weight: None,
             },
         }
     }

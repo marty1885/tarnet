@@ -36,6 +36,55 @@ pub struct WatchEvent {
     pub value: Vec<u8>,
 }
 
+/// How a node participates in a pool locally. (See memory: resource pool design.)
+/// Phase 1 supports `Closed` only; `Open` (Kpub + membership certs) lands in Phase 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PoolKind {
+    /// Private pool keyed by a shared symmetric key distributed out-of-band.
+    /// Membership = possessing the key; the registry is unguessable/unlistable.
+    Closed { key: [u8; 32] },
+}
+
+/// Handle returned by `pool_register`, used to withdraw the claim later.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolClaim {
+    pub pool: String,
+    pub service: String,
+    pub signer: ServiceId,
+}
+
+/// One live endpoint for a pool service (one per distinct owner/signer).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolEndpoint {
+    pub owner: ServiceId,
+    /// Listener port-name to connect to on the owner.
+    pub port: String,
+    pub weight: u16,
+    #[serde(with = "serde_bytes")]
+    pub meta: Vec<u8>,
+    /// Routing hint carried from the claim's embedded Peer record, if present.
+    pub peer_id: Option<PeerId>,
+}
+
+/// Options for advertising a pool endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolRegisterOptions {
+    pub weight: u16,
+    #[serde(with = "serde_bytes")]
+    pub meta: Vec<u8>,
+    pub ttl_secs: u32,
+}
+
+impl Default for PoolRegisterOptions {
+    fn default() -> Self {
+        Self {
+            weight: 1,
+            meta: Vec::new(),
+            ttl_secs: 45,
+        }
+    }
+}
+
 /// A TNS resource record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TnsRecord {
@@ -66,6 +115,19 @@ pub enum TnsRecord {
         peer_id: PeerId,
         /// Signature over `"tarnet peer record" || peer_id` using the service's signing key.
         signature: Vec<u8>,
+    },
+    /// A pool endpoint's offer for a named service ("virtual cluster" member).
+    /// Published into a pool zone alongside Identity(owner) + Peer{owner→peer_id},
+    /// stored supplementally so every member that owns the service coexists.
+    /// Multiplicity of Service records at a label is the load-balancing signal.
+    Service {
+        /// Listener port-name to connect to on the owner (the service label, by convention).
+        port: String,
+        /// Weight for weighted round-robin; default 1.
+        weight: u16,
+        /// Opaque descriptor, e.g. b"llama-3.1-8b".
+        #[serde(with = "serde_bytes")]
+        meta: Vec<u8>,
     },
 }
 
@@ -447,6 +509,58 @@ pub trait ServiceApi: Send + Sync {
 
     /// Send data through an established tunnel.
     async fn send_tunnel_data(&self, dest: &PeerId, data: &[u8]) -> ApiResult<()>;
+
+    /// Connect to a service, optionally using an explicit PeerId routing hint
+    /// (e.g. from a pool endpoint claim) to avoid a public peer-record lookup and
+    /// to reach members whose identity is not publicly resolvable.
+    /// The default implementation ignores the hint and behaves like `connect_as`;
+    /// implementations backed by a local node should thread the hint into routing.
+    async fn connect_via(
+        &self,
+        service_id: ServiceId,
+        mode: PortMode,
+        port: &str,
+        peer_hint: Option<PeerId>,
+    ) -> ApiResult<Connection> {
+        let _ = peer_hint;
+        self.connect_as(service_id, mode, port, None).await
+    }
+
+    // ── Resource pools (virtual clusters) ──
+
+    /// Import a pool under a local name (out-of-band key material). Returns the pool root.
+    async fn pool_join(&self, name: &str, kind: PoolKind) -> ApiResult<ServiceId>;
+
+    /// Forget a joined pool by local name.
+    async fn pool_leave(&self, name: &str) -> ApiResult<()>;
+
+    /// List joined pools: (local name, pool root).
+    async fn pool_list(&self) -> ApiResult<Vec<(String, ServiceId)>>;
+
+    /// Advertise an endpoint claim for `service` into the pool. The daemon keeps the
+    /// lease refreshed until `pool_withdraw`. Returns a withdrawal handle.
+    async fn pool_register(
+        &self,
+        pool: &str,
+        service: &str,
+        identity: Option<&str>,
+        port: &str,
+        opts: PoolRegisterOptions,
+    ) -> ApiResult<PoolClaim>;
+
+    /// Withdraw a previously registered claim (publishes a tombstone, stops refresh).
+    async fn pool_withdraw(&self, claim: PoolClaim) -> ApiResult<()>;
+
+    /// Resolve the live endpoint set for a pool service (one per member).
+    async fn pool_resolve(
+        &self,
+        pool: &str,
+        service: &str,
+        timeout_secs: u32,
+    ) -> ApiResult<Vec<PoolEndpoint>>;
+
+    /// Browse the pool catalog: service names members advertise.
+    async fn pool_catalog(&self, pool: &str, timeout_secs: u32) -> ApiResult<Vec<String>>;
 }
 
 pub use MessageStream as DataStream;

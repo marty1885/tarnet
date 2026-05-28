@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tarnet_api::service::{
-    DataStream, ListenerOptions, PortMode, ServiceApi, TnsRecord, TnsResolution,
+    DataStream, ListenerOptions, PoolClaim, PoolKind, PoolRegisterOptions, PortMode, ServiceApi,
+    TnsRecord, TnsResolution,
 };
 use tarnet_api::types::{PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
@@ -81,10 +82,66 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Resource pools (virtual clusters)
+    #[command(subcommand_required = true, arg_required_else_help = true)]
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
     /// Show connected peers and routes
     Status,
     /// Reload daemon configuration
     Reload,
+}
+
+#[derive(Subcommand)]
+enum PoolCommand {
+    /// Join (import) a closed pool under a local name. Prints the key if generated.
+    #[command(arg_required_else_help = true)]
+    Join {
+        /// Local name for the pool
+        name: String,
+        /// Shared key (64 hex chars). If omitted, a random key is generated and printed.
+        #[arg(long)]
+        key: Option<String>,
+    },
+    /// Forget a joined pool
+    #[command(arg_required_else_help = true)]
+    Leave { name: String },
+    /// List joined pools
+    List,
+    /// Advertise this node as an endpoint for a service in a pool
+    #[command(arg_required_else_help = true)]
+    Register {
+        /// Local pool name
+        pool: String,
+        /// Service label to advertise (e.g. "payment")
+        service: String,
+        /// Listener port-name on this node (defaults to the service label)
+        #[arg(long)]
+        port: Option<String>,
+        /// Identity to advertise under (label or ServiceId; defaults to default)
+        #[arg(long)]
+        identity: Option<String>,
+        /// Weighted round-robin weight
+        #[arg(long, default_value_t = 1)]
+        weight: u16,
+    },
+    /// Withdraw a previously registered claim
+    #[command(arg_required_else_help = true)]
+    Withdraw {
+        pool: String,
+        service: String,
+        /// Identity the claim was registered under
+        #[arg(long)]
+        identity: Option<String>,
+    },
+    /// Resolve the live endpoint set for a pool service
+    #[command(arg_required_else_help = true)]
+    Resolve { pool: String, service: String },
+    /// Browse the service names a pool advertises
+    #[command(arg_required_else_help = true)]
+    Catalog { pool: String },
 }
 
 #[derive(Subcommand)]
@@ -307,9 +364,141 @@ async fn main() {
         Command::Tarify { identity, command } => {
             cmd_tarify(&cli, identity.as_deref(), command).await
         }
+        Command::Pool { command } => cmd_pool(&cli, command).await,
         Command::Status => cmd_status(&cli).await,
         Command::Reload => cmd_reload(&cli).await,
     }
+}
+
+// ── Pool commands ──
+
+async fn cmd_pool(cli: &Cli, cmd: &PoolCommand) {
+    let client = connect_daemon(cli).await;
+
+    match cmd {
+        PoolCommand::Join { name, key } => {
+            let key_bytes = match key {
+                Some(hex) => {
+                    let b = hex_decode(hex);
+                    if b.len() != 32 {
+                        eprintln!("--key must be 64 hex chars (32 bytes), got {}", b.len());
+                        std::process::exit(1);
+                    }
+                    let mut k = [0u8; 32];
+                    k.copy_from_slice(&b);
+                    k
+                }
+                None => {
+                    let k = random_key();
+                    println!("Generated pool key (share out-of-band): {}", hex_encode(&k));
+                    k
+                }
+            };
+            match client.pool_join(name, PoolKind::Closed { key: key_bytes }).await {
+                Ok(root) => println!("Joined pool '{}' (root {})", name, root),
+                Err(e) => exit_err(&format!("pool join failed: {}", e)),
+            }
+        }
+        PoolCommand::Leave { name } => match client.pool_leave(name).await {
+            Ok(()) => println!("Left pool '{}'", name),
+            Err(e) => exit_err(&format!("pool leave failed: {}", e)),
+        },
+        PoolCommand::List => match client.pool_list().await {
+            Ok(pools) if pools.is_empty() => println!("No pools joined."),
+            Ok(pools) => {
+                for (name, root) in pools {
+                    println!("{:<20} {}", name, root);
+                }
+            }
+            Err(e) => exit_err(&format!("pool list failed: {}", e)),
+        },
+        PoolCommand::Register {
+            pool,
+            service,
+            port,
+            identity,
+            weight,
+        } => {
+            let port = port.clone().unwrap_or_else(|| service.clone());
+            let opts = PoolRegisterOptions {
+                weight: *weight,
+                meta: Vec::new(),
+                ttl_secs: 45,
+            };
+            match client
+                .pool_register(pool, service, identity.as_deref(), &port, opts)
+                .await
+            {
+                Ok(claim) => println!(
+                    "Registered endpoint '{}' in pool '{}' (signer {})",
+                    service, pool, claim.signer
+                ),
+                Err(e) => exit_err(&format!("pool register failed: {}", e)),
+            }
+        }
+        PoolCommand::Withdraw {
+            pool,
+            service,
+            identity,
+        } => {
+            // signer is informational for the daemon; resolve for a faithful handle.
+            let signer = match identity {
+                Some(id) => client
+                    .resolve_identity(id)
+                    .await
+                    .unwrap_or_else(|_| ServiceId::LOCAL),
+                None => client.default_service_id().await,
+            };
+            let claim = PoolClaim {
+                pool: pool.clone(),
+                service: service.clone(),
+                signer,
+            };
+            match client.pool_withdraw(claim).await {
+                Ok(()) => println!("Withdrew '{}' from pool '{}'", service, pool),
+                Err(e) => exit_err(&format!("pool withdraw failed: {}", e)),
+            }
+        }
+        PoolCommand::Resolve { pool, service } => match client.pool_resolve(pool, service, 5).await {
+            Ok(eps) if eps.is_empty() => println!("No endpoints for '{}' in '{}'.", service, pool),
+            Ok(eps) => {
+                println!("{} endpoint(s) for '{}' in '{}':", eps.len(), service, pool);
+                for ep in eps {
+                    let meta = String::from_utf8_lossy(&ep.meta);
+                    println!(
+                        "  owner={} port={} weight={} meta={:?}",
+                        ep.owner, ep.port, ep.weight, meta
+                    );
+                }
+            }
+            Err(e) => exit_err(&format!("pool resolve failed: {}", e)),
+        },
+        PoolCommand::Catalog { pool } => match client.pool_catalog(pool, 5).await {
+            Ok(names) if names.is_empty() => println!("Pool '{}' catalog is empty.", pool),
+            Ok(names) => {
+                println!("Services in pool '{}':", pool);
+                for n in names {
+                    println!("  {}", n);
+                }
+            }
+            Err(e) => exit_err(&format!("pool catalog failed: {}", e)),
+        },
+    }
+}
+
+/// Read 32 random bytes from the OS (Linux /dev/urandom) for a pool key.
+fn random_key() -> [u8; 32] {
+    use std::io::Read;
+    let mut k = [0u8; 32];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut k)) {
+        Ok(()) => k,
+        Err(e) => exit_err(&format!("cannot read /dev/urandom: {}", e)),
+    }
+}
+
+fn exit_err(msg: &str) -> ! {
+    eprintln!("{}", msg);
+    std::process::exit(1);
 }
 
 // ── Identity commands ──
@@ -866,6 +1055,14 @@ fn print_tns_record(rec: &TnsRecord) {
                 signing_algo,
                 signing_pubkey.len(),
                 signature.len()
+            )
+        }
+        TnsRecord::Service { port, weight, meta } => {
+            println!(
+                "  SERVICE     port={} weight={} meta_len={}",
+                port,
+                weight,
+                meta.len()
             )
         }
     }

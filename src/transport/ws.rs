@@ -123,6 +123,7 @@ impl WsDiscovery {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
+                        let _ = super::tcp::apply_keepalive(&stream);
                         let tx = tx.clone();
                         let path = accept_path.clone();
                         tokio::spawn(async move {
@@ -228,6 +229,16 @@ async fn ws_connect(addr: &str) -> Result<Box<dyn Transport>> {
     let (ws, _) = tokio_tungstenite::connect_async(addr)
         .await
         .map_err(|e| Error::Wire(format!("WebSocket connect to {}: {}", addr, e)))?;
+    // Enable TCP keepalive on the underlying socket so suspend/resume is detected.
+    match ws.get_ref() {
+        tokio_tungstenite::MaybeTlsStream::Plain(s) => {
+            let _ = super::tcp::apply_keepalive(s);
+        }
+        tokio_tungstenite::MaybeTlsStream::Rustls(s) => {
+            let _ = super::tcp::apply_keepalive(s.get_ref().0);
+        }
+        _ => {}
+    }
     log::debug!("WebSocket connected to {}", addr);
     Ok(Box::new(WsTransport::wrap(ws)))
 }

@@ -44,6 +44,12 @@ pub const REKEY_INTERVAL: u64 = 65536;
 const MAX_TIMESTAMP_DRIFT: u64 = 300;
 /// Maximum time allowed for the entire handshake (hello + auth + confirm).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Hard ceiling on a single recv: if the transport produces nothing within
+/// this window, treat it as a dead link. Slightly longer than the node-level
+/// `KEEPALIVE_DEAD_TIMEOUT` (180s) so the app-level path has first crack at
+/// declaring it dead, but a zombie socket (e.g. after suspend/resume) still
+/// unblocks.
+const RECV_STALL_TIMEOUT: Duration = Duration::from_secs(210);
 
 /// Session keys for bidirectional encrypted communication.
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -827,7 +833,9 @@ impl PeerLink {
     /// Receive and decrypt a message from the link.
     pub async fn recv_message(&self) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; 65536 + 24 + SEQ_SIZE + TAG_SIZE];
-        let n = self.transport.recv(&mut buf).await?;
+        let n = tokio::time::timeout(RECV_STALL_TIMEOUT, self.transport.recv(&mut buf))
+            .await
+            .map_err(|_| Error::Wire("link recv stalled".into()))??;
         self.crypto.lock().await.decrypt(&buf[..n])
     }
 

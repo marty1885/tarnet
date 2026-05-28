@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7,6 +8,18 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::{Discovery, Transport};
 use crate::types::{Error, Result};
+
+/// Enable TCP keepalive probes so suspend/resume or silent network drops
+/// surface as socket errors within ~30s instead of hanging indefinitely.
+pub(crate) fn apply_keepalive(stream: &TcpStream) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(stream);
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(15))
+        .with_interval(Duration::from_secs(3));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let ka = ka.with_retries(5);
+    sock.set_tcp_keepalive(&ka)
+}
 
 /// Length-prefix framed TCP transport.
 pub struct TcpTransport {
@@ -127,6 +140,7 @@ impl Discovery for TcpDiscovery {
             .await
             .ok_or_else(|| Error::Wire("all listeners closed".into()))?;
         stream.set_nodelay(true)?;
+        apply_keepalive(&stream)?;
         log::debug!("TCP accepted connection from {}", addr);
         Ok(Box::new(TcpTransport::new(stream)))
     }
@@ -135,6 +149,7 @@ impl Discovery for TcpDiscovery {
         let socket_addr = crate::types::parse_socket_addr(addr)?;
         let stream = TcpStream::connect(socket_addr).await?;
         stream.set_nodelay(true)?;
+        apply_keepalive(&stream)?;
         log::debug!("TCP connected to {}", addr);
         Ok(Box::new(TcpTransport::new(stream)))
     }

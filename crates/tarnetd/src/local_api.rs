@@ -14,8 +14,8 @@ use tarnet::state::StateDb;
 use tarnet::tns;
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::service::{
-    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi,
-    TnsRecord, TnsResolution, WatchEvent,
+    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PoolClaim, PoolEndpoint,
+    PoolKind, PoolRegisterOptions, PortMode, ServiceApi, TnsRecord, TnsResolution, WatchEvent,
 };
 use tarnet_api::types::{DhtId, PeerId, ServiceId};
 
@@ -291,6 +291,19 @@ impl ServiceApi for LocalServiceApi {
     ) -> ApiResult<Connection> {
         self.node
             .circuit_connect(service_id, mode, port, None, source_identity)
+            .await
+            .map_err(map_err)
+    }
+
+    async fn connect_via(
+        &self,
+        service_id: ServiceId,
+        mode: PortMode,
+        port: &str,
+        peer_hint: Option<PeerId>,
+    ) -> ApiResult<Connection> {
+        self.node
+            .circuit_connect(service_id, mode, port, peer_hint, None)
             .await
             .map_err(map_err)
     }
@@ -705,5 +718,60 @@ impl ServiceApi for LocalServiceApi {
             TnsResolution::NotFound => Err(ApiError::NotFound),
             TnsResolution::Error(e) => Err(ApiError::Service(e)),
         }
+    }
+
+    // ── Resource pools ──
+
+    async fn pool_join(&self, name: &str, kind: PoolKind) -> ApiResult<ServiceId> {
+        Ok(self.node.pool_join(name, kind).await)
+    }
+
+    async fn pool_leave(&self, name: &str) -> ApiResult<()> {
+        if self.node.pool_leave(name).await {
+            Ok(())
+        } else {
+            Err(ApiError::NotFound)
+        }
+    }
+
+    async fn pool_list(&self) -> ApiResult<Vec<(String, ServiceId)>> {
+        Ok(self.node.pool_list().await)
+    }
+
+    async fn pool_register(
+        &self,
+        pool: &str,
+        service: &str,
+        identity: Option<&str>,
+        port: &str,
+        opts: PoolRegisterOptions,
+    ) -> ApiResult<PoolClaim> {
+        self.node
+            .pool_register(pool, service, identity, port, opts)
+            .await
+            .map_err(map_err)
+    }
+
+    async fn pool_withdraw(&self, claim: PoolClaim) -> ApiResult<()> {
+        self.node.pool_withdraw(&claim).await.map_err(map_err)
+    }
+
+    async fn pool_resolve(
+        &self,
+        pool: &str,
+        service: &str,
+        timeout_secs: u32,
+    ) -> ApiResult<Vec<PoolEndpoint>> {
+        self.node
+            .pool_resolve(pool, service, timeout_secs)
+            .await
+            .map_err(map_err)
+    }
+
+    async fn pool_catalog(&self, pool: &str, timeout_secs: u32) -> ApiResult<Vec<String>> {
+        self.node
+            .pool_catalog(pool, timeout_secs)
+            .await
+            .map_err(map_err)
     }
 }

@@ -1510,3 +1510,63 @@ fn receiver_window_enforced() {
     }
     assert!(!cw2.can_receive(), "window should be exhausted");
 }
+
+// ── Resource pool (virtual cluster) round-trip ──
+
+#[tokio::test]
+async fn pool_register_resolve_roundtrip() {
+    use tarnet_api::service::{PoolKind, PoolRegisterOptions};
+
+    let node = Arc::new(Node::new(Keypair::generate()));
+    let owner = node.default_service_id().await;
+
+    // Join a closed pool (symmetric OOB key) under a local name.
+    let root = node
+        .pool_join("mycluster", PoolKind::Closed { key: [7u8; 32] })
+        .await;
+    assert_eq!(node.pool_list().await, vec![("mycluster".to_string(), root)]);
+
+    // Advertise an endpoint claim for service "payment".
+    let claim = node
+        .pool_register(
+            "mycluster",
+            "payment",
+            None,
+            "payment",
+            PoolRegisterOptions {
+                weight: 3,
+                meta: b"gw-v1".to_vec(),
+                ttl_secs: 45,
+            },
+        )
+        .await
+        .expect("register should succeed");
+    assert_eq!(claim.signer, owner);
+
+    // Resolve the endpoint set (local store, no network).
+    let eps = node
+        .pool_resolve("mycluster", "payment", 1)
+        .await
+        .expect("resolve should succeed");
+    assert_eq!(eps.len(), 1, "one endpoint expected");
+    assert_eq!(eps[0].owner, owner);
+    assert_eq!(eps[0].port, "payment");
+    assert_eq!(eps[0].weight, 3);
+    assert_eq!(eps[0].meta, b"gw-v1");
+    assert!(eps[0].peer_id.is_some(), "Peer routing hint expected");
+
+    // Catalog should list the service.
+    let catalog = node.pool_catalog("mycluster", 1).await.unwrap();
+    assert!(catalog.contains(&"payment".to_string()));
+
+    // Withdraw → resolve returns no endpoints (tombstone replaces the claim).
+    node.pool_withdraw(&claim).await.expect("withdraw");
+    let eps = node.pool_resolve("mycluster", "payment", 1).await.unwrap();
+    assert!(eps.is_empty(), "endpoint should be gone after withdraw");
+}
+
+#[tokio::test]
+async fn pool_resolve_unknown_pool_errors() {
+    let node = Arc::new(Node::new(Keypair::generate()));
+    assert!(node.pool_resolve("nope", "svc", 1).await.is_err());
+}

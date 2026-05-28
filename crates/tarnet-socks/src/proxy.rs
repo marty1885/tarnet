@@ -18,6 +18,8 @@ enum Route {
         service_name: String,
         port: u16,
     },
+    /// Route to a pool service: resolve the endpoint set and round-robin with failover.
+    Pool { pool: String, service: String },
     /// Fall through to clearnet (direct TCP).
     Clearnet { host: String, port: u16 },
     /// Refuse the connection (clearnet disallowed, TNS not found).
@@ -28,7 +30,27 @@ enum Route {
 struct ProxyState<S: ServiceApi> {
     api: Arc<S>,
     allow_clearnet: bool,
+    /// Round-robin cursor per (pool, service) for endpoint selection.
+    rr: std::sync::Mutex<std::collections::HashMap<(String, String), usize>>,
 }
+
+impl<S: ServiceApi> ProxyState<S> {
+    /// Next round-robin start index for a pool service, advancing the cursor.
+    fn next_rr(&self, pool: &str, service: &str, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let mut map = self.rr.lock().unwrap();
+        let key = (pool.to_string(), service.to_string());
+        let cur = map.entry(key).or_insert(0);
+        let idx = *cur % len;
+        *cur = idx.wrapping_add(1);
+        idx
+    }
+}
+
+/// How long to wait for a pool resolution before giving up (seconds).
+const POOL_RESOLVE_TIMEOUT_SECS: u32 = 5;
 
 /// Run the SOCKS5 proxy on one or more bind addresses.
 ///
@@ -68,6 +90,7 @@ pub async fn run_proxy<S: ServiceApi + 'static>(
     let state = Arc::new(ProxyState {
         api: api.clone(),
         allow_clearnet,
+        rr: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Spawn an accept loop per listener.
@@ -131,6 +154,9 @@ async fn handle_client<S: ServiceApi + 'static>(
                     )
                     .await
                 }
+                Route::Pool {
+                    pool, service, ..
+                } => handle_pool_route(state, stream, &pool, &service).await,
                 Route::Clearnet { host, port } => {
                     handle_clearnet_route(stream, &host, port).await
                 }
@@ -154,6 +180,21 @@ async fn resolve_route<S: ServiceApi>(
     port: u16,
     identity: Option<&str>,
 ) -> Route {
+    // Pool route: if the rightmost label names a joined pool, resolve as a pool
+    // service (e.g. "payment.mycluster" → service "payment" in pool "mycluster").
+    let labels: Vec<&str> = hostname.split('.').collect();
+    if labels.len() >= 2 {
+        let pool_name = labels[labels.len() - 1];
+        if let Ok(pools) = state.api.pool_list().await {
+            if pools.iter().any(|(n, _)| n == pool_name) {
+                return Route::Pool {
+                    pool: pool_name.to_string(),
+                    service: labels[0].to_string(),
+                };
+            }
+        }
+    }
+
     // Try TNS resolution — from a specific identity's zone if requested.
     let result = if let Some(id_label) = identity {
         match state.api.resolve_identity(id_label).await {
@@ -315,6 +356,101 @@ async fn handle_tarnet_route<S: ServiceApi + 'static>(
 
     let _ = tokio::join!(upload, download);
 
+    Ok(())
+}
+
+/// Route a connection to a pool service: resolve the live endpoint set, pick one
+/// round-robin, and fail over to the next on circuit-connect failure (liveness tier 1).
+async fn handle_pool_route<S: ServiceApi + 'static>(
+    state: Arc<ProxyState<S>>,
+    mut stream: TcpStream,
+    pool: &str,
+    service: &str,
+) -> std::io::Result<()> {
+    let endpoints = state
+        .api
+        .pool_resolve(pool, service, POOL_RESOLVE_TIMEOUT_SECS)
+        .await
+        .unwrap_or_default();
+
+    if endpoints.is_empty() {
+        warn!("No endpoints for pool '{}' service '{}'", pool, service);
+        socks5::send_host_unreachable(&mut stream).await?;
+        return Ok(());
+    }
+
+    // Round-robin start, then try each endpoint in turn (failover).
+    let n = endpoints.len();
+    let start = state.next_rr(pool, service, n);
+    let mut conn = None;
+    for i in 0..n {
+        let ep = &endpoints[(start + i) % n];
+        match state
+            .api
+            .connect_via(ep.owner, PortMode::ReliableOrdered, &ep.port, ep.peer_id)
+            .await
+        {
+            Ok(c) => {
+                info!(
+                    "Pool '{}' service '{}' -> endpoint {} (port {})",
+                    pool, service, ep.owner, ep.port
+                );
+                conn = Some(c);
+                break;
+            }
+            Err(e) => {
+                warn!(
+                    "Pool '{}' endpoint {} unreachable, failing over: {}",
+                    pool, ep.owner, e
+                );
+            }
+        }
+    }
+
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            error!("All {} endpoint(s) for pool '{}' failed", n, pool);
+            socks5::send_host_unreachable(&mut stream).await?;
+            return Ok(());
+        }
+    };
+
+    socks5::send_success(&mut stream).await?;
+
+    // Shuttle bytes between SOCKS client and the circuit connection.
+    let (mut read_half, mut write_half) = stream.into_split();
+    let conn = Arc::new(conn);
+
+    let conn_send = conn.clone();
+    let upload = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if conn_send.send(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let download = tokio::spawn(async move {
+        loop {
+            match conn.recv().await {
+                Ok(payload) => {
+                    if write_half.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let _ = tokio::join!(upload, download);
     Ok(())
 }
 
@@ -637,6 +773,10 @@ async fn handle_udp_associate<S: ServiceApi + 'static>(
                         debug!("UDP ASSOCIATE shutting down (TCP control closed)");
                     }
                 }
+            }
+            Route::Pool { pool, .. } => {
+                // Pool services over UDP are not supported in Phase 1.
+                warn!("UDP to pool '{}' not supported; refusing", pool);
             }
             Route::Refused => {
                 warn!("Refusing UDP association to {}:{}", hostname, port);

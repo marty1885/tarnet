@@ -27,8 +27,8 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tarnet_api::error::{ApiError, ApiResult};
 use tarnet_api::ipc::*;
 use tarnet_api::service::{
-    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi,
-    TnsRecord, TnsResolution,
+    Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PoolClaim, PoolEndpoint,
+    PoolKind, PoolRegisterOptions, PortMode, ServiceApi, TnsRecord, TnsResolution,
 };
 use tarnet_api::types::{
     DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo,
@@ -731,5 +731,72 @@ impl ServiceApi for IpcServiceApi {
         let payload = encode_payload(&req);
         let (status, resp) = self.request(METHOD_SEND_TUNNEL_DATA, &payload).await?;
         Self::check_status(status, &resp)
+    }
+
+    // ── Resource pools ──
+
+    async fn pool_join(&self, name: &str, kind: PoolKind) -> ApiResult<ServiceId> {
+        let payload = encode_payload(&(name.to_string(), kind));
+        let (status, resp) = self.request(METHOD_POOL_JOIN, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn pool_leave(&self, name: &str) -> ApiResult<()> {
+        let payload = encode_payload(&name.to_string());
+        let (status, resp) = self.request(METHOD_POOL_LEAVE, &payload).await?;
+        Self::check_status(status, &resp)
+    }
+
+    async fn pool_list(&self) -> ApiResult<Vec<(String, ServiceId)>> {
+        let (status, resp) = self.request(METHOD_POOL_LIST, &[]).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn pool_register(
+        &self,
+        pool: &str,
+        service: &str,
+        identity: Option<&str>,
+        port: &str,
+        opts: PoolRegisterOptions,
+    ) -> ApiResult<PoolClaim> {
+        let id_str: Option<String> = identity.map(|s| s.to_string());
+        let payload = encode_payload(&(
+            pool.to_string(),
+            service.to_string(),
+            id_str,
+            port.to_string(),
+            opts,
+        ));
+        let (status, resp) = self.request(METHOD_POOL_REGISTER, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn pool_withdraw(&self, claim: PoolClaim) -> ApiResult<()> {
+        let payload = encode_payload(&claim);
+        let (status, resp) = self.request(METHOD_POOL_WITHDRAW, &payload).await?;
+        Self::check_status(status, &resp)
+    }
+
+    async fn pool_resolve(
+        &self,
+        pool: &str,
+        service: &str,
+        timeout_secs: u32,
+    ) -> ApiResult<Vec<PoolEndpoint>> {
+        let payload = encode_payload(&(pool.to_string(), service.to_string(), timeout_secs));
+        let (status, resp) = self.request(METHOD_POOL_RESOLVE, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn pool_catalog(&self, pool: &str, timeout_secs: u32) -> ApiResult<Vec<String>> {
+        let payload = encode_payload(&(pool.to_string(), timeout_secs));
+        let (status, resp) = self.request(METHOD_POOL_CATALOG, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
     }
 }

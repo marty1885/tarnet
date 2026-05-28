@@ -86,6 +86,15 @@ pub const METHOD_RELOAD: u16 = 0x0024;
 /// Get the daemon's SOCKS proxy bind addresses.
 pub const METHOD_SOCKS_ADDR: u16 = 0x0025;
 
+// ── Resource pools (virtual clusters) ──
+pub const METHOD_POOL_JOIN: u16 = 0x0027;
+pub const METHOD_POOL_LEAVE: u16 = 0x0028;
+pub const METHOD_POOL_LIST: u16 = 0x0029;
+pub const METHOD_POOL_REGISTER: u16 = 0x002A;
+pub const METHOD_POOL_WITHDRAW: u16 = 0x002B;
+pub const METHOD_POOL_RESOLVE: u16 = 0x002C;
+pub const METHOD_POOL_CATALOG: u16 = 0x002D;
+
 // ── Response status codes ──
 
 pub const STATUS_OK: u8 = 0x00;

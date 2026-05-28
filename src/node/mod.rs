@@ -28,6 +28,7 @@ use crate::dht::{
 };
 use crate::identity::{self, dht_id_from_peer_id, peer_id_from_signing_pubkey, Keypair};
 use crate::identity_store::IdentityStore;
+use crate::pool::PoolStore;
 use crate::key_exchange::{kex_accept, KexOffer};
 use crate::link::PeerLink;
 use crate::peer_transport::LinkTable;
@@ -49,6 +50,7 @@ mod circuit;
 mod dht;
 mod hidden_service;
 mod identity_mgmt;
+mod pool;
 mod route_probe;
 mod tunnel;
 mod webrtc;
@@ -191,6 +193,11 @@ const HIDDEN_SERVICE_MAINTAIN_INTERVAL: Duration = Duration::from_secs(240);
 /// Re-publish hidden service intro points after this many seconds.
 /// Must be less than the TNS TTL (600s) to avoid gaps.
 const HIDDEN_SERVICE_REPUBLISH_AFTER: Duration = Duration::from_secs(480);
+
+/// How often the daemon refreshes active pool-endpoint claims (leases). Must be
+/// well under the claim TTL (default 45s) so a single missed refresh is tolerated
+/// while a crashed node's claims still expire promptly. See `project_resource_pool`.
+const POOL_CLAIM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Rendezvous point state entry.
 pub(crate) struct RendezvousEntry {
@@ -416,6 +423,10 @@ pub struct Node {
     hidden: HiddenServiceState,
     /// Identity store: named keypairs with privacy levels.
     identity_store: Arc<Mutex<IdentityStore>>,
+    /// Pool store: local name → joined virtual-cluster membership.
+    pool_store: Arc<Mutex<PoolStore>>,
+    /// Active pool claims this node advertises, keyed by (pool, service); refreshed by the lease timer.
+    pool_claims: Arc<Mutex<HashMap<(String, String), pool::ActiveClaim>>>,
     /// WebRTC connection coordinator (None if WebRTC is disabled).
     webrtc_connector: Option<Arc<WebRtcConnector>>,
     /// Random secret embedded in hello records so only peers who have seen
@@ -594,6 +605,21 @@ impl Node {
                 }
             }
         };
+        // Restore joined pools (virtual-cluster memberships) from the DB.
+        let mut pool_store = PoolStore::new();
+        if let Some(ref db) = db {
+            for (name, kind_tag, key_blob) in db.load_pools().unwrap_or_default() {
+                match kind_tag {
+                    0 if key_blob.len() == 32 => {
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&key_blob);
+                        pool_store.join(&name, tarnet_api::service::PoolKind::Closed { key });
+                    }
+                    _ => log::warn!("Skipping unrecognized pool '{}' (kind {})", name, kind_tag),
+                }
+            }
+        }
+
         let (event_tx, event_rx) = mpsc::channel(256);
         let (app_tx, app_rx) = mpsc::channel(256);
         let (tunnel_notify_tx, tunnel_notify_rx) = mpsc::channel(256);
@@ -640,6 +666,8 @@ impl Node {
             listener_rr: AtomicU64::new(0),
             hidden: HiddenServiceState::new(),
             identity_store: Arc::new(Mutex::new(identity_store)),
+            pool_store: Arc::new(Mutex::new(pool_store)),
+            pool_claims: Arc::new(Mutex::new(HashMap::new())),
             webrtc_connector: None,
             signaling_secret: rand::random(),
             pubkey_cache: Arc::new(Mutex::new(PubkeyCache::new(1024))),
@@ -864,6 +892,22 @@ impl Node {
                 loop {
                     interval.tick().await;
                     node.try_fill_outbound_links(&disc).await;
+                }
+            });
+        }
+
+        // Pool claim lease refresh: re-publish active pool-endpoint claims before
+        // their TTL so live endpoints persist and crashed ones expire (soft state).
+        {
+            let node = self.clone();
+            tokio::spawn(async move {
+                let mut interval = jittered_interval(POOL_CLAIM_REFRESH_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    let n = node.refresh_pool_claims().await;
+                    if n > 0 {
+                        log::debug!("Refreshed {} pool claim(s)", n);
+                    }
                 }
             });
         }

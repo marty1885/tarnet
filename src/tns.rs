@@ -138,6 +138,7 @@ const TAG_TEXT: u8 = 3;
 const TAG_ALIAS: u8 = 4;
 const TAG_INTRO_POINT: u8 = 6;
 const TAG_PEER: u8 = 7;
+const TAG_SERVICE: u8 = 8;
 
 fn encode_length_prefixed_string(buf: &mut Vec<u8>, tag: u8, s: &str) {
     buf.push(tag);
@@ -207,6 +208,15 @@ pub fn tns_record_to_bytes(record: &TnsRecord) -> Vec<u8> {
             let sig_len = signature.len() as u16;
             buf.extend_from_slice(&sig_len.to_be_bytes());
             buf.extend_from_slice(signature);
+        }
+        TnsRecord::Service { port, weight, meta } => {
+            buf.push(TAG_SERVICE);
+            let port_b = port.as_bytes();
+            buf.extend_from_slice(&(port_b.len() as u16).to_be_bytes());
+            buf.extend_from_slice(port_b);
+            buf.extend_from_slice(&weight.to_be_bytes());
+            buf.extend_from_slice(&(meta.len() as u16).to_be_bytes());
+            buf.extend_from_slice(meta);
         }
     }
     buf
@@ -306,6 +316,31 @@ pub fn tns_record_from_bytes(data: &[u8]) -> Result<(TnsRecord, usize)> {
                     signature,
                 },
                 total,
+            ))
+        }
+        TAG_SERVICE => {
+            // port_len(2) || port(utf8) || weight(2) || meta_len(2) || meta
+            if rest.len() < 2 {
+                return Err(Error::Wire("TNSService: too short".into()));
+            }
+            let port_len = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+            if rest.len() < 2 + port_len + 2 + 2 {
+                return Err(Error::Wire("TNSService: port truncated".into()));
+            }
+            let port = String::from_utf8(rest[2..2 + port_len].to_vec())
+                .map_err(|_| Error::Wire("TNSService: invalid UTF-8 port".into()))?;
+            let mut off = 2 + port_len;
+            let weight = u16::from_be_bytes([rest[off], rest[off + 1]]);
+            off += 2;
+            let meta_len = u16::from_be_bytes([rest[off], rest[off + 1]]) as usize;
+            off += 2;
+            if rest.len() < off + meta_len {
+                return Err(Error::Wire("TNSService: meta truncated".into()));
+            }
+            let meta = rest[off..off + meta_len].to_vec();
+            Ok((
+                TnsRecord::Service { port, weight, meta },
+                1 + off + meta_len,
             ))
         }
         _ => Err(Error::Wire(format!("TNSrecord: unknown tag {}", tag))),
@@ -929,6 +964,32 @@ mod tests {
     #[test]
     fn record_roundtrip_text() {
         let record = TnsRecord::Text("hello world".into());
+        let bytes = tns_record_to_bytes(&record);
+        let (parsed, consumed) = tns_record_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn record_roundtrip_service() {
+        let record = TnsRecord::Service {
+            port: "payment".into(),
+            weight: 7,
+            meta: b"llama-3.1-8b".to_vec(),
+        };
+        let bytes = tns_record_to_bytes(&record);
+        let (parsed, consumed) = tns_record_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn record_roundtrip_service_empty_meta() {
+        let record = TnsRecord::Service {
+            port: "".into(),
+            weight: 0,
+            meta: Vec::new(),
+        };
         let bytes = tns_record_to_bytes(&record);
         let (parsed, consumed) = tns_record_from_bytes(&bytes).unwrap();
         assert_eq!(parsed, record);
