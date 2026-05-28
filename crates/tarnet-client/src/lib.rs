@@ -72,7 +72,7 @@ fn default_node_status() -> tarnet_api::types::NodeStatus {
 /// IPC client that implements ServiceApi by talking to tarnetd over a Unix socket.
 pub struct IpcServiceApi {
     writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    next_id: AtomicU32,
+    next_id: Arc<AtomicU32>,
     pending: Arc<Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>>,
     /// Cached peer ID (fetched on connect, set exactly once).
     cached_peer_id: OnceLock<PeerId>,
@@ -164,7 +164,7 @@ impl IpcServiceApi {
 
         let client = Arc::new(Self {
             writer: Arc::new(Mutex::new(writer)),
-            next_id: AtomicU32::new(1),
+            next_id: Arc::new(AtomicU32::new(1)),
             pending,
             cached_peer_id: OnceLock::new(),
             event_tx,
@@ -241,22 +241,17 @@ impl IpcServiceApi {
         let (data_tx, data_rx) = mpsc::channel(256);
         self.conn_data.lock().await.insert(conn_id, data_tx);
 
-        // Create a sender that forwards to IPC METHOD_CONN_SEND
+        // Create a sender that forwards to IPC METHOD_CONN_SEND.
+        // Sends are fire-and-forget: we don't await a response, so we don't
+        // touch the `pending` map. The reader silently drops the daemon's
+        // response when no pending entry matches the id.
         let (app_tx, mut app_rx) = mpsc::channel::<Vec<u8>>(256);
         let writer = self.writer.clone();
-        let pending = self.pending.clone();
-        let send_counter = Arc::new(AtomicU32::new(
-            self.next_id.fetch_add(1_000_000, Ordering::Relaxed) + 1_000_000,
-        ));
+        let next_id = self.next_id.clone();
         tokio::spawn(async move {
             while let Some(data) = app_rx.recv().await {
                 let payload = encode_payload(&ConnSendReq { conn_id, data });
-
-                let request_id = send_counter.fetch_add(1, Ordering::Relaxed);
-                // Register pending so the response is consumed (fire-and-forget)
-                let (tx, _rx) = oneshot::channel();
-                pending.lock().await.insert(request_id, tx);
-
+                let request_id = next_id.fetch_add(1, Ordering::Relaxed);
                 let frame = IpcFrame::Request {
                     request_id,
                     method: METHOD_CONN_SEND,

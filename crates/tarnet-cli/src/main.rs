@@ -1535,16 +1535,13 @@ async fn cmd_tunnel(
         None
     };
 
-    // Status block.
+    // Status block + copy-pastable connect commands.
+    // The shareable name is "<label>.<ServiceId>" — using the local identity
+    // label (e.g. "default") would only resolve for the publisher.
+    let socks_addrs = client.socks_addr().await.unwrap_or_default();
+    let public_name = format!("{}.{}", label, service_id);
     println!("{} ({})", bold("tarnet tunnel"), protocol);
-    println!("  {} {} -> {}", dim("forward"), label_url(&label, id_str), local_addr);
-    println!(
-        "  {} {}   {} {}",
-        dim("ServiceId"),
-        service_id,
-        dim("port"),
-        port_name
-    );
+    println!("  {} {} -> {}", dim("forward"), public_name, local_addr);
     if let Some(p) = pool {
         let svc = service.unwrap_or(&label);
         println!("  {} {} / {}", dim("pool"), p, svc);
@@ -1555,6 +1552,20 @@ async fn cmd_tunnel(
         ttl,
         ttl / 2
     );
+    println!();
+    println!("  {}", dim("# connect from the tarnet CLI:"));
+    println!("  tarnet connect {} --port {}", public_name, port_name);
+    if !socks_addrs.is_empty() && protocol == "tcp" {
+        let proxy = socks_addrs[0];
+        println!(
+            "  {}  socks5h://{}  ->  {}:{}",
+            dim("# SOCKS5:"),
+            proxy,
+            public_name,
+            port_name
+        );
+    }
+    println!();
     println!("  {}", dim("Ctrl-C to stop."));
     println!();
 
@@ -1648,11 +1659,6 @@ async fn cmd_tunnel(
     if let Err(e) = client.close_listener(&listener).await {
         eprintln!("[!] close listener failed: {}", e);
     }
-}
-
-/// "name.identity" pretty form for the status line.
-fn label_url(label: &str, identity: &str) -> String {
-    format!("{}.{}", label, identity)
 }
 
 /// Normalize a user-supplied local address.
@@ -2215,9 +2221,4 @@ mod tests {
         assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
-    #[test]
-    fn label_url_format() {
-        assert_eq!(label_url("tun-abc12345", "alice"), "tun-abc12345.alice");
-        assert_eq!(label_url("demo", "default"), "demo.default");
-    }
 }
