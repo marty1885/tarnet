@@ -389,6 +389,11 @@ pub struct Node {
     channel_state: ChannelState,
     event_tx: mpsc::Sender<NodeEvent>,
     event_rx: Mutex<Option<mpsc::Receiver<NodeEvent>>>,
+    /// Lifecycle events (LinkUp/LinkDown) flow on a dedicated channel so they
+    /// can't be starved behind Message backpressure on `event_tx`. The event
+    /// loop drains this channel with bias over `event_rx`.
+    lifecycle_tx: mpsc::Sender<NodeEvent>,
+    lifecycle_rx: Mutex<Option<mpsc::Receiver<NodeEvent>>>,
     /// Channel for delivering data to the application layer.
     app_rx: Mutex<Option<mpsc::Receiver<(PeerId, Vec<u8>)>>>,
     app_tx: mpsc::Sender<(PeerId, Vec<u8>)>,
@@ -634,6 +639,7 @@ impl Node {
         }
 
         let (event_tx, event_rx) = mpsc::channel(256);
+        let (lifecycle_tx, lifecycle_rx) = mpsc::channel(64);
         let (app_tx, app_rx) = mpsc::channel(256);
         let (tunnel_notify_tx, tunnel_notify_rx) = mpsc::channel(256);
         let (dht_watch_tx, dht_watch_rx) = mpsc::channel(256);
@@ -652,6 +658,8 @@ impl Node {
             channel_state: ChannelState::new(),
             event_tx,
             event_rx: Mutex::new(Some(event_rx)),
+            lifecycle_tx,
+            lifecycle_rx: Mutex::new(Some(lifecycle_rx)),
             app_rx: Mutex::new(Some(app_rx)),
             app_tx,
             global_addrs: Arc::new(Mutex::new(Vec::new())),
@@ -793,9 +801,12 @@ impl Node {
         self.identity_store.lock().await.default_service_id().0
     }
 
-    /// Get a clone of the event sender for injecting LinkUp/LinkDown events from outside.
+    /// Get a clone of the lifecycle sender for injecting LinkUp/LinkDown events
+    /// from outside (e.g. mDNS, simulation harness). This is intentionally the
+    /// lifecycle channel, not the message channel — handshake-completion must
+    /// not block behind data-plane traffic.
     pub fn event_sender(&self) -> mpsc::Sender<NodeEvent> {
-        self.event_tx.clone()
+        self.lifecycle_tx.clone()
     }
 
     /// Get a clone of the identity keypair.
@@ -818,7 +829,7 @@ impl Node {
 
         // Start accepting connections
         let disc_accept = discovery.clone();
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.lifecycle_tx.clone();
         let identity = self.identity.clone();
         tokio::spawn(async move {
             loop {
@@ -855,7 +866,7 @@ impl Node {
         if !bootstrap.is_empty() {
             let links_ref = self.links.clone();
             let disc = discovery.clone();
-            let tx = self.event_tx.clone();
+            let tx = self.lifecycle_tx.clone();
             let identity = self.identity.clone();
             tokio::spawn(async move {
                 bootstrap_retry_loop(bootstrap, disc, tx, identity, links_ref).await;
@@ -867,7 +878,7 @@ impl Node {
         if !discovery_addrs.is_empty() {
             let links_ref = self.links.clone();
             let disc = discovery.clone();
-            let tx = self.event_tx.clone();
+            let tx = self.lifecycle_tx.clone();
             let identity = self.identity.clone();
             tokio::spawn(async move {
                 discovery_retry_loop(discovery_addrs, disc, tx, identity, links_ref).await;
@@ -1070,7 +1081,7 @@ impl Node {
                                             addr_str,
                                         );
                                         let _ = self
-                                            .event_tx
+                                            .lifecycle_tx
                                             .send(NodeEvent::LinkUp(link.remote_peer(), link))
                                             .await;
                                         break; // one link per peer is enough
@@ -1107,6 +1118,12 @@ impl Node {
     async fn event_loop(&self, node_arc: Arc<Node>) -> Result<()> {
         let mut event_rx = self
             .event_rx
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| Error::Protocol("event loop already running".into()))?;
+        let mut lifecycle_rx = self
+            .lifecycle_rx
             .lock()
             .await
             .take()
@@ -1162,7 +1179,7 @@ impl Node {
         //      route's last_updated so the DV expirer never wipes a live
         //      neighbor's direct route.
         let hb_links = self.links.clone();
-        let hb_event_tx = self.event_tx.clone();
+        let hb_event_tx = self.lifecycle_tx.clone();
         let hb_routing = self.routing_table.clone();
         tokio::spawn(async move {
             let mut interval = jittered_interval(HEARTBEAT_TICK);
@@ -1714,8 +1731,21 @@ impl Node {
             }
         });
 
-        // Process events
-        while let Some(event) = event_rx.recv().await {
+        // Process events. Lifecycle events (LinkUp/LinkDown) are polled with bias
+        // over message events so handshake completion can't be starved behind a
+        // data-plane backlog. If both channels close we exit.
+        loop {
+            let event = tokio::select! {
+                biased;
+                ev = lifecycle_rx.recv() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+                ev = event_rx.recv() => match ev {
+                    Some(ev) => ev,
+                    None => break,
+                },
+            };
             match event {
                 NodeEvent::LinkUp(peer_id, link) => {
                     self.handle_link_up(peer_id, link).await;
@@ -1858,6 +1888,7 @@ impl Node {
 
         // Start recv loop for this link
         let event_tx = self.event_tx.clone();
+        let lifecycle_tx = self.lifecycle_tx.clone();
         let remote = peer_id;
         let recv_link_id = link_id;
         let stats = self.stats.clone();
@@ -1884,7 +1915,7 @@ impl Node {
                         }
                     }
                     Err(_) => {
-                        let _ = event_tx
+                        let _ = lifecycle_tx
                             .send(NodeEvent::LinkDown(remote, recv_link_id))
                             .await;
                         break;
@@ -2112,7 +2143,7 @@ impl Node {
         let discovery = self.discovery.clone();
         let links = self.links.clone();
         let identity = self.identity.clone();
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.lifecycle_tx.clone();
         let bootstrap_addrs = self.bootstrap_addrs.clone();
         let kbucket = self.kbucket.clone();
         let dht_store = self.dht_store.clone();

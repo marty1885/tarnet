@@ -84,7 +84,7 @@ impl Node {
             .await
             .insert(port_hash, listener_tx);
 
-        let event_tx = self.event_tx.clone();
+        let event_tx = self.lifecycle_tx.clone();
         let identity = self.identity.clone();
         let channel_data_handlers = self.channel_state.data_handlers.clone();
         let channels = self.channel_state.channels.clone();
@@ -365,7 +365,7 @@ impl Node {
         });
 
         // Wait for transport and do PeerLink handshake
-        let event_tx2 = self.event_tx.clone();
+        let event_tx2 = self.lifecycle_tx.clone();
         let identity2 = self.identity.clone();
         tokio::spawn(async move {
             match transport_rx.await {
