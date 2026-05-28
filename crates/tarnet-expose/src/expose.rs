@@ -374,9 +374,9 @@ fn spawn_accept_tasks<S: ServiceApi + 'static>(api: Arc<S>, services: &[Register
 
                 tokio::spawn(async move {
                     if protocol == "udp" {
-                        pipe_udp::<S>(conn, &local_addr, &service_name).await;
+                        pipe_udp(conn, &local_addr, &service_name).await;
                     } else {
-                        pipe_tcp::<S>(conn, &local_addr, &service_name).await;
+                        pipe_tcp(conn, &local_addr, &service_name).await;
                     }
                 });
             }
@@ -484,7 +484,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
 }
 
 /// Pipe a circuit connection to a local TCP backend.
-async fn pipe_tcp<S: ServiceApi>(
+pub async fn pipe_tcp(
     conn: tarnet_api::service::Connection,
     local_addr: &str,
     service_name: &str,
@@ -543,7 +543,7 @@ async fn pipe_tcp<S: ServiceApi>(
 }
 
 /// Pipe a circuit connection to a local UDP backend.
-async fn pipe_udp<S: ServiceApi>(
+pub async fn pipe_udp(
     conn: tarnet_api::service::Connection,
     local_addr: &str,
     service_name: &str,

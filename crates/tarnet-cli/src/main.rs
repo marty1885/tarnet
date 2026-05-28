@@ -82,6 +82,33 @@ enum Command {
         #[arg(trailing_var_arg = true, required = true)]
         command: Vec<String>,
     },
+    /// Expose a local TCP/UDP service to tarnet temporarily (removed on exit)
+    #[command(arg_required_else_help = true)]
+    Tunnel {
+        /// Protocol: tcp or udp
+        #[arg(value_parser = ["tcp", "udp"])]
+        protocol: String,
+        /// Local address: "8080" (-> 127.0.0.1:8080) or "host:port"
+        addr: String,
+        /// Tarnet-facing port name (default: numeric local port)
+        #[arg(long)]
+        port: Option<String>,
+        /// TNS subdomain in the identity's zone (default: random tun-xxxxxxxx)
+        #[arg(long)]
+        name: Option<String>,
+        /// Identity to expose under (default: default identity)
+        #[arg(long)]
+        identity: Option<String>,
+        /// Pool to register this endpoint into
+        #[arg(long)]
+        pool: Option<String>,
+        /// Pool service label (default: the tunnel name)
+        #[arg(long)]
+        service: Option<String>,
+        /// TNS record TTL in seconds; tunnel republishes every ttl/2
+        #[arg(long, default_value_t = 300)]
+        ttl: u32,
+    },
     /// Resource pools (virtual clusters)
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Pool {
@@ -363,6 +390,29 @@ async fn main() {
         } => cmd_listen(&cli, identity, mode, port).await,
         Command::Tarify { identity, command } => {
             cmd_tarify(&cli, identity.as_deref(), command).await
+        }
+        Command::Tunnel {
+            protocol,
+            addr,
+            port,
+            name,
+            identity,
+            pool,
+            service,
+            ttl,
+        } => {
+            cmd_tunnel(
+                &cli,
+                protocol,
+                addr,
+                port.as_deref(),
+                name.as_deref(),
+                identity.as_deref(),
+                pool.as_deref(),
+                service.as_deref(),
+                *ttl,
+            )
+            .await
         }
         Command::Pool { command } => cmd_pool(&cli, command).await,
         Command::Status => cmd_status(&cli).await,
@@ -1382,6 +1432,260 @@ fn find_preload_lib() -> String {
     std::process::exit(1);
 }
 
+// ── Tunnel ──
+
+async fn cmd_tunnel(
+    cli: &Cli,
+    protocol: &str,
+    addr: &str,
+    port: Option<&str>,
+    name: Option<&str>,
+    identity: Option<&str>,
+    pool: Option<&str>,
+    service: Option<&str>,
+    ttl: u32,
+) {
+    let client = connect_daemon(cli).await;
+
+    let (local_addr, local_port) = match normalize_local_addr(addr) {
+        Ok(pair) => pair,
+        Err(e) => exit_err(&e),
+    };
+
+    // Tarnet-facing port name: explicit override, else numeric local port.
+    let port_name = port.map(|s| s.to_string()).unwrap_or_else(|| local_port.to_string());
+
+    // Resolve identity (validates it exists).
+    let id_str = identity.unwrap_or("default");
+    let service_id = match client.resolve_identity(id_str).await {
+        Ok(sid) => sid,
+        Err(e) => exit_err(&format!("Unknown identity '{}': {}", id_str, e)),
+    };
+
+    // TNS label: explicit --name or random tun-xxxxxxxx.
+    let label = match name {
+        Some(n) => n.to_string(),
+        None => format!("tun-{}", random_hex8()),
+    };
+
+    // Collision check: refuse to clobber an existing label in this zone.
+    match client.tns_get_label(identity, &label).await {
+        Ok(Some(_)) => exit_err(&format!(
+            "Label '{}' already exists in zone (pick a different --name)",
+            label
+        )),
+        Ok(None) => {}
+        Err(e) => exit_err(&format!("Failed to check label '{}': {}", label, e)),
+    }
+
+    let mode = if protocol == "udp" {
+        PortMode::UnreliableUnordered
+    } else {
+        PortMode::ReliableOrdered
+    };
+
+    let listener = match client
+        .listen(service_id, mode, &port_name, ListenerOptions::default())
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => exit_err(&format!("Failed to listen on port '{}': {}", port_name, e)),
+    };
+
+    // Set local label (private; we publish to DHT explicitly below to control TTL).
+    let records = vec![TnsRecord::Identity(service_id)];
+    if let Err(e) = client
+        .tns_set_label(identity, &label, records.clone(), false)
+        .await
+    {
+        let _ = client.close_listener(&listener).await;
+        exit_err(&format!("Failed to set local label '{}': {}", label, e));
+    }
+
+    // Publish to DHT with the configured TTL.
+    if let Err(e) = client
+        .tns_publish(identity, &label, records.clone(), ttl)
+        .await
+    {
+        let _ = client.tns_remove_label(identity, &label).await;
+        let _ = client.close_listener(&listener).await;
+        exit_err(&format!("Failed to publish '{}' to DHT: {}", label, e));
+    }
+
+    // Optionally register in a pool.
+    let pool_claim = if let Some(pool_name) = pool {
+        let svc = service.unwrap_or(&label);
+        let opts = PoolRegisterOptions {
+            weight: 1,
+            meta: Vec::new(),
+            ttl_secs: 45,
+        };
+        match client
+            .pool_register(pool_name, svc, identity, &port_name, opts)
+            .await
+        {
+            Ok(claim) => Some(claim),
+            Err(e) => {
+                let _ = client.tns_remove_label(identity, &label).await;
+                let _ = client.close_listener(&listener).await;
+                exit_err(&format!("Failed to register in pool '{}': {}", pool_name, e));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Status block.
+    println!("{} ({})", bold("tarnet tunnel"), protocol);
+    println!("  {} {} -> {}", dim("forward"), label_url(&label, id_str), local_addr);
+    println!(
+        "  {} {}   {} {}",
+        dim("ServiceId"),
+        service_id,
+        dim("port"),
+        port_name
+    );
+    if let Some(p) = pool {
+        let svc = service.unwrap_or(&label);
+        println!("  {} {} / {}", dim("pool"), p, svc);
+    }
+    println!(
+        "  {} {}s (republish every {}s)",
+        dim("ttl"),
+        ttl,
+        ttl / 2
+    );
+    println!("  {}", dim("Ctrl-C to stop."));
+    println!();
+
+    // Republish loop.
+    let republish_client = client.clone();
+    let republish_identity = identity.map(|s| s.to_string());
+    let republish_label = label.clone();
+    let republish_records = records.clone();
+    let republish_handle = tokio::spawn(async move {
+        let interval = std::cmp::max(ttl / 2, 1) as u64;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+        ticker.tick().await; // skip immediate tick (already published)
+        loop {
+            ticker.tick().await;
+            if let Err(e) = republish_client
+                .tns_publish(
+                    republish_identity.as_deref(),
+                    &republish_label,
+                    republish_records.clone(),
+                    ttl,
+                )
+                .await
+            {
+                eprintln!("[!] republish failed: {}", e);
+            }
+        }
+    });
+
+    // Accept loop.
+    let accept_client = client.clone();
+    let accept_listener = listener.clone();
+    let local_for_accept = local_addr.clone();
+    let label_for_accept = label.clone();
+    let proto_for_accept = protocol.to_string();
+    let accept_handle = tokio::spawn(async move {
+        loop {
+            match accept_client.accept(&accept_listener).await {
+                Ok(conn) => {
+                    let peer = conn.remote_service_id;
+                    let peer_str = format!("{}", peer);
+                    let short: String = peer_str.chars().take(16).collect();
+                    eprintln!("[+] {} {}", dim("conn"), short);
+                    let local = local_for_accept.clone();
+                    let svc = label_for_accept.clone();
+                    let proto = proto_for_accept.clone();
+                    tokio::spawn(async move {
+                        if proto == "udp" {
+                            tarnet_expose::expose::pipe_udp(conn, &local, &svc).await;
+                        } else {
+                            tarnet_expose::expose::pipe_tcp(conn, &local, &svc).await;
+                        }
+                        eprintln!("[-] {} {}", dim("closed"), short);
+                    });
+                }
+                Err(e) => {
+                    if e.to_string().contains("timeout") {
+                        continue;
+                    }
+                    eprintln!("Accept error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for SIGINT or SIGTERM.
+    let mut sigterm =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => exit_err(&format!("Failed to install SIGTERM handler: {}", e)),
+        };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+
+    eprintln!();
+    eprintln!("{}", dim("Shutting down..."));
+
+    republish_handle.abort();
+    accept_handle.abort();
+
+    if let Some(claim) = pool_claim {
+        if let Err(e) = client.pool_withdraw(claim).await {
+            eprintln!("[!] pool withdraw failed: {}", e);
+        }
+    }
+    if let Err(e) = client.tns_remove_label(identity, &label).await {
+        eprintln!("[!] tns remove failed: {}", e);
+    }
+    if let Err(e) = client.close_listener(&listener).await {
+        eprintln!("[!] close listener failed: {}", e);
+    }
+}
+
+/// "name.identity" pretty form for the status line.
+fn label_url(label: &str, identity: &str) -> String {
+    format!("{}.{}", label, identity)
+}
+
+/// Normalize a user-supplied local address.
+/// Bare port -> "127.0.0.1:port". "host:port" is returned as-is.
+/// Returns (full_address, port).
+fn normalize_local_addr(addr: &str) -> Result<(String, u16), String> {
+    if let Some(idx) = addr.rfind(':') {
+        let port_str = &addr[idx + 1..];
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("Invalid port in '{}': '{}'", addr, port_str))?;
+        Ok((addr.to_string(), port))
+    } else {
+        let port: u16 = addr.parse().map_err(|_| {
+            format!(
+                "Invalid address '{}': expected 'host:port' or a bare port number",
+                addr
+            )
+        })?;
+        Ok((format!("127.0.0.1:{}", port), port))
+    }
+}
+
+/// 8 hex chars from /dev/urandom for tunnel name suffixes.
+fn random_hex8() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 4];
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)) {
+        Ok(()) => b.iter().map(|x| format!("{:02x}", x)).collect(),
+        Err(_) => "00000000".to_string(),
+    }
+}
+
 // ── Status ──
 
 async fn cmd_status(cli: &Cli) {
@@ -1853,4 +2157,67 @@ fn hex_decode(s: &str) -> Vec<u8> {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_bare_port() {
+        let (addr, port) = normalize_local_addr("8080").unwrap();
+        assert_eq!(addr, "127.0.0.1:8080");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn normalize_host_port() {
+        let (addr, port) = normalize_local_addr("192.168.1.10:5432").unwrap();
+        assert_eq!(addr, "192.168.1.10:5432");
+        assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn normalize_localhost_explicit() {
+        let (addr, port) = normalize_local_addr("127.0.0.1:80").unwrap();
+        assert_eq!(addr, "127.0.0.1:80");
+        assert_eq!(port, 80);
+    }
+
+    #[test]
+    fn normalize_ipv6_bracketed() {
+        // "[::1]:8080" -> rfind(':') splits port off correctly.
+        let (addr, port) = normalize_local_addr("[::1]:8080").unwrap();
+        assert_eq!(addr, "[::1]:8080");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn normalize_rejects_non_numeric_bare() {
+        assert!(normalize_local_addr("notaport").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_bad_port_in_host_port() {
+        assert!(normalize_local_addr("host:notaport").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_port_overflow() {
+        assert!(normalize_local_addr("99999").is_err());
+        assert!(normalize_local_addr("host:99999").is_err());
+    }
+
+    #[test]
+    fn random_hex8_is_8_hex_chars() {
+        let s = random_hex8();
+        assert_eq!(s.len(), 8);
+        assert!(s.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn label_url_format() {
+        assert_eq!(label_url("tun-abc12345", "alice"), "tun-abc12345.alice");
+        assert_eq!(label_url("demo", "default"), "demo.default");
+    }
 }

@@ -2617,6 +2617,7 @@ dependencies = [
  "serde_json",
  "tarnet-api",
  "tarnet-client",
+ "tarnet-expose",
  "tokio",
 ]
 
