@@ -214,22 +214,24 @@ async fn handle_client(
                                 continue;
                             }
                         };
-                        let conns = conns.clone();
-                        let writer = writer.clone();
-                        tokio::spawn(async move {
+                        // MUST stay inline. Spawning per frame lets two sends
+                        // on the same connection race on conns.lock + conn.send,
+                        // reordering bytes on a single stream. Inline preserves
+                        // per-client ordering and gives natural backpressure.
+                        // Regression guard: tests::conn_send_handler_stays_inline.
+                        let response = {
                             let guard = conns.lock().await;
-                            let response = if let Some(conn) = guard.get(&req.conn_id) {
+                            if let Some(conn) = guard.get(&req.conn_id) {
                                 match conn.send(&req.data).await {
                                     Ok(()) => ok_response(request_id, &[]),
                                     Err(e) => err_response(request_id, &e.to_string()),
                                 }
                             } else {
                                 err_response(request_id, "unknown connection id")
-                            };
-                            drop(guard);
-                            let mut w = writer.lock().await;
-                            let _ = send_frame(&mut *w, &response).await;
-                        });
+                            }
+                        };
+                        let mut w = writer.lock().await;
+                        let _ = send_frame(&mut *w, &response).await;
                     }
                     METHOD_RELOAD => {
                         log::info!("Reload requested via IPC");
@@ -931,6 +933,38 @@ mod tests {
                 )),
             );
         }
+    }
+
+    /// Regression guard for a real bug: the per-IPC-client reader loop must
+    /// process METHOD_CONN_SEND frames sequentially. Spawning a task per frame
+    /// races them on `conns.lock()` + `conn.send().await`, reordering bytes on
+    /// a single circuit connection (e.g. a WS upload). This bug shipped from
+    /// the initial commit and stayed hidden because expose runs in-process and
+    /// never crosses METHOD_CONN_SEND; only IPC consumers (tunnel/tarify/socks)
+    /// exercise it.
+    ///
+    /// A behavioural test would need a ~200-line ServiceApi mock plus a Unix
+    /// socket harness; this structural check is the highest-leverage guard for
+    /// the exact class — any future spawn inside this handler trips it.
+    #[test]
+    fn conn_send_handler_stays_inline() {
+        let src = include_str!("ipc_server.rs");
+        let start = src
+            .find("METHOD_CONN_SEND =>")
+            .expect("METHOD_CONN_SEND arm must exist");
+        let after = &src[start + "METHOD_CONN_SEND =>".len()..];
+        // The arm ends at the next `METHOD_` match in this dispatch block.
+        let end = after
+            .find("METHOD_")
+            .expect("there should be a sibling arm after METHOD_CONN_SEND");
+        let arm = &after[..end];
+        assert!(
+            !arm.contains("tokio::spawn"),
+            "METHOD_CONN_SEND must be handled inline to preserve per-stream \
+             send ordering. Spawning a task per frame races on the conn lock \
+             and reorders bytes. Arm text:\n{}",
+            arm
+        );
     }
 
     #[test]
