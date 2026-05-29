@@ -81,6 +81,104 @@ impl DhtRecord {
     pub fn is_expired(&self) -> bool {
         self.stored_at.elapsed() > self.ttl
     }
+
+    /// Build the wire `DhtResponseRecord` for this stored record. Copies *every*
+    /// signed field (notably `signer_pubkey`) by construction, so a GET response
+    /// can never silently drop a field the verifier needs — the original
+    /// "resolution only works via push" bug was a hand-copy that omitted it.
+    pub fn to_response_record(&self) -> crate::wire::DhtResponseRecord {
+        crate::wire::DhtResponseRecord {
+            record_type: self.record_type,
+            sequence: self.sequence,
+            signer: self.signer,
+            ttl: self.remaining_ttl().as_secs() as u32,
+            value: self.value.clone(),
+            signature: self.signature.clone(),
+            signer_algo: self.signer_algo,
+            signer_pubkey: self.signer_pubkey.clone(),
+        }
+    }
+
+    /// Build a wire `DhtPutMsg` to (re)propagate this stored record, with the
+    /// originator seeded into the bloom filter. Same guarantee as
+    /// [`to_response_record`](Self::to_response_record): all signed fields are
+    /// copied, never re-derived or omitted. Carries the full stored `ttl`
+    /// (matching the existing replication / link-up propagation behavior).
+    pub fn to_put_msg(&self, originator: &PeerId, hop_limit: u8) -> crate::wire::DhtPutMsg {
+        let mut bloom = BloomFilter::new();
+        bloom.insert(originator);
+        crate::wire::DhtPutMsg {
+            key: *self.key.as_bytes(),
+            record_type: self.record_type,
+            sequence: self.sequence,
+            signer: self.signer,
+            ttl: self.ttl.as_secs() as u32,
+            value: self.value.clone(),
+            signature: self.signature.clone(),
+            signer_algo: self.signer_algo,
+            signer_pubkey: self.signer_pubkey.clone(),
+            hop_count: 0,
+            hop_limit,
+            bloom: bloom.to_bytes(),
+        }
+    }
+
+    fn remaining_ttl(&self) -> Duration {
+        self.ttl.saturating_sub(self.stored_at.elapsed())
+    }
+}
+
+/// Canonical bytes covered by a signed DHT record's signature:
+/// `key || record_type || sequence(BE) || value`.
+///
+/// Single source of truth: [`crate::wire::DhtPutMsg::signable_bytes`] and
+/// [`verify_incoming_record`] both build the signable through this, so the signed
+/// layout can never drift between the signing side and the verifying side.
+pub fn record_signable(key: &[u8; 64], record_type: RecordType, sequence: u64, value: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + 1 + 8 + value.len());
+    buf.extend_from_slice(key);
+    buf.push(record_type.as_u8());
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(value);
+    buf
+}
+
+/// The single gate every inbound signed record must pass before it is trusted or
+/// stored. Returns `Err(reason)` (suitable for logging) when the record must be
+/// dropped.
+///
+/// Every DHT ingest path — `DhtPut`, `DhtGetResponse`, `DhtWatchNotify` — routes
+/// through here, so the invariants (signer pubkey present, pubkey bound to the
+/// claimed signer PeerId, signature valid over the canonical signable) are
+/// enforced identically. Previously these were hand-coded per handler and had
+/// drifted: GET responses verified against an absent pubkey, and watch notifies
+/// skipped the pubkey↔signer binding entirely.
+pub fn verify_incoming_record(
+    key: &[u8; 64],
+    record_type: RecordType,
+    sequence: u64,
+    value: &[u8],
+    signer: &[u8; 32],
+    signer_algo: u8,
+    signer_pubkey: &[u8],
+    signature: &[u8],
+) -> std::result::Result<(), &'static str> {
+    if !record_type.is_signed() {
+        return Ok(());
+    }
+    let algo =
+        tarnet_api::types::SigningAlgo::from_u8(signer_algo).map_err(|_| "unknown signer algo")?;
+    if signer_pubkey.is_empty() {
+        return Err("missing signer pubkey");
+    }
+    if crate::identity::peer_id_from_signing_pubkey(signer_pubkey) != PeerId(*signer) {
+        return Err("signer pubkey does not match signer PeerId");
+    }
+    let signable = record_signable(key, record_type, sequence, value);
+    if !crate::identity::verify(algo, signer_pubkey, &signable, signature) {
+        return Err("invalid signature");
+    }
+    Ok(())
 }
 
 /// Local DHT storage. Supports multiple records per key (supplemental).

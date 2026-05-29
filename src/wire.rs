@@ -683,12 +683,8 @@ impl DhtPutMsg {
 
     /// The bytes covered by the signature: key || record_type || sequence || value
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(64 + 1 + 8 + self.value.len());
-        buf.extend_from_slice(&self.key);
-        buf.push(self.record_type.as_u8());
-        buf.extend_from_slice(&self.sequence.to_be_bytes());
-        buf.extend_from_slice(&self.value);
-        buf
+        // Single source of truth, shared with the verify gate.
+        crate::dht::record_signable(&self.key, self.record_type, self.sequence, &self.value)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

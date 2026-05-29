@@ -26,7 +26,7 @@ use crate::dht::{
     is_k_closest, probabilistic_select, random_select, BloomFilter, DhtQueryParams, DhtRecord,
     DhtStore, DhtWatchTable, KBucketTable, DHT_K,
 };
-use crate::identity::{self, dht_id_from_peer_id, peer_id_from_signing_pubkey, Keypair};
+use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::identity_store::IdentityStore;
 use crate::pool::PoolStore;
 use crate::key_exchange::{kex_accept, KexOffer};
@@ -44,7 +44,6 @@ use crate::types::{
 };
 use crate::wire::*;
 use tarnet_api::service::{Connection, Listener, ListenerOptions};
-use tarnet_api::types::SigningAlgo;
 
 mod circuit;
 mod dht;
@@ -1701,22 +1700,7 @@ impl Node {
                         continue;
                     }
 
-                    let mut bloom = BloomFilter::new();
-                    bloom.insert(&repl_identity.peer_id());
-                    let put = DhtPutMsg {
-                        key: *record.key.as_bytes(),
-                        record_type: record.record_type,
-                        sequence: record.sequence,
-                        signer: record.signer,
-                        ttl: record.ttl.as_secs() as u32,
-                        value: record.value.clone(),
-                        signature: record.signature.clone(),
-                        signer_algo: record.signer_algo,
-                        signer_pubkey: record.signer_pubkey.clone(),
-                        hop_count: 0,
-                        hop_limit: repl_params.hop_limit,
-                        bloom: bloom.to_bytes(),
-                    };
+                    let put = record.to_put_msg(&repl_identity.peer_id(), repl_params.hop_limit);
                     let encoded = put.to_wire().encode();
 
                     let links = repl_links.lock().await;
@@ -1976,20 +1960,7 @@ impl Node {
             let link = self.links.lock().await.get(&peer_id).cloned();
             if let Some(link) = link {
                 for record in store.all_records() {
-                    let put = DhtPutMsg {
-                        key: *record.key.as_bytes(),
-                        record_type: record.record_type,
-                        sequence: record.sequence,
-                        signer: record.signer,
-                        ttl: record.ttl.as_secs() as u32,
-                        value: record.value.clone(),
-                        signature: record.signature.clone(),
-                        signer_algo: record.signer_algo,
-                        signer_pubkey: record.signer_pubkey.clone(),
-                        hop_count: 0,
-                        hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-                        bloom: [0u8; 256],
-                    };
+                    let put = record.to_put_msg(&self.peer_id(), DhtPutMsg::DEFAULT_HOP_LIMIT);
                     let _ = link.send_deferred(&put.to_wire().encode()).await;
                 }
             }
@@ -2326,34 +2297,19 @@ impl Node {
                     put.hop_limit -= 1;
                 }
 
-                // Verify signature for signed record types before storing/propagating
-                if put.record_type.is_signed() {
-                    log::debug!(
-                        "DHT PUT verify: type={:?}, signer_algo={}, pubkey_len={}, sig_len={}, value_len={}",
-                        put.record_type, put.signer_algo, put.signer_pubkey.len(),
-                        put.signature.len(), put.value.len()
-                    );
-                    let algo = SigningAlgo::from_u8(put.signer_algo)
-                        .map_err(|e| Error::Protocol(format!("unknown signer algo: {}", e)))?;
-                    if put.signer_pubkey.is_empty() {
-                        log::warn!("DHT PUT from {:?}: signed record missing signer pubkey, dropping", from);
-                        return Ok(());
-                    }
-                    // Verify that the signer pubkey matches the claimed signer PeerId
-                    let expected_peer = peer_id_from_signing_pubkey(&put.signer_pubkey);
-                    if expected_peer != PeerId(put.signer) {
-                        log::warn!("DHT PUT from {:?}: signer pubkey does not match signer PeerId, dropping", from);
-                        return Ok(());
-                    }
-                    if !identity::verify(
-                        algo,
-                        &put.signer_pubkey,
-                        &put.signable_bytes(),
-                        &put.signature,
-                    ) {
-                        log::warn!("DHT PUT from {:?}: invalid signature, dropping", from);
-                        return Ok(());
-                    }
+                // Verify signature for signed record types before storing/propagating.
+                if let Err(reason) = crate::dht::verify_incoming_record(
+                    &put.key,
+                    put.record_type,
+                    put.sequence,
+                    &put.value,
+                    &put.signer,
+                    put.signer_algo,
+                    &put.signer_pubkey,
+                    &put.signature,
+                ) {
+                    log::warn!("DHT PUT from {:?}: {}, dropping", from, reason);
+                    return Ok(());
                 }
 
                 // Check if we already have this exact record (avoid re-flooding)
@@ -2444,28 +2400,13 @@ impl Node {
                 // Respond with local records, routed back via query_token
                 let store = self.dht_store.lock().await;
                 let records = store.get(&key);
+                // `to_response_record` copies every signed field (incl. the signer
+                // pubkey the requester must verify against) and the remaining TTL —
+                // no per-call hand-copy that can silently drop a field.
                 let response_records: Vec<DhtResponseRecord> = records
                     .iter()
-                    .filter_map(|r| {
-                        // Send remaining TTL, not the original.
-                        let elapsed = r.stored_at.elapsed();
-                        let remaining = r.ttl.checked_sub(elapsed)?;
-                        Some(DhtResponseRecord {
-                            record_type: r.record_type,
-                            sequence: r.sequence,
-                            signer: r.signer,
-                            ttl: remaining.as_secs() as u32,
-                            value: r.value.clone(),
-                            signature: r.signature.clone(),
-                            signer_algo: r.signer_algo,
-                            // Must carry the signer pubkey: the requester verifies
-                            // the signature against it (and binds it to the signer
-                            // PeerId). Omitting it makes every signed record fail
-                            // verification on pull, so resolution only ever worked
-                            // via PUT-push.
-                            signer_pubkey: r.signer_pubkey.clone(),
-                        })
-                    })
+                    .filter(|r| !r.is_expired())
+                    .map(|r| r.to_response_record())
                     .collect();
                 drop(store);
 
@@ -2503,40 +2444,23 @@ impl Node {
             MessageType::DhtGetResponse => {
                 let resp = DhtGetResponseMsg::from_bytes(&msg.payload)?;
 
-                // Store records locally (with signature validation)
+                // Store records locally (with signature validation).
                 for rec in &resp.records {
-                    if rec.record_type.is_signed() {
-                        let algo = match SigningAlgo::from_u8(rec.signer_algo) {
-                            Ok(a) => a,
-                            Err(_) => {
-                                log::warn!("DhtGetResponse from {:?}: unknown signer algo", from);
-                                continue;
-                            }
-                        };
-                        // Bind the supplied pubkey to the claimed signer PeerId so
-                        // a relay answering the GET can't substitute its own key
-                        // (mirrors the DhtPut verification path).
-                        if rec.signer_pubkey.is_empty()
-                            || peer_id_from_signing_pubkey(&rec.signer_pubkey) != PeerId(rec.signer)
-                        {
-                            log::warn!(
-                                "DhtGetResponse from {:?}: signer pubkey missing or does not match signer PeerId, dropping record",
-                                from
-                            );
-                            continue;
-                        }
-                        let mut signable = Vec::with_capacity(64 + 1 + 8 + rec.value.len());
-                        signable.extend_from_slice(&resp.key);
-                        signable.push(rec.record_type.as_u8());
-                        signable.extend_from_slice(&rec.sequence.to_be_bytes());
-                        signable.extend_from_slice(&rec.value);
-                        if !identity::verify(algo, &rec.signer_pubkey, &signable, &rec.signature) {
-                            log::warn!(
-                                "DhtGetResponse from {:?}: invalid signature, dropping record",
-                                from
-                            );
-                            continue;
-                        }
+                    if let Err(reason) = crate::dht::verify_incoming_record(
+                        &resp.key,
+                        rec.record_type,
+                        rec.sequence,
+                        &rec.value,
+                        &rec.signer,
+                        rec.signer_algo,
+                        &rec.signer_pubkey,
+                        &rec.signature,
+                    ) {
+                        log::warn!(
+                            "DhtGetResponse from {:?}: {}, dropping record",
+                            from, reason
+                        );
+                        continue;
                     }
 
                     let record = crate::dht::DhtRecord {
@@ -2672,22 +2596,20 @@ impl Node {
                 let notify = DhtWatchNotifyMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(notify.put.key);
 
-                // Verify signature if signed type
-                if notify.put.record_type.is_signed() {
-                    let algo = SigningAlgo::from_u8(notify.put.signer_algo)
-                        .map_err(|e| Error::Protocol(format!("unknown signer algo: {}", e)))?;
-                    if !identity::verify(
-                        algo,
-                        &notify.put.signer_pubkey,
-                        &notify.put.signable_bytes(),
-                        &notify.put.signature,
-                    ) {
-                        log::warn!(
-                            "DhtWatchNotify from {:?}: invalid signature, dropping",
-                            from
-                        );
-                        return Ok(());
-                    }
+                // Verify through the shared gate (pubkey present + bound to signer
+                // + valid signature) — same invariants as DhtPut / DhtGetResponse.
+                if let Err(reason) = crate::dht::verify_incoming_record(
+                    &notify.put.key,
+                    notify.put.record_type,
+                    notify.put.sequence,
+                    &notify.put.value,
+                    &notify.put.signer,
+                    notify.put.signer_algo,
+                    &notify.put.signer_pubkey,
+                    &notify.put.signature,
+                ) {
+                    log::warn!("DhtWatchNotify from {:?}: {}, dropping", from, reason);
+                    return Ok(());
                 }
 
                 // Check if we're the destination (we originated this watch)
