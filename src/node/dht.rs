@@ -92,7 +92,10 @@ impl Node {
             signature: Vec::new(),
         };
         self.db_upsert_dht_record(&record);
-        self.dht_store.lock().await.put(record);
+        self.dht_store
+            .lock()
+            .await
+            .put(crate::dht::VerifiedRecord::locally_trusted(record));
 
         let mut bloom = BloomFilter::new();
         bloom.insert(&self.peer_id());
@@ -299,7 +302,10 @@ impl Node {
             signature: put.signature.clone(),
         };
         self.db_upsert_dht_record(&record);
-        self.dht_store.lock().await.put(record);
+        self.dht_store
+            .lock()
+            .await
+            .put(crate::dht::VerifiedRecord::locally_trusted(record));
 
         // L2NSE-driven propagation to targeted peers
         let kb = self.kbucket.lock().await;
@@ -452,7 +458,10 @@ impl Node {
             signature: put.signature.clone(),
         };
         self.db_upsert_dht_record(&record);
-        self.dht_store.lock().await.put(record);
+        self.dht_store
+            .lock()
+            .await
+            .put(crate::dht::VerifiedRecord::locally_trusted(record));
 
         // L2NSE-driven propagation
         let kb = self.kbucket.lock().await;
@@ -504,7 +513,10 @@ impl Node {
     /// GET-response code path).
     #[doc(hidden)]
     pub async fn dht_store_insert_local_for_test(&self, record: crate::dht::DhtRecord) {
-        self.dht_store.lock().await.put(record);
+        self.dht_store
+            .lock()
+            .await
+            .put(crate::dht::VerifiedRecord::locally_trusted(record));
     }
 
     /// Send a DHT GET request for an arbitrary key.

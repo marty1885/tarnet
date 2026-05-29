@@ -301,7 +301,10 @@ impl Node {
             signature: put.signature.clone(),
         };
         self.db_upsert_dht_record(&record);
-        self.dht_store.lock().await.put(record);
+        self.dht_store
+            .lock()
+            .await
+            .put(crate::dht::VerifiedRecord::locally_trusted(record));
 
         // Send DHT PUT to all direct neighbors
         let encoded = put.to_wire().encode();

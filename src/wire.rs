@@ -1852,6 +1852,14 @@ mod tests {
         assert_eq!(&signable[..64], &[1u8; 64]);
         assert_eq!(signable[64], RecordType::SignedContent.as_u8());
         assert_eq!(&signable[73..], b"data");
+
+        // The signing side (this wire helper) and the verifying side
+        // (`dht::record_signable`, used by `verify_incoming_record`) must produce
+        // identical bytes, or signatures made here would never verify there.
+        assert_eq!(
+            signable,
+            crate::dht::record_signable(&put.key, put.record_type, put.sequence, &put.value)
+        );
     }
 
     #[test]

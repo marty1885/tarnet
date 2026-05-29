@@ -900,14 +900,22 @@ pub fn validate_published_aliases(
 /// Domain separator for peer record signatures.
 const PEER_RECORD_DOMAIN: &[u8] = b"tarnet peer record";
 
+/// Canonical bytes a Peer record's signature covers: `domain || peer_id`.
+/// Single source of truth shared by [`build_peer_record`] (signing) and
+/// [`verify_peer_record`] (verifying), so the layout can never drift between
+/// the two sides.
+fn peer_record_signable(peer_id: &PeerId) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(PEER_RECORD_DOMAIN.len() + 32);
+    msg.extend_from_slice(PEER_RECORD_DOMAIN);
+    msg.extend_from_slice(peer_id.as_bytes());
+    msg
+}
+
 /// Build a signed Peer record for a public service.
 pub fn build_peer_record(keypair: &Keypair, peer_id: &PeerId) -> TnsRecord {
     let signing_algo = keypair.identity.signing_algo() as u8;
     let signing_pubkey = keypair.identity.signing.signing_pubkey_bytes();
-    let mut msg = Vec::with_capacity(PEER_RECORD_DOMAIN.len() + 32);
-    msg.extend_from_slice(PEER_RECORD_DOMAIN);
-    msg.extend_from_slice(peer_id.as_bytes());
-    let signature = keypair.identity.sign(&msg);
+    let signature = keypair.identity.sign(&peer_record_signable(peer_id));
     TnsRecord::Peer {
         signing_algo,
         signing_pubkey,
@@ -940,9 +948,7 @@ pub fn verify_peer_record(record: &TnsRecord, expected_service_id: &ServiceId) -
     // 2. Verify the signature over the domain-separated message.
     let algo = tarnet_api::types::SigningAlgo::from_u8(*signing_algo)
         .map_err(|e| Error::Wire(format!("Peer record unknown signing algo: {}", e)))?;
-    let mut msg = Vec::with_capacity(PEER_RECORD_DOMAIN.len() + 32);
-    msg.extend_from_slice(PEER_RECORD_DOMAIN);
-    msg.extend_from_slice(peer_id.as_bytes());
+    let msg = peer_record_signable(peer_id);
     if !crate::identity::verify(algo, signing_pubkey, &msg, signature) {
         return Err(Error::Crypto(
             "Peer record signature verification failed".into(),

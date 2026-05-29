@@ -1635,7 +1635,10 @@ impl Node {
                     stored_at: std::time::Instant::now(),
                     signature: put.signature.clone(),
                 };
-                hello_dht.lock().await.put(record);
+                hello_dht
+                    .lock()
+                    .await
+                    .put(crate::dht::VerifiedRecord::locally_trusted(record));
 
                 // L2NSE-driven peer selection for hello propagation
                 let kb = hello_kbucket.lock().await;
@@ -2297,32 +2300,9 @@ impl Node {
                     put.hop_limit -= 1;
                 }
 
-                // Verify signature for signed record types before storing/propagating.
-                if let Err(reason) = crate::dht::verify_incoming_record(
-                    &put.key,
-                    put.record_type,
-                    put.sequence,
-                    &put.value,
-                    &put.signer,
-                    put.signer_algo,
-                    &put.signer_pubkey,
-                    &put.signature,
-                ) {
-                    log::warn!("DHT PUT from {:?}: {}, dropping", from, reason);
-                    return Ok(());
-                }
-
-                // Check if we already have this exact record (avoid re-flooding)
-                let is_new = {
-                    let store = self.dht_store.lock().await;
-                    let existing = store.get(&key);
-                    !existing.iter().any(|r| {
-                        r.signer == put.signer
-                            && r.sequence == put.sequence
-                            && r.record_type == put.record_type
-                    })
-                };
-
+                // Pass the record through the trust gate before storing or
+                // propagating. The resulting VerifiedRecord is the only thing the
+                // store will accept, so an unverified PUT cannot be persisted.
                 let record = crate::dht::DhtRecord {
                     key,
                     record_type: put.record_type,
@@ -2335,7 +2315,26 @@ impl Node {
                     stored_at: std::time::Instant::now(),
                     signature: put.signature.clone(),
                 };
-                self.db_upsert_dht_record(&record);
+                let record = match crate::dht::VerifiedRecord::verify_incoming(record) {
+                    Ok(verified) => verified,
+                    Err(reason) => {
+                        log::warn!("DHT PUT from {:?}: {}, dropping", from, reason);
+                        return Ok(());
+                    }
+                };
+
+                // Check if we already have this exact record (avoid re-flooding)
+                let is_new = {
+                    let store = self.dht_store.lock().await;
+                    let existing = store.get(&key);
+                    !existing.iter().any(|r| {
+                        r.signer == put.signer
+                            && r.sequence == put.sequence
+                            && r.record_type == put.record_type
+                    })
+                };
+
+                self.db_upsert_dht_record(record.record());
                 self.dht_store.lock().await.put(record);
                 log::debug!("DHT PUT from {:?} (type={:?})", from, put.record_type);
 
@@ -2444,25 +2443,8 @@ impl Node {
             MessageType::DhtGetResponse => {
                 let resp = DhtGetResponseMsg::from_bytes(&msg.payload)?;
 
-                // Store records locally (with signature validation).
+                // Store records locally — each must clear the trust gate first.
                 for rec in &resp.records {
-                    if let Err(reason) = crate::dht::verify_incoming_record(
-                        &resp.key,
-                        rec.record_type,
-                        rec.sequence,
-                        &rec.value,
-                        &rec.signer,
-                        rec.signer_algo,
-                        &rec.signer_pubkey,
-                        &rec.signature,
-                    ) {
-                        log::warn!(
-                            "DhtGetResponse from {:?}: {}, dropping record",
-                            from, reason
-                        );
-                        continue;
-                    }
-
                     let record = crate::dht::DhtRecord {
                         key: DhtId(resp.key),
                         record_type: rec.record_type,
@@ -2475,7 +2457,17 @@ impl Node {
                         stored_at: std::time::Instant::now(),
                         signature: rec.signature.clone(),
                     };
-                    self.db_upsert_dht_record(&record);
+                    let record = match crate::dht::VerifiedRecord::verify_incoming(record) {
+                        Ok(verified) => verified,
+                        Err(reason) => {
+                            log::warn!(
+                                "DhtGetResponse from {:?}: {}, dropping record",
+                                from, reason
+                            );
+                            continue;
+                        }
+                    };
+                    self.db_upsert_dht_record(record.record());
                     self.dht_store.lock().await.put(record);
                 }
 
@@ -2596,40 +2588,36 @@ impl Node {
                 let notify = DhtWatchNotifyMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(notify.put.key);
 
-                // Verify through the shared gate (pubkey present + bound to signer
-                // + valid signature) — same invariants as DhtPut / DhtGetResponse.
-                if let Err(reason) = crate::dht::verify_incoming_record(
-                    &notify.put.key,
-                    notify.put.record_type,
-                    notify.put.sequence,
-                    &notify.put.value,
-                    &notify.put.signer,
-                    notify.put.signer_algo,
-                    &notify.put.signer_pubkey,
-                    &notify.put.signature,
-                ) {
-                    log::warn!("DhtWatchNotify from {:?}: {}, dropping", from, reason);
-                    return Ok(());
-                }
+                // Run through the shared trust gate (pubkey present + bound to
+                // signer + valid signature) — same invariants as DhtPut /
+                // DhtGetResponse, enforced by the type the store accepts.
+                let record = crate::dht::DhtRecord {
+                    key,
+                    record_type: notify.put.record_type,
+                    sequence: notify.put.sequence,
+                    signer: notify.put.signer,
+                    signer_algo: notify.put.signer_algo,
+                    signer_pubkey: notify.put.signer_pubkey.clone(),
+                    value: notify.put.value.clone(),
+                    ttl: Duration::from_secs(notify.put.ttl as u64),
+                    stored_at: std::time::Instant::now(),
+                    signature: notify.put.signature.clone(),
+                };
+                let record = match crate::dht::VerifiedRecord::verify_incoming(record) {
+                    Ok(verified) => verified,
+                    Err(reason) => {
+                        log::warn!("DhtWatchNotify from {:?}: {}, dropping", from, reason);
+                        return Ok(());
+                    }
+                };
 
                 // Check if we're the destination (we originated this watch)
                 if self.local_watches.lock().await.contains(&notify.put.key) {
                     // Store the record locally
-                    let record = crate::dht::DhtRecord {
-                        key,
-                        record_type: notify.put.record_type,
-                        sequence: notify.put.sequence,
-                        signer: notify.put.signer,
-                        signer_algo: notify.put.signer_algo,
-                        signer_pubkey: notify.put.signer_pubkey.clone(),
-                        value: notify.put.value.clone(),
-                        ttl: Duration::from_secs(notify.put.ttl as u64),
-                        stored_at: std::time::Instant::now(),
-                        signature: notify.put.signature,
-                    };
-                    self.db_upsert_dht_record(&record);
-                    self.dht_store.lock().await.put(record.clone());
-                    let _ = self.dht_watch_tx.send((key, record)).await;
+                    self.db_upsert_dht_record(record.record());
+                    let live = record.record().clone();
+                    self.dht_store.lock().await.put(record);
+                    let _ = self.dht_watch_tx.send((key, live)).await;
                 } else {
                     // Route notification back via query_token hop-by-hop
                     let prev_hop = self

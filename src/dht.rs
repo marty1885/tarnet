@@ -181,6 +181,57 @@ pub fn verify_incoming_record(
     Ok(())
 }
 
+/// A [`DhtRecord`] that is safe to store: it either passed the trust gate
+/// ([`verify_incoming`](Self::verify_incoming)) or originated from a source this
+/// node already trusts ([`locally_trusted`](Self::locally_trusted)).
+///
+/// This is "parse, don't validate" applied to the DHT store: the inner record is
+/// private and there is no public constructor that skips both checks, so the only
+/// way to obtain a `VerifiedRecord` is to go through one of the two paths below.
+/// Because [`DhtStore::put`] accepts *only* `VerifiedRecord`, it is impossible —
+/// on any present or future code path — to store a record whose signature was
+/// never checked. The compiler enforces what call-site discipline used to.
+pub struct VerifiedRecord(DhtRecord);
+
+impl VerifiedRecord {
+    /// Trust gate for records arriving from the network. Routes through
+    /// [`verify_incoming_record`]; returns `Err(reason)` (suitable for logging)
+    /// when the record must be dropped. This is the ONLY way an inbound,
+    /// attacker-influenced record can become storable.
+    pub fn verify_incoming(record: DhtRecord) -> std::result::Result<Self, &'static str> {
+        verify_incoming_record(
+            record.key.as_bytes(),
+            record.record_type,
+            record.sequence,
+            &record.value,
+            &record.signer,
+            record.signer_algo,
+            &record.signer_pubkey,
+            &record.signature,
+        )?;
+        Ok(Self(record))
+    }
+
+    /// Trust a record by origin rather than by re-checking its signature: one
+    /// this node just minted and signed itself (the publish path), or a test
+    /// fixture. Callers must have produced the signature themselves — never pass
+    /// an externally-sourced record here; use [`verify_incoming`](Self::verify_incoming)
+    /// for that.
+    pub fn locally_trusted(record: DhtRecord) -> Self {
+        Self(record)
+    }
+
+    /// Borrow the inner record (e.g. to persist it).
+    pub fn record(&self) -> &DhtRecord {
+        &self.0
+    }
+
+    /// Consume and yield the inner record.
+    pub fn into_inner(self) -> DhtRecord {
+        self.0
+    }
+}
+
 /// Local DHT storage. Supports multiple records per key (supplemental).
 pub struct DhtStore {
     records: HashMap<[u8; 64], Vec<DhtRecord>>,
@@ -205,7 +256,8 @@ impl DhtStore {
     /// - Hello: same signer + higher sequence replaces existing.
     /// - SignedContent: add if new signer (supplemental), same signer replaces.
     /// - Content: first write wins (single record per key).
-    pub fn put(&mut self, record: DhtRecord) {
+    pub fn put(&mut self, record: VerifiedRecord) {
+        let record = record.into_inner();
         self.expire();
         if record.value.len() > self.limits.max_value_bytes {
             return;
@@ -302,9 +354,18 @@ impl DhtStore {
             .collect()
     }
 
+    /// Re-verify each persisted record on the way back in, dropping any that no
+    /// longer pass the trust gate (DB corruption or tampering). Records that
+    /// passed verification when first accepted re-verify here, since their signed
+    /// fields round-trip faithfully through persistence.
     pub fn import_records(&mut self, records: Vec<PersistedRecord>) {
         for record in records {
-            self.put(record.into_live());
+            match VerifiedRecord::verify_incoming(record.into_live()) {
+                Ok(verified) => self.put(verified),
+                Err(reason) => {
+                    log::warn!("dropping persisted DHT record on load: {}", reason)
+                }
+            }
         }
     }
 
@@ -1046,6 +1107,204 @@ mod tests {
     use crate::identity::Keypair;
     use crate::state::StorageLimits;
 
+    /// Store a hand-built record in tests without going through the signature
+    /// gate. These fixtures carry dummy signatures by design; `locally_trusted`
+    /// is the sanctioned bypass for records the test itself constructs.
+    fn put(store: &mut DhtStore, record: DhtRecord) {
+        store.put(VerifiedRecord::locally_trusted(record));
+    }
+
+    /// Mint a genuinely-signed record, exactly as the publish path builds one:
+    /// `signer`, `signer_algo`, and `signer_pubkey` are derived from `kp`, and the
+    /// signature actually covers the canonical signable — so it passes the gate.
+    fn signed_record(
+        kp: &Keypair,
+        key: DhtId,
+        record_type: RecordType,
+        sequence: u64,
+        value: Vec<u8>,
+    ) -> DhtRecord {
+        let signature = kp.sign(&record_signable(key.as_bytes(), record_type, sequence, &value));
+        DhtRecord {
+            key,
+            record_type,
+            sequence,
+            signer: *kp.peer_id().as_bytes(),
+            signer_algo: kp.identity.signing.algo() as u8,
+            signer_pubkey: kp.identity.signing.signing_pubkey_bytes(),
+            value,
+            ttl: Duration::from_secs(600),
+            stored_at: Instant::now(),
+            signature,
+        }
+    }
+
+    // ── Trust gate: VerifiedRecord::verify_incoming ──
+
+    #[test]
+    fn verify_incoming_accepts_genuine_signed_record() {
+        let kp = Keypair::generate();
+        let rec = signed_record(&kp, DhtId([0x01; 64]), RecordType::SignedContent, 1, b"payload".to_vec());
+        assert!(VerifiedRecord::verify_incoming(rec).is_ok());
+    }
+
+    #[test]
+    fn verify_incoming_rejects_empty_pubkey() {
+        // The exact field the original DhtGet responder stripped: an otherwise
+        // valid record with no signer pubkey must be rejected, never stored.
+        let kp = Keypair::generate();
+        let mut rec = signed_record(&kp, DhtId([0x02; 64]), RecordType::SignedContent, 1, b"x".to_vec());
+        rec.signer_pubkey = Vec::new();
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("missing signer pubkey")
+        );
+    }
+
+    #[test]
+    fn verify_incoming_rejects_pubkey_not_bound_to_signer() {
+        // The DhtWatchNotify forgery hole: a valid pubkey + signature pair, but
+        // the record claims a *different* signer PeerId than the pubkey hashes to.
+        let attacker = Keypair::generate();
+        let victim = Keypair::generate();
+        let mut rec = signed_record(&attacker, DhtId([0x03; 64]), RecordType::SignedContent, 1, b"x".to_vec());
+        rec.signer = *victim.peer_id().as_bytes();
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("signer pubkey does not match signer PeerId")
+        );
+    }
+
+    #[test]
+    fn verify_incoming_rejects_tampered_value() {
+        let kp = Keypair::generate();
+        let mut rec = signed_record(&kp, DhtId([0x04; 64]), RecordType::SignedContent, 1, b"original".to_vec());
+        rec.value = b"tampered".to_vec(); // signature no longer covers the value
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("invalid signature")
+        );
+    }
+
+    #[test]
+    fn verify_incoming_rejects_tampered_sequence() {
+        let kp = Keypair::generate();
+        let mut rec = signed_record(&kp, DhtId([0x05; 64]), RecordType::SignedContent, 1, b"v".to_vec());
+        rec.sequence = 999; // signable includes the sequence, so the sig breaks
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("invalid signature")
+        );
+    }
+
+    #[test]
+    fn verify_incoming_rejects_unknown_algo() {
+        let kp = Keypair::generate();
+        let mut rec = signed_record(&kp, DhtId([0x06; 64]), RecordType::SignedContent, 1, b"v".to_vec());
+        rec.signer_algo = 0xFF;
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("unknown signer algo")
+        );
+    }
+
+    #[test]
+    fn verify_incoming_skips_unsigned_content() {
+        // Content is not a signed type — an empty pubkey / signature is expected
+        // and the gate must let it through unchanged.
+        let rec = DhtRecord {
+            key: DhtId([0x07; 64]),
+            record_type: RecordType::Content,
+            sequence: 0,
+            signer: [0u8; 32],
+            signer_algo: 0,
+            signer_pubkey: Vec::new(),
+            value: b"blob".to_vec(),
+            ttl: Duration::from_secs(60),
+            stored_at: Instant::now(),
+            signature: Vec::new(),
+        };
+        assert!(VerifiedRecord::verify_incoming(rec).is_ok());
+    }
+
+    // ── DB reload re-verification: import_records ──
+
+    #[test]
+    fn import_records_keeps_valid_persisted_record() {
+        let kp = Keypair::generate();
+        let key = DhtId([0x08; 64]);
+        let mut store = DhtStore::new(&kp.peer_id());
+        put(&mut store, signed_record(&kp, key, RecordType::SignedContent, 1, b"persist".to_vec()));
+
+        let exported = store.export_records();
+        assert_eq!(exported.len(), 1);
+
+        let mut reloaded = DhtStore::new(&kp.peer_id());
+        reloaded.import_records(exported);
+        assert_eq!(reloaded.get(&key).len(), 1, "valid persisted record survives reload");
+    }
+
+    #[test]
+    fn import_records_drops_tampered_persisted_record() {
+        let kp = Keypair::generate();
+        let key = DhtId([0x09; 64]);
+        let mut store = DhtStore::new(&kp.peer_id());
+        put(&mut store, signed_record(&kp, key, RecordType::SignedContent, 1, b"genuine".to_vec()));
+
+        let mut exported = store.export_records();
+        assert_eq!(exported.len(), 1);
+        // Corrupt the on-disk value so its stored signature no longer matches.
+        exported[0].value = b"corrupted on disk".to_vec();
+
+        let mut reloaded = DhtStore::new(&kp.peer_id());
+        reloaded.import_records(exported);
+        assert!(reloaded.get(&key).is_empty(), "tampered persisted record is dropped on load");
+    }
+
+    // ── Construction helpers: guard against re-stripping signed fields ──
+
+    #[test]
+    fn to_response_record_round_trips_through_verify() {
+        // The exact regression that broke vhost: a GET response that dropped
+        // signer_pubkey could never re-verify on the receiving node. Rebuild a
+        // DhtRecord from the response fields and confirm it clears the gate.
+        let kp = Keypair::generate();
+        let key = DhtId([0x0A; 64]);
+        let original = signed_record(&kp, key, RecordType::SignedContent, 1, b"resp".to_vec());
+        let resp = original.to_response_record();
+        assert!(!resp.signer_pubkey.is_empty(), "response must carry the signer pubkey");
+
+        let rebuilt = DhtRecord {
+            key,
+            record_type: resp.record_type,
+            sequence: resp.sequence,
+            signer: resp.signer,
+            signer_algo: resp.signer_algo,
+            signer_pubkey: resp.signer_pubkey.clone(),
+            value: resp.value.clone(),
+            ttl: Duration::from_secs(resp.ttl as u64),
+            stored_at: Instant::now(),
+            signature: resp.signature.clone(),
+        };
+        assert!(VerifiedRecord::verify_incoming(rebuilt).is_ok());
+    }
+
+    #[test]
+    fn to_put_msg_carries_pubkey_and_matching_signable() {
+        let kp = Keypair::generate();
+        let key = DhtId([0x0B; 64]);
+        let rec = signed_record(&kp, key, RecordType::SignedContent, 1, b"put".to_vec());
+        let put = rec.to_put_msg(&PeerId([0x77; 32]), 5);
+
+        assert!(!put.signer_pubkey.is_empty(), "put msg must carry the signer pubkey");
+        assert_eq!(put.hop_limit, 5);
+        // Signing side (wire) and verifying side (dht) must agree on the bytes.
+        assert_eq!(
+            put.signable_bytes(),
+            record_signable(&put.key, put.record_type, put.sequence, &put.value)
+        );
+    }
+
     #[test]
     fn content_address_roundtrip() {
         let data = b"hello content-addressed DHT";
@@ -1088,7 +1347,7 @@ mod tests {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0u8; 64]);
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Content,
             sequence: 0,
@@ -1113,7 +1372,7 @@ mod tests {
         let key = DhtId([0xAA; 64]);
         let signer = [0x11; 32];
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Hello,
             sequence: 1,
@@ -1129,7 +1388,7 @@ mod tests {
         assert_eq!(store.get(&key)[0].value, b"old hello");
 
         // Higher sequence replaces
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Hello,
             sequence: 5,
@@ -1153,7 +1412,7 @@ mod tests {
         let key = DhtId([0xBB; 64]);
         let signer = [0x22; 32];
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Hello,
             sequence: 10,
@@ -1167,7 +1426,7 @@ mod tests {
         });
 
         // Lower sequence should be ignored
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Hello,
             sequence: 3,
@@ -1191,7 +1450,7 @@ mod tests {
         let key = DhtId([0xCC; 64]);
 
         // Two different signers → both stored (supplemental)
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 0,
@@ -1203,7 +1462,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 0,
@@ -1225,7 +1484,7 @@ mod tests {
         let key = DhtId([0xDD; 64]);
         let signer = [0x33; 32];
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 0,
@@ -1237,7 +1496,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 0,
@@ -1260,7 +1519,7 @@ mod tests {
         let key = DhtId([0xDD; 64]);
         let signer = [0x44; 32];
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 10,
@@ -1273,7 +1532,7 @@ mod tests {
             signature: vec![0u8; 64],
         });
         // Lower sequence should be ignored
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 3,
@@ -1297,7 +1556,7 @@ mod tests {
         let key = DhtId([0xDD; 64]);
         let signer = [0x55; 32];
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 1,
@@ -1309,7 +1568,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::SignedContent,
             sequence: 5,
@@ -1341,7 +1600,7 @@ mod tests {
         assert_ne!(blob1, blob2);
 
         let mut store = DhtStore::new(&PeerId([0u8; 32]));
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key: key1,
             record_type: RecordType::SignedContent,
             sequence: 1,
@@ -1353,7 +1612,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key: key1,
             record_type: RecordType::SignedContent,
             sequence: 1,
@@ -1388,7 +1647,7 @@ mod tests {
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xEE; 64]);
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Content,
             sequence: 0,
@@ -1400,7 +1659,7 @@ mod tests {
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Content,
             sequence: 0,
@@ -1416,7 +1675,7 @@ mod tests {
         assert_eq!(store.get(&key).len(), 2);
 
         // Duplicate values are deduplicated
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Content,
             sequence: 0,
@@ -1446,7 +1705,7 @@ mod tests {
         let key = DhtId([0xAA; 64]);
         let signer = [0x11; 32];
 
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Unknown(7),
             sequence: 1,
@@ -1462,7 +1721,7 @@ mod tests {
         assert_eq!(store.get(&key)[0].value, b"unknown v1");
 
         // Higher sequence replaces
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Unknown(7),
             sequence: 5,
@@ -1567,7 +1826,7 @@ mod tests {
             },
         );
         let key = DhtId([0xAB; 64]);
-        store.put(DhtRecord {
+        put(&mut store, DhtRecord {
             key,
             record_type: RecordType::Content,
             sequence: 0,
@@ -1598,7 +1857,7 @@ mod tests {
         );
 
         for i in 0..3u8 {
-            store.put(DhtRecord {
+            put(&mut store, DhtRecord {
                 key: DhtId([i; 64]),
                 record_type: RecordType::Unknown(9),
                 sequence: i as u64,

@@ -8,6 +8,13 @@ use std::time::Duration;
 
 use tarnet::dht::DhtStore;
 use tarnet::firewall::{Action, Firewall, Match};
+
+/// Store a hand-built fixture record without going through the signature gate.
+/// Test fixtures carry dummy signatures by design; `locally_trusted` is the
+/// sanctioned bypass for records the test itself constructs.
+fn put_record(store: &mut DhtStore, record: tarnet::dht::DhtRecord) {
+    store.put(tarnet::dht::VerifiedRecord::locally_trusted(record));
+}
 use tarnet::identity::{self, Keypair};
 use tarnet::node::{ChannelEvent, Node};
 use tarnet::transport::firewall::{FirewallDiscovery, FirewallPolicy};
@@ -856,7 +863,7 @@ fn dht_hello_sequence_ordering() {
     let mut store = DhtStore::new(&peer);
 
     // Put seq 5
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::Hello,
         sequence: 5,
@@ -874,7 +881,7 @@ fn dht_hello_sequence_ordering() {
     assert_eq!(records[0].sequence, 5);
 
     // Put seq 3 (lower) → should be ignored
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::Hello,
         sequence: 3,
@@ -892,7 +899,7 @@ fn dht_hello_sequence_ordering() {
     assert_eq!(records[0].sequence, 5, "Lower sequence should be ignored");
 
     // Put seq 7 (higher) → should replace
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::Hello,
         sequence: 7,
@@ -950,7 +957,7 @@ fn dht_signed_content_multi_signer() {
     let mut store = DhtStore::new(&local_peer);
 
     // Signer A puts
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::SignedContent,
         sequence: 1,
@@ -964,7 +971,7 @@ fn dht_signed_content_multi_signer() {
     });
 
     // Signer B puts at same key → supplemental (different signer)
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::SignedContent,
         sequence: 1,
@@ -981,7 +988,7 @@ fn dht_signed_content_multi_signer() {
     assert_eq!(records.len(), 2, "Different signers should both be stored");
 
     // Signer A puts again with higher seq → replaces A's old record
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::SignedContent,
         sequence: 2,
@@ -1015,7 +1022,7 @@ fn dht_record_expiry() {
     let mut store = DhtStore::new(&local);
 
     // Put a record with 0-second TTL (already expired)
-    store.put(DhtRecord {
+    put_record(&mut store, DhtRecord {
         key,
         record_type: RecordType::Content,
         sequence: 0,
