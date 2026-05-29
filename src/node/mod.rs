@@ -2458,7 +2458,12 @@ impl Node {
                             value: r.value.clone(),
                             signature: r.signature.clone(),
                             signer_algo: r.signer_algo,
-                            signer_pubkey: Vec::new(),
+                            // Must carry the signer pubkey: the requester verifies
+                            // the signature against it (and binds it to the signer
+                            // PeerId). Omitting it makes every signed record fail
+                            // verification on pull, so resolution only ever worked
+                            // via PUT-push.
+                            signer_pubkey: r.signer_pubkey.clone(),
                         })
                     })
                     .collect();
@@ -2508,6 +2513,18 @@ impl Node {
                                 continue;
                             }
                         };
+                        // Bind the supplied pubkey to the claimed signer PeerId so
+                        // a relay answering the GET can't substitute its own key
+                        // (mirrors the DhtPut verification path).
+                        if rec.signer_pubkey.is_empty()
+                            || peer_id_from_signing_pubkey(&rec.signer_pubkey) != PeerId(rec.signer)
+                        {
+                            log::warn!(
+                                "DhtGetResponse from {:?}: signer pubkey missing or does not match signer PeerId, dropping record",
+                                from
+                            );
+                            continue;
+                        }
                         let mut signable = Vec::with_capacity(64 + 1 + 8 + rec.value.len());
                         signable.extend_from_slice(&resp.key);
                         signable.push(rec.record_type.as_u8());
@@ -2515,18 +2532,8 @@ impl Node {
                         signable.extend_from_slice(&rec.value);
                         if !identity::verify(algo, &rec.signer_pubkey, &signable, &rec.signature) {
                             log::warn!(
-                                "DhtGetResponse from {:?}: invalid signature, dropping record \
-                                 [key={:02x?} signer={:02x?} type={:?} algo={:?} seq={} value_len={} sig_len={} pubkey_len={} signer_matches_pubkey={}]",
-                                from,
-                                &resp.key[..8.min(resp.key.len())],
-                                &rec.signer[..8.min(rec.signer.len())],
-                                rec.record_type,
-                                algo,
-                                rec.sequence,
-                                rec.value.len(),
-                                rec.signature.len(),
-                                rec.signer_pubkey.len(),
-                                peer_id_from_signing_pubkey(&rec.signer_pubkey) == PeerId(rec.signer),
+                                "DhtGetResponse from {:?}: invalid signature, dropping record",
+                                from
                             );
                             continue;
                         }

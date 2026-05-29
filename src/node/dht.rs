@@ -497,6 +497,16 @@ impl Node {
             .collect()
     }
 
+    /// Insert a record directly into the local DHT store, bypassing propagation,
+    /// link-up store-dump, and replication. Test-only seam: it is the only way to
+    /// place a record on a node such that a *peer* can obtain it solely via a
+    /// DhtGet pull (every production path pushes a full copy, masking the
+    /// GET-response code path).
+    #[doc(hidden)]
+    pub async fn dht_store_insert_local_for_test(&self, record: crate::dht::DhtRecord) {
+        self.dht_store.lock().await.put(record);
+    }
+
     /// Send a DHT GET request for an arbitrary key.
     /// Uses anonymous query token routing for reply privacy.
     pub async fn request_dht_key(&self, key: &DhtId) -> Result<()> {

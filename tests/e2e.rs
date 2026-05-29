@@ -656,6 +656,71 @@ async fn repro_vhost_resolve_cross_node() {
     assert!(resolution, "Node B should resolve VHost record from Node A");
 }
 
+/// REPRO / regression guard: a record obtained purely via a DhtGet *pull* must
+/// verify. Every production delivery path (publish propagation, link-up store
+/// dump, replication) pushes a full copy carrying signer_pubkey, which masks the
+/// GET-response path. To isolate it: an isolated publisher mints a real signed
+/// record; we inject it into the holder's store *after* the resolver is already
+/// linked (so the link-up dump misses it) and without propagation. The resolver's
+/// only route to the record is then the holder's GET response — which previously
+/// stripped signer_pubkey, making the record unverifiable on pull.
+#[tokio::test]
+async fn repro_dht_pull_carries_pubkey() {
+    init_log();
+
+    // Isolated publisher (no peers → no propagation) mints a real signed record.
+    let publisher = spawn_node(vec![]).await;
+    let zone_sid = publisher.node.identity.identity.service_id();
+    let serving = tarnet_api::types::ServiceId::from_signing_pubkey(&[0xEE; 32]);
+    tarnet::tns::publish(
+        &publisher.node,
+        &publisher.node.identity,
+        "blog",
+        &[tarnet::tns::TnsRecord::VHost(serving)],
+        3600,
+    )
+    .await
+    .unwrap();
+    let dht_key = tarnet::tns::tns_dht_key(&zone_sid, "blog");
+    let record = publisher.node.dht_get_records_at_key(&dht_key).await;
+    assert_eq!(record.len(), 1, "publisher should hold exactly one record");
+    assert!(
+        !record[0].signer_pubkey.is_empty(),
+        "minted record must carry a signer pubkey"
+    );
+
+    // Holder and resolver link first; the link-up store dump is empty for both.
+    let holder = spawn_node(vec![]).await;
+    let resolver = spawn_node(vec![holder.addr.clone()]).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Place the record on the holder ONLY, bypassing propagation/link-up dump.
+    holder
+        .node
+        .dht_store_insert_local_for_test(record[0].clone())
+        .await;
+
+    // Resolver has no local copy; its only route is a GET pulled from the holder.
+    let resolved = wait_for(Duration::from_secs(15), || {
+        let r = resolver.node.clone();
+        let key = dht_key;
+        async move {
+            let _ = r.request_dht_key(&key).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            matches!(
+                tarnet::tns::resolve(&*r, zone_sid, "blog").await,
+                tarnet::tns::TnsResolution::VHost { .. }
+            )
+        }
+    })
+    .await;
+
+    assert!(
+        resolved,
+        "resolver must verify a GET-pulled record (signer_pubkey must be carried in the response)"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Link break and cleanup
 // ═══════════════════════════════════════════════════════════════════════
