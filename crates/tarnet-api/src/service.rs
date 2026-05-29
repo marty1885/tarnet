@@ -94,6 +94,13 @@ pub enum TnsRecord {
     Zone(ServiceId),
     /// Restart resolution with this name (CNAME).
     Alias(String),
+    /// Terminal, singular service endpoint. Stores the serving ServiceId to
+    /// connect to. Unlike `Identity` (which asserts "this name IS this entity"
+    /// and signs), a VHost names a *connectable endpoint*: the wire port is
+    /// derived from the record's canonical label (its position in the home
+    /// zone) so knowing the serving SID alone never yields the port. Like
+    /// `Zone`, a VHost must be the sole non-supplemental record at its label.
+    VHost(ServiceId),
     /// Raw content-addressed DHT reference.
     ContentRef(#[serde(with = "crate::types::serde_byte_array_64")] [u8; 64]),
     /// Arbitrary text (like TXT records).
@@ -131,11 +138,43 @@ pub enum TnsRecord {
     },
 }
 
+/// Context for the VHost wire-port derivation key.
+const VHOST_LABEL_CTX: &str = "tarnet/vhost/label/v1";
+
+/// Derive the opaque wire port for a VHost endpoint from its canonical label
+/// and the connector's supplied port.
+///
+/// Two-stage MAC chain, each stage consuming exactly one variable-length input,
+/// so there is no concatenation boundary to alias: `("ab","c")` and `("a","bc")`
+/// derive distinct ports. Stage 1 derives a per-label key; stage 2 keys a hash
+/// of the supplied port. The result is a 64-char lowercase hex string used as
+/// the circuit demux port — it is one-way (a connection arriving on it cannot be
+/// reversed to label or port) and never surfaces to a human.
+///
+/// Both the connector (deriving where to dial) and the publisher (deciding which
+/// derived port to listen on) call this with the same `(canonical_label,
+/// supplied_port)` and arrive at the identical wire port. The apex is not
+/// special: it uses canonical label `"@"`.
+pub fn vhost_wire_port(canonical_label: &str, supplied_port: &str) -> String {
+    let label_key = blake3::derive_key(VHOST_LABEL_CTX, canonical_label.as_bytes());
+    blake3::keyed_hash(&label_key, supplied_port.as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 /// The result of a TNS name resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TnsResolution {
     /// Terminal records found.
     Records(Vec<TnsRecord>),
+    /// A VHost endpoint: the serving identity to connect to, plus the canonical
+    /// label (the record's authoritative position in its home zone) from which
+    /// the wire port is derived. Surfaced separately from `Records` because the
+    /// canonical label is read from resolution position, not from the record.
+    VHost {
+        serving: ServiceId,
+        canonical_label: String,
+    },
     /// Name not found.
     NotFound,
     /// Resolution failed with an error.

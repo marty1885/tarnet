@@ -5,7 +5,8 @@ use std::sync::Arc;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use tarnet_api::service::{
-    Listener, ListenerOptions, PoolClaim, PoolRegisterOptions, PortMode, ServiceApi, TnsRecord,
+    vhost_wire_port, Listener, ListenerOptions, PoolClaim, PoolRegisterOptions, PortMode,
+    ServiceApi, TnsRecord,
 };
 use tarnet_api::types::{PrivacyLevel, ServiceId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,6 +30,17 @@ pub struct ServiceConfig {
     /// at the identity's zone apex (@) and reached by name + port.
     /// If set, the service is published as `<subdomain>.<identity>`.
     pub subdomain: Option<String>,
+    /// Published record type for a subdomain: "vhost" (default) or "identity".
+    /// A VHost is a connectable endpoint whose wire port is derived from the
+    /// subdomain label; an Identity names an entity (e.g. a delegation/petname
+    /// target) and is reached via apex semantics. Ignored at the apex (always
+    /// Identity — the apex *is* the entity).
+    pub record: Option<String>,
+    /// ServiceId (base32) the published record should point at. Defaults to this
+    /// config's own identity. Set it to a *different* machine's ServiceId to
+    /// publish a pointer to that machine — a publish-only entry with no local
+    /// listener (that machine serves the backend).
+    pub target: Option<String>,
     /// Optional pool (virtual cluster) to advertise this service into, by local name.
     /// When set, the daemon publishes this node as an endpoint for `service` in the pool
     /// and keeps the lease refreshed. Independent of `publish` (a service can be both).
@@ -61,7 +73,9 @@ struct ExposeState<S: ServiceApi> {
 #[derive(Debug, Clone)]
 struct RegisteredService {
     service_id: ServiceId,
-    listener: Listener,
+    /// None for publish-only entries (the record points at another machine, so
+    /// we publish a pointer but bind no local listener).
+    listener: Option<Listener>,
     service: LoadedService,
     /// Set when this service was also advertised into a pool; used to withdraw on shutdown.
     pool_claim: Option<PoolClaim>,
@@ -227,31 +241,20 @@ async fn register_services<S: ServiceApi>(
             }
         };
 
-        // The tarnet-facing port name. For a pool service, use the pool service
-        // label so inbound pool tunnels land on this listener. Otherwise use the
-        // subdomain (so multiple subdomain services don't collide), else the
-        // numeric port.
-        let pool_service = svc
-            .config
-            .pool
-            .as_ref()
-            .map(|_| svc.config.service.clone().unwrap_or_else(|| svc.filename.clone()));
-        let port_name = if let Some(ref service) = pool_service {
-            service.clone()
-        } else if let Some(ref subdomain) = svc.config.subdomain {
-            subdomain.clone()
-        } else {
-            match listen_port(&svc.config) {
-                Some(p) => p.to_string(),
-                None => {
-                    error!(
-                        "Cannot parse port from '{}' for '{}'",
-                        svc.config.local, svc.filename
-                    );
+        // The serving SID the published record points at: an explicit `target`
+        // (possibly another machine) or this config's own identity. If it isn't
+        // us, this is a publish-only entry — we bind no local listener.
+        let serving_sid = match svc.config.target.as_deref() {
+            Some(t) => match ServiceId::parse(t) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Invalid target '{}' for '{}': {}", t, svc.filename, e);
                     continue;
                 }
-            }
+            },
+            None => sid,
         };
+        let we_serve = serving_sid == sid;
 
         let mode = if svc.config.protocol == "udp" {
             PortMode::UnreliableUnordered
@@ -259,71 +262,117 @@ async fn register_services<S: ServiceApi>(
             PortMode::ReliableOrdered
         };
 
-        let listener = match api
-            .listen(
-                sid,
-                mode,
-                &port_name,
-                ListenerOptions::default(),
-            )
-            .await
-        {
-            Ok(listener) => listener,
-            Err(e) => {
-                error!(
-                    "Failed to listen on {:?} port {} for '{}': {}",
-                    sid, port_name, svc.filename, e
-                );
-                continue;
+        // The tarnet-facing port name to bind the local listener on (only when we
+        // serve the backend).
+        //
+        // - Pool services keep the pool service label verbatim: pool consumers
+        //   dial it literally via connect_via (the pool path has no VHost
+        //   derivation).
+        // - A VHost endpoint binds the *derived* wire port for
+        //   `(canonical_label, supplied_port)`: canonical label is the subdomain.
+        // - An Identity (or the apex) is reached via apex semantics, so connect_to
+        //   derives from "@" — bind the wire port for `("@", supplied_port)`.
+        let is_vhost = svc.config.record.as_deref().unwrap_or("vhost") != "identity";
+        let pool_service = svc
+            .config
+            .pool
+            .as_ref()
+            .map(|_| svc.config.service.clone().unwrap_or_else(|| svc.filename.clone()));
+
+        let listener = if !we_serve {
+            // Publish-only: the target machine binds the listener, not us.
+            info!(
+                "'{}' is a publish-only pointer to {} (no local listener)",
+                svc.filename, serving_sid
+            );
+            None
+        } else {
+            let port_name = if let Some(ref service) = pool_service {
+                service.clone()
+            } else {
+                let supplied_port = match listen_port(&svc.config) {
+                    Some(p) => p.to_string(),
+                    None => {
+                        error!(
+                            "Cannot parse port from '{}' for '{}'",
+                            svc.config.local, svc.filename
+                        );
+                        continue;
+                    }
+                };
+                let canonical_label = match svc.config.subdomain.as_deref() {
+                    Some(sub) if is_vhost => sub,
+                    _ => "@",
+                };
+                vhost_wire_port(canonical_label, &supplied_port)
+            };
+
+            match api
+                .listen(sid, mode, &port_name, ListenerOptions::default())
+                .await
+            {
+                Ok(listener) => Some(listener),
+                Err(e) => {
+                    error!(
+                        "Failed to listen on {:?} port {} for '{}': {}",
+                        sid, port_name, svc.filename, e
+                    );
+                    continue;
+                }
             }
         };
         // Advertise into a pool if configured (independent of TNS publish).
-        let pool_claim = if let Some(ref pool) = svc.config.pool {
-            let service = pool_service.as_deref().unwrap_or(&svc.filename);
-            let opts = PoolRegisterOptions {
-                weight: svc.config.weight.unwrap_or(1),
-                meta: Vec::new(),
-                ..Default::default()
-            };
-            match api
-                .pool_register(
-                    pool,
-                    service,
-                    svc.config.identity.as_deref(),
-                    &port_name,
-                    opts,
-                )
-                .await
-            {
-                Ok(claim) => {
-                    info!(
-                        "Registered '{}' as endpoint '{}' in pool '{}'",
-                        svc.filename, service, pool
-                    );
-                    Some(claim)
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to register '{}' in pool '{}': {}",
-                        svc.filename, pool, e
-                    );
-                    None
+        // Pool advertisement only makes sense when we serve locally.
+        let pool_claim = match (svc.config.pool.as_ref(), &listener) {
+            (Some(pool), Some(bound)) => {
+                let service = pool_service.as_deref().unwrap_or(&svc.filename);
+                let opts = PoolRegisterOptions {
+                    weight: svc.config.weight.unwrap_or(1),
+                    meta: Vec::new(),
+                    ..Default::default()
+                };
+                // Pool consumers dial the listener's port verbatim via connect_via.
+                match api
+                    .pool_register(
+                        pool,
+                        service,
+                        svc.config.identity.as_deref(),
+                        &bound.port,
+                        opts,
+                    )
+                    .await
+                {
+                    Ok(claim) => {
+                        info!(
+                            "Registered '{}' as endpoint '{}' in pool '{}'",
+                            svc.filename, service, pool
+                        );
+                        Some(claim)
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to register '{}' in pool '{}': {}",
+                            svc.filename, pool, e
+                        );
+                        None
+                    }
                 }
             }
-        } else {
-            None
+            _ => None,
         };
 
+        if let Some(bound) = &listener {
+            info!(
+                "Registered service '{}' on {:?} port {}",
+                svc.filename, sid, bound.port
+            );
+        }
         services.push(RegisteredService {
             service_id: sid,
             listener,
             service: svc.clone(),
             pool_claim,
         });
-        info!(
-            "Registered service '{}' on {:?} port {}",
-            svc.filename, sid, port_name
-        );
     }
 
     services
@@ -340,27 +389,34 @@ async fn close_services<S: ServiceApi>(api: &S, services: &[RegisteredService]) 
                 );
             }
         }
-        if let Err(e) = api.close_listener(&service.listener).await {
-            warn!(
-                "Failed to close listener on {:?} port {} for '{}': {}",
-                service.service_id, service.listener.port, service.service.filename, e
-            );
+        if let Some(listener) = &service.listener {
+            if let Err(e) = api.close_listener(listener).await {
+                warn!(
+                    "Failed to close listener on {:?} port {} for '{}': {}",
+                    service.service_id, listener.port, service.service.filename, e
+                );
+            }
         }
     }
 }
 
 fn spawn_accept_tasks<S: ServiceApi + 'static>(api: Arc<S>, services: &[RegisteredService]) {
     for registered in services.iter().cloned() {
+        // Publish-only entries have no listener to accept on.
+        let listener = match registered.listener.clone() {
+            Some(l) => l,
+            None => continue,
+        };
         let api = api.clone();
         tokio::spawn(async move {
             loop {
-                let conn = match api.accept(&registered.listener).await {
+                let conn = match api.accept(&listener).await {
                     Ok(c) => c,
                     Err(e) => {
                         info!(
                             "Listener {:?} port {} for '{}' stopped accepting: {}",
                             registered.service_id,
-                            registered.listener.port,
+                            listener.port,
                             registered.service.filename,
                             e
                         );
@@ -414,22 +470,47 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
 
         let identity_key = identity_label.unwrap_or("default").to_string();
 
+        // The SID the published record points at: an explicit target (possibly
+        // another machine) or this config's own identity.
+        let serving_sid = match svc.config.target.as_deref() {
+            Some(t) => match ServiceId::parse(t) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Invalid target '{}' for '{}': {}", t, svc.filename, e);
+                    continue;
+                }
+            },
+            None => self_sid,
+        };
+        let is_vhost = svc.config.record.as_deref().unwrap_or("vhost") != "identity";
+
         if let Some(ref subdomain) = svc.config.subdomain {
-            // Subdomain mode: publish <subdomain> → Identity(self_sid).
-            let identity_record = TnsRecord::Identity(self_sid);
+            // Subdomain mode: publish <subdomain> → VHost(serving) by default (a
+            // connectable endpoint whose wire port is derived from the subdomain
+            // label), or Identity(serving) when `record = "identity"` (a naming /
+            // delegation target reached via apex semantics).
+            let (record, kind) = if is_vhost {
+                (TnsRecord::VHost(serving_sid), "VHost")
+            } else {
+                (TnsRecord::Identity(serving_sid), "Identity")
+            };
             match state
                 .api
-                .tns_publish(identity_label, subdomain, vec![identity_record], 3600)
+                .tns_publish(identity_label, subdomain, vec![record], 3600)
                 .await
             {
-                Ok(()) => info!("Published TNS record for '{}.{}'", subdomain, identity_key),
+                Ok(()) => info!(
+                    "Published {} record for '{}.{}' -> {}",
+                    kind, subdomain, identity_key, serving_sid
+                ),
                 Err(e) => error!(
                     "{}: failed to publish subdomain '{}': {}",
                     svc.filename, subdomain, e
                 ),
             }
         } else {
-            // Apex mode: publish Identity(self_sid) at "@".
+            // Apex mode: publish Identity(serving) at "@" (the apex is always an
+            // Identity — it *is* the entity; `record` is ignored here).
             // Only need to do this once per identity.
             if *apex_published.get(&identity_key).unwrap_or(&false) {
                 continue;
@@ -440,10 +521,10 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                 Ok(Some((records, _))) => {
                     let is_self = records
                         .iter()
-                        .any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == self_sid));
+                        .any(|r| matches!(r, TnsRecord::Identity(sid) if *sid == serving_sid));
                     let has_other = records.iter().any(|r| match r {
-                        TnsRecord::Identity(sid) => *sid != self_sid,
-                        TnsRecord::Alias(_) | TnsRecord::Zone(_) => true,
+                        TnsRecord::Identity(sid) => *sid != serving_sid,
+                        TnsRecord::Alias(_) | TnsRecord::Zone(_) | TnsRecord::VHost(_) => true,
                         _ => false,
                     });
                     if has_other && !is_self {
@@ -461,7 +542,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                 }
             }
 
-            let identity_record = TnsRecord::Identity(self_sid);
+            let identity_record = TnsRecord::Identity(serving_sid);
             match state
                 .api
                 .tns_publish(identity_label, "@", vec![identity_record], 3600)
@@ -469,8 +550,8 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
             {
                 Ok(()) => {
                     info!(
-                        "Published Identity at apex (@) for identity '{}'",
-                        identity_key
+                        "Published Identity at apex (@) for identity '{}' -> {}",
+                        identity_key, serving_sid
                     );
                     apex_published.insert(identity_key, true);
                 }
@@ -736,6 +817,8 @@ mod tests {
         listen_hidden_called: Arc<AtomicBool>,
         /// Set to true if tns_publish is called at all.
         tns_publish_called: Arc<AtomicBool>,
+        /// Captured (label, records) for each tns_publish call.
+        published: Arc<std::sync::Mutex<Vec<(String, Vec<TnsRecord>)>>>,
     }
 
     impl MockApi {
@@ -756,6 +839,7 @@ mod tests {
                 hidden_identity_leaked: Arc::new(AtomicBool::new(false)),
                 listen_hidden_called: Arc::new(AtomicBool::new(false)),
                 tns_publish_called: Arc::new(AtomicBool::new(false)),
+                published: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -888,6 +972,10 @@ mod tests {
             _ttl_secs: u32,
         ) -> ApiResult<()> {
             self.tns_publish_called.store(true, Ordering::SeqCst);
+            self.published
+                .lock()
+                .unwrap()
+                .push((_label.to_string(), records.clone()));
             let (hidden_sid, is_hidden) = match self.identity_privacy(identity) {
                 Some((sid, PrivacyLevel::Hidden { .. })) => (Some(sid), true),
                 _ => (None, false),
@@ -1044,6 +1132,8 @@ mod tests {
                 publish: true,
                 identity: identity.map(|s| s.to_string()),
                 subdomain: subdomain.map(|s| s.to_string()),
+                record: None,
+                target: None,
                 pool: None,
                 service: None,
                 weight: None,
@@ -1143,6 +1233,88 @@ mod tests {
         publish_services(&state).await;
 
         assert!(api.tns_publish_called.load(Ordering::SeqCst));
+    }
+
+    /// Subdomain with `record = "identity"` publishes a plain Identity, not a VHost.
+    #[tokio::test]
+    async fn subdomain_record_identity_publishes_identity() {
+        let public_sid = ServiceId::from_signing_pubkey(&[0x07; 32]);
+        let api = Arc::new(MockApi::new(vec![(
+            "default".into(),
+            public_sid,
+            PrivacyLevel::Public,
+            1,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
+
+        let mut svc = make_service("blog", None, Some("blog"));
+        svc.config.record = Some("identity".into());
+        let state = make_publish_state(api.clone(), vec![svc]).await;
+        publish_services(&state).await;
+
+        let published = api.published.lock().unwrap();
+        let (label, records) = published.iter().find(|(l, _)| l == "blog").expect("published blog");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0], TnsRecord::Identity(public_sid), "expected Identity, got {:?}", records[0]);
+        assert!(!matches!(records[0], TnsRecord::VHost(_)));
+        let _ = label;
+    }
+
+    /// Subdomain defaults to a VHost record pointing at the serving SID.
+    #[tokio::test]
+    async fn subdomain_defaults_to_vhost() {
+        let public_sid = ServiceId::from_signing_pubkey(&[0x08; 32]);
+        let api = Arc::new(MockApi::new(vec![(
+            "default".into(),
+            public_sid,
+            PrivacyLevel::Public,
+            1,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
+
+        let svc = make_service("blog", None, Some("blog"));
+        let state = make_publish_state(api.clone(), vec![svc]).await;
+        publish_services(&state).await;
+
+        let published = api.published.lock().unwrap();
+        let (_, records) = published.iter().find(|(l, _)| l == "blog").expect("published blog");
+        assert_eq!(records[0], TnsRecord::VHost(public_sid));
+    }
+
+    /// A `target` pointing at another machine yields a publish-only entry (no
+    /// local listener) carrying that machine's SID.
+    #[tokio::test]
+    async fn target_elsewhere_is_publish_only() {
+        let self_sid = ServiceId::from_signing_pubkey(&[0x09; 32]);
+        let other_sid = ServiceId::from_signing_pubkey(&[0x0A; 32]);
+        let api = Arc::new(MockApi::new(vec![(
+            "default".into(),
+            self_sid,
+            PrivacyLevel::Public,
+            1,
+            IdentityScheme::Ed25519,
+            SigningAlgo::Ed25519,
+            KemAlgo::X25519,
+        )]));
+
+        let mut svc = make_service("relay", None, Some("relay"));
+        svc.config.target = Some(other_sid.to_string());
+        let registered = register_services(&*api, &[svc.clone()]).await;
+        assert_eq!(registered.len(), 1);
+        assert!(
+            registered[0].listener.is_none(),
+            "publish-only entry must have no local listener"
+        );
+
+        let state = make_publish_state(api.clone(), vec![svc]).await;
+        publish_services(&state).await;
+        let published = api.published.lock().unwrap();
+        let (_, records) = published.iter().find(|(l, _)| l == "relay").expect("published relay");
+        assert_eq!(records[0], TnsRecord::VHost(other_sid));
     }
 
     /// Mixed: public services get tns_publish, hidden services are skipped.

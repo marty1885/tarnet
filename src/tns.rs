@@ -139,6 +139,7 @@ const TAG_ALIAS: u8 = 4;
 const TAG_INTRO_POINT: u8 = 6;
 const TAG_PEER: u8 = 7;
 const TAG_SERVICE: u8 = 8;
+const TAG_VHOST: u8 = 9;
 
 fn encode_length_prefixed_string(buf: &mut Vec<u8>, tag: u8, s: &str) {
     buf.push(tag);
@@ -169,6 +170,10 @@ pub fn tns_record_to_bytes(record: &TnsRecord) -> Vec<u8> {
         }
         TnsRecord::Zone(sid) => {
             buf.push(TAG_ZONE);
+            buf.extend_from_slice(sid.as_bytes());
+        }
+        TnsRecord::VHost(sid) => {
+            buf.push(TAG_VHOST);
             buf.extend_from_slice(sid.as_bytes());
         }
         TnsRecord::ContentRef(hash) => {
@@ -244,6 +249,14 @@ pub fn tns_record_from_bytes(data: &[u8]) -> Result<(TnsRecord, usize)> {
             let mut id = [0u8; 32];
             id.copy_from_slice(&rest[..32]);
             Ok((TnsRecord::Zone(ServiceId(id)), 1 + 32))
+        }
+        TAG_VHOST => {
+            if rest.len() < 32 {
+                return Err(Error::Wire("TNSVHost: too short".into()));
+            }
+            let mut id = [0u8; 32];
+            id.copy_from_slice(&rest[..32]);
+            Ok((TnsRecord::VHost(ServiceId(id)), 1 + 32))
         }
         TAG_CONTENT_REF => {
             if rest.len() < 64 {
@@ -403,6 +416,10 @@ fn derive_tns_key(context: &str, zone: &ServiceId, label: &str) -> [u8; 32] {
 pub fn tns_encryption_key(zone: &ServiceId, label: &str) -> [u8; 32] {
     derive_tns_key(TNS_RECORD_ENC_LABEL, zone, label)
 }
+
+/// Derive the opaque wire port for a VHost endpoint (canonical, shared with the
+/// listen side via the API crate). See [`tarnet_api::service::vhost_wire_port`].
+pub use tarnet_api::service::vhost_wire_port;
 
 // ── Encryption / Decryption ──
 
@@ -575,6 +592,20 @@ async fn resolve_inner(
         }
 
         if is_terminal {
+            // A terminal VHost names a connectable endpoint. Surface the serving
+            // SID together with the canonical label — `label`, the record's
+            // authoritative position in `current_zone`, regardless of the path
+            // (alias / delegation / raw-SID) the connector took to reach it.
+            if let Some(serving) = records.iter().find_map(|r| match r {
+                TnsRecord::VHost(sid) => Some(*sid),
+                _ => None,
+            }) {
+                return TnsResolution::VHost {
+                    serving,
+                    canonical_label: label.to_string(),
+                };
+            }
+
             // If the terminal label is a Zone delegation, auto-follow into
             // that zone and look up "@" (the apex).  This lets petnames like
             // `lacia.self` resolve to lacia's Identity record published at @
@@ -795,6 +826,9 @@ pub fn validate_alias_target(target: &str) -> Result<()> {
 /// Rules:
 /// - Zone must be the sole non-supplemental record (GNS rule).
 ///   Text and ContentRef are supplemental and may coexist with Zone.
+/// - VHost is likewise terminal and singular: it must be the sole
+///   non-supplemental record at its label (so `Identity + VHost` — ambiguous
+///   "entity or vhost?" — is rejected).
 /// - Alias targets must be valid (bare label or absolute).
 pub fn validate_records(records: &[TnsRecord]) -> Result<()> {
     if records.is_empty() {
@@ -807,6 +841,16 @@ pub fn validate_records(records: &[TnsRecord]) -> Result<()> {
         if non_supplemental_count > 1 {
             return Err(Error::Protocol(
                 "Zone record must be the sole non-supplemental record at a label".into(),
+            ));
+        }
+    }
+
+    let has_vhost = records.iter().any(|r| matches!(r, TnsRecord::VHost(_)));
+    if has_vhost {
+        let non_supplemental_count = records.iter().filter(|r| !is_supplemental(r)).count();
+        if non_supplemental_count > 1 {
+            return Err(Error::Protocol(
+                "VHost record must be the sole non-supplemental record at a label".into(),
             ));
         }
     }
@@ -950,6 +994,72 @@ mod tests {
         let (parsed, consumed) = tns_record_from_bytes(&bytes).unwrap();
         assert_eq!(parsed, record);
         assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn record_roundtrip_vhost() {
+        let sid = ServiceId::from_signing_pubkey(&[0xCD; 32]);
+        let record = TnsRecord::VHost(sid);
+        let bytes = tns_record_to_bytes(&record);
+        let (parsed, consumed) = tns_record_from_bytes(&bytes).unwrap();
+        assert_eq!(parsed, record);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn vhost_wire_port_deterministic() {
+        assert_eq!(
+            vhost_wire_port("blog", "80"),
+            vhost_wire_port("blog", "80")
+        );
+        // 64-char lowercase hex.
+        let p = vhost_wire_port("blog", "80");
+        assert_eq!(p.len(), 64);
+        assert!(p.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn vhost_wire_port_no_label_port_aliasing() {
+        // The MAC chain must not let the (label, port) boundary slide:
+        // ("ab","c") and ("a","bc") must derive distinct ports.
+        assert_ne!(vhost_wire_port("ab", "c"), vhost_wire_port("a", "bc"));
+        // Distinct labels / ports give distinct ports.
+        assert_ne!(vhost_wire_port("blog", "80"), vhost_wire_port("ssh", "80"));
+        assert_ne!(vhost_wire_port("blog", "80"), vhost_wire_port("blog", "443"));
+    }
+
+    #[test]
+    fn vhost_wire_port_apex_distinct() {
+        // The apex label "@" is just another label; its derivation differs from
+        // any other label and is publicly computable (correct — apex is public).
+        assert_ne!(vhost_wire_port("@", "443"), vhost_wire_port("blog", "443"));
+        assert_eq!(vhost_wire_port("@", "443"), vhost_wire_port("@", "443"));
+    }
+
+    #[test]
+    fn validate_records_vhost_sole_non_supplemental() {
+        let vsid = ServiceId::from_signing_pubkey(&[0x05; 32]);
+        let id_sid = ServiceId::from_signing_pubkey(&[0x06; 32]);
+
+        // VHost alone — ok.
+        assert!(validate_records(&[TnsRecord::VHost(vsid)]).is_ok());
+
+        // VHost + Text (supplemental) — ok.
+        assert!(validate_records(&[
+            TnsRecord::VHost(vsid),
+            TnsRecord::Text("desc".into()),
+        ])
+        .is_ok());
+
+        // VHost + Identity — rejected (ambiguous: entity or vhost?).
+        assert!(
+            validate_records(&[TnsRecord::VHost(vsid), TnsRecord::Identity(id_sid)]).is_err()
+        );
+
+        // VHost + Zone — rejected.
+        assert!(
+            validate_records(&[TnsRecord::VHost(vsid), TnsRecord::Zone(id_sid)]).is_err()
+        );
     }
 
     #[test]
@@ -1792,6 +1902,86 @@ mod tests {
                     assert_eq!(records, vec![TnsRecord::Identity(target)]);
                 }
                 other => panic!("expected Identity via absolute alias, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn resolve_vhost_surfaces_canonical_label() {
+        // Zone has "blog" → VHost(serving). Resolving "blog" returns the serving
+        // SID and canonical label "blog" regardless of approach path.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone = Keypair::generate();
+            let zone_sid = zone.identity.service_id();
+            let serving = ServiceId::from_signing_pubkey(&[0xEE; 32]);
+
+            publish(&node, &zone, "blog", &[TnsRecord::VHost(serving)], 600)
+                .await
+                .unwrap();
+
+            // Direct in-zone.
+            match resolve(&node, zone_sid, "blog").await {
+                TnsResolution::VHost {
+                    serving: s,
+                    canonical_label,
+                } => {
+                    assert_eq!(s, serving);
+                    assert_eq!(canonical_label, "blog");
+                }
+                other => panic!("expected VHost, got {:?}", other),
+            }
+
+            // Via raw SID suffix: "blog.<zone_sid>" — same canonical label.
+            let name = format!("blog.{}", zone_sid);
+            match resolve_name(&node, &name).await {
+                TnsResolution::VHost {
+                    serving: s,
+                    canonical_label,
+                } => {
+                    assert_eq!(s, serving);
+                    assert_eq!(canonical_label, "blog");
+                }
+                other => panic!("expected VHost via raw SID, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn resolve_vhost_via_absolute_alias() {
+        // Zone A: "alice-blog" → Alias("blog.<ALICE_SID>"). Alice zone: "blog" →
+        // VHost. Canonical label must be "blog" (final position), not the alias.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone_a = Keypair::generate();
+            let alice = Keypair::generate();
+            let alice_sid = alice.identity.service_id();
+            let serving = ServiceId::from_signing_pubkey(&[0xAB; 32]);
+
+            publish(
+                &node,
+                &zone_a,
+                "alice-blog",
+                &[TnsRecord::Alias(format!("blog.{}", alice_sid))],
+                600,
+            )
+            .await
+            .unwrap();
+            publish(&node, &alice, "blog", &[TnsRecord::VHost(serving)], 600)
+                .await
+                .unwrap();
+
+            match resolve(&node, zone_a.identity.service_id(), "alice-blog").await {
+                TnsResolution::VHost {
+                    serving: s,
+                    canonical_label,
+                } => {
+                    assert_eq!(s, serving);
+                    assert_eq!(canonical_label, "blog");
+                }
+                other => panic!("expected VHost via alias, got {:?}", other),
             }
         });
     }

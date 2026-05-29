@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tarnet_api::service::{
-    DataStream, ListenerOptions, PoolClaim, PoolKind, PoolRegisterOptions, PortMode, ServiceApi,
-    TnsRecord, TnsResolution,
+    vhost_wire_port, DataStream, ListenerOptions, PoolClaim, PoolKind, PoolRegisterOptions,
+    PortMode, ServiceApi, TnsRecord, TnsResolution,
 };
 use tarnet_api::types::{PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
@@ -1054,6 +1054,7 @@ fn parse_tns_record(type_str: &str, value: &str) -> TnsRecord {
     match type_str {
         "identity" => TnsRecord::Identity(parse_service_id(value)),
         "zone" => TnsRecord::Zone(parse_service_id(value)),
+        "vhost" => TnsRecord::VHost(parse_service_id(value)),
         "text" => TnsRecord::Text(value.to_string()),
         "alias" => TnsRecord::Alias(value.to_string()),
         "content-ref" => {
@@ -1068,7 +1069,7 @@ fn parse_tns_record(type_str: &str, value: &str) -> TnsRecord {
         }
         other => {
             eprintln!("Unknown record type: {}", other);
-            eprintln!("Valid types: identity, zone, text, alias, content-ref");
+            eprintln!("Valid types: identity, zone, vhost, text, alias, content-ref");
             std::process::exit(1);
         }
     }
@@ -1078,6 +1079,7 @@ fn print_tns_record(rec: &TnsRecord) {
     match rec {
         TnsRecord::Identity(sid) => println!("  IDENTITY    {}", sid),
         TnsRecord::Zone(sid) => println!("  ZONE        {}", sid),
+        TnsRecord::VHost(sid) => println!("  VHOST       {}", sid),
         TnsRecord::Text(s) => println!("  TEXT        {}", s),
         TnsRecord::Alias(s) => println!("  ALIAS       {}", s),
         TnsRecord::ContentRef(h) => println!("  CONTENT-REF {}", hex_encode(h)),
@@ -1125,6 +1127,13 @@ fn print_resolution(name: &str, resolution: &TnsResolution) {
             for rec in records {
                 print_tns_record(rec);
             }
+        }
+        TnsResolution::VHost {
+            serving,
+            canonical_label,
+        } => {
+            println!("{}:", name);
+            println!("  VHOST       {} (canonical label: {})", serving, canonical_label);
         }
         TnsResolution::NotFound => {
             eprintln!("{}: not found", name);
@@ -1484,8 +1493,12 @@ async fn cmd_tunnel(
         PortMode::ReliableOrdered
     };
 
+    // VHost model: connectors derive the wire port from the canonical label
+    // (this tunnel's label) and their supplied port (port_name); listen on the
+    // matching derived port so the first connection lands — no fallback.
+    let wire_port = vhost_wire_port(&label, &port_name);
     let listener = match client
-        .listen(service_id, mode, &port_name, ListenerOptions::default())
+        .listen(service_id, mode, &wire_port, ListenerOptions::default())
         .await
     {
         Ok(l) => l,
@@ -1493,7 +1506,8 @@ async fn cmd_tunnel(
     };
 
     // Set local label (private; we publish to DHT explicitly below to control TTL).
-    let records = vec![TnsRecord::Identity(service_id)];
+    // Publish a VHost (the connectable endpoint), not an Identity.
+    let records = vec![TnsRecord::VHost(service_id)];
     if let Err(e) = client
         .tns_set_label(identity, &label, records.clone(), false)
         .await
@@ -1520,8 +1534,11 @@ async fn cmd_tunnel(
             meta: Vec::new(),
             ttl_secs: 45,
         };
+        // The tunnel has a single listener on the derived wire port, so the pool
+        // endpoint must advertise that exact port (pool consumers dial it
+        // verbatim via connect_via — no derivation on the pool path).
         match client
-            .pool_register(pool_name, svc, identity, &port_name, opts)
+            .pool_register(pool_name, svc, identity, &wire_port, opts)
             .await
         {
             Ok(claim) => Some(claim),
@@ -1555,7 +1572,7 @@ async fn cmd_tunnel(
     println!();
     println!("  {}", dim("# connect from the tarnet CLI:"));
     println!("  tarnet connect {} --port {}", public_name, port_name);
-    if !socks_addrs.is_empty() && protocol == "tcp" {
+    if !socks_addrs.is_empty() && protocol == "tcp" && port_name.parse::<u16>().is_ok() {
         let proxy = socks_addrs[0];
         println!(
             "  {}  socks5h://{}  ->  {}:{}",

@@ -2,29 +2,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::{debug, error, info, warn};
-use tarnet_api::service::{PortMode, ServiceApi, TnsRecord, TnsResolution};
+use tarnet_api::service::{PortMode, ServiceApi};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 
 use crate::socks5;
-
-/// Where to route a connection.
-#[derive(Debug)]
-enum Route {
-    /// Route through tarnet to a ServiceId + port.
-    Tarnet {
-        service_id: tarnet_api::types::ServiceId,
-        service_name: String,
-        port: u16,
-    },
-    /// Route to a pool service: resolve the endpoint set and round-robin with failover.
-    Pool { pool: String, service: String },
-    /// Fall through to clearnet (direct TCP).
-    Clearnet { host: String, port: u16 },
-    /// Refuse the connection (clearnet disallowed, TNS not found).
-    Refused,
-}
 
 /// State shared across the proxy.
 struct ProxyState<S: ServiceApi> {
@@ -134,38 +117,15 @@ async fn handle_client<S: ServiceApi + 'static>(
     match req.command {
         socks5::SocksCommand::Connect => {
             debug!("CONNECT request: {}:{}", req.hostname, req.port);
-            let identity = req.identity.clone();
-            let route =
-                resolve_route(&state, &req.hostname, req.port, identity.as_deref()).await;
 
-            match route {
-                Route::Tarnet {
-                    service_id,
-                    service_name,
-                    port,
-                } => {
-                    handle_tarnet_route(
-                        state,
-                        stream,
-                        service_id,
-                        &service_name,
-                        port,
-                        identity.as_deref(),
-                    )
-                    .await
-                }
-                Route::Pool {
-                    pool, service, ..
-                } => handle_pool_route(state, stream, &pool, &service).await,
-                Route::Clearnet { host, port } => {
-                    handle_clearnet_route(stream, &host, port).await
-                }
-                Route::Refused => {
-                    warn!("Refusing connection to {}:{}", req.hostname, req.port);
-                    socks5::send_host_unreachable(&mut stream).await?;
-                    Ok(())
-                }
+            // Pool route: if the rightmost label names a joined pool, resolve as
+            // a pool service (e.g. "payment.mycluster" → service "payment" in
+            // pool "mycluster") with round-robin + failover.
+            if let Some((pool, service)) = pool_match(&state, &req.hostname).await {
+                return handle_pool_route(state, stream, &pool, &service).await;
             }
+
+            handle_connect(state, stream, &req.hostname, req.port).await
         }
         socks5::SocksCommand::UdpAssociate => {
             debug!("UDP ASSOCIATE request: {}:{}", req.hostname, req.port);
@@ -174,155 +134,62 @@ async fn handle_client<S: ServiceApi + 'static>(
     }
 }
 
-async fn resolve_route<S: ServiceApi>(
+/// If the rightmost label of `hostname` names a joined pool, return
+/// `(pool, service)`. Pools are addressed `<service>.<pool>`.
+async fn pool_match<S: ServiceApi>(
     state: &ProxyState<S>,
     hostname: &str,
-    port: u16,
-    identity: Option<&str>,
-) -> Route {
-    // Pool route: if the rightmost label names a joined pool, resolve as a pool
-    // service (e.g. "payment.mycluster" → service "payment" in pool "mycluster").
+) -> Option<(String, String)> {
     let labels: Vec<&str> = hostname.split('.').collect();
-    if labels.len() >= 2 {
-        let pool_name = labels[labels.len() - 1];
-        if let Ok(pools) = state.api.pool_list().await {
-            if pools.iter().any(|(n, _)| n == pool_name) {
-                return Route::Pool {
-                    pool: pool_name.to_string(),
-                    service: labels[0].to_string(),
-                };
-            }
-        }
+    if labels.len() < 2 {
+        return None;
     }
-
-    // Try TNS resolution — from a specific identity's zone if requested.
-    let result = if let Some(id_label) = identity {
-        match state.api.resolve_identity(id_label).await {
-            Ok(zone_sid) => state.api.tns_resolve(zone_sid, hostname).await,
-            Err(e) => {
-                warn!("Unknown identity '{}': {}", id_label, e);
-                state.api.tns_resolve_name(hostname).await
-            }
-        }
+    let pool_name = labels[labels.len() - 1];
+    let pools = state.api.pool_list().await.ok()?;
+    if pools.iter().any(|(n, _)| n == pool_name) {
+        Some((pool_name.to_string(), labels[0].to_string()))
     } else {
-        state.api.tns_resolve_name(hostname).await
-    };
+        None
+    }
+}
 
-    match result {
-        Ok(TnsResolution::Records(records)) => {
-            // Look for Identity records.
-            let service_name = first_label(hostname);
-
-            for rec in &records {
-                if let TnsRecord::Identity(sid) = rec {
-                    return Route::Tarnet {
-                        service_id: *sid,
-                        service_name: service_name.to_string(),
-                        port,
-                    };
-                }
-            }
-
-            // Records found but no routable ones.
-            if state.allow_clearnet {
-                Route::Clearnet {
-                    host: hostname.to_string(),
-                    port,
-                }
-            } else {
-                warn!(
-                    "TNS records found but no routable Identity for {}",
-                    hostname
-                );
-                Route::Refused
-            }
-        }
-        Ok(TnsResolution::NotFound) | Ok(TnsResolution::Error(_)) => {
-            if state.allow_clearnet {
-                Route::Clearnet {
-                    host: hostname.to_string(),
-                    port,
-                }
-            } else {
-                warn!("TNS not found for {} and clearnet disallowed", hostname);
-                Route::Refused
-            }
+/// Route a CONNECT through the single `connect_to` chokepoint. The daemon
+/// resolves the target (SID / VHost / apex Identity) and *derives* the wire
+/// port from the canonical label + supplied port — no first-label heuristic, no
+/// numeric fallback. On failure, fall through to clearnet if allowed.
+async fn handle_connect<S: ServiceApi + 'static>(
+    state: Arc<ProxyState<S>>,
+    mut stream: TcpStream,
+    hostname: &str,
+    port: u16,
+) -> std::io::Result<()> {
+    match state
+        .api
+        .connect_to(hostname, PortMode::ReliableOrdered, &port.to_string())
+        .await
+    {
+        Ok(conn) => {
+            info!("Tarnet route to {}:{}", hostname, port);
+            socks5::send_success(&mut stream).await?;
+            splice(stream, conn).await;
+            Ok(())
         }
         Err(e) => {
-            warn!("TNS resolve error for {}: {}", hostname, e);
             if state.allow_clearnet {
-                Route::Clearnet {
-                    host: hostname.to_string(),
-                    port,
-                }
+                debug!("connect_to {} failed ({}), falling through to clearnet", hostname, e);
+                handle_clearnet_route(stream, hostname, port).await
             } else {
-                Route::Refused
+                warn!("Refusing connection to {}:{}: {}", hostname, port, e);
+                socks5::send_host_unreachable(&mut stream).await?;
+                Ok(())
             }
         }
     }
 }
 
-async fn handle_tarnet_route<S: ServiceApi + 'static>(
-    state: Arc<ProxyState<S>>,
-    mut stream: TcpStream,
-    service_id: tarnet_api::types::ServiceId,
-    service_name: &str,
-    port: u16,
-    identity: Option<&str>,
-) -> std::io::Result<()> {
-    info!(
-        "Tarnet route to {} service={} port={}",
-        service_id, service_name, port
-    );
-
-    // Resolve source identity ServiceId for connect_as.
-    let source_sid = if let Some(id_label) = identity {
-        state.api.resolve_identity(id_label).await.ok()
-    } else {
-        None
-    };
-
-    // Try the service name (hostname first label) as the port name first.
-    // Subdomain services register using their subdomain as the port name,
-    // so e.g. "nina" in "nina.service-directory" maps to port "nina".
-    // Fall back to the numeric URL port for apex services.
-    let conn = match state
-        .api
-        .connect_as(
-            service_id,
-            PortMode::ReliableOrdered,
-            service_name,
-            source_sid,
-        )
-        .await
-    {
-        Ok(c) => c,
-        Err(_) => {
-            let port_name = port.to_string();
-            match state
-                .api
-                .connect_as(
-                    service_id,
-                    PortMode::ReliableOrdered,
-                    &port_name,
-                    source_sid,
-                )
-                .await
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    error!("Failed to connect to {}: {}", service_id, e);
-                    socks5::send_host_unreachable(&mut stream).await?;
-                    return Ok(());
-                }
-            }
-        }
-    };
-
-    // Send SOCKS5 success.
-    socks5::send_success(&mut stream).await?;
-
-    // Shuttle bytes between SOCKS client and circuit connection.
+/// Shuttle bytes bidirectionally between a SOCKS client TCP stream and a tarnet
+/// circuit connection until either side closes.
+async fn splice(stream: TcpStream, conn: tarnet_api::service::Connection) {
     let (mut read_half, mut write_half) = stream.into_split();
     let conn = Arc::new(conn);
 
@@ -355,8 +222,6 @@ async fn handle_tarnet_route<S: ServiceApi + 'static>(
     });
 
     let _ = tokio::join!(upload, download);
-
-    Ok(())
 }
 
 /// Route a connection to a pool service: resolve the live endpoint set, pick one
@@ -417,40 +282,7 @@ async fn handle_pool_route<S: ServiceApi + 'static>(
     };
 
     socks5::send_success(&mut stream).await?;
-
-    // Shuttle bytes between SOCKS client and the circuit connection.
-    let (mut read_half, mut write_half) = stream.into_split();
-    let conn = Arc::new(conn);
-
-    let conn_send = conn.clone();
-    let upload = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
-        loop {
-            match read_half.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if conn_send.send(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let download = tokio::spawn(async move {
-        loop {
-            match conn.recv().await {
-                Ok(payload) => {
-                    if write_half.write_all(&payload).await.is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let _ = tokio::join!(upload, download);
+    splice(stream, conn).await;
     Ok(())
 }
 
@@ -591,6 +423,7 @@ async fn handle_udp_associate<S: ServiceApi + 'static>(
     let udp_send = udp_socket.clone();
     let client_addr_send = client_addr.clone();
 
+    let allow_clearnet = state.allow_clearnet;
     let relay_task = tokio::spawn(async move {
         // Wait for the first datagram to know where to connect.
         let (hostname, port, first_payload) = match inbound_rx.recv().await {
@@ -598,44 +431,23 @@ async fn handle_udp_associate<S: ServiceApi + 'static>(
             None => return,
         };
 
-        let route = resolve_route(&state, &hostname, port, identity.as_deref()).await;
+        // Pool services over UDP are not supported in Phase 1.
+        let _ = &identity;
+        if let Some((pool, _)) = pool_match(&state, &hostname).await {
+            warn!("UDP to pool '{}' not supported; refusing", pool);
+            return;
+        }
 
-        match route {
-            Route::Tarnet {
-                service_id,
-                service_name,
-                port,
-                ..
-            } => {
-                info!(
-                    "UDP Tarnet route to {} service={} port={}",
-                    service_id, service_name, port
-                );
+        // Try tarnet via the single connect_to chokepoint (derives the wire port).
+        let tarnet_conn = state
+            .api
+            .connect_to(&hostname, PortMode::UnreliableUnordered, &port.to_string())
+            .await;
 
-                // Resolve source identity for connect_as.
-                let source_sid = if let Some(ref id_label) = identity {
-                    state.api.resolve_identity(id_label).await.ok()
-                } else {
-                    None
-                };
-
-                let port_name = port.to_string();
-                let conn = match state
-                    .api
-                    .connect_as(
-                        service_id,
-                        PortMode::UnreliableUnordered,
-                        &port_name,
-                        source_sid,
-                    )
-                    .await
-                {
-                    Ok(c) => Arc::new(c),
-                    Err(e) => {
-                        error!("Failed to connect UDP to {}: {}", service_id, e);
-                        return;
-                    }
-                };
+        match tarnet_conn {
+            Ok(c) => {
+                info!("UDP Tarnet route to {}:{}", hostname, port);
+                let conn = Arc::new(c);
 
                 // Send the first datagram.
                 if let Err(e) = conn.send(&first_payload).await {
@@ -691,7 +503,18 @@ async fn handle_udp_associate<S: ServiceApi + 'static>(
                     }
                 }
             }
-            Route::Clearnet { host, port } => {
+            Err(e) if !allow_clearnet => {
+                warn!(
+                    "Refusing UDP association to {}:{}: {}",
+                    hostname, port, e
+                );
+            }
+            Err(e) => {
+                debug!(
+                    "UDP connect_to {} failed ({}), falling through to clearnet",
+                    hostname, e
+                );
+                let host = hostname.clone();
                 info!("UDP clearnet relay to {}:{}", host, port);
 
                 // Resolve destination address.
@@ -774,13 +597,6 @@ async fn handle_udp_associate<S: ServiceApi + 'static>(
                     }
                 }
             }
-            Route::Pool { pool, .. } => {
-                // Pool services over UDP are not supported in Phase 1.
-                warn!("UDP to pool '{}' not supported; refusing", pool);
-            }
-            Route::Refused => {
-                warn!("Refusing UDP association to {}:{}", hostname, port);
-            }
         }
     });
 
@@ -851,10 +667,4 @@ fn build_udp_header(hostname: &str, port: u16) -> Vec<u8> {
 
     header.extend_from_slice(&port.to_be_bytes());
     header
-}
-
-/// Extract the first label from a dot-separated hostname.
-/// e.g., "web.alice" -> "web", "ssh.bob.carol" -> "ssh"
-fn first_label(hostname: &str) -> &str {
-    hostname.split('.').next().unwrap_or(hostname)
 }

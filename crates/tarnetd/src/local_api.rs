@@ -127,7 +127,7 @@ impl LocalServiceApi {
     /// Insert a TNS resolution result into the cache.
     async fn tns_cache_put(&self, key: String, resolution: TnsResolution) {
         let ttl = match &resolution {
-            TnsResolution::Records(_) => TNS_CACHE_TTL_SUCCESS,
+            TnsResolution::Records(_) | TnsResolution::VHost { .. } => TNS_CACHE_TTL_SUCCESS,
             TnsResolution::NotFound => TNS_CACHE_TTL_NOT_FOUND,
             TnsResolution::Error(_) => return, // don't cache errors
         };
@@ -203,6 +203,18 @@ impl LocalServiceApi {
                         .collect();
 
                     if labels.len() == 1 {
+                        // A terminal VHost in our own zone: surface the serving
+                        // SID + canonical label (the label itself) so connect_to
+                        // can derive the wire port.
+                        if let Some(serving) = records.iter().find_map(|r| match r {
+                            TnsRecord::VHost(sid) => Some(*sid),
+                            _ => None,
+                        }) {
+                            return Ok(TnsResolution::VHost {
+                                serving,
+                                canonical_label: root_label.to_string(),
+                            });
+                        }
                         return Ok(TnsResolution::Records(records));
                     }
 
@@ -696,18 +708,34 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection> {
-        // 1. Try parsing target directly as a ServiceId.
+        // The single connect chokepoint. The wire port is always *derived* from a
+        // canonical label + the supplied port — there is no verbatim-port path.
+        // `port` is the connector's supplied port (a URL u16 stringified, or a
+        // native string); it is never fed to the circuit layer directly.
+
+        // 1. Bare ServiceId: the un-petnamed apex form. Canonical label is "@".
         if let Ok(sid) = ServiceId::parse(target) {
-            return self.connect(sid, mode, port).await;
+            let wire = tns::vhost_wire_port("@", port);
+            return self.connect(sid, mode, &wire).await;
         }
 
-        // 2. Try resolving via TNS (local labels, dotted names).
+        // 2. Resolve via TNS (local labels, dotted names, raw-SID suffixes).
         match self.tns_resolve_name(target).await? {
+            // 2a. VHost endpoint: derive from the canonical label surfaced by the
+            //     resolver, connect to the serving identity.
+            TnsResolution::VHost {
+                serving,
+                canonical_label,
+            } => {
+                let wire = tns::vhost_wire_port(&canonical_label, port);
+                self.connect(serving, mode, &wire).await
+            }
+            // 2b. Plain Identity (apex / petname → @): canonical label is "@".
             TnsResolution::Records(records) => {
-                // Find a connectable record (Identity).
                 for rec in &records {
                     if let TnsRecord::Identity(sid) = rec {
-                        return self.connect(*sid, mode, port).await;
+                        let wire = tns::vhost_wire_port("@", port);
+                        return self.connect(*sid, mode, &wire).await;
                     }
                 }
                 Err(ApiError::Service(format!(
