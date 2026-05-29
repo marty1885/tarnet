@@ -194,7 +194,7 @@ async fn splice(stream: TcpStream, conn: tarnet_api::service::Connection) {
     let conn = Arc::new(conn);
 
     let conn_send = conn.clone();
-    let upload = tokio::spawn(async move {
+    let mut upload = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match read_half.read(&mut buf).await {
@@ -208,7 +208,7 @@ async fn splice(stream: TcpStream, conn: tarnet_api::service::Connection) {
         }
     });
 
-    let download = tokio::spawn(async move {
+    let mut download = tokio::spawn(async move {
         loop {
             match conn.recv().await {
                 Ok(payload) => {
@@ -221,7 +221,13 @@ async fn splice(stream: TcpStream, conn: tarnet_api::service::Connection) {
         }
     });
 
-    let _ = tokio::join!(upload, download);
+    // Tear down as soon as either direction ends. If the circuit dies (download's
+    // recv() errors after a StreamEnd), aborting upload drops the read half and
+    // resets the client socket so it stops reusing a dead connection.
+    tokio::select! {
+        _ = &mut upload => { download.abort(); }
+        _ = &mut download => { upload.abort(); }
+    }
 }
 
 /// Route a connection to a pool service: resolve the live endpoint set, pick one

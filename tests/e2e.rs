@@ -163,6 +163,133 @@ async fn baseline_circuit_connect() {
     assert_eq!(data, b"test");
 }
 
+/// Regression: when the endpoint (server) side drops its Connection — e.g. the
+/// expose backend closed/restarted — the initiator's `recv()` must error
+/// promptly via a StreamEnd, not hang. A hang here is the "tunnel unavailable
+/// for a while after restart; F5 eventually works" bug.
+#[tokio::test]
+async fn stream_end_propagates_endpoint_close_to_initiator() {
+    init_log();
+    let node_a = Arc::new(Node::new(Keypair::generate()));
+    let node_b = Arc::new(Node::new(Keypair::generate()));
+    let pid_b = node_b.peer_id();
+    let service_id_b = node_b.default_service_id().await;
+
+    let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let addr_b = disc_b.local_addrs()[0].to_string();
+    let nb = node_b.clone();
+    tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    let nb2 = node_b.clone();
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
+
+    let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let na = node_a.clone();
+    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let conn_a = tokio::time::timeout(
+        Duration::from_secs(5),
+        node_a.circuit_connect(service_id_b, TEST_MODE, "80", Some(pid_b), None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let conn_b = tokio::time::timeout(Duration::from_secs(5), accept_handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Confirm the stream is live before tearing it down.
+    conn_a.send(b"ping").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), conn_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"ping");
+
+    // Endpoint goes away (backend closed / restarted).
+    drop(conn_b);
+
+    // The initiator must observe the close, not block forever.
+    let recv = tokio::time::timeout(Duration::from_secs(3), conn_a.recv()).await;
+    assert!(
+        recv.is_ok(),
+        "initiator recv() hung after endpoint dropped — StreamEnd not propagated"
+    );
+    assert!(
+        recv.unwrap().is_err(),
+        "initiator recv() should error once the stream is torn down"
+    );
+}
+
+/// Regression: the reverse direction — when the initiator (client) side drops
+/// its Connection, the endpoint's `recv()` must error promptly via a StreamEnd
+/// so the backend socket is released rather than lingering half-open.
+#[tokio::test]
+async fn stream_end_propagates_initiator_close_to_endpoint() {
+    init_log();
+    let node_a = Arc::new(Node::new(Keypair::generate()));
+    let node_b = Arc::new(Node::new(Keypair::generate()));
+    let pid_b = node_b.peer_id();
+    let service_id_b = node_b.default_service_id().await;
+
+    let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let addr_b = disc_b.local_addrs()[0].to_string();
+    let nb = node_b.clone();
+    tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listener_b = node_b
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    let nb2 = node_b.clone();
+    let accept_handle =
+        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
+
+    let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let na = node_a.clone();
+    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let conn_a = tokio::time::timeout(
+        Duration::from_secs(5),
+        node_a.circuit_connect(service_id_b, TEST_MODE, "80", Some(pid_b), None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let conn_b = tokio::time::timeout(Duration::from_secs(5), accept_handle)
+        .await
+        .unwrap()
+        .unwrap();
+
+    conn_a.send(b"ping").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), conn_b.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"ping");
+
+    // Client goes away.
+    drop(conn_a);
+
+    let recv = tokio::time::timeout(Duration::from_secs(3), conn_b.recv()).await;
+    assert!(
+        recv.is_ok(),
+        "endpoint recv() hung after initiator dropped — StreamEnd not propagated"
+    );
+    assert!(
+        recv.unwrap().is_err(),
+        "endpoint recv() should error once the stream is torn down"
+    );
+}
+
 /// Create named identities, verify creation and listing.
 /// Connect using wildcard listener (custom identity in STREAM_BEGIN has a known
 /// timing bug with the backward relay cell path — tracked separately).

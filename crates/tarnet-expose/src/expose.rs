@@ -591,7 +591,7 @@ pub async fn pipe_tcp(
 
     let svc = service_name.to_string();
     let conn_upload = conn.clone();
-    let upload = tokio::spawn(async move {
+    let mut upload = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
             match tcp_read.read(&mut buf).await {
@@ -606,7 +606,7 @@ pub async fn pipe_tcp(
     });
 
     let svc2 = svc.clone();
-    let download = tokio::spawn(async move {
+    let mut download = tokio::spawn(async move {
         loop {
             match conn.recv().await {
                 Ok(payload) => {
@@ -620,7 +620,14 @@ pub async fn pipe_tcp(
         }
     });
 
-    let _ = tokio::join!(upload, download);
+    // Tear down as soon as either direction ends rather than waiting for both.
+    // When the backend EOFs (upload ends), aborting download drops the Connection
+    // promptly, which triggers a StreamEnd back to the initiator so it can reset
+    // the client. Waiting on join!() here would hang until the client also closed.
+    tokio::select! {
+        _ = &mut upload => { download.abort(); }
+        _ = &mut download => { upload.abort(); }
+    }
 }
 
 /// Pipe a circuit connection to a local UDP backend.

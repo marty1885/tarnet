@@ -208,6 +208,15 @@ impl Node {
                                 }
                                 return Ok(());
                             }
+                            if relay_cell.command == RelayCellCommand::StreamEnd {
+                                // The endpoint closed the stream (backend EOF, dial
+                                // failed, or backend restart). Drop the data channel
+                                // so the app's recv() errors and splice() resets the
+                                // local client (e.g. Chromium) socket — without this,
+                                // the client keeps reusing a dead pooled connection.
+                                self.endpoints.data_txs.lock().await.remove(&circuit_id);
+                                return Ok(());
+                            }
                             // Rendezvous protocol backward cells
                             if relay_cell.command == RelayCellCommand::IntroRegistered
                                 || relay_cell.command == RelayCellCommand::IntroduceAck
@@ -365,6 +374,28 @@ impl Node {
             RelayCellCommand::StreamBegin => {
                 self.handle_stream_begin(from, circuit_id, &relay_cell.data)
                     .await
+            }
+            RelayCellCommand::StreamEnd => {
+                // The initiator closed the stream. Drop the data channel so the
+                // local backend Connection's recv() errors and pipe_tcp closes the
+                // backend socket, then clear the rest of the per-stream state.
+                self.endpoints.data_txs.lock().await.remove(&circuit_id);
+                self.endpoints
+                    .stream_owners
+                    .lock()
+                    .await
+                    .remove(&circuit_id);
+                self.endpoints
+                    .recv_congestion
+                    .lock()
+                    .await
+                    .remove(&circuit_id);
+                self.endpoints
+                    .send_congestion
+                    .lock()
+                    .await
+                    .remove(&circuit_id);
+                Ok(())
             }
             RelayCellCommand::Introduce => {
                 self.handle_introduce(from, circuit_id, &relay_cell.data)
@@ -565,6 +596,9 @@ impl Node {
         let links = self.links.clone();
         let hop_backward_keys = self.circuits.hop_backward_keys.clone();
         let send_cw = self.endpoints.send_congestion.clone();
+        let ep_data_txs = self.endpoints.data_txs.clone();
+        let ep_stream_owners = self.endpoints.stream_owners.clone();
+        let ep_recv_congestion = self.endpoints.recv_congestion.clone();
         tokio::spawn(async move {
             let mut rx = circuit_rx;
             while let Some(data) = rx.recv().await {
@@ -642,6 +676,39 @@ impl Node {
                     break;
                 }
             }
+
+            // The local application dropped its Connection (the expose backend
+            // closed/EOF'd, or the initial dial failed). Tell the initiator the
+            // stream is gone so it can reset the client socket, then clean up our
+            // endpoint state — leaving a stale data_txs entry would let a reused
+            // circuit_id match the idempotent StreamBegin fast-path and silently
+            // black-hole a fresh connection.
+            let end_cell = {
+                let mut map = hop_backward_keys.lock().await;
+                map.get_mut(&(circuit_id, from)).map(|entry| {
+                    let nonce = entry.3;
+                    entry.3 += 1;
+                    encrypt_backward_cell(
+                        entry.0,
+                        entry.1,
+                        entry.2,
+                        nonce,
+                        circuit_id,
+                        RelayCellCommand::StreamEnd,
+                        &[],
+                    )
+                })
+            };
+            if let Some(encoded) = end_cell {
+                let links_guard = links.lock().await;
+                if let Some(link) = links_guard.get(&from) {
+                    let _ = link.send_message(&encoded).await;
+                }
+            }
+            ep_data_txs.lock().await.remove(&circuit_id);
+            ep_stream_owners.lock().await.remove(&circuit_id);
+            ep_recv_congestion.lock().await.remove(&circuit_id);
+            send_cw.lock().await.remove(&circuit_id);
         });
 
         // Build the Connection and route it to the matching listener.
@@ -2136,6 +2203,7 @@ impl Node {
 
         let node_circuits = self.circuits.outbound.clone();
         let node_links = self.links.clone();
+        let init_data_txs = self.endpoints.data_txs.clone();
         tokio::spawn(async move {
             let mut rx = circuit_rx;
             while let Some(data) = rx.recv().await {
@@ -2187,6 +2255,27 @@ impl Node {
                     break;
                 }
             }
+
+            // The local (SOCKS/tunnel) side dropped its Connection. Notify the
+            // endpoint so it closes the backend socket, then drop our stream state.
+            let end = {
+                let mut circuits = node_circuits.lock().await;
+                circuits.get_mut(&circuit_id).map(|c| {
+                    c.send_relay_cell(&RelayCell {
+                        command: RelayCellCommand::StreamEnd,
+                        stream_id: 0,
+                        data: Vec::new(),
+                    })
+                })
+            };
+            if let Some((first_hop, cid, cell)) = end {
+                let encoded = encode_circuit_relay_cell(cid, &cell);
+                let links = node_links.lock().await;
+                if let Some(link) = links.get(&first_hop) {
+                    let _ = link.send_message(&encoded).await;
+                }
+            }
+            init_data_txs.lock().await.remove(&circuit_id);
         });
 
         let conn = tarnet_api::service::Connection::new(
