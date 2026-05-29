@@ -10,12 +10,16 @@ const INSTANCE_PREFIX: &str = "tarnet-";
 const EXCLUDED_IFACE_PREFIXES: &[&str] = &["wg", "tun", "tap", "veth", "docker", "br-", "virbr"];
 
 /// Start mDNS service registration and discovery.
-/// Returns a channel that yields discovered peer addresses (host:port strings).
+/// Returns a channel that yields `(peer_id_prefix, host:port)` for discovered
+/// peers, where `peer_id_prefix` is the 16-hex-char prefix advertised in the
+/// mDNS instance name (empty if it couldn't be parsed). The prefix lets the
+/// dialer skip peers it's already connected to — mDNS re-resolves the same
+/// peer continuously, so dialing unconditionally piles up duplicate links.
 /// The returned handle keeps the daemon alive; drop it to stop.
 pub fn start(
     peer_id_hex: &str,
     tcp_port: u16,
-) -> Result<(mpsc::UnboundedReceiver<String>, MdnsHandle), String> {
+) -> Result<(mpsc::UnboundedReceiver<(String, String)>, MdnsHandle), String> {
     let mdns = ServiceDaemon::new().map_err(|e| format!("mDNS daemon: {}", e))?;
 
     // Disable tunnel/VPN/virtual interfaces where multicast doesn't work
@@ -58,6 +62,14 @@ pub fn start(
                     if name.contains(&our_instance) {
                         continue;
                     }
+                    // The instance name is `tarnet-<16hex>._tarnet._tcp.local.`;
+                    // pull the 16-hex peer-id prefix so the dialer can dedup
+                    // against links it already holds.
+                    let peer_prefix = name
+                        .strip_prefix(INSTANCE_PREFIX)
+                        .and_then(|s| s.get(..16))
+                        .unwrap_or("")
+                        .to_string();
                     let port = info.get_port();
                     // Pick one address per peer: prefer non-link-local, then IPv4 over IPv6.
                     // Connecting to every address wastes links (they typically all
@@ -76,7 +88,7 @@ pub fn start(
                             peer_addr,
                             addrs.len()
                         );
-                        let _ = tx.send(peer_addr);
+                        let _ = tx.send((peer_prefix, peer_addr));
                     }
                 }
                 _ => {}

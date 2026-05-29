@@ -18,6 +18,22 @@ use tokio::sync::{mpsc, Notify};
 
 use config::{CliOverrides, ResolvedConfig};
 
+/// Removes a peer-id prefix from the mDNS in-flight-dial set when a dial
+/// task finishes (success, failure, or panic), so a later re-resolution can
+/// dial again if the link dropped in the meantime.
+struct DialGuard {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    key: String,
+}
+
+impl Drop for DialGuard {
+    fn drop(&mut self) {
+        if !self.key.is_empty() {
+            self.set.lock().unwrap().remove(&self.key);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -279,12 +295,41 @@ async fn main() {
             Ok((mut rx, handle)) => {
                 let event_tx = node.event_sender();
                 let identity_for_mdns = node.identity_clone();
+                let mdns_node = node.clone();
+                // Peers (by 16-hex id prefix) we already have a dial in flight to.
+                // mDNS re-resolves the same peer continuously; without this guard
+                // every re-resolution opens another link to a peer we already
+                // have, piling up dozens of redundant links to one host.
+                let in_flight: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+                    Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
                 tokio::spawn(async move {
-                    while let Some(addr) = rx.recv().await {
+                    while let Some((peer_prefix, addr)) = rx.recv().await {
+                        // Skip if we already hold a link to this peer.
+                        if !peer_prefix.is_empty() {
+                            let already_linked = mdns_node
+                                .connected_peers()
+                                .await
+                                .iter()
+                                .any(|p| format!("{}", p).starts_with(&peer_prefix));
+                            if already_linked {
+                                continue;
+                            }
+                            // Skip if a dial to this peer is already in flight.
+                            let mut guard = in_flight.lock().unwrap();
+                            if !guard.insert(peer_prefix.clone()) {
+                                continue;
+                            }
+                        }
                         log::info!("mDNS: connecting to discovered peer at {}", addr);
                         let tx = event_tx.clone();
                         let id = identity_for_mdns.clone();
+                        let in_flight = in_flight.clone();
+                        let dial_prefix = peer_prefix.clone();
                         tokio::spawn(async move {
+                            let _release = DialGuard {
+                                set: in_flight,
+                                key: dial_prefix,
+                            };
                             match tokio::net::TcpStream::connect(&addr).await {
                                 Ok(stream) => {
                                     let _ = stream.set_nodelay(true);

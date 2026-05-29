@@ -620,6 +620,42 @@ async fn tns_delegation_chain() {
     }
 }
 
+/// REPRO: Node A publishes a VHost record, Node C resolves it (through B).
+#[tokio::test]
+async fn repro_vhost_resolve_cross_node() {
+    init_log();
+    let nodes = spawn_chain(3).await;
+    let (a, b) = (&nodes[0].node, &nodes[2].node);
+
+    let zone_sid = a.identity.identity.service_id();
+    let serving = tarnet_api::types::ServiceId::from_signing_pubkey(&[0xEE; 32]);
+
+    let record = tarnet::tns::TnsRecord::VHost(serving);
+    tarnet::tns::publish(a, &a.identity, "blog", &[record.clone()], 3600)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let dht_key = tarnet::tns::tns_dht_key(&zone_sid, "blog");
+    for _ in 0..5 {
+        let _ = b.request_dht_key(&dht_key).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let resolution = wait_for(Duration::from_secs(15), || {
+        let b = b.clone();
+        async move {
+            matches!(
+                tarnet::tns::resolve(&*b, zone_sid, "blog").await,
+                tarnet::tns::TnsResolution::VHost { .. }
+            )
+        }
+    })
+    .await;
+
+    assert!(resolution, "Node B should resolve VHost record from Node A");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Link break and cleanup
 // ═══════════════════════════════════════════════════════════════════════

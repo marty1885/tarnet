@@ -2515,8 +2515,18 @@ impl Node {
                         signable.extend_from_slice(&rec.value);
                         if !identity::verify(algo, &rec.signer_pubkey, &signable, &rec.signature) {
                             log::warn!(
-                                "DhtGetResponse from {:?}: invalid signature, dropping record",
-                                from
+                                "DhtGetResponse from {:?}: invalid signature, dropping record \
+                                 [key={:02x?} signer={:02x?} type={:?} algo={:?} seq={} value_len={} sig_len={} pubkey_len={} signer_matches_pubkey={}]",
+                                from,
+                                &resp.key[..8.min(resp.key.len())],
+                                &rec.signer[..8.min(rec.signer.len())],
+                                rec.record_type,
+                                algo,
+                                rec.sequence,
+                                rec.value.len(),
+                                rec.signature.len(),
+                                rec.signer_pubkey.len(),
+                                peer_id_from_signing_pubkey(&rec.signer_pubkey) == PeerId(rec.signer),
                             );
                             continue;
                         }
