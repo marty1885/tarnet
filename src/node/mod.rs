@@ -2490,29 +2490,6 @@ impl Node {
                     log::debug!("DhtGetResponse with unknown query_token, storing locally only");
                 }
             }
-            MessageType::DhtFindClosest => {
-                let find = DhtFindClosestMsg::from_bytes(&msg.payload)?;
-                let key = DhtId(find.key);
-                let kb = self.kbucket.lock().await;
-                let closest = kb.closest_peers(&key, DHT_K);
-                drop(kb);
-
-                let response = DhtFindClosestResponseMsg {
-                    key: find.key,
-                    peers: closest,
-                };
-                self.send_to_peer_deferred(&from, &response.to_wire().encode())
-                    .await?;
-            }
-            MessageType::DhtFindClosestResponse => {
-                let resp = DhtFindClosestResponseMsg::from_bytes(&msg.payload)?;
-                // Learn about discovered peers
-                let mut kb = self.kbucket.lock().await;
-                for (pid, did) in &resp.peers {
-                    kb.insert(*pid, *did);
-                }
-                drop(kb);
-            }
             MessageType::TunnelKeyExchange => {
                 self.handle_tunnel_key_exchange(from, &msg.payload).await?;
             }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tarnet::dht::{BloomFilter, IterativeLookup, KBucketTable};
+use tarnet::dht::{BloomFilter, KBucketTable};
 use tarnet::identity::{self, dht_id_from_peer_id, Keypair};
 use tarnet::link::PeerLink;
 use tarnet::node::Node;
@@ -475,56 +475,6 @@ fn bloom_filter_dedup() {
     assert!(!empty.contains(&peer_c));
 }
 
-/// Test iterative lookup state machine.
-#[test]
-fn iterative_lookup_state_machine() {
-    let target = DhtId([0x55; 64]);
-    let mut peers = Vec::new();
-    for i in 0..10u8 {
-        let pid = PeerId([i; 32]);
-        let did = dht_id_from_peer_id(&pid);
-        peers.push((pid, did));
-    }
-
-    let mut lookup = IterativeLookup::new(target, peers.clone());
-
-    // Should return alpha=3 peers to query first
-    let to_query = lookup.next_to_query();
-    assert_eq!(to_query.len(), 3);
-
-    // Process response from first peer with no new peers
-    lookup.process_response(to_query[0], vec![], vec![]);
-
-    // Should still have more to query
-    assert!(!lookup.is_done());
-
-    // Process all remaining
-    for peer in &to_query[1..] {
-        lookup.process_response(*peer, vec![], vec![]);
-    }
-
-    // Get more to query
-    let more = lookup.next_to_query();
-    for peer in more {
-        lookup.process_response(peer, vec![], vec![]);
-    }
-
-    // Keep querying until done
-    loop {
-        let batch = lookup.next_to_query();
-        if batch.is_empty() {
-            break;
-        }
-        for peer in batch {
-            lookup.process_response(peer, vec![], vec![]);
-        }
-    }
-
-    assert!(lookup.is_done());
-    let closest = lookup.k_closest_peers();
-    assert!(!closest.is_empty());
-}
-
 /// Test handshake with anti-replay protection (timestamp + challenge).
 #[tokio::test]
 async fn handshake_anti_replay() {
@@ -688,29 +638,6 @@ fn signature_validation_on_get_response() {
         &put_valid.signature,
     );
     assert!(valid, "Valid signature should verify");
-}
-
-/// Test DhtFindClosest/DhtFindClosestResponse roundtrip.
-#[test]
-fn dht_find_closest_roundtrip() {
-    let find = DhtFindClosestMsg { key: [0xAA; 64] };
-    let bytes = find.to_bytes();
-    let decoded = DhtFindClosestMsg::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.key, [0xAA; 64]);
-
-    let resp = DhtFindClosestResponseMsg {
-        key: [0xBB; 64],
-        peers: vec![
-            (PeerId([0x11; 32]), DhtId([0x22; 64])),
-            (PeerId([0x33; 32]), DhtId([0x44; 64])),
-        ],
-    };
-    let bytes = resp.to_bytes();
-    let decoded = DhtFindClosestResponseMsg::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.key, [0xBB; 64]);
-    assert_eq!(decoded.peers.len(), 2);
-    assert_eq!(decoded.peers[0].0, PeerId([0x11; 32]));
-    assert_eq!(decoded.peers[1].1, DhtId([0x44; 64]));
 }
 
 /// Test DhtGetMsg with hop_limit and bloom roundtrip.

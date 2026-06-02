@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -23,8 +23,6 @@ fn hash_64(input: &[u8]) -> [u8; 64] {
 pub const DHT_K: usize = 20;
 /// Maximum entries per k-bucket.
 pub const KBUCKET_SIZE: usize = 20;
-/// Parallelism for iterative lookups.
-pub const ALPHA: usize = 3;
 
 /// Application-tunable parameters for DHT queries.
 #[derive(Debug, Clone, Copy)]
@@ -774,106 +772,6 @@ impl BloomFilter {
 impl Default for BloomFilter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-// ── Iterative Lookup ──
-
-/// State machine for iterative DHT lookups.
-pub struct IterativeLookup {
-    pub target: DhtId,
-    pub contacted: HashSet<PeerId>,
-    pub pending: HashSet<PeerId>,
-    /// Peers sorted by XOR distance to target — key is distance, value is (peer_id, dht_id).
-    pub closest: BTreeMap<DhtId, (PeerId, DhtId)>,
-    pub results: Vec<DhtRecord>,
-    pub alpha: usize,
-}
-
-impl IterativeLookup {
-    /// Create a new iterative lookup seeded with initial peers.
-    pub fn new(target: DhtId, initial_peers: Vec<(PeerId, DhtId)>) -> Self {
-        let mut closest = BTreeMap::new();
-        for (pid, did) in &initial_peers {
-            let dist = target.xor_distance(did);
-            closest.insert(dist, (*pid, *did));
-        }
-        Self {
-            target,
-            contacted: HashSet::new(),
-            pending: HashSet::new(),
-            closest,
-            results: Vec::new(),
-            alpha: ALPHA,
-        }
-    }
-
-    /// Returns up to `alpha` uncontacted peers closest to target.
-    pub fn next_to_query(&mut self) -> Vec<PeerId> {
-        let mut result = Vec::new();
-        for (_, (pid, _)) in &self.closest {
-            if result.len() >= self.alpha {
-                break;
-            }
-            if !self.contacted.contains(pid) && !self.pending.contains(pid) {
-                result.push(*pid);
-            }
-        }
-        for pid in &result {
-            self.pending.insert(*pid);
-        }
-        result
-    }
-
-    /// Process a response from a peer, adding closer peers and records.
-    pub fn process_response(
-        &mut self,
-        peer: PeerId,
-        closer_peers: Vec<(PeerId, DhtId)>,
-        records: Vec<DhtRecord>,
-    ) {
-        self.pending.remove(&peer);
-        self.contacted.insert(peer);
-
-        for (pid, did) in closer_peers {
-            if !self.contacted.contains(&pid) {
-                let dist = self.target.xor_distance(&did);
-                self.closest.entry(dist).or_insert((pid, did));
-            }
-        }
-
-        self.results.extend(records);
-    }
-
-    /// Mark a peer as failed (timed out or error).
-    pub fn mark_failed(&mut self, peer: PeerId) {
-        self.pending.remove(&peer);
-        self.contacted.insert(peer);
-    }
-
-    /// Check if the lookup is complete.
-    pub fn is_done(&self) -> bool {
-        if !self.pending.is_empty() {
-            return false;
-        }
-        // Done if all k-closest have been contacted or no uncontacted peers remain
-        let k = DHT_K;
-        let mut count = 0;
-        for (_, (pid, _)) in &self.closest {
-            if count >= k {
-                break;
-            }
-            if !self.contacted.contains(pid) {
-                return false;
-            }
-            count += 1;
-        }
-        true
-    }
-
-    /// Get the k-closest peers found so far.
-    pub fn k_closest_peers(&self) -> Vec<(PeerId, DhtId)> {
-        self.closest.values().take(DHT_K).copied().collect()
     }
 }
 

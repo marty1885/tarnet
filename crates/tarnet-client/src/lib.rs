@@ -259,9 +259,20 @@ impl IpcServiceApi {
                 };
                 let mut w = writer.lock().await;
                 if send_frame(&mut *w, &frame).await.is_err() {
-                    break;
+                    return;
                 }
             }
+            // app_rx closed => the app dropped its Connection (e.g. pipe_tcp saw
+            // the backend EOF). Tell the daemon to close the endpoint side so a
+            // StreamEnd propagates to the remote and the stale stream is reset.
+            let request_id = next_id.fetch_add(1, Ordering::Relaxed);
+            let frame = IpcFrame::Request {
+                request_id,
+                method: METHOD_CONN_CLOSE,
+                payload: encode_payload(&conn_id),
+            };
+            let mut w = writer.lock().await;
+            let _ = send_frame(&mut *w, &frame).await;
         });
 
         Ok(Connection::new(
@@ -793,5 +804,41 @@ impl ServiceApi for IpcServiceApi {
         let (status, resp) = self.request(METHOD_POOL_CATALOG, &payload).await?;
         Self::check_status(status, &resp)?;
         decode_payload(&resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Regression guard for the tunnel-restart bug. An IPC-backed Connection's
+    /// send-forwarding task must, once the app drops the Connection (its
+    /// `app_rx` closes), send METHOD_CONN_CLOSE to the daemon. That is the only
+    /// signal that tells the daemon to tear down the endpoint side so a
+    /// StreamEnd propagates to the remote. Without it, dropping a Connection
+    /// (e.g. `pipe_tcp` after a backend EOF) is silent and the stale stream
+    /// lingers until timeout — the reported "tunnel unavailable for a while
+    /// after the backend restarts" symptom.
+    ///
+    /// A behavioural test needs a full daemon + Unix socket harness; this
+    /// structural check guards the exact line that fixes the regression.
+    #[test]
+    fn ipc_connection_sends_conn_close_on_drop() {
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("async fn make_ipc_connection")
+            .expect("make_ipc_connection must exist");
+        // Scope to the forwarding task: from the function start to the
+        // Connection::new construction that ends it.
+        let end = src[start..]
+            .find("Connection::new")
+            .expect("make_ipc_connection builds a Connection");
+        let body = &src[start..start + end];
+        assert!(
+            body.contains("METHOD_CONN_CLOSE"),
+            "make_ipc_connection's send-forwarding task must send \
+             METHOD_CONN_CLOSE when app_rx closes (the app dropped its \
+             Connection), so the daemon tears down the endpoint and a StreamEnd \
+             reaches the remote. Body:\n{}",
+            body
+        );
     }
 }

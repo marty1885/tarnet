@@ -132,9 +132,7 @@ fn proto_category(mt: MessageType) -> ProtoCategory {
         | MessageType::DhtGet
         | MessageType::DhtGetResponse
         | MessageType::DhtWatch
-        | MessageType::DhtWatchNotify
-        | MessageType::DhtFindClosest
-        | MessageType::DhtFindClosestResponse => ProtoCategory::Dht,
+        | MessageType::DhtWatchNotify => ProtoCategory::Dht,
 
         MessageType::TunnelKeyExchange | MessageType::TunnelKeyResponse => ProtoCategory::Tunnel,
 

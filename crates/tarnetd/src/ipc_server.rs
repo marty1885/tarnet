@@ -14,14 +14,22 @@ use tarnet_api::ipc::*;
 use tarnet_api::service::{Connection, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi};
 use tarnet_api::types::{DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
 
-/// Per-client connection table: maps conn_id -> Connection.
+/// A registered IPC connection plus the abort handle of its recv-relay task.
+/// Holding the relay handle lets `METHOD_CONN_CLOSE` stop the relay so the last
+/// `Arc<Connection>` drops — which fires the endpoint's StreamEnd teardown.
+struct ConnEntry {
+    conn: Arc<Connection>,
+    relay: tokio::task::AbortHandle,
+}
+
+/// Per-client connection table: maps conn_id -> ConnEntry.
 /// Shared between the dispatch task and event-pushing tasks.
-type ConnTable = Arc<Mutex<HashMap<u32, Arc<Connection>>>>;
+type ConnTable = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 type ListenerTable = Arc<Mutex<HashMap<u32, Listener>>>;
 
 /// Allocate an opaque client-local handle ID for a connection.
 /// The handle space is scoped to a single Unix socket connection.
-fn allocate_client_conn_id(conns: &HashMap<u32, Arc<Connection>>) -> u32 {
+fn allocate_client_conn_id<V>(conns: &HashMap<u32, V>) -> u32 {
     let mut rng = rand::thread_rng();
     loop {
         let conn_id = rng.gen::<u32>();
@@ -48,12 +56,24 @@ async fn register_connection(
 ) -> ConnectResp {
     let internal_conn_id = conn.id;
     let remote_service_id = conn.remote_service_id;
+    let mode = conn.mode;
+    let port = conn.port.clone();
     let conn = Arc::new(conn);
 
+    // Allocate the id, spawn the recv-relay, and insert the entry under one lock
+    // so the abort handle is in place before the client can ever close it.
     let client_conn_id = {
         let mut guard = conns.lock().await;
-        let client_conn_id = allocate_client_conn_id(&guard);
-        guard.insert(client_conn_id, conn.clone());
+        let client_conn_id = allocate_client_conn_id(&*guard);
+        let relay =
+            spawn_conn_recv_relay(client_conn_id, conn.clone(), writer.clone(), conns.clone());
+        guard.insert(
+            client_conn_id,
+            ConnEntry {
+                conn: conn.clone(),
+                relay,
+            },
+        );
         client_conn_id
     };
 
@@ -63,13 +83,11 @@ async fn register_connection(
         internal_conn_id
     );
 
-    spawn_conn_recv_relay(client_conn_id, conn.clone(), writer.clone(), conns.clone());
-
     ConnectResp {
         conn_id: client_conn_id,
         remote_service_id,
-        mode: conn.mode,
-        port: conn.port.clone(),
+        mode,
+        port,
     }
 }
 
@@ -221,8 +239,8 @@ async fn handle_client(
                         // Regression guard: tests::conn_send_handler_stays_inline.
                         let response = {
                             let guard = conns.lock().await;
-                            if let Some(conn) = guard.get(&req.conn_id) {
-                                match conn.send(&req.data).await {
+                            if let Some(entry) = guard.get(&req.conn_id) {
+                                match entry.conn.send(&req.data).await {
                                     Ok(()) => ok_response(request_id, &[]),
                                     Err(e) => err_response(request_id, &e.to_string()),
                                 }
@@ -272,7 +290,13 @@ async fn handle_client(
                                 continue;
                             }
                         };
-                        conns.lock().await.remove(&conn_id);
+                        // Abort the recv-relay so its Arc<Connection> drops. Once
+                        // both this table entry and the relay release the Arc, the
+                        // endpoint Connection drops, ending its backward task, which
+                        // sends StreamEnd upstream so the initiator resets its client.
+                        if let Some(entry) = conns.lock().await.remove(&conn_id) {
+                            entry.relay.abort();
+                        }
                         let mut w = writer.lock().await;
                         let _ = send_frame(&mut *w, &ok_response(request_id, &[])).await;
                     }
@@ -332,7 +356,7 @@ fn spawn_conn_recv_relay(
     conn: Arc<Connection>,
     writer: Arc<Mutex<OwnedWriteHalf>>,
     conns: ConnTable,
-) {
+) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         loop {
             match conn.recv().await {
@@ -359,7 +383,8 @@ fn spawn_conn_recv_relay(
                 }
             }
         }
-    });
+    })
+    .abort_handle()
 }
 
 /// Dispatch a request to the appropriate ServiceApi method and build a response.
@@ -964,6 +989,57 @@ mod tests {
              send ordering. Spawning a task per frame races on the conn lock \
              and reorders bytes. Arm text:\n{}",
             arm
+        );
+    }
+
+    /// Regression guard for the tunnel-restart bug: when a client (tunnel CLI,
+    /// tarify, socks) drops its Connection — e.g. `pipe_tcp` sees the backend
+    /// EOF after a server restart — it sends METHOD_CONN_CLOSE. The daemon must
+    /// then drop the endpoint `Connection` so its backward task fires StreamEnd
+    /// upstream and the initiator resets its client socket. Removing the conn
+    /// from the table is NOT enough: the recv-relay task holds a second
+    /// `Arc<Connection>` blocked in `recv()`, so the handler must also abort the
+    /// relay. Without the abort, the stale stream lingers and a reused
+    /// connection hangs until timeout (the reported symptom).
+    ///
+    /// A behavioural test would need a ServiceApi mock plus a Unix socket
+    /// harness; this structural check guards the exact regression.
+    #[test]
+    fn conn_close_handler_aborts_recv_relay() {
+        let src = include_str!("ipc_server.rs");
+        let start = src
+            .find("METHOD_CONN_CLOSE =>")
+            .expect("METHOD_CONN_CLOSE arm must exist");
+        let after = &src[start + "METHOD_CONN_CLOSE =>".len()..];
+        let end = after
+            .find("METHOD_")
+            .expect("there should be a sibling arm after METHOD_CONN_CLOSE");
+        let arm = &after[..end];
+        assert!(
+            arm.contains(".relay.abort()"),
+            "METHOD_CONN_CLOSE must abort the recv-relay so the endpoint \
+             Connection drops and StreamEnd propagates. Just removing the conn \
+             from the table leaves the relay holding an Arc, so the stream never \
+             tears down and a reused connection hangs. Arm text:\n{}",
+            arm
+        );
+    }
+
+    /// The recv-relay's abort handle must be stored when the connection is
+    /// registered, otherwise `conn_close_handler_aborts_recv_relay` has nothing
+    /// to abort. Guards the `register_connection` -> `ConnEntry { relay }` wiring.
+    #[test]
+    fn register_connection_stores_relay_handle() {
+        let src = include_str!("ipc_server.rs");
+        let start = src
+            .find("async fn register_connection")
+            .expect("register_connection must exist");
+        let body = &src[start..start + 1200.min(src.len() - start)];
+        assert!(
+            body.contains("spawn_conn_recv_relay") && body.contains("relay"),
+            "register_connection must capture the recv-relay abort handle into \
+             the ConnEntry so METHOD_CONN_CLOSE can stop it. Body:\n{}",
+            body
         );
     }
 

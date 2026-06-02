@@ -128,8 +128,6 @@ enum_with_u16! {
         DhtGetResponse = 0x0202,
         DhtWatch = 0x0203,
         DhtWatchNotify = 0x0204,
-        DhtFindClosest = 0x0205,
-        DhtFindClosestResponse = 0x0206,
         // Tunnel (0x03xx) — stateless key exchange
         TunnelKeyExchange = 0x0300,
         TunnelKeyResponse = 0x0301,
@@ -1418,74 +1416,6 @@ impl HelloRecord {
             introducers,
             global_addresses,
         })
-    }
-}
-
-/// DhtFindClosest: key(64)
-#[derive(Debug, Clone)]
-pub struct DhtFindClosestMsg {
-    pub key: [u8; 64],
-}
-
-impl DhtFindClosestMsg {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.key.to_vec()
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 64 {
-            return Err(Error::Wire("DhtFindClosest too short".into()));
-        }
-        let mut r = Reader::new(data);
-        let key = r.read_array::<64>()?;
-        Ok(Self { key })
-    }
-
-    pub fn to_wire(&self) -> WireMessage {
-        WireMessage::new(MessageType::DhtFindClosest, self.to_bytes())
-    }
-}
-
-/// DhtFindClosestResponse: key(64) || peer_count(u16) || [peer_id(32) || dht_id(64)]...
-#[derive(Debug, Clone)]
-pub struct DhtFindClosestResponseMsg {
-    pub key: [u8; 64],
-    pub peers: Vec<(PeerId, crate::types::DhtId)>,
-}
-
-impl DhtFindClosestResponseMsg {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(66 + self.peers.len() * 96);
-        buf.extend_from_slice(&self.key);
-        buf.extend_from_slice(&(self.peers.len() as u16).to_be_bytes());
-        for (peer_id, dht_id) in &self.peers {
-            buf.extend_from_slice(peer_id.as_bytes());
-            buf.extend_from_slice(dht_id.as_bytes());
-        }
-        buf
-    }
-
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 66 {
-            return Err(Error::Wire("DhtFindClosestResponse too short".into()));
-        }
-        let mut r = Reader::new(data);
-        let key = r.read_array::<64>()?;
-        let peer_count = r.read_u16()? as usize;
-        let mut peers = Vec::with_capacity(peer_count);
-        for _ in 0..peer_count {
-            if r.remaining() < 96 {
-                return Err(Error::Wire("DhtFindClosestResponse truncated".into()));
-            }
-            let pid = r.read_array::<32>()?;
-            let did = r.read_array::<64>()?;
-            peers.push((PeerId(pid), crate::types::DhtId(did)));
-        }
-        Ok(Self { key, peers })
-    }
-
-    pub fn to_wire(&self) -> WireMessage {
-        WireMessage::new(MessageType::DhtFindClosestResponse, self.to_bytes())
     }
 }
 
