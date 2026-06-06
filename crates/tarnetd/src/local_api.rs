@@ -404,19 +404,15 @@ impl ServiceApi for LocalServiceApi {
             return None;
         }
 
-        // Issue a network request and poll until found or timeout.
-        if self.node.request_content(inner_hash).await.is_err() {
-            return None;
-        }
-
+        // Search the network, re-reading the store as records stream back.
         let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+        let mut search = self.node.dht_search_content(inner_hash, deadline).await;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Some(data) = self.node.dht_get_content(inner_hash).await {
                 return Some(data);
             }
-            if tokio::time::Instant::now() >= deadline {
+            if search.next().await.is_none() {
                 return None;
             }
         }
@@ -442,15 +438,11 @@ impl ServiceApi for LocalServiceApi {
             return Vec::new();
         }
 
-        // Issue a network request and poll until found or timeout.
-        if self.node.request_signed_content(inner_hash).await.is_err() {
-            return Vec::new();
-        }
-
+        // Search the network, re-reading the store as records stream back.
         let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+        let mut search = self.node.dht_search_content(inner_hash, deadline).await;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let results = self.node.dht_get_signed_content(inner_hash).await;
             if !results.is_empty() {
                 return results
@@ -458,7 +450,7 @@ impl ServiceApi for LocalServiceApi {
                     .map(|(signer, data)| DhtEntry { signer, data })
                     .collect();
             }
-            if tokio::time::Instant::now() >= deadline {
+            if search.next().await.is_none() {
                 return Vec::new();
             }
         }
@@ -486,19 +478,15 @@ impl ServiceApi for LocalServiceApi {
             return None;
         }
 
-        // Issue a network request and poll until found or timeout.
-        if self.node.request_hello(peer_id).await.is_err() {
-            return None;
-        }
-
+        // Search the network, re-reading the store as records stream back.
         let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+        let mut search = self.node.dht_search_hello(peer_id, deadline).await;
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Some(hello) = self.node.lookup_hello(peer_id).await {
                 return Some(to_hello_info(hello));
             }
-            if tokio::time::Instant::now() >= deadline {
+            if search.next().await.is_none() {
                 return None;
             }
         }

@@ -63,6 +63,58 @@ impl Node {
         DhtQueryParams::from_l2nse(kb.estimate_l2nse())
     }
 
+    /// Next monotonic sequence for signed-content / signed-at-key records,
+    /// persisted so it survives restart.
+    async fn next_signed_content_sequence(&self) -> u64 {
+        let mut seq = self.signed_content_sequence.lock().await;
+        *seq += 1;
+        let sequence = *seq;
+        self.db_set_metadata("signed_content_sequence", sequence);
+        sequence
+    }
+
+    /// The single publish path: persist a freshly-minted record, store it
+    /// locally, and fan the derived PUT out to the L2NSE-selected peers (falling
+    /// back to all direct neighbors). The `DhtPutMsg` is *derived* from the
+    /// record via [`to_put_msg`](crate::dht::DhtRecord::to_put_msg), never built
+    /// in parallel — so the wire copy and the stored copy can't drift.
+    pub(crate) async fn dht_publish(
+        &self,
+        record: crate::dht::VerifiedRecord,
+        params: DhtQueryParams,
+    ) {
+        let put = record
+            .record()
+            .to_put_msg(&self.peer_id(), params.hop_limit);
+        let key = DhtId(put.key);
+        self.db_upsert_dht_record(record.record());
+        self.dht_store.lock().await.put(record);
+
+        let encoded = put.to_wire().encode();
+        let kb = self.kbucket.lock().await;
+        let all_peers = kb.all_peers();
+        drop(kb);
+        let targets = probabilistic_select(&key, &all_peers, params.fan_out);
+
+        let links = self.links.lock().await;
+        if targets.is_empty() {
+            for (_, link) in links.iter() {
+                let _ = link.send_deferred(&encoded).await;
+            }
+        } else {
+            for (pid, _) in &targets {
+                if let Some(link) = links.get(pid) {
+                    let _ = link.send_deferred(&encoded).await;
+                }
+            }
+            for (pid, link) in links.iter() {
+                if !targets.iter().any(|(p, _)| p == pid) {
+                    let _ = link.send_deferred(&encoded).await;
+                }
+            }
+        }
+    }
+
     /// Content-addressed DHT put: stores locally and sends to targeted peers.
     /// Returns the inner hash (64 bytes) needed for retrieval.
     pub async fn dht_put_content(&self, value: &[u8]) -> [u8; 64] {
@@ -76,67 +128,9 @@ impl Node {
         value: &[u8],
         params: DhtQueryParams,
     ) -> [u8; 64] {
-        let inner_hash: [u8; 64] = blake3_hash_64(value);
-        let (key, blob) = crate::dht::content_address_put(value);
-
-        let record = crate::dht::DhtRecord {
-            key: key.clone(),
-            record_type: RecordType::Content,
-            sequence: 0,
-            signer: [0u8; 32],
-            signer_algo: 0,
-            signer_pubkey: Vec::new(),
-            value: blob.clone(),
-            ttl: Duration::from_secs(3600),
-            stored_at: std::time::Instant::now(),
-            signature: Vec::new(),
-        };
-        self.db_upsert_dht_record(&record);
-        self.dht_store
-            .lock()
-            .await
-            .put(crate::dht::VerifiedRecord::locally_trusted(record));
-
-        let mut bloom = BloomFilter::new();
-        bloom.insert(&self.peer_id());
-        let put = DhtPutMsg {
-            key: *key.as_bytes(),
-            record_type: RecordType::Content,
-            sequence: 0,
-            signer: [0u8; 32],
-            ttl: 3600,
-            value: blob,
-            signature: Vec::new(),
-            signer_algo: 0,
-            signer_pubkey: Vec::new(),
-            hop_count: 0,
-            hop_limit: params.hop_limit,
-            bloom: bloom.to_bytes(),
-        };
-        let encoded = put.to_wire().encode();
-
-        let kb = self.kbucket.lock().await;
-        let all_peers = kb.all_peers();
-        let targets = probabilistic_select(&key, &all_peers, params.fan_out);
-        drop(kb);
-
-        let links = self.links.lock().await;
-        if targets.is_empty() {
-            for (_, link) in links.iter() {
-                let _ = link.send_message(&encoded).await;
-            }
-        } else {
-            for (pid, _) in &targets {
-                if let Some(link) = links.get(pid) {
-                    let _ = link.send_message(&encoded).await;
-                }
-            }
-            for (pid, link) in links.iter() {
-                if !targets.iter().any(|(p, _)| p == pid) {
-                    let _ = link.send_message(&encoded).await;
-                }
-            }
-        }
+        let (record, inner_hash) =
+            crate::dht::VerifiedRecord::new_content(value, Duration::from_secs(3600));
+        self.dht_publish(record, params).await;
 
         let hash_hex: String = inner_hash.iter().map(|b| format!("{:02x}", b)).collect();
         log::info!("DHT content put (inner hash: {})", hash_hex);
@@ -260,83 +254,17 @@ impl Node {
     ///
     /// Returns the inner hash (64 bytes) needed for retrieval.
     pub async fn dht_put_signed_content(&self, value: &[u8], ttl_secs: u32) -> [u8; 64] {
-        let inner_hash: [u8; 64] = blake3_hash_64(value);
-        let (key, blob) = crate::dht::content_address_put(value);
-        let encrypted = crate::dht::signed_record_encrypt(&key, &blob);
-
-        let mut seq = self.signed_content_sequence.lock().await;
-        *seq += 1;
-        let sequence = *seq;
-        self.db_set_metadata("signed_content_sequence", sequence);
-        drop(seq);
-
-        let signer = *self.peer_id().as_bytes();
-        let mut bloom = BloomFilter::new();
-        bloom.insert(&self.peer_id());
-        let mut put = DhtPutMsg {
-            key: *key.as_bytes(),
-            record_type: RecordType::SignedContent,
+        let sequence = self.next_signed_content_sequence().await;
+        let (record, inner_hash) = crate::dht::VerifiedRecord::new_signed_content(
+            &self.identity,
+            value,
             sequence,
-            signer,
-            ttl: ttl_secs,
-            value: encrypted.clone(),
-            signature: Vec::new(),
-            signer_algo: self.identity.identity.signing.algo() as u8,
-            signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
-            hop_count: 0,
-            hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-            bloom: bloom.to_bytes(),
-        };
-        put.signature = self.identity.sign(&put.signable_bytes());
+            Duration::from_secs(ttl_secs as u64),
+        );
+        let params = self.dht_query_params().await;
+        self.dht_publish(record, params).await;
 
-        let record = crate::dht::DhtRecord {
-            key,
-            record_type: RecordType::SignedContent,
-            sequence,
-            signer,
-            signer_algo: put.signer_algo,
-            signer_pubkey: put.signer_pubkey.clone(),
-            value: encrypted,
-            ttl: Duration::from_secs(ttl_secs as u64),
-            stored_at: std::time::Instant::now(),
-            signature: put.signature.clone(),
-        };
-        self.db_upsert_dht_record(&record);
-        self.dht_store
-            .lock()
-            .await
-            .put(crate::dht::VerifiedRecord::locally_trusted(record));
-
-        // L2NSE-driven propagation to targeted peers
-        let kb = self.kbucket.lock().await;
-        let all_peers = kb.all_peers();
-        let l2nse = kb.estimate_l2nse();
-        drop(kb);
-        let params = DhtQueryParams::from_l2nse(l2nse);
-        put.hop_limit = params.hop_limit;
-        let targets = probabilistic_select(&key, &all_peers, params.fan_out);
-
-        let encoded = put.to_wire().encode();
-        let links = self.links.lock().await;
-        if targets.is_empty() {
-            for (_, link) in links.iter() {
-                let _ = link.send_message(&encoded).await;
-            }
-        } else {
-            for (pid, _) in &targets {
-                if let Some(link) = links.get(pid) {
-                    let _ = link.send_message(&encoded).await;
-                }
-            }
-            // Also send to direct neighbors not in selected set
-            for (pid, link) in links.iter() {
-                if !targets.iter().any(|(p, _)| p == pid) {
-                    let _ = link.send_message(&encoded).await;
-                }
-            }
-        }
-
-        log::info!("DHT signed content put (key: {:?})", key);
+        log::info!("DHT signed content put");
         inner_hash
     }
 
@@ -407,89 +335,35 @@ impl Node {
 
     // ── TNS support: arbitrary-key DHT operations ──
 
+    /// Next monotonic, restart-persisted sequence for signed-at-key records.
+    /// Callers that must embed the sequence in a value *before* publishing (the
+    /// TNS/pool self-authenticating bundle signs over it) take it here and pass
+    /// it back into [`dht_put_signed_at_key`], so both layers agree on it.
+    pub async fn next_dht_sequence(&self) -> u64 {
+        self.next_signed_content_sequence().await
+    }
+
     /// Store signed content at an arbitrary DHT key (not content-addressed).
-    /// The caller provides the signing keypair (zone key), the DHT key, the
-    /// already-encrypted value, and a TTL.  The value is further encrypted
-    /// with the DHT key so storage nodes cannot read it.
+    /// `signer_keypair` is the *disposable* per-label key (not the zone master);
+    /// `value` is stored verbatim (the caller seals it); `sequence` must be the
+    /// same value the caller bound into `value`.
     pub async fn dht_put_signed_at_key(
         &self,
         signer_keypair: &crate::identity::Keypair,
         key: DhtId,
         value: &[u8],
+        sequence: u64,
         ttl_secs: u32,
     ) -> Result<()> {
-        let encrypted = crate::dht::signed_record_encrypt(&key, value);
-
-        let mut seq = self.signed_content_sequence.lock().await;
-        *seq += 1;
-        let sequence = *seq;
-        self.db_set_metadata("signed_content_sequence", sequence);
-        drop(seq);
-
-        let signer = *signer_keypair.peer_id().as_bytes();
-        let mut bloom = BloomFilter::new();
-        bloom.insert(&self.peer_id());
-        let mut put = DhtPutMsg {
-            key: *key.as_bytes(),
-            record_type: RecordType::SignedContent,
-            sequence,
-            signer,
-            ttl: ttl_secs,
-            value: encrypted.clone(),
-            signature: Vec::new(),
-            signer_algo: signer_keypair.identity.signing.algo() as u8,
-            signer_pubkey: signer_keypair.identity.signing.signing_pubkey_bytes(),
-            hop_count: 0,
-            hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-            bloom: bloom.to_bytes(),
-        };
-        put.signature = signer_keypair.sign(&put.signable_bytes());
-
-        let record = crate::dht::DhtRecord {
+        let record = crate::dht::VerifiedRecord::new_signed_at_key(
+            signer_keypair,
             key,
-            record_type: RecordType::SignedContent,
+            value,
             sequence,
-            signer,
-            signer_algo: put.signer_algo,
-            signer_pubkey: put.signer_pubkey.clone(),
-            value: encrypted,
-            ttl: Duration::from_secs(ttl_secs as u64),
-            stored_at: std::time::Instant::now(),
-            signature: put.signature.clone(),
-        };
-        self.db_upsert_dht_record(&record);
-        self.dht_store
-            .lock()
-            .await
-            .put(crate::dht::VerifiedRecord::locally_trusted(record));
-
-        // L2NSE-driven propagation
-        let kb = self.kbucket.lock().await;
-        let all_peers = kb.all_peers();
-        let l2nse = kb.estimate_l2nse();
-        drop(kb);
-        let params = DhtQueryParams::from_l2nse(l2nse);
-        put.hop_limit = params.hop_limit;
-        let targets = probabilistic_select(&key, &all_peers, params.fan_out);
-
-        let encoded = put.to_wire().encode();
-        let links = self.links.lock().await;
-        if targets.is_empty() {
-            for (_, link) in links.iter() {
-                let _ = link.send_message(&encoded).await;
-            }
-        } else {
-            for (pid, _) in &targets {
-                if let Some(link) = links.get(pid) {
-                    let _ = link.send_message(&encoded).await;
-                }
-            }
-            for (pid, link) in links.iter() {
-                if !targets.iter().any(|(p, _)| p == pid) {
-                    let _ = link.send_message(&encoded).await;
-                }
-            }
-        }
+            Duration::from_secs(ttl_secs as u64),
+        );
+        let params = self.dht_query_params().await;
+        self.dht_publish(record, params).await;
 
         log::info!("TNS signed put at key {:?}", key);
         Ok(())
@@ -547,5 +421,124 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    /// Issue a DHT search for `key` and return a [`DhtSearch`] stream that yields
+    /// distinct, infra-verified records as responses route back, ending at
+    /// `deadline`. This is the single read primitive: it ties the act of reading
+    /// search results to actually having issued the query, and replaces the old
+    /// "fire a `request_*` then busy-poll the store" pattern. Dropping the
+    /// returned stream cancels the search (RAII) — callers terminate simply by
+    /// breaking their loop or letting it fall out of scope.
+    pub async fn dht_search(&self, key: DhtId, deadline: Instant) -> DhtSearch {
+        let mut bloom = BloomFilter::new();
+        bloom.insert(&self.peer_id());
+        let mut query_token = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut query_token);
+        self.query_tokens
+            .lock()
+            .await
+            .insert(query_token, (self.peer_id(), Instant::now()));
+        // Bounded: the stream is used as a wake-up signal and callers re-read the
+        // store (which holds every delivered record), so a dropped send is
+        // harmless — the next wake still sees the complete picture.
+        let (tx, rx) = mpsc::channel(16);
+        self.dht_searches.lock().unwrap().insert(query_token, tx);
+
+        let params = self.dht_query_params().await;
+        let get = DhtGetMsg {
+            key: *key.as_bytes(),
+            query_token,
+            hop_count: 0,
+            hop_limit: params.hop_limit,
+            bloom: bloom.to_bytes(),
+        };
+        let encoded = get.to_wire().encode();
+        {
+            let links = self.links.lock().await;
+            for (peer_id, link) in links.iter() {
+                if let Err(e) = link.send_message(&encoded).await {
+                    log::warn!("Failed to send DHT search GET to {:?}: {}", peer_id, e);
+                }
+            }
+        }
+
+        DhtSearch {
+            rx,
+            token: query_token,
+            deadline,
+            seen: HashSet::new(),
+            registry: self.dht_searches.clone(),
+        }
+    }
+
+    /// [`dht_search`](Self::dht_search) for a content-addressed key: derives the
+    /// outer lookup hash from `inner_hash` (the same derivation
+    /// [`request_content`](Self::request_content) /
+    /// [`request_signed_content`](Self::request_signed_content) use). Serves both
+    /// plain and signed content gets — they share the lookup key and differ only
+    /// in how the caller decrypts the streamed records.
+    pub async fn dht_search_content(&self, inner_hash: &[u8; 64], deadline: Instant) -> DhtSearch {
+        let outer_hash: [u8; 64] = blake3_hash_64(inner_hash);
+        self.dht_search(DhtId(outer_hash), deadline).await
+    }
+
+    /// [`dht_search`](Self::dht_search) for a peer's hello record, keyed by the
+    /// identity-addressed DHT key for `target`.
+    pub async fn dht_search_hello(&self, target: &PeerId, deadline: Instant) -> DhtSearch {
+        let key = crate::dht::identity_address_key(target);
+        self.dht_search(key, deadline).await
+    }
+}
+
+/// A live DHT search: an async stream of distinct, infra-verified records routed
+/// back for one query. The only way to consume search results, so a caller
+/// cannot read results without having issued the query (the read-side mirror of
+/// the typed publish constructors). [`Drop`] deregisters the query token,
+/// cancelling the search.
+pub struct DhtSearch {
+    rx: mpsc::Receiver<crate::dht::VerifiedRecord>,
+    token: [u8; 32],
+    deadline: Instant,
+    /// Fingerprints of records already yielded, so a record delivered over
+    /// multiple R5N paths is surfaced once.
+    seen: HashSet<[u8; 64]>,
+    registry: Arc<std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<crate::dht::VerifiedRecord>>>>,
+}
+
+impl DhtSearch {
+    /// Await the next distinct verified record, or `None` once the deadline
+    /// passes (or the node shuts the channel). Records are guaranteed to have
+    /// cleared the trust gate — invalid records never reach application logic.
+    pub async fn next(&mut self) -> Option<crate::dht::VerifiedRecord> {
+        loop {
+            let remaining = self.deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let rec = tokio::select! {
+                r = self.rx.recv() => r?,
+                _ = tokio::time::sleep(remaining) => return None,
+            };
+            let r = rec.record();
+            let mut fp_input = Vec::with_capacity(64 + 1 + 8 + 32 + r.value.len());
+            fp_input.extend_from_slice(r.key.as_bytes());
+            fp_input.push(r.record_type.as_u8());
+            fp_input.extend_from_slice(&r.sequence.to_be_bytes());
+            fp_input.extend_from_slice(&r.signer);
+            fp_input.extend_from_slice(&r.value);
+            let fp = blake3_hash_64(&fp_input);
+            if self.seen.insert(fp) {
+                return Some(rec);
+            }
+        }
+    }
+}
+
+impl Drop for DhtSearch {
+    fn drop(&mut self) {
+        if let Ok(mut reg) = self.registry.lock() {
+            reg.remove(&self.token);
+        }
     }
 }

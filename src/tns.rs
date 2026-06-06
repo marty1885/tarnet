@@ -31,8 +31,6 @@ const MAX_DELEGATION_DEPTH: usize = 16;
 const PER_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the entire resolution chain.
 const TOTAL_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Poll interval when waiting for DHT results.
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Negative cache TTL: how long to remember "name not found".
 const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Maximum entries in the TNS cache.
@@ -128,6 +126,11 @@ impl TnsCache {
 }
 /// Context string for record encryption key derivation.
 const TNS_RECORD_ENC_LABEL: &str = "tarnet tns record enc";
+/// Domain separator for the inner master signature that authenticates a record
+/// set to its namespace owner.
+const TNS_RECORD_DOMAIN: &[u8] = b"tarnet tns record v1";
+/// Version byte for the authenticity bundle wire format.
+const TNS_BUNDLE_VERSION: u8 = 1;
 const TNS_TAG_SIZE: usize = 16;
 
 // Wire tags
@@ -421,44 +424,61 @@ pub fn tns_encryption_key(zone: &ServiceId, label: &str) -> [u8; 32] {
 /// listen side via the API crate). See [`tarnet_api::service::vhost_wire_port`].
 pub use tarnet_api::service::vhost_wire_port;
 
-// ── Encryption / Decryption ──
+/// Mint a fresh **disposable** DHT signing key for a record.
+///
+/// This key signs the DHT record but is NOT a trust root — authenticity is the
+/// inner master signature in the bundle. Its only jobs are (a) carrying a signer
+/// pubkey that reveals nothing about the zone owner and (b) preventing anyone
+/// else from overwriting this record at the storage layer.
+///
+/// It MUST be post-quantum (default FalconEd25519 scheme): the disposable pubkey
+/// is published in clear, so a non-PQ key would let a quantum adversary forge its
+/// signature and overwrite the legitimate record with junk — a denial-of-
+/// resolution. Falcon has no deterministic keygen from a seed, so this is random
+/// per publish; republishes therefore land in new slots (bounded by TTL/LRU) and
+/// readers dedup by author taking the max sequence.
+pub(crate) fn disposable_record_key() -> Keypair {
+    Keypair::generate()
+}
 
-/// Encrypt a record set for storage in the DHT.
-/// Returns `nonce(24) || ciphertext || tag(16)`.
-pub fn encrypt_record_set(zone: &ServiceId, label: &str, records: &[TnsRecord]) -> Vec<u8> {
-    let plaintext = serialize_record_set(records);
-    let enc_key = tns_encryption_key(zone, label);
+// ── Confidentiality layer (seal/unseal) ──
+//
+// AEAD under a key derived from the *public* name (namespace + label). This hides
+// the record from storage nodes and the network; it is NOT authentication —
+// anyone who knows the name derives the same key. Authentication is the inner
+// master signature (see the bundle layer below).
+
+/// Seal plaintext under the name-derived key. Returns `nonce(24) || ct+tag`.
+pub(crate) fn seal(namespace: &ServiceId, label: &str, plaintext: &[u8]) -> Vec<u8> {
+    let enc_key = tns_encryption_key(namespace, label);
     let mut nonce = [0u8; 24];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
-
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let ciphertext = cipher
         .encrypt(
             (&nonce).into(),
             Payload {
-                msg: &plaintext,
+                msg: plaintext,
                 aad: b"",
             },
         )
         .expect("AEAD encryption should not fail");
-
     let mut blob = Vec::with_capacity(24 + ciphertext.len());
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
     blob
 }
 
-/// Decrypt a record set from a DHT blob.
-pub fn decrypt_record_set(zone: &ServiceId, label: &str, blob: &[u8]) -> Result<Vec<TnsRecord>> {
+/// Reverse of [`seal`].
+pub(crate) fn unseal(namespace: &ServiceId, label: &str, blob: &[u8]) -> Result<Vec<u8>> {
     if blob.len() < 24 + TNS_TAG_SIZE {
         return Err(Error::Wire("TNS blob too short for nonce+tag".into()));
     }
     let nonce = &blob[..24];
     let ciphertext_with_tag = &blob[24..];
-
-    let enc_key = tns_encryption_key(zone, label);
+    let enc_key = tns_encryption_key(namespace, label);
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
-    let plaintext = cipher
+    cipher
         .decrypt(
             nonce.into(),
             Payload {
@@ -466,8 +486,118 @@ pub fn decrypt_record_set(zone: &ServiceId, label: &str, blob: &[u8]) -> Result<
                 aad: b"",
             },
         )
-        .map_err(|_| Error::Crypto("TNS AEAD decryption failed".into()))?;
-    deserialize_record_set(&plaintext)
+        .map_err(|_| Error::Crypto("TNS AEAD decryption failed".into()))
+}
+
+/// Encrypt a record set's confidentiality layer only (no authenticity bundle).
+/// Retained for the encrypt/decrypt unit tests; the publish path uses the full
+/// [`seal`] + [`build_bundle`] envelope.
+pub fn encrypt_record_set(zone: &ServiceId, label: &str, records: &[TnsRecord]) -> Vec<u8> {
+    seal(zone, label, &serialize_record_set(records))
+}
+
+/// Reverse of [`encrypt_record_set`].
+pub fn decrypt_record_set(zone: &ServiceId, label: &str, blob: &[u8]) -> Result<Vec<TnsRecord>> {
+    deserialize_record_set(&unseal(zone, label, blob)?)
+}
+
+// ── Authenticity layer (bundle) ──
+//
+// The bundle carries the namespace owner's master public key and a signature
+// over the record set, *inside* the sealed blob. The resolver checks the
+// signature to authenticate; storage nodes never see the master pubkey in clear.
+// No homomorphic key-blinding is used, so this is fully PQ (the master signature
+// is Falcon when the zone is PQ).
+
+/// Canonical message the master signature covers. Binds namespace + label +
+/// sequence so a record can't be replayed into another name or rolled within one.
+fn bundle_signable(namespace: &ServiceId, label: &str, sequence: u64, records_ser: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(TNS_RECORD_DOMAIN.len() + 32 + 2 + label.len() + 8 + records_ser.len());
+    m.extend_from_slice(TNS_RECORD_DOMAIN);
+    m.extend_from_slice(namespace.as_bytes());
+    m.extend_from_slice(&(label.len() as u16).to_be_bytes());
+    m.extend_from_slice(label.as_bytes());
+    m.extend_from_slice(&sequence.to_be_bytes());
+    m.extend_from_slice(records_ser);
+    m
+}
+
+/// Build the self-authenticating bundle (plaintext, before [`seal`]):
+/// `ver(1) || algo(1) || pk_len(2) || master_pubkey || seq(8) || recs_len(4) ||
+///  records || sig_len(2) || master_sig`.
+pub(crate) fn build_bundle(
+    owner: &Keypair,
+    namespace: &ServiceId,
+    label: &str,
+    sequence: u64,
+    records: &[TnsRecord],
+) -> Vec<u8> {
+    let records_ser = serialize_record_set(records);
+    let pubkey = owner.identity.signing.signing_pubkey_bytes();
+    let algo = owner.identity.signing_algo() as u8;
+    let sig = owner.identity.sign(&bundle_signable(namespace, label, sequence, &records_ser));
+
+    let mut b = Vec::with_capacity(1 + 1 + 2 + pubkey.len() + 8 + 4 + records_ser.len() + 2 + sig.len());
+    b.push(TNS_BUNDLE_VERSION);
+    b.push(algo);
+    b.extend_from_slice(&(pubkey.len() as u16).to_be_bytes());
+    b.extend_from_slice(&pubkey);
+    b.extend_from_slice(&sequence.to_be_bytes());
+    b.extend_from_slice(&(records_ser.len() as u32).to_be_bytes());
+    b.extend_from_slice(&records_ser);
+    b.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+    b.extend_from_slice(&sig);
+    b
+}
+
+/// Parse and verify a bundle. Returns `(records, sequence, author)` only if the
+/// inner master signature is valid. When `require_owner` is true (single-owner
+/// TNS zones), the author's ServiceId must equal `namespace`; pools pass false
+/// (any member who knows the pool key may write, bound to the pool root).
+pub(crate) fn open_bundle(
+    namespace: &ServiceId,
+    label: &str,
+    plaintext: &[u8],
+    require_owner: bool,
+) -> Option<(Vec<TnsRecord>, u64, ServiceId)> {
+    // ver(1) || algo(1) || pk_len(2)
+    if plaintext.len() < 4 || plaintext[0] != TNS_BUNDLE_VERSION {
+        return None;
+    }
+    let algo = tarnet_api::types::SigningAlgo::from_u8(plaintext[1]).ok()?;
+    let pk_len = u16::from_be_bytes([plaintext[2], plaintext[3]]) as usize;
+    let mut off = 4;
+    if plaintext.len() < off + pk_len + 8 + 4 {
+        return None;
+    }
+    let pubkey = &plaintext[off..off + pk_len];
+    off += pk_len;
+    let sequence = u64::from_be_bytes(plaintext[off..off + 8].try_into().ok()?);
+    off += 8;
+    let recs_len = u32::from_be_bytes(plaintext[off..off + 4].try_into().ok()?) as usize;
+    off += 4;
+    if plaintext.len() < off + recs_len + 2 {
+        return None;
+    }
+    let records_ser = &plaintext[off..off + recs_len];
+    off += recs_len;
+    let sig_len = u16::from_be_bytes([plaintext[off], plaintext[off + 1]]) as usize;
+    off += 2;
+    if plaintext.len() < off + sig_len {
+        return None;
+    }
+    let sig = &plaintext[off..off + sig_len];
+
+    let signable = bundle_signable(namespace, label, sequence, records_ser);
+    if !crate::identity::verify(algo, pubkey, &signable, sig) {
+        return None;
+    }
+    let author = ServiceId::from_signing_pubkey(pubkey);
+    if require_owner && author != *namespace {
+        return None;
+    }
+    let records = deserialize_record_set(records_ser).ok()?;
+    Some((records, sequence, author))
 }
 
 // ── Resolution ──
@@ -697,15 +827,9 @@ async fn fetch_records(
         return Ok(Vec::new());
     }
 
-    // 3. Issue a DHT GET and poll.
-    if let Err(e) = node.request_dht_key(&dht_key).await {
-        return Err(format!("DHT GET failed: {}", e));
-    }
-
-    let deadline = Instant::now() + PER_STEP_TIMEOUT;
+    // 3. Issue a DHT search; re-check the store as records stream back.
+    let mut search = node.dht_search(dht_key, Instant::now() + PER_STEP_TIMEOUT).await;
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
-
         if let Some((records, remaining_ttl)) = try_decrypt_local(node, zone, label, &dht_key).await
         {
             let ttl = if remaining_ttl.is_zero() {
@@ -720,8 +844,8 @@ async fn fetch_records(
             return Ok(records);
         }
 
-        if Instant::now() >= deadline {
-            // Negative cache: remember that this name was not found.
+        if search.next().await.is_none() {
+            // Deadline reached. Negative cache: remember this name was not found.
             node.tns_cache()
                 .lock()
                 .await
@@ -731,48 +855,41 @@ async fn fetch_records(
     }
 }
 
-/// Try to find and decrypt TNS records from the local DHT store.
-/// Only accepts records signed by the zone owner.
-///
-/// PeerId (signer) and ServiceId (zone) are both hashes of the same signing
-/// pubkey but with different derivation contexts, so direct comparison is
-/// impossible without the pubkey. For local zones we verify via the identity
-/// store; for remote zones we rely on successful decryption (only the zone
-/// owner can produce valid encrypted records for a given zone+label).
-/// Returns `(records, remaining_ttl)` on success.
+/// Find, decrypt, and **authenticate** the record set for a zone+label from the
+/// local DHT store. A record is accepted only if its inner master signature
+/// verifies AND the signer's ServiceId equals `zone` — so forged records (anyone
+/// can derive the public seal key and the DHT location) are rejected here, the
+/// same way for local and remote zones. Among valid records, the highest
+/// sequence wins. Returns `(records, remaining_ttl)` on success.
 async fn try_decrypt_local(
     node: &Node,
     zone: &ServiceId,
     label: &str,
     dht_key: &DhtId,
 ) -> Option<(Vec<TnsRecord>, Duration)> {
-    // If this is a local zone, find the expected PeerId from the identity store.
-    let expected_signer: Option<PeerId> =
-        node.keypair_for_service(zone).await.map(|kp| kp.peer_id());
-
     let raw_records = node.dht_get_records_at_key(dht_key).await;
+    let mut best: Option<(Vec<TnsRecord>, u64, Duration)> = None;
     for record in &raw_records {
         if record.record_type != RecordType::SignedContent {
             continue;
         }
-        // For local zones, only accept records signed by our identity.
-        if let Some(expected) = &expected_signer {
-            if record.signer != *expected.as_bytes() {
-                continue;
-            }
-        }
-        let inner_value = match crate::dht::signed_record_decrypt(dht_key, &record.value) {
+        let plaintext = match unseal(zone, label, &record.value) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Ok(records) = decrypt_record_set(zone, label, &inner_value) {
-            if !records.is_empty() {
-                let remaining = record.ttl.saturating_sub(record.stored_at.elapsed());
-                return Some((records, remaining));
-            }
+        let Some((records, sequence, _author)) = open_bundle(zone, label, &plaintext, true) else {
+            continue;
+        };
+        if records.is_empty() {
+            continue;
+        }
+        let remaining = record.ttl.saturating_sub(record.stored_at.elapsed());
+        match &best {
+            Some((_, best_seq, _)) if *best_seq >= sequence => {}
+            _ => best = Some((records, sequence, remaining)),
         }
     }
-    None
+    best.map(|(records, _seq, ttl)| (records, ttl))
 }
 
 /// Try to parse a label as a raw Crockford Base32-encoded ServiceId.
@@ -961,7 +1078,11 @@ pub fn verify_peer_record(record: &TnsRecord, expected_service_id: &ServiceId) -
 // ── Publishing ──
 
 /// Publish a TNS record set for a label in the given zone.
-/// The zone keypair signs the record. Uses the node's DHT infrastructure.
+///
+/// The zone master key signs an inner authenticity bundle, which is sealed under
+/// the name-derived key and stored at the blinded location. The DHT record
+/// itself is signed by a disposable per-label key, so the zone master pubkey
+/// never appears on the DHT in clear.
 pub async fn publish(
     node: &Node,
     zone_keypair: &Keypair,
@@ -971,9 +1092,12 @@ pub async fn publish(
 ) -> Result<()> {
     let zone_id = zone_keypair.identity.service_id();
     let dht_key = tns_dht_key(&zone_id, label);
-    let encrypted = encrypt_record_set(&zone_id, label, records);
+    let sequence = node.next_dht_sequence().await;
+    let bundle = build_bundle(zone_keypair, &zone_id, label, sequence, records);
+    let value = seal(&zone_id, label, &bundle);
+    let record_key = disposable_record_key();
 
-    node.dht_put_signed_at_key(zone_keypair, dht_key, &encrypted, ttl_secs)
+    node.dht_put_signed_at_key(&record_key, dht_key, &value, sequence, ttl_secs)
         .await
 }
 
@@ -1144,6 +1268,75 @@ mod tests {
         let blob = encrypt_record_set(&zone, label, &records);
         let decrypted = decrypt_record_set(&zone, label, &blob).unwrap();
         assert_eq!(decrypted, records);
+    }
+
+    #[test]
+    fn bundle_authenticates_owner_and_binding() {
+        let owner = Keypair::generate();
+        let zone = owner.identity.service_id();
+        let label = "www";
+        let recs = vec![TnsRecord::Text("ok".into())];
+        let b = build_bundle(&owner, &zone, label, 7, &recs);
+
+        // Valid: right owner, right (zone,label).
+        let (got, seq, author) = open_bundle(&zone, label, &b, true).unwrap();
+        assert_eq!(got, recs);
+        assert_eq!(seq, 7);
+        assert_eq!(author, zone);
+
+        // Cross-label and cross-zone replay are rejected (signature binds both).
+        assert!(open_bundle(&zone, "mail", &b, true).is_none());
+        let other = ServiceId::from_signing_pubkey(&[0x99; 32]);
+        assert!(open_bundle(&other, label, &b, true).is_none());
+
+        // Tamper: flip a byte in the records region → signature fails.
+        let mut tampered = b.clone();
+        let n = tampered.len();
+        tampered[n / 2] ^= 0xFF;
+        assert!(open_bundle(&zone, label, &tampered, true).is_none());
+
+        // A bundle signed by a NON-owner for `zone` is rejected under require_owner
+        // (the forgery hole), but accepted in pool mode (any member may write).
+        let attacker = Keypair::generate();
+        let evil = build_bundle(&attacker, &zone, label, 8, &recs);
+        assert!(open_bundle(&zone, label, &evil, true).is_none());
+        assert!(open_bundle(&zone, label, &evil, false).is_some());
+    }
+
+    #[test]
+    fn forged_record_rejected_legit_accepted() {
+        // An attacker who knows the public name can derive the seal key and the
+        // DHT location and plant a validly-sealed, self-signed record at the same
+        // place. Resolution must reject it (signer != zone owner) and still serve
+        // the legitimate record.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone_id = node.default_service_id().await;
+            let victim = node.keypair_for_service(&zone_id).await.unwrap();
+            let label = "www";
+
+            let good = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x11; 32]))];
+            publish(&node, &victim, label, &good, 600).await.unwrap();
+
+            // Attacker forges at the same location with their own key.
+            let attacker = Keypair::generate();
+            let loc = tns_dht_key(&zone_id, label);
+            let seq = node.next_dht_sequence().await;
+            let evil = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0xEE; 32]))];
+            let bundle = build_bundle(&attacker, &zone_id, label, seq, &evil);
+            let value = seal(&zone_id, label, &bundle);
+            let lk = disposable_record_key();
+            node.dht_put_signed_at_key(&lk, loc, &value, seq, 600)
+                .await
+                .unwrap();
+
+            // Only the legitimate record resolves.
+            match resolve(&node, zone_id, label).await {
+                TnsResolution::Records(r) => assert_eq!(r, good),
+                other => panic!("expected legit Records only, got {:?}", other),
+            }
+        });
     }
 
     #[test]

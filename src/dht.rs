@@ -5,7 +5,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::{Rng, RngCore};
 
-use crate::identity::dht_id_from_peer_id;
+use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::state::{PersistedRecord, StorageLimits};
 use crate::types::{DhtId, PeerId, RecordType, Result};
 
@@ -141,6 +141,33 @@ pub fn record_signable(key: &[u8; 64], record_type: RecordType, sequence: u64, v
     buf
 }
 
+/// Build and sign a `DhtRecord`: derives `signer` / `signer_algo` /
+/// `signer_pubkey` from the keypair and signs the canonical signable. This is
+/// the single place publish-side signing happens, so `signer` can never drift
+/// from the pubkey that signed (the binding the ingest gate re-checks).
+fn sign_record(
+    kp: &Keypair,
+    key: DhtId,
+    record_type: RecordType,
+    sequence: u64,
+    value: Vec<u8>,
+    ttl: Duration,
+) -> DhtRecord {
+    let signature = kp.sign(&record_signable(key.as_bytes(), record_type, sequence, &value));
+    DhtRecord {
+        key,
+        record_type,
+        sequence,
+        signer: *kp.peer_id().as_bytes(),
+        signer_algo: kp.identity.signing.algo() as u8,
+        signer_pubkey: kp.identity.signing.signing_pubkey_bytes(),
+        value,
+        ttl,
+        stored_at: Instant::now(),
+        signature,
+    }
+}
+
 /// The single gate every inbound signed record must pass before it is trusted or
 /// stored. Returns `Err(reason)` (suitable for logging) when the record must be
 /// dropped.
@@ -189,6 +216,7 @@ pub fn verify_incoming_record(
 /// Because [`DhtStore::put`] accepts *only* `VerifiedRecord`, it is impossible —
 /// on any present or future code path — to store a record whose signature was
 /// never checked. The compiler enforces what call-site discipline used to.
+#[derive(Clone)]
 pub struct VerifiedRecord(DhtRecord);
 
 impl VerifiedRecord {
@@ -215,8 +243,146 @@ impl VerifiedRecord {
     /// fixture. Callers must have produced the signature themselves — never pass
     /// an externally-sourced record here; use [`verify_incoming`](Self::verify_incoming)
     /// for that.
+    ///
+    /// Prefer the typed publish constructors ([`new_content`](Self::new_content),
+    /// [`new_signed_content`](Self::new_signed_content),
+    /// [`new_signed_at_key`](Self::new_signed_at_key), [`new_hello`](Self::new_hello))
+    /// over this: they apply the correct encryption and signing for the record
+    /// type *by construction*, so there is no per-call-site chance to forget a
+    /// step. This bare escape hatch exists for self-minted records that don't fit
+    /// a constructor and for test fixtures with dummy signatures.
     pub fn locally_trusted(record: DhtRecord) -> Self {
         Self(record)
+    }
+
+    // ── Typed publish constructors ──
+    //
+    // Each mints a record that is valid *by construction*: it derives the key,
+    // applies the encryption appropriate to the record type, and signs (where
+    // the type is signed) with fields derived from the keypair. Because these
+    // return a `VerifiedRecord` and `DhtStore::put` accepts only `VerifiedRecord`,
+    // a publish path physically cannot store a record that skipped encryption or
+    // signing. This is the publish-side mirror of [`verify_incoming`].
+
+    /// Mint an unsigned, content-addressed record. The value is content-addressed
+    /// (key = `H(H(v))`, enc-key = `H(v)`), so storage nodes hold only an opaque
+    /// blob. Returns the record and the inner hash a reader needs to fetch and
+    /// decrypt it.
+    pub fn new_content(plaintext: &[u8], ttl: Duration) -> (Self, [u8; 64]) {
+        let inner_hash = hash_64(plaintext);
+        let (key, blob) = content_address_put(plaintext);
+        let record = DhtRecord {
+            key,
+            record_type: RecordType::Content,
+            sequence: 0,
+            signer: [0u8; 32],
+            signer_algo: 0,
+            signer_pubkey: Vec::new(),
+            value: blob,
+            ttl,
+            stored_at: Instant::now(),
+            signature: Vec::new(),
+        };
+        (Self(record), inner_hash)
+    }
+
+    /// Mint a signed, content-addressed record. The value is content-addressed
+    /// and then wrapped with [`signed_record_encrypt`] under the lookup key, so
+    /// storage nodes see only a blob; the record is signed by `signer`. Returns
+    /// the record and the inner hash a reader needs to fetch and decrypt it.
+    pub fn new_signed_content(
+        signer: &Keypair,
+        plaintext: &[u8],
+        sequence: u64,
+        ttl: Duration,
+    ) -> (Self, [u8; 64]) {
+        let inner_hash = hash_64(plaintext);
+        let (key, blob) = content_address_put(plaintext);
+        let value = signed_record_encrypt(&key, &blob);
+        let record = sign_record(signer, key, RecordType::SignedContent, sequence, value, ttl);
+        (Self(record), inner_hash)
+    }
+
+    /// Mint a signed record at an arbitrary lookup key (TNS / pool). `value` is
+    /// the caller's payload, stored verbatim — the caller is responsible for any
+    /// confidentiality (e.g. the TNS layer AEAD-seals a self-authenticating
+    /// bundle). `signer` here is a *disposable* per-label key, not the zone's
+    /// master key, so the master signing pubkey never appears on the DHT.
+    pub fn new_signed_at_key(
+        signer: &Keypair,
+        key: DhtId,
+        value: &[u8],
+        sequence: u64,
+        ttl: Duration,
+    ) -> Self {
+        Self(sign_record(
+            signer,
+            key,
+            RecordType::SignedContent,
+            sequence,
+            value.to_vec(),
+            ttl,
+        ))
+    }
+
+    /// Mint a Hello record at the identity-addressed key for `identity`. The
+    /// serialized hello bytes are wrapped with [`signed_record_encrypt`] under
+    /// the key so storage nodes see only a blob, then signed by `identity`.
+    pub fn new_hello(identity: &Keypair, hello_bytes: &[u8], sequence: u64, ttl: Duration) -> Self {
+        let key = identity_address_key(&identity.peer_id());
+        let encrypted = signed_record_encrypt(&key, hello_bytes);
+        Self(sign_record(
+            identity,
+            key,
+            RecordType::Hello,
+            sequence,
+            encrypted,
+            ttl,
+        ))
+    }
+
+    // ── Ingest constructors ──
+    //
+    // Build a record from a wire message and run it through the trust gate in one
+    // step, so the inbound handlers never hand-assemble a `DhtRecord` literal
+    // (the historical source of dropped-field bugs).
+
+    /// Build and verify a record from an inbound [`DhtPutMsg`](crate::wire::DhtPutMsg).
+    pub fn from_put_msg(
+        put: &crate::wire::DhtPutMsg,
+    ) -> std::result::Result<Self, &'static str> {
+        Self::verify_incoming(DhtRecord {
+            key: DhtId(put.key),
+            record_type: put.record_type,
+            sequence: put.sequence,
+            signer: put.signer,
+            signer_algo: put.signer_algo,
+            signer_pubkey: put.signer_pubkey.clone(),
+            value: put.value.clone(),
+            ttl: Duration::from_secs(put.ttl as u64),
+            stored_at: Instant::now(),
+            signature: put.signature.clone(),
+        })
+    }
+
+    /// Build and verify a record from an inbound
+    /// [`DhtResponseRecord`](crate::wire::DhtResponseRecord) at `key`.
+    pub fn from_response_record(
+        key: DhtId,
+        rec: &crate::wire::DhtResponseRecord,
+    ) -> std::result::Result<Self, &'static str> {
+        Self::verify_incoming(DhtRecord {
+            key,
+            record_type: rec.record_type,
+            sequence: rec.sequence,
+            signer: rec.signer,
+            signer_algo: rec.signer_algo,
+            signer_pubkey: rec.signer_pubkey.clone(),
+            value: rec.value.clone(),
+            ttl: Duration::from_secs(rec.ttl as u64),
+            stored_at: Instant::now(),
+            signature: rec.signature.clone(),
+        })
     }
 
     /// Borrow the inner record (e.g. to persist it).

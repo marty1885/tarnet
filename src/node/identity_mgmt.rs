@@ -256,64 +256,27 @@ impl Node {
         }
     }
 
-    /// Publish our hello record to the local DHT store and flood it to neighbors.
-    pub async fn publish_hello(&self) {
-        let hello = self.create_hello_record().await;
-        let key = crate::dht::identity_address_key(&self.peer_id());
-        let value = crate::dht::signed_record_encrypt(&key, &hello.to_bytes());
-
+    /// Next monotonic hello sequence, persisted so it survives restart.
+    async fn next_hello_sequence(&self) -> u64 {
         let mut seq = self.hello_sequence.lock().await;
         *seq += 1;
         let sequence = *seq;
         self.db_set_metadata("hello_sequence", sequence);
-        drop(seq);
+        sequence
+    }
 
-        let signer = *self.peer_id().as_bytes();
-        let mut bloom = BloomFilter::new();
-        bloom.insert(&self.peer_id());
-        let mut put = DhtPutMsg {
-            key: *key.as_bytes(),
-            record_type: RecordType::Hello,
+    /// Publish our hello record to the local DHT store and flood it to neighbors.
+    pub async fn publish_hello(&self) {
+        let hello = self.create_hello_record().await;
+        let sequence = self.next_hello_sequence().await;
+        let record = crate::dht::VerifiedRecord::new_hello(
+            &self.identity,
+            &hello.to_bytes(),
             sequence,
-            signer,
-            ttl: HELLO_TTL,
-            value: value.clone(),
-            signature: Vec::new(),
-            signer_algo: self.identity.identity.signing.algo() as u8,
-            signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
-            hop_count: 0,
-            hop_limit: self.dht_query_params().await.hop_limit,
-            bloom: bloom.to_bytes(),
-        };
-        put.signature = self.identity.sign(&put.signable_bytes());
-
-        // Store locally
-        let record = crate::dht::DhtRecord {
-            key: key.clone(),
-            record_type: RecordType::Hello,
-            sequence,
-            signer,
-            signer_algo: put.signer_algo,
-            signer_pubkey: put.signer_pubkey.clone(),
-            value,
-            ttl: Duration::from_secs(HELLO_TTL as u64),
-            stored_at: std::time::Instant::now(),
-            signature: put.signature.clone(),
-        };
-        self.db_upsert_dht_record(&record);
-        self.dht_store
-            .lock()
-            .await
-            .put(crate::dht::VerifiedRecord::locally_trusted(record));
-
-        // Send DHT PUT to all direct neighbors
-        let encoded = put.to_wire().encode();
-        let links = self.links.lock().await;
-        for (peer_id, link) in links.iter() {
-            if let Err(e) = link.send_deferred(&encoded).await {
-                log::warn!("Failed to send hello PUT to {:?}: {}", peer_id, e);
-            }
-        }
+            Duration::from_secs(HELLO_TTL as u64),
+        );
+        let params = self.dht_query_params().await;
+        self.dht_publish(record, params).await;
         log::info!(
             "Published hello record ({} global addrs, {} introducers)",
             hello.global_addresses.len(),

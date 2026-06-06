@@ -17,16 +17,11 @@ use tarnet_api::types::{PeerId, ServiceId};
 
 use crate::identity::Keypair;
 use crate::node::Node;
-use crate::tns::{
-    build_peer_record, decrypt_record_set, encrypt_record_set, tns_dht_key,
-};
+use crate::tns::{build_bundle, build_peer_record, disposable_record_key, open_bundle, seal, tns_dht_key, unseal};
 use crate::types::Result;
 
 /// Reserved label carrying the list of service names members offer (browse/enumerate).
 pub const CATALOG_LABEL: &str = "_catalog";
-
-/// How long to poll the DHT for pool records before giving up.
-const RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// BLAKE3 derive_key context for the closed-pool root identifier.
 const POOL_ROOT_CONTEXT: &str = "tarnet pool root v1";
@@ -115,11 +110,13 @@ impl Default for PoolStore {
 // ── Claim publish / resolve (closed pool) ──
 //
 // A claim is published at `tns_dht_key(pool_root, service)` as a SignedContent
-// record: the record SET is encrypted under `tns_encryption_key(pool_root, service)`
-// (so only pool members holding K can read it), and SIGNED by the member's own
-// identity keypair (so each member owns its own supplemental slot and claims are
-// attributable). This is `tns::publish` with the keying zone (pool_root) decoupled
-// from the signer (the member).
+// record carrying a TNS authenticity bundle: the record SET is sealed under the
+// pool-root-derived key (so only members holding K, from which the unguessable
+// pool_root is derived, can locate and read it) and the bundle is signed by the
+// member's own master identity key (so claims are attributable). The DHT record
+// is signed by the member's disposable per-label key, so members never expose
+// their master pubkey on the DHT. Consumers authenticate via `open_bundle` with
+// `require_owner = false`: any member's signature is accepted, bound to pool_root.
 
 /// Assemble a claim record set: Identity(owner) + Peer{owner→peer} + Service{..}.
 fn build_claim_records(
@@ -167,7 +164,11 @@ pub async fn withdraw_claim(
     publish_record_set(node, pool_root, member_keypair, service, &[], 1).await
 }
 
-/// Low-level: encrypt a record set under the pool key and put it signed by the member.
+/// Low-level: seal a member's authenticity bundle under the pool key and put it
+/// signed by the member's disposable per-label key. The bundle is signed by the
+/// member's own master key and bound to `pool_root`; consumers authenticate it
+/// with [`open_bundle`] (any member who knows the pool key may write — confidentiality
+/// is K-gated because the pool root is unguessable without K).
 async fn publish_record_set(
     node: &Node,
     pool_root: &ServiceId,
@@ -177,30 +178,44 @@ async fn publish_record_set(
     ttl_secs: u32,
 ) -> Result<()> {
     let dht_key = tns_dht_key(pool_root, label);
-    let encrypted = encrypt_record_set(pool_root, label, records);
-    node.dht_put_signed_at_key(member_keypair, dht_key, &encrypted, ttl_secs)
+    let sequence = node.next_dht_sequence().await;
+    let bundle = build_bundle(member_keypair, pool_root, label, sequence, records);
+    let value = seal(pool_root, label, &bundle);
+    let record_key = disposable_record_key();
+    node.dht_put_signed_at_key(&record_key, dht_key, &value, sequence, ttl_secs)
         .await
 }
 
-/// Decrypt every supplemental record set at the pool key (one per signer/member).
+/// Decrypt and authenticate every member's record set at the pool key, one per
+/// member. `require_owner` is false: any member's master signature is accepted,
+/// since pool authority is membership (knowing K), bound to `pool_root`.
+///
+/// Records are signed by disposable (random, non-deterministic) DHT keys, so a
+/// member's republishes appear as distinct slots until they expire; we dedup by
+/// author (the member's master identity), keeping each member's highest-sequence
+/// set, so a stale slot can't shadow a fresh one or double-count an endpoint.
 fn decrypt_all_sets(node_records: &[crate::dht::DhtRecord], pool_root: &ServiceId, label: &str)
     -> Vec<Vec<TnsRecord>>
 {
-    let dht_key = tns_dht_key(pool_root, label);
-    let mut sets = Vec::new();
+    let mut latest: HashMap<ServiceId, (u64, Vec<TnsRecord>)> = HashMap::new();
     for record in node_records {
         if record.record_type != crate::types::RecordType::SignedContent {
             continue;
         }
-        let inner = match crate::dht::signed_record_decrypt(&dht_key, &record.value) {
+        let plaintext = match unseal(pool_root, label, &record.value) {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if let Ok(set) = decrypt_record_set(pool_root, label, &inner) {
-            sets.push(set);
+        if let Some((set, seq, author)) = open_bundle(pool_root, label, &plaintext, false) {
+            match latest.get(&author) {
+                Some((best_seq, _)) if *best_seq >= seq => {}
+                _ => {
+                    latest.insert(author, (seq, set));
+                }
+            }
         }
     }
-    sets
+    latest.into_values().map(|(_, set)| set).collect()
 }
 
 /// Turn one member's decrypted record set into a routable endpoint, if it is one.
@@ -243,14 +258,12 @@ pub async fn resolve_endpoints(
     let local = node.dht_get_records_at_key(&dht_key).await;
     let mut sets = decrypt_all_sets(&local, pool_root, service);
     if sets.is_empty() {
-        // Poll the network.
-        let _ = node.request_dht_key(&dht_key).await;
-        let deadline = Instant::now() + timeout;
+        // Search the network, re-reading the store as records stream back.
+        let mut search = node.dht_search(dht_key, Instant::now() + timeout).await;
         loop {
-            tokio::time::sleep(RESOLVE_POLL_INTERVAL).await;
             let recs = node.dht_get_records_at_key(&dht_key).await;
             sets = decrypt_all_sets(&recs, pool_root, service);
-            if !sets.is_empty() || Instant::now() >= deadline {
+            if !sets.is_empty() || search.next().await.is_none() {
                 break;
             }
         }
@@ -262,8 +275,7 @@ pub async fn resolve_endpoints(
 /// Resolve the pool catalog: the union of service names members have published.
 pub async fn resolve_catalog(node: &Node, pool_root: &ServiceId, timeout: Duration) -> Vec<String> {
     let dht_key = tns_dht_key(pool_root, CATALOG_LABEL);
-    let _ = node.request_dht_key(&dht_key).await;
-    let deadline = Instant::now() + timeout;
+    let mut search = node.dht_search(dht_key, Instant::now() + timeout).await;
     let mut names: Vec<String> = Vec::new();
     loop {
         let recs = node.dht_get_records_at_key(&dht_key).await;
@@ -276,10 +288,9 @@ pub async fn resolve_catalog(node: &Node, pool_root: &ServiceId, timeout: Durati
                 }
             }
         }
-        if !names.is_empty() || Instant::now() >= deadline {
+        if !names.is_empty() || search.next().await.is_none() {
             break;
         }
-        tokio::time::sleep(RESOLVE_POLL_INTERVAL).await;
     }
     names
 }
