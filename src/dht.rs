@@ -137,9 +137,17 @@ impl DhtRecord {
     /// `stored_at`, so k-closest holders mutually refreshed a record to full
     /// life every replication interval and it never expired — outliving the
     /// publisher. With remaining TTL, a record ages toward a single fixed
-    /// deadline no matter how many times it is replicated; it stays alive for
-    /// exactly its TTL and then expires unless the owner republishes (pool
-    /// lease refresh, hello/peer/intro maintenance, TNS republish).
+    /// deadline (publish time + TTL) no matter how many times it is replicated.
+    ///
+    /// Note the TTL carried here is NOT authenticated — it is deliberately not
+    /// part of the signed bytes (`record_signable`) because it is rewritten on
+    /// every hop. Lifetime integrity therefore does not rest on the signature; it
+    /// rests on two things: `upsert_by_signer` never lets an equal-sequence
+    /// replace shorten a record's life (so a replayed `ttl=0` cannot force-expire
+    /// it), and storage is ultimately capacity-bound (evicted oldest-first under
+    /// pressure regardless of TTL). The record reaches its deadline and expires
+    /// unless the owner republishes with a higher sequence (pool lease refresh,
+    /// hello/peer/intro maintenance, TNS republish).
     pub fn to_put_msg(&self, originator: &PeerId, hop_limit: u8) -> crate::wire::DhtPutMsg {
         let mut bloom = BloomFilter::new();
         bloom.insert(originator);
@@ -170,6 +178,14 @@ impl DhtRecord {
 /// Single source of truth: [`crate::wire::DhtPutMsg::signable_bytes`] and
 /// [`verify_incoming_record`] both build the signable through this, so the signed
 /// layout can never drift between the signing side and the verifying side.
+///
+/// `ttl` is intentionally NOT covered. Each forward ships the *remaining* TTL
+/// (see [`DhtRecord::to_put_msg`]), so the field is mutated per hop and cannot be
+/// signed. The consequence is that an incoming `ttl` is attacker-influenced; the
+/// store must therefore never trust it to shorten a record. That invariant lives
+/// in [`upsert_by_signer`] (equal-sequence replace keeps the later deadline), not
+/// here. Do not "fix" this by adding `ttl` to the signable — it would break
+/// remaining-ttl replication. The model is capacity-bound, not ttl-trusting.
 pub fn record_signable(key: &[u8; 64], record_type: RecordType, sequence: u64, value: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64 + 1 + 8 + value.len());
     buf.extend_from_slice(key);
@@ -651,10 +667,28 @@ impl DhtStore {
 /// Returns whether the record was stored.
 fn upsert_by_signer(entries: &mut Vec<DhtRecord>, record: DhtRecord, allow_equal: bool) -> bool {
     if let Some(existing) = entries.iter_mut().find(|r| r.signer == record.signer) {
-        if record.sequence > existing.sequence
-            || (allow_equal && record.sequence == existing.sequence)
-        {
+        // A strictly higher sequence is a genuinely newer record (sequence is
+        // signed, so only the owner can produce one) — take it wholesale.
+        if record.sequence > existing.sequence {
             *existing = record;
+            return true;
+        }
+        // Equal-sequence replace exists ONLY to refresh `stored_at` for
+        // replication — it must never SHORTEN a record's life. `ttl` is not in
+        // the signed bytes (it is rewritten per hop as remaining-ttl, see
+        // `to_put_msg`), so a replayed equal-sequence record can carry an
+        // attacker-chosen `ttl` — `ttl=0` would otherwise force-expire a healthy
+        // copy. Keep the later deadline: a refresh may extend (bounded by the
+        // original fixed deadline, since remaining-ttl only decays within a
+        // sequence, so this can't resurrect immortality) but can never cut life
+        // short. This is where lifetime integrity lives, since the signature
+        // cannot cover the mutable `ttl`.
+        if allow_equal && record.sequence == existing.sequence {
+            let existing_remaining = existing.remaining_ttl();
+            *existing = record;
+            if existing_remaining > existing.ttl {
+                existing.ttl = existing_remaining;
+            }
             return true;
         }
         false
@@ -688,15 +722,39 @@ pub struct DhtWatch {
     pub expires_at: Instant,
 }
 
+/// Cap on a watch's lifetime, regardless of the (wire-supplied) request. Watch
+/// re-sends are short-lived: callers refresh at 300s (see node::mod re-send and
+/// dht_watch). 1 hour gives ample slack over that cadence while bounding how
+/// long an abandoned/forged watch can squat memory after its via_peer goes
+/// quiet — without it, a u32::MAX request would pin an entry for ~136 years.
+const MAX_WATCH_EXPIRATION_SECS: u32 = 3600;
+
+/// Per-via_peer cap on distinct watches. A single neighbor proxies many local
+/// app watches (one query_token per watched key), but 256 distinct keys from one
+/// link is already generous; beyond it we assume abuse and refuse new entries.
+const MAX_WATCHES_PER_PEER: usize = 256;
+
+/// Global cap across all peers, bounding total watch memory independent of how
+/// many peers participate (worst case ~8192 * (96B entry + 64B key) ≈ low MB).
+const MAX_WATCHES_TOTAL: usize = 8192;
+
 /// Table of remote watches on DHT keys, indexed by query_token.
 pub struct DhtWatchTable {
     watches: HashMap<[u8; 64], Vec<DhtWatch>>,
+    /// Running count of watches per via_peer, kept in sync with `watches` so the
+    /// per-peer cap is O(1) to check instead of scanning every key on insert.
+    per_peer_count: HashMap<PeerId, usize>,
+    /// Running total of all watch entries (sum of `per_peer_count`), for the
+    /// global cap without an O(total) scan.
+    total_count: usize,
 }
 
 impl DhtWatchTable {
     pub fn new() -> Self {
         Self {
             watches: HashMap::new(),
+            per_peer_count: HashMap::new(),
+            total_count: 0,
         }
     }
 
@@ -706,36 +764,86 @@ impl DhtWatchTable {
     }
 
     /// Set or cancel a watch. expiration_secs=0 cancels by query_token.
+    /// Returns false if a *new* watch was refused for exceeding a cap; refreshing
+    /// an existing (key, query_token) and cancelling always succeed (return true).
     pub fn set_watch(
         &mut self,
         key: [u8; 64],
         query_token: [u8; 32],
         via_peer: PeerId,
         expiration_secs: u32,
-    ) {
+    ) -> bool {
         if expiration_secs == 0 {
-            // Cancel by token
+            // Cancel by token. Collect the via_peers of the entries being dropped
+            // first, then decrement the per-peer/total counters — avoids holding a
+            // mutable borrow on `self.watches` while touching `self.per_peer_count`.
             if let Some(entries) = self.watches.get_mut(&key) {
+                let dropped: Vec<PeerId> = entries
+                    .iter()
+                    .filter(|w| w.query_token == query_token)
+                    .map(|w| w.via_peer)
+                    .collect();
                 entries.retain(|w| w.query_token != query_token);
-                if entries.is_empty() {
+                let empty = entries.is_empty();
+                for peer in &dropped {
+                    self.decr_peer(peer);
+                }
+                self.total_count = self.total_count.saturating_sub(dropped.len());
+                if empty {
                     self.watches.remove(&key);
                 }
             }
-            return;
+            return true;
         }
 
+        // Clamp the wire-supplied lifetime so a forged-large value can't pin an
+        // entry effectively forever. 0 is handled above (cancel), so we never
+        // clamp a cancel up into a live watch.
+        let expiration_secs = expiration_secs.min(MAX_WATCH_EXPIRATION_SECS);
         let expires_at = Instant::now() + Duration::from_secs(expiration_secs as u64);
         let entries = self.watches.entry(key).or_default();
-        // Refresh if same token already watching
+        // Refresh if same token already watching (must always succeed so legit
+        // periodic refresh isn't broken once a peer is at its cap). The watch may
+        // have re-arrived via a different neighbor; note the old via_peer so we
+        // can fix the per-peer counters after the borrow ends.
         if let Some(existing) = entries.iter_mut().find(|w| w.query_token == query_token) {
+            let prev_peer = existing.via_peer;
             existing.expires_at = expires_at;
             existing.via_peer = via_peer;
-        } else {
-            entries.push(DhtWatch {
-                query_token,
-                via_peer,
-                expires_at,
-            });
+            if prev_peer != via_peer {
+                self.decr_peer(&prev_peer);
+                *self.per_peer_count.entry(via_peer).or_insert(0) += 1;
+            }
+            return true;
+        }
+
+        // New entry: enforce the per-peer and global caps before inserting.
+        let peer_count = self.per_peer_count.get(&via_peer).copied().unwrap_or(0);
+        if peer_count >= MAX_WATCHES_PER_PEER || self.total_count >= MAX_WATCHES_TOTAL {
+            if entries.is_empty() {
+                self.watches.remove(&key);
+            }
+            return false;
+        }
+        entries.push(DhtWatch {
+            query_token,
+            via_peer,
+            expires_at,
+        });
+        *self.per_peer_count.entry(via_peer).or_insert(0) += 1;
+        self.total_count += 1;
+        true
+    }
+
+    /// Decrement the per-peer counter for `peer`, removing the map entry at zero.
+    /// Saturating so a fixture that inserts straight into `watches` (bypassing the
+    /// counters) can't drive a count below zero.
+    fn decr_peer(&mut self, peer: &PeerId) {
+        if let Some(c) = self.per_peer_count.get_mut(peer) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.per_peer_count.remove(peer);
+            }
         }
     }
 
@@ -755,17 +863,34 @@ impl DhtWatchTable {
     /// Remove expired watches.
     pub fn expire(&mut self) {
         let now = Instant::now();
+        let per_peer = &mut self.per_peer_count;
+        let mut removed = 0usize;
         for entries in self.watches.values_mut() {
-            entries.retain(|w| w.expires_at > now);
+            entries.retain(|w| {
+                let keep = w.expires_at > now;
+                if !keep {
+                    if let Some(c) = per_peer.get_mut(&w.via_peer) {
+                        *c = c.saturating_sub(1);
+                    }
+                    removed += 1;
+                }
+                keep
+            });
         }
+        per_peer.retain(|_, c| *c != 0);
+        // saturating: fixtures may insert into `watches` without bumping the count.
+        self.total_count = self.total_count.saturating_sub(removed);
         self.watches.retain(|_, v| !v.is_empty());
     }
 
     /// Remove all watches routed through a specific peer (link went down).
     pub fn remove_peer(&mut self, peer: &PeerId) {
         for entries in self.watches.values_mut() {
+            let before = entries.len();
             entries.retain(|w| w.via_peer != *peer);
+            self.total_count = self.total_count.saturating_sub(before - entries.len());
         }
+        self.per_peer_count.remove(peer);
         self.watches.retain(|_, v| !v.is_empty());
     }
 }
@@ -1947,6 +2072,161 @@ mod tests {
         table.set_watch(key, token, peer, 600); // refresh
         let watchers = table.get_watchers(&key);
         assert_eq!(watchers.len(), 1); // still only one entry
+    }
+
+    // ── F3: watch table is bounded against a single-peer flood ──
+
+    #[test]
+    fn watch_table_clamps_expiration() {
+        // A forged u32::MAX lifetime must be clamped to MAX_WATCH_EXPIRATION_SECS,
+        // not honored as ~136 years — otherwise the entry is effectively permanent.
+        let mut table = DhtWatchTable::new();
+        let key = [0x01; 64];
+        let peer = PeerId([1u8; 32]);
+        assert!(table.set_watch(key, [0xAB; 32], peer, u32::MAX));
+        let expires_at = table.watches[&key][0].expires_at;
+        let cap = Instant::now() + Duration::from_secs(MAX_WATCH_EXPIRATION_SECS as u64);
+        // Allow a little slack for the clock advancing between the two `now`s.
+        assert!(expires_at <= cap + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn watch_table_zero_still_cancels_after_clamp() {
+        // expiration_secs == 0 must keep its cancel semantics, never be clamped up.
+        let mut table = DhtWatchTable::new();
+        let key = [0x02; 64];
+        let token = [0xCD; 32];
+        let peer = PeerId([2u8; 32]);
+        table.set_watch(key, token, peer, 300);
+        assert_eq!(table.watch_count(), 1);
+        table.set_watch(key, token, peer, 0);
+        assert!(table.get_watchers(&key).is_empty());
+        assert_eq!(table.watch_count(), 0);
+    }
+
+    #[test]
+    fn watch_table_per_peer_cap_refuses_new_but_allows_refresh() {
+        let mut table = DhtWatchTable::new();
+        let peer = PeerId([3u8; 32]);
+        // Fill the per-peer cap with distinct tokens (distinct keys to be safe).
+        for i in 0..MAX_WATCHES_PER_PEER {
+            let mut token = [0u8; 32];
+            token[0] = (i & 0xff) as u8;
+            token[1] = (i >> 8) as u8;
+            let mut k = [0u8; 64];
+            k[0..2].copy_from_slice(&token[0..2]);
+            assert!(table.set_watch(k, token, peer, 300));
+        }
+        assert_eq!(table.watch_count(), MAX_WATCHES_PER_PEER);
+        // One more *new* watch from the same peer is refused.
+        assert!(!table.set_watch([0xFF; 64], [0xFF; 32], peer, 300));
+        assert_eq!(table.watch_count(), MAX_WATCHES_PER_PEER);
+        // But refreshing an existing watch still succeeds even at the cap.
+        let mut existing_token = [0u8; 32];
+        existing_token[0] = 0;
+        let mut existing_key = [0u8; 64];
+        existing_key[0..2].copy_from_slice(&existing_token[0..2]);
+        assert!(table.set_watch(existing_key, existing_token, peer, 600));
+        assert_eq!(table.watch_count(), MAX_WATCHES_PER_PEER);
+    }
+
+    #[test]
+    fn watch_table_global_cap_refuses_new() {
+        let mut table = DhtWatchTable::new();
+        // Spread across many peers so the per-peer cap never trips first.
+        let mut inserted = 0usize;
+        'outer: for p in 0..=255u8 {
+            let peer = PeerId([p; 32]);
+            for i in 0..MAX_WATCHES_PER_PEER {
+                if inserted >= MAX_WATCHES_TOTAL {
+                    break 'outer;
+                }
+                let mut token = [0u8; 32];
+                token[0] = p;
+                token[1] = (i & 0xff) as u8;
+                token[2] = (i >> 8) as u8;
+                let mut k = [0u8; 64];
+                k[0..3].copy_from_slice(&token[0..3]);
+                assert!(table.set_watch(k, token, peer, 300));
+                inserted += 1;
+            }
+        }
+        assert_eq!(table.watch_count(), MAX_WATCHES_TOTAL);
+        // A new watch from a fresh peer is refused at the global cap.
+        let fresh = PeerId([0xAA; 32]);
+        assert!(!table.set_watch([0xBE; 64], [0xEF; 32], fresh, 300));
+        assert_eq!(table.watch_count(), MAX_WATCHES_TOTAL);
+    }
+
+    #[test]
+    fn watch_table_counts_stay_consistent_through_cancel_and_remove_peer() {
+        let mut table = DhtWatchTable::new();
+        let peer_a = PeerId([7u8; 32]);
+        let peer_b = PeerId([8u8; 32]);
+        table.set_watch([0x10; 64], [0x10; 32], peer_a, 300);
+        table.set_watch([0x11; 64], [0x11; 32], peer_a, 300);
+        table.set_watch([0x12; 64], [0x12; 32], peer_b, 300);
+        assert_eq!(table.watch_count(), 3);
+        // Cancel frees a slot so a new watch is accepted again (count tracked).
+        table.set_watch([0x10; 64], [0x10; 32], peer_a, 0);
+        assert_eq!(table.watch_count(), 2);
+        // remove_peer drops peer_a's remaining watch and clears its per-peer count.
+        table.remove_peer(&peer_a);
+        assert_eq!(table.watch_count(), 1);
+        table.set_watch([0x13; 64], [0x13; 32], peer_a, 300);
+        assert_eq!(table.watch_count(), 2);
+    }
+
+    // ── F2: a stale lower-sequence record is is_new BUT not accepted ──
+
+    /// Replicates the (signer, sequence, record_type) exact-tuple test the DhtPut
+    /// handler uses for `is_new`.
+    fn is_new(store: &DhtStore, key: &DhtId, rec: &DhtRecord) -> bool {
+        !store
+            .get(key)
+            .iter()
+            .any(|r| r.signer == rec.signer && r.sequence == rec.sequence && r.record_type == rec.record_type)
+    }
+
+    #[test]
+    fn stale_lower_seq_is_new_but_not_accepted() {
+        // The exact case behind F2: a known signer's lower-sequence record has no
+        // matching stored tuple (is_new=true) yet the store refuses it
+        // (accepted=false). The handler must forward only on is_new && accepted —
+        // forwarding on is_new alone re-floods this rejected record forever.
+        let kp = Keypair::generate();
+        let key = DhtId([0x70; 64]);
+        let mut store = DhtStore::new(&PeerId([0u8; 32]));
+
+        let high = signed_record(&kp, key, RecordType::SignedContent, 5, b"v5".to_vec());
+        assert!(store.put(VerifiedRecord::verify_incoming(high).unwrap()));
+
+        // Replay an older sequence from the same signer.
+        let stale = signed_record(&kp, key, RecordType::SignedContent, 3, b"v3".to_vec());
+        assert!(is_new(&store, &key, &stale), "lower seq has no exact tuple -> is_new");
+        let accepted = store.put(VerifiedRecord::verify_incoming(stale).unwrap());
+        assert!(!accepted, "store must reject the stale lower-seq record");
+        // is_new && accepted == false -> the handler does NOT forward. (bug fixed)
+    }
+
+    #[test]
+    fn equal_seq_refresh_is_accepted_but_not_new() {
+        // The reason the gate is is_new && accepted, not accepted alone:
+        // SignedContent uses allow_equal=true, so an equal-sequence re-arrival is
+        // ACCEPTED (replaces) but is NOT new (tuple already present). Gating on
+        // accepted alone would re-flood every refresh.
+        let kp = Keypair::generate();
+        let key = DhtId([0x71; 64]);
+        let mut store = DhtStore::new(&PeerId([0u8; 32]));
+
+        let first = signed_record(&kp, key, RecordType::SignedContent, 4, b"v4".to_vec());
+        assert!(store.put(VerifiedRecord::verify_incoming(first).unwrap()));
+
+        let again = signed_record(&kp, key, RecordType::SignedContent, 4, b"v4".to_vec());
+        assert!(!is_new(&store, &key, &again), "equal-seq tuple already stored -> not new");
+        let accepted = store.put(VerifiedRecord::verify_incoming(again).unwrap());
+        assert!(accepted, "allow_equal=true: equal-seq replaces -> accepted");
+        // is_new && accepted == false -> handler does NOT re-flood. (correct)
     }
 
     #[test]

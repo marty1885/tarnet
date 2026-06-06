@@ -2306,6 +2306,15 @@ impl Node {
                 let mut put = DhtPutMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(put.key);
 
+                // Clamp the attacker-controlled ingress hop_limit (raw u8 off the
+                // wire, up to 255) to this node's L2NSE-derived budget *before*
+                // decrementing, so a forged-large value cannot extend flood depth
+                // beyond what our network-size estimate justifies.
+                let params = self.dht_query_params().await;
+                if put.hop_limit > params.hop_limit {
+                    put.hop_limit = params.hop_limit;
+                }
+
                 // Hop limit enforcement
                 if put.hop_limit == 0 {
                     log::debug!("DHT PUT hop limit reached, not forwarding");
@@ -2345,8 +2354,17 @@ impl Node {
                 }
                 log::debug!("DHT PUT from {:?} (type={:?})", from, put.record_type);
 
-                // Forward to targeted peers if new and hop limit not exhausted
-                if is_new && put.hop_limit > 0 {
+                // Forward to targeted peers only if the record was both unseen
+                // (is_new) AND actually stored (accepted). Gating on is_new alone
+                // re-floods records the store rejected: a stale lower-sequence
+                // record from a known signer has no exact (signer, sequence, type)
+                // tuple match (is_new=true) yet is refused by upsert_by_signer
+                // (accepted=false). Since PUT's only flood brake is store-on-
+                // first-sight, a never-stored record never trips it and re-floods
+                // the whole network on every replay. Requiring `accepted` closes
+                // that; we still need `is_new` so an equal-sequence refresh (which
+                // upsert_by_signer accepts with allow_equal=true) doesn't re-flood.
+                if is_new && accepted && put.hop_limit > 0 {
                     let old_bloom = put.bloom;
                     let mut fwd_bloom = BloomFilter::new();
                     fwd_bloom.insert(&self.peer_id());
@@ -2384,6 +2402,15 @@ impl Node {
             MessageType::DhtGet => {
                 let mut get = DhtGetMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(get.key);
+
+                // Clamp the attacker-controlled ingress hop_limit to our L2NSE
+                // budget, mirroring DhtPut. GET already converges via query_token
+                // dedup, but a clamp keeps a forged-large value from extending the
+                // forward depth past what the network size justifies.
+                let get_params = self.dht_query_params().await;
+                if get.hop_limit > get_params.hop_limit {
+                    get.hop_limit = get_params.hop_limit;
+                }
 
                 // Reverse-path forwarding with first-writer-wins dedup. The
                 // first neighbor to deliver a given query_token becomes this
