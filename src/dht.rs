@@ -458,24 +458,24 @@ impl DhtStore {
     /// - Hello: same signer + higher sequence replaces existing.
     /// - SignedContent: add if new signer (supplemental), same signer replaces.
     /// - Content: first write wins (single record per key).
-    pub fn put(&mut self, record: VerifiedRecord) {
+    pub fn put(&mut self, record: VerifiedRecord) -> bool {
         let record = record.into_inner();
         self.expire();
         if record.value.len() > self.limits.max_value_bytes {
-            return;
+            return false;
         }
 
         let key = *record.key.as_bytes();
         let entries = self.records.entry(key).or_default();
 
-        match record.record_type {
+        let stored = match record.record_type {
             RecordType::Hello => {
                 // Same signer + strictly higher sequence replaces
-                upsert_by_signer(entries, record, false);
+                upsert_by_signer(entries, record, false)
             }
             RecordType::SignedContent => {
                 // Different signers are supplemental; same signer replaces if >= sequence
-                upsert_by_signer(entries, record, true);
+                upsert_by_signer(entries, record, true)
             }
             RecordType::Content => {
                 // Keep up to N candidates to resist poisoning attacks.
@@ -486,16 +486,22 @@ impl DhtStore {
                     && !entries.iter().any(|r| r.value == record.value)
                 {
                     entries.push(record);
+                    true
+                } else {
+                    false
                 }
             }
             RecordType::Unknown(_) => {
                 // Best-effort store-and-relay: same signer + strictly higher sequence replaces
-                upsert_by_signer(entries, record, false);
+                upsert_by_signer(entries, record, false)
             }
-        }
+        };
 
-        self.enforce_key_limits(&key);
-        self.enforce_global_limits();
+        if stored {
+            self.enforce_key_limits(&key);
+            self.enforce_global_limits();
+        }
+        stored
     }
 
     /// Retrieve all non-expired records at a key.
@@ -562,8 +568,13 @@ impl DhtStore {
     /// fields round-trip faithfully through persistence.
     pub fn import_records(&mut self, records: Vec<PersistedRecord>) {
         for record in records {
-            match VerifiedRecord::verify_incoming(record.into_live()) {
-                Ok(verified) => self.put(verified),
+            let Some(live) = record.into_live() else {
+                continue;
+            };
+            match VerifiedRecord::verify_incoming(live) {
+                Ok(verified) => {
+                    let _ = self.put(verified);
+                }
                 Err(reason) => {
                     log::warn!("dropping persisted DHT record on load: {}", reason)
                 }

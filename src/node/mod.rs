@@ -17,10 +17,10 @@ use crate::circuit::{
     build_introduce_payload, build_rendezvous_establish_payload, build_stream_begin_payload,
     derive_hop_keys, parse_extend_payload, parse_extended_payload, parse_intro_register_payload,
     parse_introduce_payload, parse_rendezvous_establish_payload, parse_rendezvous_join_payload,
-    parse_stream_begin_payload, relay_cell_digest_for_sendme, CircuitAction, CircuitKey,
-    CircuitState as CircuitPhase, CircuitTable, CongestionWindow, CryptoOp, HopCrypto, HopKey,
-    OutboundCircuit, RelayCell, RelayCellCommand, ReplayWindow, CELL_BODY_SIZE, CELL_PAYLOAD_MAX,
-    CELL_SIZE, EXTENDED_FLAG_REACHED, SENDME_STALL_TIMEOUT, write_cell_body,
+    parse_stream_begin_payload, relay_cell_digest_for_sendme, write_cell_body, CircuitAction,
+    CircuitKey, CircuitState as CircuitPhase, CircuitTable, CongestionWindow, CryptoOp, HopCrypto,
+    HopKey, OutboundCircuit, RelayCell, RelayCellCommand, ReplayWindow, CELL_BODY_SIZE,
+    CELL_PAYLOAD_MAX, CELL_SIZE, EXTENDED_FLAG_REACHED, SENDME_STALL_TIMEOUT,
 };
 use crate::dht::{
     is_k_closest, probabilistic_select, random_select, BloomFilter, DhtQueryParams, DhtRecord,
@@ -28,10 +28,10 @@ use crate::dht::{
 };
 use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::identity_store::IdentityStore;
-use crate::pool::PoolStore;
 use crate::key_exchange::{kex_accept, KexOffer};
 use crate::link::PeerLink;
 use crate::peer_transport::LinkTable;
+use crate::pool::PoolStore;
 use crate::pubkey_cache::PubkeyCache;
 use crate::routing::dv;
 use crate::routing::RoutingTable;
@@ -61,10 +61,7 @@ const ROUTE_AD_INTERVAL: Duration = Duration::from_secs(30);
 fn jittered_interval(period: Duration) -> tokio::time::Interval {
     use rand::Rng;
     let jitter = rand::thread_rng().gen_range(Duration::ZERO..period / 2);
-    let mut interval = tokio::time::interval_at(
-        tokio::time::Instant::now() + jitter,
-        period,
-    );
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + jitter, period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
 }
@@ -425,7 +422,7 @@ pub struct Node {
     /// Remote subscriptions: who wants notifications from us when a watched key changes.
     dht_watches: Arc<Mutex<DhtWatchTable>>,
     /// Keys we are watching locally.
-    local_watches: Arc<Mutex<HashSet<[u8; 64]>>>,
+    local_watches: Arc<Mutex<HashMap<[u8; 64], HashMap<PeerId, [u8; 32]>>>>,
     /// Channel for delivering watch notifications to the application.
     dht_watch_tx: mpsc::Sender<(DhtId, DhtRecord)>,
     dht_watch_rx: Mutex<Option<mpsc::Receiver<(DhtId, DhtRecord)>>>,
@@ -438,7 +435,8 @@ pub struct Node {
     /// DhtGetResponse handler feeds verified records into, waking the
     /// originating [`DhtSearch`] stream. A `std::sync::Mutex` so the stream's
     /// `Drop` can deregister synchronously (RAII cancel).
-    dht_searches: Arc<std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<crate::dht::VerifiedRecord>>>>,
+    dht_searches:
+        Arc<std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<crate::dht::VerifiedRecord>>>>,
     /// Monotonically increasing sequence number for signed content records.
     signed_content_sequence: Arc<Mutex<u64>>,
     circuits: CircuitState,
@@ -685,7 +683,7 @@ impl Node {
             channel_event_rx: Mutex::new(Some(channel_event_rx)),
             seen_nonces: Arc::new(Mutex::new(VecDeque::new())),
             dht_watches: Arc::new(Mutex::new(DhtWatchTable::new())),
-            local_watches: Arc::new(Mutex::new(HashSet::new())),
+            local_watches: Arc::new(Mutex::new(HashMap::new())),
             dht_watch_tx,
             dht_watch_rx: Mutex::new(Some(dht_watch_rx)),
             kbucket: Arc::new(Mutex::new(KBucketTable::new(&peer_id))),
@@ -1407,6 +1405,7 @@ impl Node {
         let dht_ref = self.dht_store.clone();
         let watches_ref = self.dht_watches.clone();
         let tokens_ref = self.query_tokens.clone();
+        let db_ref = self.db.clone();
         let nonces_ref = self.seen_nonces.clone();
         let relay_ext_ref = self.circuits.relay_extend_pending.clone();
         let pke_ref = self.pending_key_exchanges.clone();
@@ -1416,6 +1415,11 @@ impl Node {
             loop {
                 interval.tick().await;
                 dht_ref.lock().await.expire();
+                if let Some(db) = &db_ref {
+                    if let Err(e) = db.delete_expired_dht_records() {
+                        log::warn!("Failed to delete expired DHT records from DB: {}", e);
+                    }
+                }
                 watches_ref.lock().await.expire();
                 let now = Instant::now();
                 // Expire stale query token mappings
@@ -1650,7 +1654,7 @@ impl Node {
 
                 let key = crate::dht::identity_address_key(&peer_id);
                 let put = record.record().to_put_msg(&peer_id, params.hop_limit);
-                hello_dht.lock().await.put(record);
+                let _ = hello_dht.lock().await.put(record);
                 let targets = probabilistic_select(&key, &all_peers, params.fan_out);
 
                 let encoded = put.to_wire().encode();
@@ -1975,20 +1979,26 @@ impl Node {
 
         // Re-send DhtWatch for all local watches to the new peer
         {
-            let watches = self.local_watches.lock().await;
-            if !watches.is_empty() {
+            let keys: Vec<[u8; 64]> = self.local_watches.lock().await.keys().copied().collect();
+            if !keys.is_empty() {
                 let link = self.links.lock().await.get(&peer_id).cloned();
                 if let Some(link) = link {
-                    for key in watches.iter() {
+                    for key in keys {
                         // Generate fresh token per watch per link
                         let mut token = [0u8; 32];
                         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut token);
+                        self.local_watches
+                            .lock()
+                            .await
+                            .entry(key)
+                            .or_default()
+                            .insert(peer_id, token);
                         self.query_tokens
                             .lock()
                             .await
                             .insert(token, (self.peer_id(), Instant::now()));
                         let watch = DhtWatchMsg {
-                            key: *key,
+                            key,
                             query_token: token,
                             expiration_secs: 300,
                         };
@@ -2087,8 +2097,7 @@ impl Node {
             }
             // Clean up rendezvous entries where the disconnected peer was a participant.
             self.hidden.rendezvous.lock().await.retain(|_, entry| {
-                entry.client_from != peer_id
-                    && entry.service_from.map_or(true, |p| p != peer_id)
+                entry.client_from != peer_id && entry.service_from.map_or(true, |p| p != peer_id)
             });
             // Notify application that this peer is gone
             let _ = self
@@ -2140,9 +2149,10 @@ impl Node {
                 if !first {
                     // Jitter: ±25% of backoff to avoid thundering herd
                     let jitter_range = backoff / 4;
-                    let jitter = Duration::from_millis(
-                        rand::Rng::gen_range(&mut rand::thread_rng(), 0..=jitter_range.as_millis() as u64 * 2),
-                    );
+                    let jitter = Duration::from_millis(rand::Rng::gen_range(
+                        &mut rand::thread_rng(),
+                        0..=jitter_range.as_millis() as u64 * 2,
+                    ));
                     let delay = backoff - jitter_range + jitter;
                     tokio::time::sleep(delay).await;
                 }
@@ -2326,11 +2336,13 @@ impl Node {
                     })
                 };
 
-                self.db_upsert_dht_record(record.record());
                 // Keep a copy for the local-watch notification below; the
                 // VerifiedRecord itself is moved into the store.
                 let live = record.record().clone();
-                self.dht_store.lock().await.put(record);
+                let accepted = self.dht_store.lock().await.put(record.clone());
+                if accepted {
+                    self.db_upsert_dht_record(record.record());
+                }
                 log::debug!("DHT PUT from {:?} (type={:?})", from, put.record_type);
 
                 // Forward to targeted peers if new and hop limit not exhausted
@@ -2364,7 +2376,7 @@ impl Node {
                     }
 
                     // Notify local app if we're watching this key
-                    if self.local_watches.lock().await.contains(&put.key) {
+                    if self.local_watches.lock().await.contains_key(&put.key) {
                         let _ = self.dht_watch_tx.send((key, live)).await;
                     }
                 }
@@ -2384,14 +2396,13 @@ impl Node {
                 // *after* it has received, it can never be its own forwarder's
                 // parent, so the parent graph is an acyclic tree rooted at the
                 // originator — replies walk it back without a loop bound.
-                let first_arrival =
-                    match self.query_tokens.lock().await.entry(get.query_token) {
-                        std::collections::hash_map::Entry::Occupied(_) => false,
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            slot.insert((from, Instant::now()));
-                            true
-                        }
-                    };
+                let first_arrival = match self.query_tokens.lock().await.entry(get.query_token) {
+                    std::collections::hash_map::Entry::Occupied(_) => false,
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert((from, Instant::now()));
+                        true
+                    }
+                };
                 if !first_arrival {
                     return Ok(());
                 }
@@ -2441,18 +2452,18 @@ impl Node {
                 // Store records locally — each must clear the trust gate first.
                 let resp_key = DhtId(resp.key);
                 for rec in &resp.records {
-                    let record = match crate::dht::VerifiedRecord::from_response_record(resp_key, rec)
-                    {
-                        Ok(verified) => verified,
-                        Err(reason) => {
-                            log::warn!(
-                                "DhtGetResponse from {:?}: {}, dropping record",
-                                from, reason
-                            );
-                            continue;
-                        }
-                    };
-                    self.db_upsert_dht_record(record.record());
+                    let record =
+                        match crate::dht::VerifiedRecord::from_response_record(resp_key, rec) {
+                            Ok(verified) => verified,
+                            Err(reason) => {
+                                log::warn!(
+                                    "DhtGetResponse from {:?}: {}, dropping record",
+                                    from,
+                                    reason
+                                );
+                                continue;
+                            }
+                        };
                     // Wake any local search waiting on this token. Best-effort:
                     // the record is also stored below, so a full channel just
                     // means the next wake re-reads it from the store.
@@ -2462,7 +2473,10 @@ impl Node {
                             let _ = tx.try_send(record.clone());
                         }
                     }
-                    self.dht_store.lock().await.put(record);
+                    let accepted = self.dht_store.lock().await.put(record.clone());
+                    if accepted {
+                        self.db_upsert_dht_record(record.record());
+                    }
                 }
 
                 // Route response back via query_token hop-by-hop
@@ -2478,7 +2492,8 @@ impl Node {
                         log::debug!("DhtGetResponse arrived for our query");
                     } else {
                         // Forward response back toward originator
-                        self.send_to_peer_deferred(&prev, &resp.to_wire().encode()).await?;
+                        self.send_to_peer_deferred(&prev, &resp.to_wire().encode())
+                            .await?;
                     }
                 } else {
                     log::debug!("DhtGetResponse with unknown query_token, storing locally only");
@@ -2571,11 +2586,18 @@ impl Node {
                 };
 
                 // Check if we're the destination (we originated this watch)
-                if self.local_watches.lock().await.contains(&notify.put.key) {
+                if self
+                    .local_watches
+                    .lock()
+                    .await
+                    .contains_key(&notify.put.key)
+                {
                     // Store the record locally
-                    self.db_upsert_dht_record(record.record());
                     let live = record.record().clone();
-                    self.dht_store.lock().await.put(record);
+                    let accepted = self.dht_store.lock().await.put(record.clone());
+                    if accepted {
+                        self.db_upsert_dht_record(record.record());
+                    }
                     let _ = self.dht_watch_tx.send((key, live)).await;
                 } else {
                     // Route notification back via query_token hop-by-hop
@@ -2586,7 +2608,8 @@ impl Node {
                         .get(&notify.query_token)
                         .map(|(peer, _)| *peer);
                     if let Some(prev) = prev_hop {
-                        self.send_to_peer_deferred(&prev, &notify.to_wire().encode()).await?;
+                        self.send_to_peer_deferred(&prev, &notify.to_wire().encode())
+                            .await?;
                     } else {
                         log::debug!("DhtWatchNotify with unknown query_token, dropping");
                     }

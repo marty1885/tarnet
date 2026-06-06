@@ -88,8 +88,10 @@ impl Node {
             .record()
             .to_put_msg(&self.peer_id(), params.hop_limit);
         let key = DhtId(put.key);
-        self.db_upsert_dht_record(record.record());
-        self.dht_store.lock().await.put(record);
+        let accepted = self.dht_store.lock().await.put(record.clone());
+        if accepted {
+            self.db_upsert_dht_record(record.record());
+        }
 
         let encoded = put.to_wire().encode();
         let kb = self.kbucket.lock().await;
@@ -197,13 +199,18 @@ impl Node {
     /// Uses per-neighbor query tokens for anonymous notification routing.
     pub async fn dht_watch(&self, key: &DhtId, expiration_secs: u32) {
         let key_bytes = *key.as_bytes();
-        self.local_watches.lock().await.insert(key_bytes);
 
         let links = self.links.lock().await;
-        for (_, link) in links.iter() {
+        for (peer_id, link) in links.iter() {
             // Fresh token per neighbor so notifications route back correctly
             let mut token = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut token);
+            self.local_watches
+                .lock()
+                .await
+                .entry(key_bytes)
+                .or_default()
+                .insert(*peer_id, token);
             self.query_tokens
                 .lock()
                 .await
@@ -221,19 +228,20 @@ impl Node {
     /// Stop watching a DHT key. Sends DhtWatch with expiration=0 to all neighbors.
     pub async fn dht_unwatch(&self, key: &DhtId) {
         let key_bytes = *key.as_bytes();
-        self.local_watches.lock().await.remove(&key_bytes);
+        let tokens = self.local_watches.lock().await.remove(&key_bytes);
 
         let links = self.links.lock().await;
-        for (_, link) in links.iter() {
-            // Use a fresh token for cancellation (zero-expiry signals cancel)
-            let mut token = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut token);
-            let watch = DhtWatchMsg {
-                key: key_bytes,
-                query_token: token,
-                expiration_secs: 0,
-            };
-            let _ = link.send_message(&watch.to_wire().encode()).await;
+        if let Some(tokens) = tokens {
+            for (peer_id, token) in tokens {
+                if let Some(link) = links.get(&peer_id) {
+                    let watch = DhtWatchMsg {
+                        key: key_bytes,
+                        query_token: token,
+                        expiration_secs: 0,
+                    };
+                    let _ = link.send_message(&watch.to_wire().encode()).await;
+                }
+            }
         }
     }
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex as StdMutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -35,6 +35,8 @@ pub struct PersistedRecord {
     pub sequence: u64,
     pub signer: [u8; 32],
     pub ttl_secs: u64,
+    pub expires_at_unix: u64,
+    pub fingerprint: [u8; 32],
     pub value: Vec<u8>,
     pub signature: Vec<u8>,
     pub signer_algo: u8,
@@ -47,12 +49,16 @@ impl PersistedRecord {
             return None;
         }
         let remaining_ttl = record.ttl.checked_sub(record.stored_at.elapsed())?;
+        let now = unix_now_secs();
+        let ttl_secs = remaining_ttl.as_secs().max(1);
         Some(Self {
             key: *record.key.as_bytes(),
             record_type: record.record_type.as_u8(),
             sequence: record.sequence,
             signer: record.signer,
-            ttl_secs: remaining_ttl.as_secs().max(1),
+            ttl_secs,
+            expires_at_unix: now.saturating_add(ttl_secs),
+            fingerprint: dht_record_fingerprint(record),
             value: record.value.clone(),
             signature: record.signature.to_vec(),
             signer_algo: record.signer_algo,
@@ -60,7 +66,12 @@ impl PersistedRecord {
         })
     }
 
-    pub fn into_live(self) -> DhtRecord {
+    pub fn into_live(self) -> Option<DhtRecord> {
+        let now = unix_now_secs();
+        if self.expires_at_unix <= now {
+            return None;
+        }
+        let ttl_secs = self.expires_at_unix.saturating_sub(now).max(1);
         DhtRecord {
             key: DhtId(self.key),
             record_type: RecordType::from_u8(self.record_type),
@@ -69,10 +80,11 @@ impl PersistedRecord {
             signer_algo: self.signer_algo,
             signer_pubkey: self.signer_pubkey,
             value: self.value,
-            ttl: Duration::from_secs(self.ttl_secs),
+            ttl: Duration::from_secs(ttl_secs),
             stored_at: Instant::now(),
             signature: self.signature,
         }
+        .into()
     }
 }
 
@@ -141,14 +153,16 @@ impl StateDb {
              CREATE TABLE IF NOT EXISTS dht_records (
                  key BLOB NOT NULL,
                  signer BLOB NOT NULL,
+                 fingerprint BLOB NOT NULL,
                  record_type INTEGER NOT NULL,
                  sequence INTEGER NOT NULL,
                  ttl_secs INTEGER NOT NULL,
+                 expires_at_unix INTEGER NOT NULL,
                  value BLOB NOT NULL,
                  signature BLOB NOT NULL,
                  signer_algo INTEGER NOT NULL,
                  signer_pubkey BLOB NOT NULL,
-                 PRIMARY KEY (key, signer)
+                 PRIMARY KEY (key, signer, fingerprint)
              );
              CREATE TABLE IF NOT EXISTS tns_labels (
                  identity TEXT NOT NULL DEFAULT '',
@@ -169,6 +183,7 @@ impl StateDb {
              );",
         )
         .map_err(sqlite_err)?;
+        migrate_dht_records_schema(&conn).map_err(sqlite_err)?;
 
         Ok(Self {
             conn: StdMutex::new(conn),
@@ -339,25 +354,29 @@ impl StateDb {
 
     pub fn load_dht_records(&self) -> Result<Vec<PersistedRecord>> {
         let conn = self.lock()?;
+        let now = unix_now_secs();
         let mut stmt = conn
             .prepare_cached(
-                "SELECT key, signer, record_type, sequence, ttl_secs, value,
+                "SELECT key, signer, fingerprint, record_type, sequence, ttl_secs, expires_at_unix, value,
                         signature, signer_algo, signer_pubkey
-                 FROM dht_records",
+                 FROM dht_records
+                 WHERE expires_at_unix > ?1",
             )
             .map_err(sqlite_err)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(params![now], |row| {
                 Ok(PersistedRecord {
                     key: vec_to_array::<64>(row.get::<_, Vec<u8>>(0)?)?,
                     signer: vec_to_array::<32>(row.get::<_, Vec<u8>>(1)?)?,
-                    record_type: row.get(2)?,
-                    sequence: row.get(3)?,
-                    ttl_secs: row.get(4)?,
-                    value: row.get(5)?,
-                    signature: row.get(6)?,
-                    signer_algo: row.get(7)?,
-                    signer_pubkey: row.get(8)?,
+                    fingerprint: vec_to_array::<32>(row.get::<_, Vec<u8>>(2)?)?,
+                    record_type: row.get(3)?,
+                    sequence: row.get(4)?,
+                    ttl_secs: row.get(5)?,
+                    expires_at_unix: row.get(6)?,
+                    value: row.get(7)?,
+                    signature: row.get(8)?,
+                    signer_algo: row.get(9)?,
+                    signer_pubkey: row.get(10)?,
                 })
             })
             .map_err(sqlite_err)?;
@@ -369,34 +388,52 @@ impl StateDb {
 
     pub fn upsert_dht_record(&self, record: &PersistedRecord) -> Result<()> {
         let conn = self.lock()?;
-        let mut stmt = conn
+        conn.execute_batch("BEGIN").map_err(sqlite_err)?;
+        let result = (|| {
+            if RecordType::from_u8(record.record_type) != RecordType::Content {
+                conn.prepare_cached("DELETE FROM dht_records WHERE key = ?1 AND signer = ?2")
+                    .map_err(sqlite_err)?
+                    .execute(params![&record.key[..], &record.signer[..]])
+                    .map_err(sqlite_err)?;
+            }
+            let mut stmt = conn
             .prepare_cached(
-                "INSERT INTO dht_records(key, signer, record_type, sequence, ttl_secs, value,
-                                         signature, signer_algo, signer_pubkey)
-                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                 ON CONFLICT(key, signer) DO UPDATE SET
+                "INSERT INTO dht_records(key, signer, fingerprint, record_type, sequence, ttl_secs,
+                                         expires_at_unix, value, signature, signer_algo, signer_pubkey)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(key, signer, fingerprint) DO UPDATE SET
                      record_type = excluded.record_type,
                      sequence = excluded.sequence,
                      ttl_secs = excluded.ttl_secs,
+                     expires_at_unix = excluded.expires_at_unix,
                      value = excluded.value,
                      signature = excluded.signature,
                      signer_algo = excluded.signer_algo,
                      signer_pubkey = excluded.signer_pubkey",
             )
             .map_err(sqlite_err)?;
-        stmt.execute(params![
-            &record.key[..],
-            &record.signer[..],
-            record.record_type,
-            record.sequence,
-            record.ttl_secs,
-            &record.value,
-            &record.signature,
-            record.signer_algo,
-            &record.signer_pubkey,
-        ])
-        .map_err(sqlite_err)?;
-        Ok(())
+            stmt.execute(params![
+                &record.key[..],
+                &record.signer[..],
+                &record.fingerprint[..],
+                record.record_type,
+                record.sequence,
+                record.ttl_secs,
+                record.expires_at_unix,
+                &record.value,
+                &record.signature,
+                record.signer_algo,
+                &record.signer_pubkey,
+            ])
+            .map_err(sqlite_err)?;
+            Ok(())
+        })();
+        if result.is_ok() {
+            conn.execute_batch("COMMIT").map_err(sqlite_err)?;
+        } else {
+            let _ = conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     pub fn delete_dht_record(&self, key: &[u8; 64], signer: &[u8; 32]) -> Result<()> {
@@ -404,7 +441,17 @@ impl StateDb {
         let mut stmt = conn
             .prepare_cached("DELETE FROM dht_records WHERE key = ?1 AND signer = ?2")
             .map_err(sqlite_err)?;
-        stmt.execute(params![&key[..], &signer[..]]).map_err(sqlite_err)?;
+        stmt.execute(params![&key[..], &signer[..]])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    pub fn delete_expired_dht_records(&self) -> Result<()> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare_cached("DELETE FROM dht_records WHERE expires_at_unix <= ?1")
+            .map_err(sqlite_err)?;
+        stmt.execute(params![unix_now_secs()]).map_err(sqlite_err)?;
         Ok(())
     }
 
@@ -427,12 +474,10 @@ impl StateDb {
             .map_err(sqlite_err)?
             .execute(params![identity, label, publish as i32])
             .map_err(sqlite_err)?;
-            conn.prepare_cached(
-                "DELETE FROM tns_records WHERE identity = ?1 AND label = ?2",
-            )
-            .map_err(sqlite_err)?
-            .execute(params![identity, label])
-            .map_err(sqlite_err)?;
+            conn.prepare_cached("DELETE FROM tns_records WHERE identity = ?1 AND label = ?2")
+                .map_err(sqlite_err)?
+                .execute(params![identity, label])
+                .map_err(sqlite_err)?;
             let mut ins = conn
                 .prepare_cached(
                     "INSERT INTO tns_records(identity, label, record) VALUES(?1, ?2, ?3)",
@@ -456,9 +501,7 @@ impl StateDb {
         let conn = self.lock()?;
         let publish: Option<bool> = {
             let mut stmt = conn
-                .prepare_cached(
-                    "SELECT publish FROM tns_labels WHERE identity = ?1 AND label = ?2",
-                )
+                .prepare_cached("SELECT publish FROM tns_labels WHERE identity = ?1 AND label = ?2")
                 .map_err(sqlite_err)?;
             stmt.query_row(params![identity, label], |row| {
                 let v: i32 = row.get(0)?;
@@ -546,6 +589,144 @@ fn sqlite_err(err: rusqlite::Error) -> Error {
     Error::Protocol(format!("sqlite error: {}", err))
 }
 
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn dht_record_fingerprint(record: &DhtRecord) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(record.key.as_bytes());
+    h.update(&[record.record_type.as_u8()]);
+    h.update(&record.sequence.to_be_bytes());
+    h.update(&record.signer);
+    h.update(&record.value);
+    *h.finalize().as_bytes()
+}
+
+fn persisted_record_fingerprint(
+    key: &[u8; 64],
+    record_type: u8,
+    sequence: u64,
+    signer: &[u8; 32],
+    value: &[u8],
+) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(key);
+    h.update(&[record_type]);
+    h.update(&sequence.to_be_bytes());
+    h.update(signer);
+    h.update(value);
+    *h.finalize().as_bytes()
+}
+
+fn migrate_dht_records_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(dht_records)")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_fingerprint = columns.iter().any(|c| c == "fingerprint");
+    let has_expires_at = columns.iter().any(|c| c == "expires_at_unix");
+    if has_fingerprint && has_expires_at {
+        return Ok(());
+    }
+
+    let now = unix_now_secs();
+    conn.execute_batch("BEGIN")?;
+    let result = (|| {
+        conn.execute_batch(
+            "ALTER TABLE dht_records RENAME TO dht_records_old;
+             CREATE TABLE dht_records (
+                 key BLOB NOT NULL,
+                 signer BLOB NOT NULL,
+                 fingerprint BLOB NOT NULL,
+                 record_type INTEGER NOT NULL,
+                 sequence INTEGER NOT NULL,
+                 ttl_secs INTEGER NOT NULL,
+                 expires_at_unix INTEGER NOT NULL,
+                 value BLOB NOT NULL,
+                 signature BLOB NOT NULL,
+                 signer_algo INTEGER NOT NULL,
+                 signer_pubkey BLOB NOT NULL,
+                 PRIMARY KEY (key, signer, fingerprint)
+             );",
+        )?;
+
+        let mut select = conn.prepare(
+            "SELECT key, signer, record_type, sequence, ttl_secs, value,
+                    signature, signer_algo, signer_pubkey
+             FROM dht_records_old",
+        )?;
+        let rows = select.query_map([], |row| {
+            let key = vec_to_array::<64>(row.get::<_, Vec<u8>>(0)?)?;
+            let signer = vec_to_array::<32>(row.get::<_, Vec<u8>>(1)?)?;
+            let record_type: u8 = row.get(2)?;
+            let sequence: u64 = row.get(3)?;
+            let ttl_secs: u64 = row.get(4)?;
+            let value: Vec<u8> = row.get(5)?;
+            let signature: Vec<u8> = row.get(6)?;
+            let signer_algo: u8 = row.get(7)?;
+            let signer_pubkey: Vec<u8> = row.get(8)?;
+            let fingerprint =
+                persisted_record_fingerprint(&key, record_type, sequence, &signer, &value);
+            Ok(PersistedRecord {
+                key,
+                signer,
+                fingerprint,
+                record_type,
+                sequence,
+                ttl_secs,
+                expires_at_unix: now.saturating_add(ttl_secs.max(1)),
+                value,
+                signature,
+                signer_algo,
+                signer_pubkey,
+            })
+        })?;
+        let records = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(select);
+
+        for record in records {
+            if RecordType::from_u8(record.record_type) != RecordType::Content {
+                conn.execute(
+                    "DELETE FROM dht_records WHERE key = ?1 AND signer = ?2",
+                    params![&record.key[..], &record.signer[..]],
+                )?;
+            }
+            conn.execute(
+                "INSERT INTO dht_records(key, signer, fingerprint, record_type, sequence,
+                                         ttl_secs, expires_at_unix, value, signature,
+                                         signer_algo, signer_pubkey)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    &record.key[..],
+                    &record.signer[..],
+                    &record.fingerprint[..],
+                    record.record_type,
+                    record.sequence,
+                    record.ttl_secs,
+                    record.expires_at_unix,
+                    &record.value,
+                    &record.signature,
+                    record.signer_algo,
+                    &record.signer_pubkey,
+                ],
+            )?;
+        }
+
+        conn.execute_batch("DROP TABLE dht_records_old")?;
+        Ok(())
+    })();
+    if result.is_ok() {
+        conn.execute_batch("COMMIT")?;
+    } else {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
 fn vec_to_array<const N: usize>(value: Vec<u8>) -> rusqlite::Result<[u8; N]> {
     if value.len() != N {
         return Err(rusqlite::Error::FromSqlConversionFailure(
@@ -602,6 +783,14 @@ mod tests {
             sequence: 3,
             signer: [2u8; 32],
             ttl_secs: 42,
+            expires_at_unix: unix_now_secs() + 42,
+            fingerprint: persisted_record_fingerprint(
+                &[1u8; 64],
+                RecordType::SignedContent.as_u8(),
+                3,
+                &[2u8; 32],
+                b"value",
+            ),
             value: b"value".to_vec(),
             signature: vec![3u8; 64],
             signer_algo: 1,
@@ -641,6 +830,8 @@ mod tests {
             sequence: 1,
             signer: [2u8; 32],
             ttl_secs: 100,
+            expires_at_unix: unix_now_secs() + 100,
+            fingerprint: persisted_record_fingerprint(&[1u8; 64], 1, 1, &[2u8; 32], b"v1"),
             value: b"v1".to_vec(),
             signature: vec![0; 64],
             signer_algo: 1,
@@ -651,6 +842,13 @@ mod tests {
         // Upsert same key+signer with new sequence
         let updated = PersistedRecord {
             sequence: 2,
+            fingerprint: persisted_record_fingerprint(
+                &record.key,
+                record.record_type,
+                2,
+                &record.signer,
+                b"v2",
+            ),
             value: b"v2".to_vec(),
             ..record.clone()
         };
@@ -664,6 +862,74 @@ mod tests {
         db.delete_dht_record(&record.key, &record.signer).unwrap();
         assert!(db.load_dht_records().unwrap().is_empty());
 
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dht_content_records_persist_multiple_candidates() {
+        let path = temp_db_path("dht-content-candidates");
+        let db = StateDb::open(&path).unwrap();
+        let key = [9u8; 64];
+        let signer = [0u8; 32];
+
+        for (seq, value) in [(0u64, b"first".to_vec()), (0u64, b"second".to_vec())] {
+            let record = PersistedRecord {
+                key,
+                record_type: RecordType::Content.as_u8(),
+                sequence: seq,
+                signer,
+                ttl_secs: 100,
+                expires_at_unix: unix_now_secs() + 100,
+                fingerprint: persisted_record_fingerprint(
+                    &key,
+                    RecordType::Content.as_u8(),
+                    seq,
+                    &signer,
+                    &value,
+                ),
+                value,
+                signature: Vec::new(),
+                signer_algo: 0,
+                signer_pubkey: Vec::new(),
+            };
+            db.upsert_dht_record(&record).unwrap();
+        }
+
+        let loaded = db.load_dht_records().unwrap();
+        assert_eq!(loaded.len(), 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn dht_expired_records_not_loaded() {
+        let path = temp_db_path("dht-expired");
+        let db = StateDb::open(&path).unwrap();
+        let key = [7u8; 64];
+        let signer = [8u8; 32];
+        let record = PersistedRecord {
+            key,
+            record_type: RecordType::Content.as_u8(),
+            sequence: 0,
+            signer,
+            ttl_secs: 1,
+            expires_at_unix: unix_now_secs().saturating_sub(1),
+            fingerprint: persisted_record_fingerprint(
+                &key,
+                RecordType::Content.as_u8(),
+                0,
+                &signer,
+                b"expired",
+            ),
+            value: b"expired".to_vec(),
+            signature: Vec::new(),
+            signer_algo: 0,
+            signer_pubkey: Vec::new(),
+        };
+        db.upsert_dht_record(&record).unwrap();
+
+        assert!(db.load_dht_records().unwrap().is_empty());
+        db.delete_expired_dht_records().unwrap();
+        assert!(db.load_dht_records().unwrap().is_empty());
         cleanup(&path);
     }
 
@@ -756,7 +1022,7 @@ mod tests {
         db.upsert_dht_record(&persisted).unwrap();
 
         let loaded_records = db.load_dht_records().unwrap();
-        let loaded = loaded_records[0].clone().into_live();
+        let loaded = loaded_records[0].clone().into_live().unwrap();
 
         let forwarded_put = DhtPutMsg {
             key: *loaded.key.as_bytes(),
