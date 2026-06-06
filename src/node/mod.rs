@@ -211,6 +211,15 @@ const HIDDEN_SERVICE_REPUBLISH_AFTER: Duration = Duration::from_secs(480);
 /// while a crashed node's claims still expire promptly. See `project_resource_pool`.
 const POOL_CLAIM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
+/// TTL for republished TNS zone labels, and how often we republish them. Owned
+/// published labels are soft state: the DHT now honours TTL (a record ages to a
+/// single deadline regardless of replication), so a name persists only while its
+/// owner keeps republishing. Refresh at half the TTL so one missed round still
+/// leaves the record live, mirroring hello/peer/intro maintenance; when the owner
+/// stops (or removes the label) the name expires within one TTL.
+const TNS_REPUBLISH_TTL: u32 = 3600;
+const TNS_REPUBLISH_INTERVAL: Duration = Duration::from_secs(1800);
+
 /// Rendezvous point state entry.
 pub(crate) struct RendezvousEntry {
     client_circuit_id: u32,
@@ -968,6 +977,23 @@ impl Node {
                 loop {
                     interval.tick().await;
                     node.maintain_peer_records().await;
+                }
+            });
+        }
+
+        // TNS zone maintenance: republish owned, published labels before their TTL
+        // so names persist while the owner runs and expire within one TTL after it
+        // stops (now that the DHT honours record TTL).
+        {
+            let node = self.clone();
+            tokio::spawn(async move {
+                // Wait for bootstrap to settle before first publish
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                node.maintain_tns_zones().await;
+                let mut interval = jittered_interval(TNS_REPUBLISH_INTERVAL);
+                loop {
+                    interval.tick().await;
+                    node.maintain_tns_zones().await;
                 }
             });
         }
@@ -2347,11 +2373,28 @@ impl Node {
                 let mut get = DhtGetMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(get.key);
 
-                // Record query_token → previous_hop for anonymous reply routing
-                self.query_tokens
-                    .lock()
-                    .await
-                    .insert(get.query_token, (from, Instant::now()));
+                // Reverse-path forwarding with first-writer-wins dedup. The
+                // first neighbor to deliver a given query_token becomes this
+                // node's parent on the reply tree, and we answer + relay the
+                // query exactly once. Later duplicate arrivals of the same
+                // flood are dropped here. Without this, a query re-floods on
+                // every arrival (O(degree) amplification per node) and a reply
+                // can ping-pong forever between two nodes that each recorded
+                // the other as previous hop. Because a node only forwards
+                // *after* it has received, it can never be its own forwarder's
+                // parent, so the parent graph is an acyclic tree rooted at the
+                // originator — replies walk it back without a loop bound.
+                let first_arrival =
+                    match self.query_tokens.lock().await.entry(get.query_token) {
+                        std::collections::hash_map::Entry::Occupied(_) => false,
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert((from, Instant::now()));
+                            true
+                        }
+                    };
+                if !first_arrival {
+                    return Ok(());
+                }
 
                 // Respond with local records, routed back via query_token
                 let store = self.dht_store.lock().await;
@@ -2377,13 +2420,8 @@ impl Node {
                         .await?;
                 }
 
-                // Forward GET to other peers if hop limit allows.
-                // Use query_token dedup: we just inserted (from, now) above;
-                // if the token was already present with a DIFFERENT previous_hop,
-                // that means we already forwarded this GET from another neighbor.
-                // (The insert above overwrites, so check before inserting.)
-                // Note: the insertion on line above always happens (for reply routing),
-                // so we track forwarding separately via bloom membership.
+                // Forward the GET onward (exactly once — duplicate arrivals
+                // already returned above) if the hop budget allows.
                 if get.hop_limit > 0 {
                     get.hop_limit -= 1;
                     let old_bloom = get.bloom;

@@ -537,6 +537,81 @@ impl Node {
         }
     }
 
+    /// Re-publish every owned, published TNS zone label so names stay resolvable.
+    ///
+    /// TNS zones are published once by the operator (via `tns_set_label` /
+    /// `tns_publish`); the label DB (`publish = true`) is the durable source of
+    /// truth, while the DHT copy is soft state that now honours its TTL. Without
+    /// this loop a name would resolve only for one TTL and then vanish — the old
+    /// behaviour where it lived forever was an artifact of replication resetting
+    /// the record clock, not a design feature. Mirrors `maintain_peer_records`:
+    /// each round re-mints with a fresh sequence (so it supersedes the prior
+    /// copy) and a full TTL; stopping the daemon — or removing the label — lets
+    /// the name expire within one TTL.
+    pub(super) async fn maintain_tns_zones(&self) {
+        let Some(db) = self.db.clone() else { return };
+
+        if self.connected_peers().await.is_empty() {
+            log::debug!("maintain_tns_zones: no peers, skipping");
+            return;
+        }
+
+        // Snapshot (identity label, owned keypair) pairs up front so we hold the
+        // identity_store lock only briefly — not across the DB reads / async
+        // publishes below. The label DB is keyed by the identity's label, which
+        // is exactly what `identity_store.list()` yields.
+        let identities: Vec<(String, crate::identity::Keypair)> = {
+            let is = self.identity_store.lock().await;
+            is.list()
+                .into_iter()
+                .filter_map(|(label, sid, ..)| {
+                    is.keypair_for(&sid).map(|kp| {
+                        (
+                            label,
+                            crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes())
+                                .expect("round-trip of a stored keypair"),
+                        )
+                    })
+                })
+                .collect()
+        };
+
+        let mut republished = 0usize;
+        for (id_label, keypair) in &identities {
+            let labels = match db.label_list(id_label) {
+                Ok(labels) => labels,
+                Err(e) => {
+                    log::warn!("maintain_tns_zones: label_list({}) failed: {}", id_label, e);
+                    continue;
+                }
+            };
+            for (label, blobs, publish) in labels {
+                if !publish {
+                    continue;
+                }
+                let records: Vec<crate::tns::TnsRecord> = blobs
+                    .iter()
+                    .filter_map(|b| crate::tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
+                    .collect();
+                if records.is_empty() {
+                    continue;
+                }
+                match crate::tns::publish(self, keypair, &label, &records, TNS_REPUBLISH_TTL).await {
+                    Ok(()) => republished += 1,
+                    Err(e) => log::warn!(
+                        "maintain_tns_zones: republish {}/{} failed: {}",
+                        id_label,
+                        label,
+                        e
+                    ),
+                }
+            }
+        }
+        if republished > 0 {
+            log::debug!("Republished {} TNS label(s)", republished);
+        }
+    }
+
     /// Scan identity_store for all Hidden identities and ensure each has
     /// active intro points. Re-publishes if approaching TTL expiry or if
     /// intro circuits have failed.

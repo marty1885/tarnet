@@ -1324,7 +1324,14 @@ async fn link_backpressure_drops_cells() {
     let total: usize = 20_000;
     let payload = vec![0xCCu8; 1000];
 
-    let deadline = tokio::time::timeout(Duration::from_secs(5), async {
+    // The deadline guards against a *hang* (send_message blocking forever on a
+    // full queue), not throughput. It is deliberately generous: each cell pays
+    // a full XChaCha20-Poly1305 seal, which is ~9x slower in an unoptimized
+    // debug build (~0.6s for the whole blast in release, ~5.4s in debug), so a
+    // tight bound would flag steady-but-slow progress as a block. A true block
+    // never makes progress and trips any deadline; this one only needs to clear
+    // honest debug-build crypto cost.
+    let deadline = tokio::time::timeout(Duration::from_secs(20), async {
         for _ in 0..total {
             link_a.send_message(&payload).await.unwrap();
         }

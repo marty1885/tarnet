@@ -12,9 +12,10 @@ pub(super) fn blake3_hash_64(input: &[u8]) -> [u8; 64] {
 
 impl Node {
     /// Forward a DHT message to targeted peers using R5N-style hybrid routing:
-    /// random walk for the first l2nse hops, then greedy convergence toward the key.
-    /// Advisory bloom is respected for non-critical peers but overridden for
-    /// k-closest to resist bloom-stuffing attacks.
+    /// a short random-walk prefix (`params.random_hops`) for originator
+    /// decorrelation, then greedy convergence toward the key. Advisory bloom is
+    /// respected for non-critical peers but overridden for k-closest to resist
+    /// bloom-stuffing attacks.
     pub(super) async fn dht_forward(
         &self,
         key: &DhtId,
@@ -31,7 +32,7 @@ impl Node {
         drop(kb);
 
         let params = DhtQueryParams::from_l2nse(l2nse);
-        let targets = if hop_count < (l2nse.round().min(255.0) as u8) {
+        let targets = if hop_count < params.random_hops {
             random_select(&all_peers, params.fan_out)
         } else {
             probabilistic_select(key, &all_peers, params.fan_out)

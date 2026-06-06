@@ -24,6 +24,18 @@ pub const DHT_K: usize = 20;
 /// Maximum entries per k-bucket.
 pub const KBUCKET_SIZE: usize = 20;
 
+/// Hops a query random-walks before switching to greedy convergence.
+///
+/// Kept deliberately small and constant: its only job is to decorrelate a
+/// query from its originator (the R5N anonymity property). It is *not* a
+/// coverage mechanism — greedy convergence reaches the k-closest, and
+/// forward-once dedup bounds the cost. The earlier design random-walked for
+/// ~L2NSE hops and left only ~2 for convergence, which never actually
+/// converged; it worked only because forwarding was undeduplicated and the
+/// query flooded. Now that each node relays a query at most once, the budget
+/// must fund real convergence, so the random prefix shrinks to this constant.
+pub const RANDOM_WALK_HOPS: u8 = 2;
+
 /// Application-tunable parameters for DHT queries.
 #[derive(Debug, Clone, Copy)]
 pub struct DhtQueryParams {
@@ -31,6 +43,10 @@ pub struct DhtQueryParams {
     pub hop_limit: u8,
     /// Number of peers to forward to at each hop.
     pub fan_out: usize,
+    /// Hops of random walk before greedy convergence kicks in. Must match the
+    /// threshold the forwarder uses, so it travels in the params rather than
+    /// being recomputed from L2NSE at each site (where it could drift).
+    pub random_hops: u8,
 }
 
 impl Default for DhtQueryParams {
@@ -38,6 +54,7 @@ impl Default for DhtQueryParams {
         Self {
             hop_limit: 10,
             fan_out: DHT_K,
+            random_hops: RANDOM_WALK_HOPS,
         }
     }
 }
@@ -45,10 +62,17 @@ impl Default for DhtQueryParams {
 impl DhtQueryParams {
     /// Compute query parameters from an L2NSE (log₂ network size estimate).
     ///
-    /// - `hop_limit`: L2NSE + 2, floored at 4, capped at 20.
-    /// - `fan_out`: DHT_K for small networks, scales up slowly for large ones.
+    /// The hop budget is `random_hops + greedy_hops`: a short fixed random
+    /// prefix ([`RANDOM_WALK_HOPS`]) for originator decorrelation, then ~L2NSE
+    /// greedy hops — the depth a recursive lookup needs to converge on the
+    /// k-closest. `fan_out` is DHT_K for small networks and scales up slowly
+    /// for large ones.
     pub fn from_l2nse(l2nse: f64) -> Self {
-        let hop_limit = (l2nse + 2.0).round().clamp(4.0, 20.0) as u8;
+        let random_hops = RANDOM_WALK_HOPS;
+        // Greedy convergence needs ~log₂(N) = L2NSE hops; clamp so tiny
+        // networks still get a couple and huge ones stay within a u8 budget.
+        let greedy_hops = l2nse.ceil().clamp(2.0, 22.0);
+        let hop_limit = (random_hops as f64 + greedy_hops).clamp(4.0, 24.0) as u8;
         let fan_out = if l2nse < 5.0 {
             DHT_K
         } else {
@@ -56,7 +80,11 @@ impl DhtQueryParams {
                 .round()
                 .clamp(DHT_K as f64, (DHT_K * 2) as f64) as usize
         };
-        Self { hop_limit, fan_out }
+        Self {
+            hop_limit,
+            fan_out,
+            random_hops,
+        }
     }
 }
 
@@ -100,8 +128,18 @@ impl DhtRecord {
     /// Build a wire `DhtPutMsg` to (re)propagate this stored record, with the
     /// originator seeded into the bloom filter. Same guarantee as
     /// [`to_response_record`](Self::to_response_record): all signed fields are
-    /// copied, never re-derived or omitted. Carries the full stored `ttl`
-    /// (matching the existing replication / link-up propagation behavior).
+    /// copied, never re-derived or omitted.
+    ///
+    /// Carries the *remaining* TTL, not the full original — exactly like
+    /// [`to_response_record`](Self::to_response_record). Propagating the full
+    /// TTL let replication resurrect a record's clock on every hop: each
+    /// `SignedContent` round (which replaces on equal sequence) reset
+    /// `stored_at`, so k-closest holders mutually refreshed a record to full
+    /// life every replication interval and it never expired — outliving the
+    /// publisher. With remaining TTL, a record ages toward a single fixed
+    /// deadline no matter how many times it is replicated; it stays alive for
+    /// exactly its TTL and then expires unless the owner republishes (pool
+    /// lease refresh, hello/peer/intro maintenance, TNS republish).
     pub fn to_put_msg(&self, originator: &PeerId, hop_limit: u8) -> crate::wire::DhtPutMsg {
         let mut bloom = BloomFilter::new();
         bloom.insert(originator);
@@ -110,7 +148,7 @@ impl DhtRecord {
             record_type: self.record_type,
             sequence: self.sequence,
             signer: self.signer,
-            ttl: self.ttl.as_secs() as u32,
+            ttl: self.remaining_ttl().as_secs() as u32,
             value: self.value.clone(),
             signature: self.signature.clone(),
             signer_algo: self.signer_algo,
@@ -1366,6 +1404,30 @@ mod tests {
         assert_eq!(
             put.signable_bytes(),
             record_signable(&put.key, put.record_type, put.sequence, &put.value)
+        );
+    }
+
+    #[test]
+    fn to_put_msg_carries_remaining_not_full_ttl() {
+        // Immortality guard: replication propagates a record via to_put_msg, and
+        // the receiver stores it with stored_at = now. If the PUT carried the
+        // *full* original TTL, every replication round would reset the record's
+        // clock and (for SignedContent, which replaces on equal sequence) it
+        // would never expire — outliving its publisher. The PUT must carry the
+        // remaining TTL so the record ages toward one fixed deadline regardless
+        // of how many times it is replicated.
+        let kp = Keypair::generate();
+        let mut rec = signed_record(&kp, DhtId([0x0C; 64]), RecordType::SignedContent, 1, b"v".to_vec());
+        rec.ttl = Duration::from_secs(100);
+        rec.stored_at = Instant::now() - Duration::from_secs(60);
+
+        let put = rec.to_put_msg(&PeerId([0x88; 32]), 5);
+        // ~40s remaining, never the full 100s. Allow a second of slack for the
+        // elapsed() call between construction and measurement.
+        assert!(
+            (38..=41).contains(&put.ttl),
+            "expected ~40s remaining TTL, got {}",
+            put.ttl
         );
     }
 
