@@ -965,7 +965,13 @@ impl DhtGetResponseMsg {
 }
 
 /// TunnelKeyExchange: kem_algo(1) || eph_pk_len(2 BE) || eph_pk(variable) || initiator_peer_id(32) || nonce(32) || timestamp(u64 BE)
+///   || signer_algo(1) || signer_pk_len(2 BE) || signer_pubkey(variable) || sig_len(2 BE) || signature(variable)
 /// Routed via DataMsg envelope (origin, destination, TTL).
+///
+/// The signature binds the ephemeral KEM offer to the initiator's static
+/// identity and to the intended responder (`destination`), so an on-path relay
+/// cannot substitute its own ephemeral key to mount a man-in-the-middle attack.
+/// See [`tunnel_kex_signed_bytes`].
 #[derive(Debug, Clone)]
 pub struct TunnelKeyExchangeMsg {
     pub kem_algo: u8,
@@ -973,9 +979,26 @@ pub struct TunnelKeyExchangeMsg {
     pub initiator_peer_id: PeerId,
     pub nonce: [u8; 32],
     pub timestamp: u64,
+    pub signer_algo: u8,
+    pub signer_pubkey: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 impl TunnelKeyExchangeMsg {
+    /// Bytes the initiator signs (and the responder verifies). Binds the
+    /// ephemeral KEM pubkey to the initiator identity and the intended
+    /// responder so a relay cannot redirect or MITM the exchange.
+    pub fn signed_bytes(&self, destination: &PeerId) -> Vec<u8> {
+        tunnel_kex_signed_bytes(
+            destination,
+            self.kem_algo,
+            &self.ephemeral_pubkey,
+            &self.initiator_peer_id,
+            &self.nonce,
+            self.timestamp,
+        )
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let pk_len = self.ephemeral_pubkey.len() as u16;
         let mut buf = Vec::with_capacity(3 + self.ephemeral_pubkey.len() + 72);
@@ -985,6 +1008,11 @@ impl TunnelKeyExchangeMsg {
         buf.extend_from_slice(self.initiator_peer_id.as_bytes());
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.push(self.signer_algo);
+        buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signer_pubkey);
+        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signature);
         buf
     }
 
@@ -1002,12 +1030,20 @@ impl TunnelKeyExchangeMsg {
         let initiator = r.read_array::<32>()?;
         let nonce = r.read_array::<32>()?;
         let timestamp = r.read_u64()?;
+        let signer_algo = r.read_u8()?;
+        let signer_pk_len = r.read_u16()? as usize;
+        let signer_pubkey = r.read_bytes(signer_pk_len)?.to_vec();
+        let sig_len = r.read_u16()? as usize;
+        let signature = r.read_bytes(sig_len)?.to_vec();
         Ok(Self {
             kem_algo,
             ephemeral_pubkey,
             initiator_peer_id: PeerId(initiator),
             nonce,
             timestamp,
+            signer_algo,
+            signer_pubkey,
+            signature,
         })
     }
 
@@ -1016,8 +1052,39 @@ impl TunnelKeyExchangeMsg {
     }
 }
 
+/// Canonical bytes signed by the initiator of a tunnel key exchange.
+///
+/// Length-prefixes the variable-length ephemeral pubkey so no two distinct
+/// field sets can produce the same transcript. The `destination` binds the
+/// offer to one responder; the responder verifies with its own PeerId.
+pub fn tunnel_kex_signed_bytes(
+    destination: &PeerId,
+    kem_algo: u8,
+    ephemeral_pubkey: &[u8],
+    initiator_peer_id: &PeerId,
+    nonce: &[u8; 32],
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20 + 32 + 1 + 2 + ephemeral_pubkey.len() + 32 + 32 + 8);
+    buf.extend_from_slice(b"tarnet tunnel kex v1");
+    buf.extend_from_slice(destination.as_bytes());
+    buf.push(kem_algo);
+    buf.extend_from_slice(&(ephemeral_pubkey.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ephemeral_pubkey);
+    buf.extend_from_slice(initiator_peer_id.as_bytes());
+    buf.extend_from_slice(nonce);
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf
+}
+
 /// TunnelKeyResponse: kem_algo(1) || ct_len(2 BE) || ciphertext(variable) || responder_peer_id(32) || nonce(32) || initiator_nonce(32) || timestamp(u64 BE)
+///   || signer_algo(1) || signer_pk_len(2 BE) || signer_pubkey(variable) || sig_len(2 BE) || signature(variable)
 /// Echoes back the initiator's nonce to bind the exchange.
+///
+/// The signature binds the KEM ciphertext to the responder's static identity
+/// and to the initiator's *original* ephemeral pubkey. The initiator verifies
+/// using the ephemeral key it actually sent, so a relay that substituted a
+/// different ephemeral key is detected. See [`tunnel_kex_resp_signed_bytes`].
 #[derive(Debug, Clone)]
 pub struct TunnelKeyResponseMsg {
     pub kem_algo: u8,
@@ -1026,9 +1093,29 @@ pub struct TunnelKeyResponseMsg {
     pub nonce: [u8; 32],
     pub initiator_nonce: [u8; 32],
     pub timestamp: u64,
+    pub signer_algo: u8,
+    pub signer_pubkey: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 impl TunnelKeyResponseMsg {
+    /// Bytes the responder signs (and the initiator verifies). `ephemeral_pubkey`
+    /// is the initiator's offered KEM key — the responder supplies what it
+    /// received, the initiator supplies what it sent; a mismatch (relay
+    /// substitution) makes verification fail.
+    pub fn signed_bytes(&self, initiator_peer_id: &PeerId, ephemeral_pubkey: &[u8]) -> Vec<u8> {
+        tunnel_kex_resp_signed_bytes(
+            initiator_peer_id,
+            &self.responder_peer_id,
+            self.kem_algo,
+            ephemeral_pubkey,
+            &self.ciphertext,
+            &self.initiator_nonce,
+            &self.nonce,
+            self.timestamp,
+        )
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let ct_len = self.ciphertext.len() as u16;
         let mut buf = Vec::with_capacity(3 + self.ciphertext.len() + 104);
@@ -1039,6 +1126,11 @@ impl TunnelKeyResponseMsg {
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.initiator_nonce);
         buf.extend_from_slice(&self.timestamp.to_be_bytes());
+        buf.push(self.signer_algo);
+        buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signer_pubkey);
+        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signature);
         buf
     }
 
@@ -1057,6 +1149,11 @@ impl TunnelKeyResponseMsg {
         let nonce = r.read_array::<32>()?;
         let initiator_nonce = r.read_array::<32>()?;
         let timestamp = r.read_u64()?;
+        let signer_algo = r.read_u8()?;
+        let signer_pk_len = r.read_u16()? as usize;
+        let signer_pubkey = r.read_bytes(signer_pk_len)?.to_vec();
+        let sig_len = r.read_u16()? as usize;
+        let signature = r.read_bytes(sig_len)?.to_vec();
         Ok(Self {
             kem_algo,
             ciphertext,
@@ -1064,12 +1161,48 @@ impl TunnelKeyResponseMsg {
             nonce,
             initiator_nonce,
             timestamp,
+            signer_algo,
+            signer_pubkey,
+            signature,
         })
     }
 
     pub fn to_wire(&self) -> WireMessage {
         WireMessage::new(MessageType::TunnelKeyResponse, self.to_bytes())
     }
+}
+
+/// Canonical bytes signed by the responder of a tunnel key exchange.
+///
+/// Length-prefixes the variable-length ephemeral pubkey and ciphertext so no
+/// two distinct field sets collide. Binds the ciphertext to both identities and
+/// to the initiator's original ephemeral key.
+#[allow(clippy::too_many_arguments)]
+pub fn tunnel_kex_resp_signed_bytes(
+    initiator_peer_id: &PeerId,
+    responder_peer_id: &PeerId,
+    kem_algo: u8,
+    ephemeral_pubkey: &[u8],
+    ciphertext: &[u8],
+    initiator_nonce: &[u8; 32],
+    responder_nonce: &[u8; 32],
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        25 + 32 + 32 + 1 + 2 + ephemeral_pubkey.len() + 2 + ciphertext.len() + 32 + 32 + 8,
+    );
+    buf.extend_from_slice(b"tarnet tunnel kex-resp v1");
+    buf.extend_from_slice(initiator_peer_id.as_bytes());
+    buf.extend_from_slice(responder_peer_id.as_bytes());
+    buf.push(kem_algo);
+    buf.extend_from_slice(&(ephemeral_pubkey.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ephemeral_pubkey);
+    buf.extend_from_slice(&(ciphertext.len() as u16).to_be_bytes());
+    buf.extend_from_slice(ciphertext);
+    buf.extend_from_slice(initiator_nonce);
+    buf.extend_from_slice(responder_nonce);
+    buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf
 }
 
 /// Data / EncryptedData: overlay-routed message.
@@ -2061,6 +2194,9 @@ mod tests {
             initiator_peer_id: PeerId([0x22; 32]),
             nonce: [0x33; 32],
             timestamp: 1234567890,
+            signer_algo: 0x01,
+            signer_pubkey: vec![0x44; 32],
+            signature: vec![0x55; 64],
         };
         let bytes = ke.to_bytes();
         let decoded = TunnelKeyExchangeMsg::from_bytes(&bytes).unwrap();
@@ -2069,6 +2205,9 @@ mod tests {
         assert_eq!(decoded.initiator_peer_id, PeerId([0x22; 32]));
         assert_eq!(decoded.nonce, [0x33; 32]);
         assert_eq!(decoded.timestamp, 1234567890);
+        assert_eq!(decoded.signer_algo, 0x01);
+        assert_eq!(decoded.signer_pubkey, vec![0x44; 32]);
+        assert_eq!(decoded.signature, vec![0x55; 64]);
     }
 
     #[test]
@@ -2080,6 +2219,9 @@ mod tests {
             nonce: [0xCC; 32],
             initiator_nonce: [0xDD; 32],
             timestamp: 9876543210,
+            signer_algo: 0x01,
+            signer_pubkey: vec![0xEE; 32],
+            signature: vec![0xFF; 64],
         };
         let bytes = kr.to_bytes();
         let decoded = TunnelKeyResponseMsg::from_bytes(&bytes).unwrap();
@@ -2089,6 +2231,130 @@ mod tests {
         assert_eq!(decoded.nonce, [0xCC; 32]);
         assert_eq!(decoded.initiator_nonce, [0xDD; 32]);
         assert_eq!(decoded.timestamp, 9876543210);
+        assert_eq!(decoded.signer_algo, 0x01);
+        assert_eq!(decoded.signer_pubkey, vec![0xEE; 32]);
+        assert_eq!(decoded.signature, vec![0xFF; 64]);
+    }
+
+    #[test]
+    fn tunnel_kex_signature_binds_ephemeral_and_identity() {
+        use crate::identity::{verify_with_pubkey, Keypair};
+        use tarnet_api::types::SigningAlgo;
+
+        let alice = Keypair::generate_ed25519(); // initiator
+        let bob = Keypair::generate_ed25519(); // responder
+        let mallory = Keypair::generate_ed25519(); // on-path relay
+
+        let alice_algo = SigningAlgo::Ed25519;
+        let eph_alice = vec![0xA1; 1216]; // Alice's genuine ephemeral KEM pubkey
+        let mut ke = TunnelKeyExchangeMsg {
+            kem_algo: 0x02,
+            ephemeral_pubkey: eph_alice.clone(),
+            initiator_peer_id: alice.peer_id(),
+            nonce: [0x33; 32],
+            timestamp: 1_000,
+            signer_algo: alice_algo as u8,
+            signer_pubkey: alice.identity.signing.signing_pubkey_bytes(),
+            signature: Vec::new(),
+        };
+        ke.signature = alice.sign(&ke.signed_bytes(&bob.peer_id()));
+
+        // Honest path: Bob verifies Alice's offer against his own PeerId.
+        assert!(
+            verify_with_pubkey(
+                alice_algo,
+                &ke.signer_pubkey,
+                &ke.initiator_peer_id,
+                &ke.signed_bytes(&bob.peer_id()),
+                &ke.signature,
+            ),
+            "genuine offer must verify"
+        );
+
+        // MITM #1: Mallory swaps the ephemeral key but leaves Alice's id+sig.
+        // Bob reconstructs the transcript with the swapped key → verify fails.
+        let mut swapped = ke.clone();
+        swapped.ephemeral_pubkey = vec![0xEE; 1216];
+        assert!(
+            !verify_with_pubkey(
+                alice_algo,
+                &swapped.signer_pubkey,
+                &swapped.initiator_peer_id,
+                &swapped.signed_bytes(&bob.peer_id()),
+                &swapped.signature,
+            ),
+            "ephemeral substitution must be rejected"
+        );
+
+        // MITM #2: Mallory re-signs with her own key but keeps Alice's PeerId.
+        // The PeerId↔pubkey binding in verify_with_pubkey rejects it.
+        let mut forged = ke.clone();
+        forged.signer_pubkey = mallory.identity.signing.signing_pubkey_bytes();
+        forged.signature = mallory.sign(&forged.signed_bytes(&bob.peer_id()));
+        assert!(
+            !verify_with_pubkey(
+                alice_algo,
+                &forged.signer_pubkey,
+                &forged.initiator_peer_id, // still claims to be Alice
+                &forged.signed_bytes(&bob.peer_id()),
+                &forged.signature,
+            ),
+            "impersonating Alice's PeerId with another key must be rejected"
+        );
+
+        // MITM #3: redirection — Bob's offer was meant for Bob, not Mallory.
+        // Verifying with Mallory's PeerId as the destination fails.
+        assert!(
+            !verify_with_pubkey(
+                alice_algo,
+                &ke.signer_pubkey,
+                &ke.initiator_peer_id,
+                &ke.signed_bytes(&mallory.peer_id()),
+                &ke.signature,
+            ),
+            "offer bound to Bob must not verify for a different responder"
+        );
+
+        // Response leg: Bob signs over the ephemeral key he received.
+        let mut kr = TunnelKeyResponseMsg {
+            kem_algo: 0x02,
+            ciphertext: vec![0xBB; 1120],
+            responder_peer_id: bob.peer_id(),
+            nonce: [0xCC; 32],
+            initiator_nonce: ke.nonce,
+            timestamp: 1_001,
+            signer_algo: alice_algo as u8,
+            signer_pubkey: bob.identity.signing.signing_pubkey_bytes(),
+            signature: Vec::new(),
+        };
+        kr.signature = bob.sign(&kr.signed_bytes(&alice.peer_id(), &eph_alice));
+
+        // Alice verifies using the ephemeral key SHE actually sent.
+        assert!(
+            verify_with_pubkey(
+                alice_algo,
+                &kr.signer_pubkey,
+                &bob.peer_id(),
+                &kr.signed_bytes(&alice.peer_id(), &eph_alice),
+                &kr.signature,
+            ),
+            "genuine response must verify"
+        );
+
+        // MITM on the response: Bob actually encapsulated to a swapped key, so
+        // he signs over that swapped key. Alice reconstructs with her real
+        // ephemeral key → verify fails, defeating the MITM.
+        let kr_swapped_sig = bob.sign(&kr.signed_bytes(&alice.peer_id(), &[0xEE; 1216]));
+        assert!(
+            !verify_with_pubkey(
+                alice_algo,
+                &kr.signer_pubkey,
+                &bob.peer_id(),
+                &kr.signed_bytes(&alice.peer_id(), &eph_alice),
+                &kr_swapped_sig,
+            ),
+            "response signed over a substituted ephemeral key must be rejected"
+        );
     }
 
     #[test]

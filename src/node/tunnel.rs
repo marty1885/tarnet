@@ -9,6 +9,33 @@ impl Node {
     ) -> Result<()> {
         let ke = TunnelKeyExchangeMsg::from_bytes(payload)?;
 
+        // Authenticate the offer before doing any other work (so a forged
+        // message can't even pollute the replay cache). The signature must bind
+        // the ephemeral KEM key to the claimed initiator identity and to us as
+        // the intended responder; otherwise an on-path relay could substitute
+        // its own ephemeral key and MITM the end-to-end tunnel.
+        let Ok(signer_algo) = tarnet_api::types::SigningAlgo::from_u8(ke.signer_algo) else {
+            log::warn!(
+                "TunnelKeyExchange from {:?}: unknown signer algo {}, rejecting",
+                ke.initiator_peer_id,
+                ke.signer_algo
+            );
+            return Ok(());
+        };
+        if !crate::identity::verify_with_pubkey(
+            signer_algo,
+            &ke.signer_pubkey,
+            &ke.initiator_peer_id,
+            &ke.signed_bytes(&self.peer_id()),
+            &ke.signature,
+        ) {
+            log::warn!(
+                "TunnelKeyExchange from {:?}: signature verification failed, rejecting",
+                ke.initiator_peer_id
+            );
+            return Ok(());
+        }
+
         // Check timestamp drift
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -59,14 +86,24 @@ impl Node {
         let mut resp_nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rng, &mut resp_nonce);
 
-        let response = TunnelKeyResponseMsg {
+        let mut response = TunnelKeyResponseMsg {
             kem_algo: ke.kem_algo,
             ciphertext: reply_ciphertext,
             responder_peer_id: self.peer_id(),
             nonce: resp_nonce,
             initiator_nonce: ke.nonce,
             timestamp: now,
+            signer_algo: self.identity.identity.signing_algo() as u8,
+            signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
+            signature: Vec::new(),
         };
+        // Authenticate the response: bind the KEM ciphertext to our static
+        // identity and to the initiator's *original* ephemeral key (the one we
+        // received). The initiator verifies against the key it actually sent, so
+        // a relay that swapped the ephemeral key is detected.
+        response.signature =
+            self.identity
+                .sign(&response.signed_bytes(&ke.initiator_peer_id, &ke.ephemeral_pubkey));
 
         // Send response back via routed DataMsg (not EncryptedData since tunnel isn't established on initiator yet)
         let msg = DataMsg {
@@ -107,6 +144,33 @@ impl Node {
                     "TunnelKeyResponse responder mismatch: expected {:?}, got {:?}",
                     dest,
                     kr.responder_peer_id
+                );
+                return Ok(());
+            }
+
+            // Authenticate the responder: the signature must bind the KEM
+            // ciphertext to the responder's static identity (which must hash to
+            // `dest`) and to the ephemeral key WE actually sent. A relay that
+            // substituted a different ephemeral key signed over that key and
+            // fails this check, so the MITM cannot complete the handshake.
+            let Ok(signer_algo) = tarnet_api::types::SigningAlgo::from_u8(kr.signer_algo) else {
+                log::warn!(
+                    "TunnelKeyResponse from {:?}: unknown signer algo {}, rejecting",
+                    dest,
+                    kr.signer_algo
+                );
+                return Ok(());
+            };
+            if !crate::identity::verify_with_pubkey(
+                signer_algo,
+                &kr.signer_pubkey,
+                &dest,
+                &kr.signed_bytes(&self.peer_id(), &kex.pubkey_bytes()),
+                &kr.signature,
+            ) {
+                log::warn!(
+                    "TunnelKeyResponse from {:?}: signature verification failed, rejecting",
+                    dest
                 );
                 return Ok(());
             }
@@ -411,13 +475,20 @@ impl Node {
             .unwrap_or_default()
             .as_secs();
 
-        let ke = TunnelKeyExchangeMsg {
+        let mut ke = TunnelKeyExchangeMsg {
             kem_algo: kex.algo_byte(),
             ephemeral_pubkey: kex.pubkey_bytes(),
             initiator_peer_id: self.peer_id(),
             nonce,
             timestamp,
+            signer_algo: self.identity.identity.signing_algo() as u8,
+            signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
+            signature: Vec::new(),
         };
+        // Authenticate the offer: bind the ephemeral KEM key to our static
+        // identity and to `dest` as the intended responder, so an on-path relay
+        // cannot substitute its own ephemeral key and MITM the tunnel.
+        ke.signature = self.identity.sign(&ke.signed_bytes(&dest));
 
         // Wrap in a DataMsg for routing
         let inner = ke.to_wire().encode();

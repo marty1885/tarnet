@@ -14,9 +14,10 @@ use crate::bootstrap;
 use crate::channel::Channel;
 use crate::circuit::{
     build_extend_payload, build_extended_payload, build_intro_register_payload,
-    build_introduce_payload, build_rendezvous_establish_payload, build_stream_begin_payload,
-    derive_hop_keys, parse_extend_payload, parse_extended_payload, parse_intro_register_payload,
-    parse_introduce_payload, parse_rendezvous_establish_payload, parse_rendezvous_join_payload,
+    build_introduce_cell, build_introduce_payload, build_rendezvous_establish_payload,
+    build_stream_begin_payload, derive_hop_keys, parse_extend_payload, parse_extended_payload,
+    parse_intro_register_payload, parse_introduce_cell, parse_introduce_payload,
+    parse_rendezvous_establish_payload, parse_rendezvous_join_payload,
     parse_stream_begin_payload, relay_cell_digest_for_sendme, write_cell_body, CircuitAction,
     CircuitKey, CircuitState as CircuitPhase, CircuitTable, CongestionWindow, CryptoOp, HopCrypto,
     HopKey, OutboundCircuit, RelayCell, RelayCellCommand, ReplayWindow, CELL_BODY_SIZE,

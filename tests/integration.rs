@@ -1201,6 +1201,136 @@ async fn hidden_service_rendezvous() {
     log::info!("Rendezvous e2e data exchange verified");
 }
 
+/// Regression test for the multi-hidden-service bug: a node hosting more than
+/// one hidden service must be reachable on *every* one, not just the default.
+///
+/// Before the fix the intro point forwarded each INTRODUCE to an arbitrary
+/// registered service, and the host decrypted it with the *default* identity's
+/// KEM key and dispatched under the default ServiceId — so every non-default
+/// hidden service silently dropped all connections. Here C hosts two hidden
+/// services (default sid1 + non-default sid2), both with intro points on B, and
+/// A connects to the non-default one.
+#[tokio::test]
+async fn hidden_service_multi_non_default_reachable() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let node_a = Arc::new(Node::new(Keypair::generate()));
+    let node_b = Arc::new(Node::new(Keypair::generate()));
+    let node_c = Arc::new(Node::new(Keypair::generate()));
+
+    // Start B (relay / intro / rendezvous).
+    let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let addr_b = disc_b.local_addrs()[0].to_string();
+    let addr_b_for_a = addr_b.clone();
+    let addr_b_for_c = addr_b.clone();
+    let nb = node_b.clone();
+    tokio::spawn(async move {
+        nb.run(Box::new(disc_b), vec![], vec![]).await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Start C (hidden service host), connected to B.
+    let disc_c = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let nc = node_c.clone();
+    tokio::spawn(async move {
+        nc.run(Box::new(disc_c), vec![addr_b_for_c], vec![])
+            .await
+            .ok();
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        node_b.connected_peers().await.contains(&node_c.peer_id()),
+        "B should be connected to C"
+    );
+
+    // Service 1 = C's default identity, published as a hidden service so B holds
+    // an intro registration for it too (creating the shared-intro-point case
+    // that the old `regs.iter().next()` mishandled).
+    let sid1 = node_c.default_service_id().await;
+    node_c
+        .publish_hidden_service(sid1, 1)
+        .await
+        .expect("publish sid1");
+
+    // Service 2 = a second, NON-default hidden identity on the same node.
+    // create_identity auto-publishes its intro points (on B, the only peer).
+    let sid2 = node_c
+        .create_identity(
+            "svc2",
+            tarnet_api::types::PrivacyLevel::Hidden { intro_points: 1 },
+            1,
+            tarnet_api::types::IdentityScheme::Ed25519,
+        )
+        .await
+        .expect("create svc2");
+    assert_ne!(sid1, sid2);
+    let kp2 = node_c.keypair_for_service(&sid2).await.unwrap();
+
+    // Listener bound specifically to sid2 (not ALL): the connection is delivered
+    // here only if the host dispatches it under sid2, not the default.
+    let listener2 = node_c
+        .circuit_listen(sid2, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+
+    // Start A (client), connected to B but NOT to C.
+    let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let na = node_a.clone();
+    tokio::spawn(async move {
+        na.run(Box::new(disc_a), vec![addr_b_for_a], vec![])
+            .await
+            .ok();
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        node_a.connected_peers().await.contains(&node_b.peer_id()),
+        "A should be connected to B"
+    );
+
+    // C accepts on sid2's listener.
+    let node_c_accept = node_c.clone();
+    let service_conn_handle = tokio::spawn(async move {
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            node_c_accept.circuit_accept(listener2.id),
+        )
+        .await
+        .expect("accept on sid2 timed out (non-default hidden service unreachable)")
+        .expect("accept on sid2 failed")
+    });
+
+    // A connects to the NON-default service via rendezvous, encrypting INTRODUCE
+    // to sid2's KEM key.
+    let intro_points = vec![(
+        node_b.peer_id(),
+        kp2.identity.kem_algo() as u8,
+        kp2.identity.kem.kem_pubkey_bytes(),
+    )];
+    let client_conn = tokio::time::timeout(
+        Duration::from_secs(10),
+        node_a.connect_via_rendezvous(sid2, TEST_MODE, "80", &intro_points),
+    )
+    .await
+    .expect("connect to sid2 timed out")
+    .expect("connect to sid2 failed");
+
+    assert_eq!(
+        client_conn.remote_service_id, sid2,
+        "client must be connected to the non-default service"
+    );
+
+    let service_conn = service_conn_handle.await.expect("accept task panicked");
+
+    // End-to-end data proves the KEM secret matched sid2's key (decryption used
+    // the right keypair).
+    client_conn.send(b"ping non-default").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), service_conn.recv())
+        .await
+        .expect("recv at service timed out")
+        .expect("recv at service failed");
+    assert_eq!(got, b"ping non-default");
+}
+
 /// Test: flow control allows bulk data transfer.
 /// Sends far more cells than CWND_INIT (4) — if SENDME is broken, the
 /// sender would stall after 4 cells and the recv side would time out.

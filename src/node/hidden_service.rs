@@ -90,17 +90,20 @@ impl Node {
         // Send encrypted INTRODUCE through intro circuit.
         // The payload is encrypted to the service's KEM public key so the intro
         // point cannot learn the rendezvous peer or cookie.
+        let sealed = build_introduce_payload(
+            &rendezvous_peer,
+            &cookie,
+            mode,
+            port,
+            &kem_ciphertext,
+            &shared_secret,
+        );
         let introduce_cell = RelayCell {
             command: RelayCellCommand::Introduce,
             stream_id: 0,
-            data: build_introduce_payload(
-                &rendezvous_peer,
-                &cookie,
-                mode,
-                port,
-                &kem_ciphertext,
-                &shared_secret,
-            ),
+            // Prefix the target ServiceId so the intro point forwards to the
+            // right service circuit when it hosts more than one service.
+            data: build_introduce_cell(&service_id, &sealed),
         };
         {
             let mut circuits = self.circuits.outbound.lock().await;
@@ -691,16 +694,45 @@ impl Node {
     }
 
     /// Handle an INTRODUCE message arriving at the service (forwarded by intro point).
-    pub(super) async fn handle_introduce_at_service(&self, _intro_circuit_id: u32, payload: &[u8]) {
-        // Decrypt the INTRODUCE payload using our service KEM keypair.
+    pub(super) async fn handle_introduce_at_service(&self, intro_circuit_id: u32, payload: &[u8]) {
+        // Resolve which hidden service this INTRODUCE is for. The cell arrived on
+        // the circuit we built to an intro point when publishing one specific
+        // service, so map that circuit back to the owning service. Using the
+        // default identity here would decrypt with the wrong key for every
+        // non-default hidden service and silently drop the connection.
+        let service_sid = {
+            let intros = self.hidden.intros.lock().await;
+            intros.iter().find_map(|(sid, circuits)| {
+                circuits
+                    .iter()
+                    .any(|(_, cid)| *cid == intro_circuit_id)
+                    .then_some(*sid)
+            })
+        };
+        let service_sid = match service_sid {
+            Some(sid) => sid,
+            None => {
+                log::debug!(
+                    "INTRODUCE on circuit {} not owned by any hidden service, dropping",
+                    intro_circuit_id
+                );
+                return;
+            }
+        };
+
+        // Decrypt the INTRODUCE payload using that service's KEM keypair.
         // The client encrypted it to our KEM public key so the intro point can't read it.
         let service_keypair = {
             let is = self.identity_store.lock().await;
-            let sid = is.default_service_id();
-            match is.keypair_for(&sid) {
+            match is.keypair_for(&service_sid) {
                 Some(kp) => crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap(),
-                None => crate::identity::Keypair::from_full_bytes(&self.identity.to_full_bytes())
-                    .unwrap(),
+                None => {
+                    log::debug!(
+                        "No keypair for hidden service {:?}, dropping INTRODUCE",
+                        service_sid
+                    );
+                    return;
+                }
             }
         };
 
@@ -834,26 +866,25 @@ impl Node {
             }
         });
 
-        let service_id = self.default_service_id().await;
         let conn = tarnet_api::service::Connection::new(
-            service_id, mode, port, circuit_id, app_tx, app_rx,
+            service_sid, mode, port, circuit_id, app_tx, app_rx,
         );
         let port_name = conn.port.clone();
         match self
-            .dispatch_incoming_connection(service_id, mode, &port_name, conn)
+            .dispatch_incoming_connection(service_sid, mode, &port_name, conn)
             .await
         {
             ListenerDispatch::Enqueued => {}
             ListenerDispatch::NoListener => {
                 log::debug!(
                     "Dropping hidden-service connection: no listener for {:?}",
-                    service_id
+                    service_sid
                 );
             }
             ListenerDispatch::QueueFull => {
                 log::warn!(
                     "Dropping hidden-service connection: listener queue full for {:?}",
-                    service_id
+                    service_sid
                 );
             }
         }

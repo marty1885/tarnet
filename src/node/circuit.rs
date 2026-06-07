@@ -1196,25 +1196,41 @@ impl Node {
             circuit_id,
         );
 
-        // Look up which service registered on this intro point.
-        // The INTRODUCE arrives on the client's circuit to this intro point.
-        // We need to find the service's circuit and the peer that registered it.
+        // The client prefixes the target ServiceId so we forward to the circuit
+        // of the service it actually wants. Without this we'd forward to an
+        // arbitrary registered service, and any node hosting more than one
+        // hidden service (which typically share intro points) would be
+        // unreachable for all but one of them.
+        let (target_sid, sealed) = match parse_introduce_cell(payload) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[B-INTRO] malformed INTRODUCE cell: {}", e);
+                return Ok(());
+            }
+        };
+
+        // Look up the registration for the requested service. The INTRODUCE
+        // arrives on the client's circuit to this intro point; we forward it on
+        // the matching service's circuit.
         let regs = self.hidden.intro_registrations.lock().await;
-        let service_entry = regs.iter().next();
-        let (service_circuit_id, _service_id, service_from) = match service_entry {
-            Some((&cid, (sid, peer))) => (cid, sid.clone(), *peer),
+        let service_entry = regs.iter().find(|(_, (sid, _))| *sid == target_sid);
+        let (service_circuit_id, service_from) = match service_entry {
+            Some((&cid, (_sid, peer))) => (cid, *peer),
             None => {
-                log::warn!("[B-INTRO] No service registered at this intro point");
+                log::warn!(
+                    "[B-INTRO] No service {:?} registered at this intro point",
+                    target_sid
+                );
                 return Ok(());
             }
         };
         drop(regs);
 
-        // Send the INTRODUCE data as a relay cell to the service
+        // Send the (still-sealed) INTRODUCE data as a relay cell to the service.
         let intro_cell = RelayCell {
             command: RelayCellCommand::Introduce,
             stream_id: 0,
-            data: payload.to_vec(),
+            data: sealed.to_vec(),
         };
         let bwd_info = self
             .get_hop_backward_crypto(service_circuit_id, service_from)

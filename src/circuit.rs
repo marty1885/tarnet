@@ -1169,6 +1169,31 @@ pub fn parse_introduce_payload(
     Ok((PeerId(peer), cookie, mode, port, shared_bytes))
 }
 
+/// Build the INTRODUCE *relay-cell* payload: `target_service_id(32) || sealed`.
+///
+/// The leading ServiceId is a plaintext selector the intro point uses to route
+/// the INTRODUCE to the circuit of the service the client actually wants. The
+/// intro point already learned this ServiceId via `IntroRegister`, so it leaks
+/// nothing new. `sealed` is the [`build_introduce_payload`] blob, encrypted to
+/// the service's KEM key — the intro point cannot read it.
+pub fn build_introduce_cell(service_id: &tarnet_api::types::ServiceId, sealed: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + sealed.len());
+    out.extend_from_slice(service_id.as_bytes());
+    out.extend_from_slice(sealed);
+    out
+}
+
+/// Parse the INTRODUCE relay-cell payload built by [`build_introduce_cell`].
+/// Returns `(target_service_id, sealed_introduce_payload)`.
+pub fn parse_introduce_cell(data: &[u8]) -> Result<(tarnet_api::types::ServiceId, &[u8])> {
+    if data.len() < 32 {
+        return Err(Error::Wire("INTRODUCE cell too short".into()));
+    }
+    let mut sid = [0u8; 32];
+    sid.copy_from_slice(&data[..32]);
+    Ok((tarnet_api::types::ServiceId(sid), &data[32..]))
+}
+
 /// Build a rendezvous cookie payload (used by both ESTABLISH and JOIN).
 /// Format: cookie(32)
 pub fn build_rendezvous_cookie_payload(cookie: &[u8; 32]) -> Vec<u8> {
