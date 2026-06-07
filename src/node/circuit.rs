@@ -911,7 +911,7 @@ impl Node {
             circuit_id: outbound_id,
             encrypted_payload: create_payload,
         };
-        self.send_to_peer(&next_hop, &create.to_wire().encode())
+        self.send_to_peer_critical(&next_hop, &create.to_wire().encode())
             .await
     }
 
@@ -979,7 +979,8 @@ impl Node {
             circuit_id: msg.circuit_id,
             encrypted_reply: build_extended_payload(offer_algo as u8, &reply_ciphertext),
         };
-        self.send_to_peer(&from, &reply.to_wire().encode()).await
+        self.send_to_peer_critical(&from, &reply.to_wire().encode())
+            .await
     }
 
     /// Handle CircuitCreated — confirmation that a circuit hop was set up.
@@ -1042,7 +1043,7 @@ impl Node {
 
             let encoded = encode_circuit_relay_cell(inbound_circuit_id, &cell);
             return self
-                .send_to_peer(&inbound_from, &encoded)
+                .send_to_peer_critical(&inbound_from, &encoded)
                 .await;
         }
 
@@ -1185,7 +1186,7 @@ impl Node {
         };
         crypto.process_cell(&mut cell);
         let encoded = encode_circuit_relay_cell(circuit_id, &cell);
-        self.send_to_peer(&from, &encoded).await
+        self.send_to_peer_critical(&from, &encoded).await
     }
 
     /// Handle INTRODUCE at an intro point: forward the INTRODUCE data to the registered service.
@@ -1234,7 +1235,7 @@ impl Node {
         crypto.process_cell(&mut cell);
         let encoded = encode_circuit_relay_cell(service_circuit_id, &cell);
         let _ = self
-            .send_to_peer(&service_from, &encoded)
+            .send_to_peer_critical(&service_from, &encoded)
             .await;
 
         // Send IntroduceAck back to the client
@@ -1259,7 +1260,7 @@ impl Node {
         };
         crypto.process_cell(&mut cell);
         let encoded = encode_circuit_relay_cell(circuit_id, &cell);
-        self.send_to_peer(&from, &encoded).await
+        self.send_to_peer_critical(&from, &encoded).await
     }
 
     /// Handle RENDEZVOUS_ESTABLISH: client registers a cookie at the rendezvous point.
@@ -1365,7 +1366,7 @@ impl Node {
         };
         crypto.process_cell(&mut cell);
         let encoded = encode_circuit_relay_cell(client_circuit_id, &cell);
-        self.send_to_peer(&client_from, &encoded)
+        self.send_to_peer_critical(&client_from, &encoded)
             .await
     }
 
@@ -1447,7 +1448,7 @@ impl Node {
             circuit_id,
             encrypted_payload: create_payload,
         };
-        self.send_to_peer(&first_hop, &create.to_wire().encode())
+        self.send_to_peer_critical(&first_hop, &create.to_wire().encode())
             .await?;
 
         // Wait for CircuitCreated
@@ -1513,7 +1514,7 @@ impl Node {
                     drop(circuits);
 
                     let encoded = encode_circuit_relay_cell(cid, &cell_bytes);
-                    self.send_to_peer(&first_hop_send, &encoded)
+                    self.send_to_peer_critical(&first_hop_send, &encoded)
                         .await?;
                 }
 
@@ -1974,6 +1975,12 @@ impl Node {
     }
 
     /// Try each first_hop candidate to build a circuit and establish a connection.
+    ///
+    /// The whole sweep is retried with backoff: mid-path relays forward
+    /// EXTEND/EXTENDED as opaque cells they may drop under congestion, so a
+    /// build failure is often transient. Each retry starts a fresh circuit
+    /// (new circuit_id, new KEM offers), which keeps the protocol free of
+    /// duplicate-EXTEND idempotency concerns.
     async fn try_build_with_hops(
         &self,
         service_id: tarnet_api::types::ServiceId,
@@ -1983,30 +1990,37 @@ impl Node {
         waypoints: &[PeerId],
         first_hops: &[PeerId],
     ) -> Option<tarnet_api::service::Connection> {
-        for first_hop in first_hops {
-            match self.build_circuit(*first_hop, waypoints.to_vec()).await {
-                Ok(circuit_id) => {
-                    match self
-                        .setup_circuit_connection(service_id, mode, port, circuit_id)
-                        .await
-                    {
-                        Ok(conn) => return Some(conn),
-                        Err(e) => {
-                            log::info!(
-                                "circuit_connect: StreamBegin to {:?} failed: {}",
-                                dest_peer,
-                                e
-                            );
-                            let _ = self.destroy_circuit(circuit_id).await;
+        const BUILD_ATTEMPTS: u32 = 3;
+        for attempt in 0..BUILD_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200 << attempt)).await;
+            }
+            for first_hop in first_hops {
+                match self.build_circuit(*first_hop, waypoints.to_vec()).await {
+                    Ok(circuit_id) => {
+                        match self
+                            .setup_circuit_connection(service_id, mode, port, circuit_id)
+                            .await
+                        {
+                            Ok(conn) => return Some(conn),
+                            Err(e) => {
+                                log::info!(
+                                    "circuit_connect: StreamBegin to {:?} failed: {}",
+                                    dest_peer,
+                                    e
+                                );
+                                let _ = self.destroy_circuit(circuit_id).await;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    log::info!(
-                        "circuit_connect: build_circuit to {:?} failed: {}",
-                        dest_peer,
-                        e
-                    );
+                    Err(e) => {
+                        log::info!(
+                            "circuit_connect: build_circuit to {:?} failed (attempt {}): {}",
+                            dest_peer,
+                            attempt + 1,
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -2137,7 +2151,7 @@ impl Node {
                 drop(circuits);
 
                 let encoded = encode_circuit_relay_cell(cid, &cell);
-                self.send_to_peer(&fh, &encoded).await?;
+                self.send_to_peer_critical(&fh, &encoded).await?;
             }
 
             // Wait for StreamConnected or StreamRefused.

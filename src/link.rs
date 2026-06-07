@@ -881,13 +881,8 @@ impl PeerLink {
         padded
     }
 
-    /// Encrypt and enqueue a message (pad → encrypt → channel).
-    fn encrypt_and_enqueue(
-        crypto: &mut LinkCrypto,
-        tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-        data: &[u8],
-        remote: PeerId,
-    ) -> Result<()> {
+    /// Pad and encrypt a message into a wire frame, enforcing the size contract.
+    fn encrypt_frame(crypto: &mut LinkCrypto, data: &[u8], remote: PeerId) -> Result<Vec<u8>> {
         // Enforce the frame-size contract at the one send chokepoint. A message
         // larger than MAX_LINK_MESSAGE would encrypt to a frame that overflows
         // the peer's recv buffer (tearing down the link) and whose wire LEN
@@ -906,8 +901,17 @@ impl PeerLink {
                 MAX_LINK_MESSAGE
             )));
         }
-        let padded = Self::pad(data);
-        let encrypted = crypto.encrypt(&padded);
+        Ok(crypto.encrypt(&Self::pad(data)))
+    }
+
+    /// Encrypt and enqueue a message (pad → encrypt → channel).
+    fn encrypt_and_enqueue(
+        crypto: &mut LinkCrypto,
+        tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+        data: &[u8],
+        remote: PeerId,
+    ) -> Result<()> {
+        let encrypted = Self::encrypt_frame(crypto, data, remote)?;
         match tx.try_send(encrypted) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -928,6 +932,27 @@ impl PeerLink {
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
         let mut crypto = self.crypto.lock().await;
         Self::encrypt_and_enqueue(&mut crypto, &self.outbound_tx, data, self.remote_peer)
+    }
+
+    /// Send over the high-priority queue, awaiting capacity instead of
+    /// dropping when the queue is full.
+    ///
+    /// Circuit-control cells (CREATE/EXTEND/EXTENDED/StreamBegin/…) are
+    /// one-shot request/replies with no retransmission — a silent drop turns
+    /// link congestion into a hard connect failure, so backpressure is the
+    /// correct policy for them. Bulk stream data keeps using
+    /// [`send_message`], where drops are recovered by end-to-end flow control.
+    pub async fn send_message_critical(&self, data: &[u8]) -> Result<()> {
+        // The crypto lock is held across the awaited enqueue so frames enter
+        // the queue in seq order even when this send has to wait. The drain
+        // task never takes this lock, so it keeps draining and the wait is
+        // bounded by transport progress.
+        let mut crypto = self.crypto.lock().await;
+        let encrypted = Self::encrypt_frame(&mut crypto, data, self.remote_peer)?;
+        self.outbound_tx
+            .send(encrypted)
+            .await
+            .map_err(|_| Error::Wire("link closed".into()))
     }
 
     /// Send a non-critical message via the deferred queue.
@@ -1080,7 +1105,10 @@ impl PeerLink {
 
             // The reply MUST go out under the current (old) key — the peer can
             // only decrypt it before it switches. Send first, install after.
-            self.send_message(&reply.to_wire().encode()).await?;
+            // Non-droppable: we install the new send key right after, so a
+            // dropped reply would leave the peer unable to decrypt anything
+            // we send from then on.
+            self.send_message_critical(&reply.to_wire().encode()).await?;
             let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
             self.crypto
                 .lock()

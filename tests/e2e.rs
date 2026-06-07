@@ -1819,7 +1819,6 @@ async fn two_node_pressure() {
 /// Receiver regenerates the same PRNG stream and verifies every byte.
 /// All connections are bidirectional (F/G also sends back to A).
 #[tokio::test]
-#[ignore = "faulty: timeout-sensitive pressure test, flakes under concurrent CPU load (not a code defect)"]
 async fn mesh_pressure() {
     init_log();
 

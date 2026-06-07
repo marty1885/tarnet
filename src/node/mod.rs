@@ -1976,7 +1976,19 @@ impl Node {
                             }
                         }
                     }
-                    Err(_) => {
+                    // Frame-level failures must not kill the link. A stale frame
+                    // (deferred-queue coalescing can reorder past the replay
+                    // window under load) or an undecryptable frame (garbage
+                    // injection) costs only that frame; tearing down the link
+                    // would hand an attacker — or mere congestion — a kill
+                    // switch for every circuit on it. A genuinely desynced
+                    // link stops producing decryptable frames and is reaped
+                    // by the keepalive dead-timeout instead.
+                    Err(e @ (Error::Replay(_) | Error::Crypto(_))) => {
+                        log::debug!("dropping bad frame from {:?}: {}", remote, e);
+                    }
+                    Err(e) => {
+                        log::info!("recv_message from {:?} failed, link down: {}", remote, e);
                         let _ = lifecycle_tx
                             .send(NodeEvent::LinkDown(remote, recv_link_id))
                             .await;
@@ -2791,6 +2803,27 @@ impl Node {
             .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
         self.stats.record_send(peer, data.len() as u64);
         link.send_message(data).await
+    }
+
+    /// Send a circuit-control message, awaiting link queue capacity instead
+    /// of dropping when the peer is congested. One-shot control cells
+    /// (CREATE/EXTEND/EXTENDED/StreamBegin/…) have no retransmission, so the
+    /// data path's silent-drop policy would turn congestion into hard
+    /// connect failures.
+    ///
+    /// The link Arc is cloned out of the table before the awaited send so the
+    /// global links lock is never held while waiting for queue space.
+    async fn send_to_peer_critical(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
+        self.bandwidth.acquire_upload(data.len()).await;
+        let link = self
+            .links
+            .lock()
+            .await
+            .get(peer)
+            .cloned()
+            .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
+        self.stats.record_send(peer, data.len() as u64);
+        link.send_message_critical(data).await
     }
 
     /// Send a non-critical message via the deferred (coalescing) queue.
