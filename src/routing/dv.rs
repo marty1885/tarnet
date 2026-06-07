@@ -6,14 +6,23 @@ use tarnet_api::types::SigningAlgo;
 
 use super::{RouteSource, RoutingTable};
 
-/// Generate a signed route advertisement from our routing table.
-pub fn generate_advertisement(
+/// Wire size of a single `RouteEntry` (destination(32) || cost(4)).
+const ROUTE_ENTRY_BYTES: usize = 36;
+/// Bytes an advertisement spends on everything *except* its entries: wire
+/// header(5) + advertiser(32) + entry_count(2) + sig_len(2) + signature. The
+/// signature reserve (1024) comfortably covers a Falcon-512 + Ed25519 hybrid
+/// (~750 B, and variable-length) with margin, so a chunk never overruns the
+/// size budget even when the next signature is slightly larger than the last.
+const AD_OVERHEAD_RESERVE: usize = 5 + 32 + 2 + 2 + 1024;
+
+/// Build the (destination, cost) entry list to advertise to `exclude_next_hop`,
+/// applying split horizon with poison reverse. Entry 0 is always ourselves at
+/// cost 0.
+fn advertisement_entries(
     identity: &Keypair,
     table: &RoutingTable,
     exclude_next_hop: &PeerId,
-) -> RouteAdvertisement {
-    // Split horizon: don't advertise routes learned through the peer we're
-    // sending to. Also include ourselves at cost 0.
+) -> Vec<RouteEntry> {
     let mut entries: Vec<RouteEntry> = vec![RouteEntry {
         destination: identity.peer_id(),
         cost: 0,
@@ -37,14 +46,59 @@ pub fn generate_advertisement(
         });
     }
 
-    let mut ad = RouteAdvertisement {
-        advertiser: identity.peer_id(),
-        entries,
-        signature: Vec::new(),
-    };
-    let signable = ad.signable_bytes();
-    ad.signature = identity.sign(&signable);
-    ad
+    entries
+}
+
+/// Generate signed route advertisements from our routing table, split into as
+/// many messages as needed so each fits `max_message_bytes` (the recipient
+/// link's per-frame budget — see [`PeerLink::max_wire_message`]).
+///
+/// This is safe to split because `process_advertisement` is pure soft state:
+/// each entry is an independent (dest, cost) refresh with no snapshot/replace
+/// semantics, and routes age out via expiry. As long as every chunk ships
+/// within one advertisement cycle (well inside `ROUTE_EXPIRY`), splitting is
+/// indistinguishable from one large advertisement. Each chunk is a complete,
+/// independently-signed advertisement.
+pub fn generate_advertisements(
+    identity: &Keypair,
+    table: &RoutingTable,
+    exclude_next_hop: &PeerId,
+    max_message_bytes: usize,
+) -> Vec<RouteAdvertisement> {
+    let entries = advertisement_entries(identity, table, exclude_next_hop);
+
+    // Entries that fit one message under the size budget (at least one, so we
+    // always make progress even with a pathologically small MTU).
+    let per_chunk = max_message_bytes
+        .saturating_sub(AD_OVERHEAD_RESERVE)
+        / ROUTE_ENTRY_BYTES;
+    let per_chunk = per_chunk.max(1);
+
+    entries
+        .chunks(per_chunk)
+        .map(|chunk| {
+            let mut ad = RouteAdvertisement {
+                advertiser: identity.peer_id(),
+                entries: chunk.to_vec(),
+                signature: Vec::new(),
+            };
+            ad.signature = identity.sign(&ad.signable_bytes());
+            ad
+        })
+        .collect()
+}
+
+/// Single-message convenience wrapper (no size limit). Test-only — production
+/// senders use [`generate_advertisements`] with the link's frame budget.
+#[cfg(test)]
+pub fn generate_advertisement(
+    identity: &Keypair,
+    table: &RoutingTable,
+    exclude_next_hop: &PeerId,
+) -> RouteAdvertisement {
+    generate_advertisements(identity, table, exclude_next_hop, usize::MAX)
+        .pop()
+        .expect("at least the self-route entry is always present")
 }
 
 /// Process a received route advertisement. Returns true if routing table changed.
@@ -157,6 +211,42 @@ mod tests {
         let route = table_a.lookup(&PeerId([3u8; 32])).unwrap();
         assert_eq!(route.next_hop, kp_b.peer_id());
         assert_eq!(route.cost, 2);
+    }
+
+    #[test]
+    fn chunks_to_fit_budget_and_reassemble_via_processing() {
+        // A large table must split into multiple frame-sized advertisements,
+        // each independently valid, and applying all chunks reproduces the full
+        // routing knowledge (soft-state: order/splitting-independent).
+        let kp_b = Keypair::generate();
+        let mut table_b = RoutingTable::with_capacity(kp_b.peer_id(), 10_000, 200);
+        for i in 0..300u32 {
+            let mut d = [0u8; 32];
+            d[0..4].copy_from_slice(&i.to_be_bytes());
+            table_b.update_with_source(PeerId(d), pid(200), i + 1, RouteSource::Advertisement);
+        }
+
+        // Budget that forces several chunks (room for ~ a dozen entries each).
+        let budget = AD_OVERHEAD_RESERVE + 12 * ROUTE_ENTRY_BYTES;
+        let ads = generate_advertisements(&kp_b, &table_b, &pid(99), budget);
+        assert!(ads.len() > 1, "expected multiple chunks, got {}", ads.len());
+
+        // Every chunk fits the budget once wrapped for the wire.
+        for ad in &ads {
+            assert!(ad.to_wire().encode().len() <= budget);
+        }
+
+        // Applying all chunks teaches a fresh table every destination.
+        let kp_a = Keypair::generate();
+        let mut table_a = RoutingTable::with_capacity(kp_a.peer_id(), 10_000, 200);
+        table_a.add_neighbor(kp_b.peer_id());
+        let mut cache = make_cache_for(&kp_b);
+        for ad in &ads {
+            process_advertisement(&mut table_a, ad, &mut cache).unwrap();
+        }
+        for (dest, _) in table_b.entries_for_advertisement() {
+            assert!(table_a.lookup(&dest).is_some(), "missing dest after chunked apply");
+        }
     }
 
     #[test]

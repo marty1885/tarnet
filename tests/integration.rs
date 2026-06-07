@@ -125,8 +125,11 @@ async fn route_propagation_three_nodes() {
     table_b.add_neighbor(kp_c.peer_id());
     table_c.add_neighbor(kp_b.peer_id());
 
-    // B advertises to A (including C)
-    let ad_b_to_a = dv::generate_advertisement(&kp_b, &table_b, &kp_a.peer_id());
+    // B advertises to A (including C). Small table → a single chunk.
+    let ad_b_to_a = dv::generate_advertisements(&kp_b, &table_b, &kp_a.peer_id(), usize::MAX)
+        .into_iter()
+        .next()
+        .unwrap();
     let mut cache = make_pubkey_cache(&kp_b);
     let changed = dv::process_advertisement(&mut table_a, &ad_b_to_a, &mut cache).unwrap();
     assert!(changed);
@@ -136,8 +139,11 @@ async fn route_propagation_three_nodes() {
     assert_eq!(route.next_hop, kp_b.peer_id());
     assert_eq!(route.cost, 2); // A→B (1) + B→C (1) = 2
 
-    // B advertises to C (including A)
-    let ad_b_to_c = dv::generate_advertisement(&kp_b, &table_b, &kp_c.peer_id());
+    // B advertises to C (including A). Small table → a single chunk.
+    let ad_b_to_c = dv::generate_advertisements(&kp_b, &table_b, &kp_c.peer_id(), usize::MAX)
+        .into_iter()
+        .next()
+        .unwrap();
     let mut cache = make_pubkey_cache(&kp_b);
     let changed = dv::process_advertisement(&mut table_c, &ad_b_to_c, &mut cache).unwrap();
     assert!(changed);

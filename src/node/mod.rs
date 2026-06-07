@@ -839,7 +839,18 @@ impl Node {
         *self.discovery.lock().await = Some(discovery.clone());
         *self.bootstrap_addrs.lock().await = bootstrap.clone();
 
-        // Start accepting connections
+        // Start accepting connections.
+        //
+        // Cap the number of *concurrent, not-yet-authenticated* handshakes. A
+        // remote can otherwise open connections that never finish the handshake
+        // and pin one task + socket + buffer each for up to the handshake
+        // timeout — `max_inbound` only limits *established* links, so it does
+        // not catch this. Excess connections are dropped immediately (the
+        // transport closes) rather than queued, so the flood can't grow
+        // unbounded. Headroom over `max_inbound` leaves room for legitimate
+        // bursts where many peers connect at once.
+        let max_inflight = self.max_inbound.max(64).saturating_add(64);
+        let handshake_limit = Arc::new(tokio::sync::Semaphore::new(max_inflight));
         let disc_accept = discovery.clone();
         let event_tx = self.lifecycle_tx.clone();
         let identity = self.identity.clone();
@@ -847,9 +858,23 @@ impl Node {
             loop {
                 match disc_accept.accept().await {
                     Ok(transport) => {
+                        let permit = match handshake_limit.clone().try_acquire_owned() {
+                            Ok(p) => p,
+                            Err(_) => {
+                                log::warn!(
+                                    "Inbound handshake limit ({}) reached, dropping connection",
+                                    max_inflight
+                                );
+                                // Drop `transport` → closes the connection.
+                                continue;
+                            }
+                        };
                         let tx = event_tx.clone();
                         let id = identity.clone();
                         tokio::spawn(async move {
+                            // Hold the permit for the lifetime of the handshake;
+                            // it is released when this task ends (success or fail).
+                            let _permit = permit;
                             match PeerLink::responder(transport, &id).await {
                                 Ok(link) => {
                                     let link = Arc::new(link);
@@ -1177,9 +1202,15 @@ impl Node {
                     let table = routing_ref.lock().await;
                     links
                         .iter()
-                        .map(|(peer_id, link)| {
-                            let ad = dv::generate_advertisement(&identity, &table, peer_id);
-                            (*peer_id, link.clone(), ad.to_wire().encode())
+                        .flat_map(|(peer_id, link)| {
+                            // Split into per-frame-sized chunks for this link's MTU.
+                            let budget = link.max_wire_message();
+                            let peer_id = *peer_id;
+                            let link = link.clone();
+                            dv::generate_advertisements(&identity, &table, &peer_id, budget)
+                                .into_iter()
+                                .map(move |ad| (peer_id, link.clone(), ad.to_wire().encode()))
+                                .collect::<Vec<_>>()
                         })
                         .collect()
                 };
@@ -1230,6 +1261,30 @@ impl Node {
                         KEEPALIVE_DEAD_TIMEOUT.as_secs()
                     );
                     let _ = hb_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
+                }
+
+                // Rekey sweep: rotate session keys on any link that has carried
+                // REKEY_INTERVAL messages in either direction, giving long-lived
+                // links forward secrecy against key compromise. Only the link
+                // initiator drives this; the responder answers in-band.
+                let rekey_links: Vec<Arc<PeerLink>> = {
+                    let links = hb_links.lock().await;
+                    links
+                        .all_links()
+                        .into_iter()
+                        .filter(|l| l.is_initiator())
+                        .collect()
+                };
+                for link in rekey_links {
+                    if link.needs_rekey().await {
+                        if let Err(e) = link.rekey_initiate().await {
+                            log::debug!(
+                                "Rekey initiate to {:?} failed: {}",
+                                link.remote_peer(),
+                                e
+                            );
+                        }
+                    }
                 }
 
                 if due.is_empty() {
@@ -1807,7 +1862,7 @@ impl Node {
                     } else {
                         let node = node_arc.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = node.handle_message(from, msg).await {
+                            if let Err(e) = node.handle_message(from, msg_link_id, msg).await {
                                 log::warn!("Error handling message from {:?}: {}", from, e);
                             }
                         });
@@ -1919,14 +1974,19 @@ impl Node {
             }
         });
 
-        // Send initial route advertisement to the new peer
+        // Send initial route advertisement(s) to the new peer
         {
-            let table = self.routing_table.lock().await;
-            let ad = dv::generate_advertisement(&self.identity, &table, &peer_id);
             let link = self.links.lock().await.get(&peer_id).cloned();
             if let Some(link) = link {
-                if let Err(e) = link.send_deferred(&ad.to_wire().encode()).await {
-                    log::warn!("Failed to send initial route ad to {:?}: {}", peer_id, e);
+                let budget = link.max_wire_message();
+                let ads = {
+                    let table = self.routing_table.lock().await;
+                    dv::generate_advertisements(&self.identity, &table, &peer_id, budget)
+                };
+                for ad in ads {
+                    if let Err(e) = link.send_deferred(&ad.to_wire().encode()).await {
+                        log::warn!("Failed to send initial route ad to {:?}: {}", peer_id, e);
+                    }
                 }
             }
         }
@@ -2278,7 +2338,12 @@ impl Node {
         });
     }
 
-    async fn handle_message(&self, from: PeerId, msg: WireMessage) -> Result<()> {
+    async fn handle_message(
+        &self,
+        from: PeerId,
+        msg_link_id: LinkId,
+        msg: WireMessage,
+    ) -> Result<()> {
         // Update k-bucket on non-relay messages. CircuitRelay is the highest-frequency
         // message type and carries no new routing information — the peer is already known.
         if msg.msg_type != MessageType::CircuitRelay {
@@ -2554,8 +2619,21 @@ impl Node {
                 );
             }
             MessageType::Rekey => {
-                // Re-key messages are handled at the link layer, not here
-                log::debug!("Received rekey message from {:?}", from);
+                let rekey = RekeyMsg::from_bytes(&msg.payload)?;
+                // Drive the rekey on the exact link the message arrived on —
+                // not merely the active link, which may use different keys.
+                let link = self.links.lock().await.get_link(&from, msg_link_id);
+                if let Some(link) = link {
+                    if let Err(e) = link.handle_rekey_msg(&rekey).await {
+                        log::warn!("Rekey from {:?} failed: {}", from, e);
+                    }
+                } else {
+                    log::debug!(
+                        "Rekey from {:?} for unknown link_id={}, ignoring",
+                        from,
+                        msg_link_id
+                    );
+                }
             }
             MessageType::Keepalive => {
                 let ka = KeepaliveMsg::from_bytes(&msg.payload)?;
@@ -2667,14 +2745,27 @@ impl Node {
 
     /// Send triggered route updates to all neighbors except the source.
     async fn send_triggered_updates(&self, exclude: &PeerId) {
-        let links = self.links.lock().await;
-        let table = self.routing_table.lock().await;
-        for (peer_id, link) in links.iter() {
-            if peer_id == exclude {
-                continue;
-            }
-            let ad = dv::generate_advertisement(&self.identity, &table, peer_id);
-            if let Err(e) = link.send_deferred(&ad.to_wire().encode()).await {
+        // Collect chunked advertisements under lock, then send without holding
+        // the routing/link locks across the per-link crypto await.
+        let to_send: Vec<(PeerId, Arc<PeerLink>, Vec<u8>)> = {
+            let links = self.links.lock().await;
+            let table = self.routing_table.lock().await;
+            links
+                .iter()
+                .filter(|(peer_id, _)| *peer_id != exclude)
+                .flat_map(|(peer_id, link)| {
+                    let budget = link.max_wire_message();
+                    let peer_id = *peer_id;
+                    let link = link.clone();
+                    dv::generate_advertisements(&self.identity, &table, &peer_id, budget)
+                        .into_iter()
+                        .map(move |ad| (peer_id, link.clone(), ad.to_wire().encode()))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        for (peer_id, link, msg) in to_send {
+            if let Err(e) = link.send_deferred(&msg).await {
                 log::warn!("Failed triggered update to {:?}: {}", peer_id, e);
             }
         }

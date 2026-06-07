@@ -326,6 +326,24 @@ impl LinkTable {
         self.peers.get(peer).and_then(|pt| pt.active_link())
     }
 
+    /// Get a specific link to a peer by id. Needed when a reply must go out on
+    /// the exact link a message arrived on (e.g. a rekey), not merely the
+    /// currently-active one.
+    pub fn get_link(&self, peer: &PeerId, link_id: LinkId) -> Option<Arc<PeerLink>> {
+        self.peers
+            .get(peer)
+            .and_then(|pt| pt.links.get(&link_id))
+            .map(|sl| sl.link.clone())
+    }
+
+    /// Every link across all peers (not just the active one per peer).
+    pub fn all_links(&self) -> Vec<Arc<PeerLink>> {
+        self.peers
+            .values()
+            .flat_map(|pt| pt.links.values().map(|sl| sl.link.clone()))
+            .collect()
+    }
+
     /// Iterate (peer_id, best_link) for all connected peers.
     /// Same shape as HashMap::iter() — callers don't change.
     pub fn iter(&self) -> impl Iterator<Item = (&PeerId, &Arc<PeerLink>)> {
@@ -564,6 +582,50 @@ mod tests {
         );
 
         (Arc::new(link_a.unwrap()), Arc::new(link_b.unwrap()))
+    }
+
+    /// Drive a full in-band rekey end-to-end over a real link pair and confirm
+    /// traffic keeps flowing both ways under the rotated keys. Mirrors what the
+    /// node receive loop does: shuttle the Rekey frames to `handle_rekey_msg`.
+    #[tokio::test]
+    async fn in_band_rekey_end_to_end() {
+        use crate::wire::{KeepaliveMsg, MessageType, RekeyMsg, WireMessage};
+
+        let (a, b) = make_test_link_pair().await; // a = initiator, b = responder
+
+        // a initiates: sends its ephemeral KEM pubkey as a Rekey frame.
+        a.rekey_initiate().await.unwrap();
+
+        // b receives the request and answers with the ciphertext.
+        let req = b.recv_message().await.unwrap();
+        let req = WireMessage::decode(&req).unwrap();
+        assert_eq!(req.msg_type, MessageType::Rekey);
+        b.handle_rekey_msg(&RekeyMsg::from_bytes(&req.payload).unwrap())
+            .await
+            .unwrap();
+
+        // a receives the response and completes the rekey.
+        let resp = a.recv_message().await.unwrap();
+        let resp = WireMessage::decode(&resp).unwrap();
+        assert_eq!(resp.msg_type, MessageType::Rekey);
+        a.handle_rekey_msg(&RekeyMsg::from_bytes(&resp.payload).unwrap())
+            .await
+            .unwrap();
+
+        // Post-rekey: a→b and b→a both decrypt under the new keys. (Frames are
+        // padded before encryption, so decode rather than compare raw bytes.)
+        let frame = KeepaliveMsg {
+            timestamp_us: None,
+            padding: Vec::new(),
+        }
+        .to_wire()
+        .encode();
+        a.send_message(&frame).await.unwrap();
+        let got = WireMessage::decode(&b.recv_message().await.unwrap()).unwrap();
+        assert_eq!(got.msg_type, MessageType::Keepalive);
+        b.send_message(&frame).await.unwrap();
+        let got = WireMessage::decode(&a.recv_message().await.unwrap()).unwrap();
+        assert_eq!(got.msg_type, MessageType::Keepalive);
     }
 
     // ── PeerTransport unit tests ──

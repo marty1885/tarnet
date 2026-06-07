@@ -13,8 +13,8 @@ use crate::identity::{self, peer_id_from_signing_pubkey, KemKeypair, Keypair};
 use crate::transport::Transport;
 use crate::types::{Error, PeerId, Result};
 use crate::wire::{
-    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage, WIRE_VERSION_MAX,
-    WIRE_VERSION_MIN,
+    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage, HEADER_SIZE,
+    MAX_PAYLOAD, WIRE_VERSION_MAX, WIRE_VERSION_MIN,
 };
 use tarnet_api::types::{KemAlgo, SigningAlgo};
 
@@ -36,6 +36,18 @@ const DEFERRED_FLUSH_MS: u64 = 30;
 
 const TAG_SIZE: usize = 16;
 const SEQ_SIZE: usize = 8;
+/// XChaCha20 nonce length, prepended to every frame.
+const NONCE_SIZE: usize = 24;
+/// Largest plaintext wire message the link will encrypt or accept: a full wire
+/// header plus the maximum wire payload. This is the single frame-size contract
+/// both ends agree on — the send path rejects anything larger (so a too-big
+/// message can never reach the wire and corrupt the receiver), and the recv
+/// buffer below is sized to hold exactly this much.
+const MAX_LINK_MESSAGE: usize = HEADER_SIZE + MAX_PAYLOAD;
+/// Largest on-the-wire frame: nonce || seq || MAX_LINK_MESSAGE || tag. The recv
+/// buffer must be at least this big or a maximum-size message is rejected as
+/// "exceeds buffer" and the link is torn down.
+const MAX_LINK_FRAME: usize = NONCE_SIZE + SEQ_SIZE + MAX_LINK_MESSAGE + TAG_SIZE;
 /// Sliding window size for replay detection.
 const REPLAY_WINDOW: u64 = 128;
 /// Re-key after this many messages sent.
@@ -56,12 +68,25 @@ const RECV_STALL_TIMEOUT: Duration = Duration::from_secs(210);
 struct LinkCrypto {
     send_enc_key: [u8; 32],
     recv_enc_key: [u8; 32],
+    /// Previous recv key, retained across a rekey so in-flight frames the peer
+    /// sent under the old key still decrypt. Held until the *next* rekey rotates
+    /// it out (see [`install_rekey`]), not dropped on the first new-key frame —
+    /// that earlier heuristic assumed in-order delivery, so an old-key straggler
+    /// reordered *after* a new-key frame would fail to decrypt. Retaining the key
+    /// for the whole epoch makes decryption independent of transport ordering
+    /// (needed for datagram transports such as UDP); replay is still caught
+    /// per-key by `prev_recv_window`/`prev_recv_bitmap`.
+    prev_recv_key: Option<[u8; 32]>,
     #[zeroize(skip)]
     send_seq: u64,
     #[zeroize(skip)]
     recv_window: u64,
     #[zeroize(skip)]
     recv_bitmap: u128,
+    #[zeroize(skip)]
+    prev_recv_window: u64,
+    #[zeroize(skip)]
+    prev_recv_bitmap: u128,
 }
 
 impl LinkCrypto {
@@ -78,10 +103,46 @@ impl LinkCrypto {
         Self {
             send_enc_key: send_enc,
             recv_enc_key: recv_enc,
+            prev_recv_key: None,
             send_seq: 0,
             recv_window: 0,
             recv_bitmap: 0,
+            prev_recv_window: 0,
+            prev_recv_bitmap: 0,
         }
+    }
+
+    /// Install freshly-rekeyed session keys derived from `new_shared`.
+    ///
+    /// The current recv key is retained as `prev_recv_key` so frames the peer
+    /// already put on the wire under the old key keep decrypting. It is held for
+    /// the whole new epoch and only rotated out here at the *next* rekey (the
+    /// `prev_recv_key.take()` below zeroizes the key from two epochs ago), so at
+    /// most one previous epoch is ever live. The send key flips immediately; the
+    /// peer tolerates the overlap symmetrically via its own retained previous key.
+    fn install_rekey(&mut self, new_shared: &[u8; 32], is_initiator: bool) {
+        let fresh = Self::derive(new_shared, is_initiator);
+        if let Some(mut old) = self.prev_recv_key.take() {
+            old.zeroize();
+        }
+        self.prev_recv_key = Some(self.recv_enc_key);
+        self.prev_recv_window = self.recv_window;
+        self.prev_recv_bitmap = self.recv_bitmap;
+
+        self.send_enc_key = fresh.send_enc_key;
+        self.recv_enc_key = fresh.recv_enc_key;
+        self.send_seq = 0;
+        self.recv_window = 0;
+        self.recv_bitmap = 0;
+        // `fresh` drops here; ZeroizeOnDrop wipes its own key copies.
+    }
+
+    /// True once either direction has sent/received enough messages to warrant
+    /// a rekey. Checking `recv_window` (the highest seq seen from the peer)
+    /// means a link whose heavy direction is inbound still rotates keys, even
+    /// if our own send side is mostly idle.
+    fn should_rekey(&self) -> bool {
+        self.send_seq >= REKEY_INTERVAL || self.recv_window >= REKEY_INTERVAL
     }
 
     fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
@@ -114,14 +175,12 @@ impl LinkCrypto {
         out
     }
 
-    fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 24 + SEQ_SIZE + TAG_SIZE {
-            return Err(Error::Crypto("encrypted message too short".into()));
-        }
+    /// AEAD-open `data` under `key`, returning (payload_without_seq, seq).
+    /// Does not run replay detection — the caller picks the matching window.
+    fn aead_open(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, u64)> {
         let nonce = &data[..24];
         let ciphertext_with_tag = &data[24..];
-
-        let cipher = XChaCha20Poly1305::new((&self.recv_enc_key).into());
+        let cipher = XChaCha20Poly1305::new(key.into());
         let mut plaintext = cipher
             .decrypt(
                 nonce.into(),
@@ -131,51 +190,78 @@ impl LinkCrypto {
                 },
             )
             .map_err(|_| Error::Crypto("AEAD decryption failed".into()))?;
-
-        // Extract sequence number
         if plaintext.len() < SEQ_SIZE {
             return Err(Error::Crypto("decrypted payload too short for seq".into()));
         }
         let seq = u64::from_be_bytes(plaintext[..SEQ_SIZE].try_into().unwrap());
-
-        // Anti-replay check
-        self.check_replay(seq)?;
-
-        // Strip the seq prefix in-place — no second allocation needed.
         plaintext.drain(..SEQ_SIZE);
-        Ok(plaintext)
+        Ok((plaintext, seq))
     }
 
-    /// Sliding-window replay detection.
-    fn check_replay(&mut self, seq: u64) -> Result<()> {
-        if self.recv_window == 0 && self.recv_bitmap == 0 {
+    fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < 24 + SEQ_SIZE + TAG_SIZE {
+            return Err(Error::Crypto("encrypted message too short".into()));
+        }
+
+        // Try the current recv key first.
+        match Self::aead_open(&self.recv_enc_key, data) {
+            Ok((plaintext, seq)) => {
+                Self::check_replay_at(&mut self.recv_window, &mut self.recv_bitmap, seq)?;
+                // Keep the previous-epoch key until the next rekey rotates it
+                // out: a straggler the peer sent under the old key may still
+                // arrive *after* this new-key frame on a reordering transport.
+                Ok(plaintext)
+            }
+            Err(current_err) => {
+                // During a rekey overlap, the peer may still be sending under
+                // the old key. Fall back to it before declaring failure.
+                if let Some(prev) = self.prev_recv_key {
+                    if let Ok((plaintext, seq)) = Self::aead_open(&prev, data) {
+                        Self::check_replay_at(
+                            &mut self.prev_recv_window,
+                            &mut self.prev_recv_bitmap,
+                            seq,
+                        )?;
+                        return Ok(plaintext);
+                    }
+                }
+                Err(current_err)
+            }
+        }
+    }
+
+    /// Sliding-window replay detection against a given (window, bitmap) pair.
+    /// `window` is the highest seq accepted so far; `bitmap` bit `i` marks
+    /// seq `window - i` as seen.
+    fn check_replay_at(window: &mut u64, bitmap: &mut u128, seq: u64) -> Result<()> {
+        if *window == 0 && *bitmap == 0 {
             // First packet
-            self.recv_window = seq;
-            self.recv_bitmap = 1;
+            *window = seq;
+            *bitmap = 1;
             return Ok(());
         }
 
-        if seq > self.recv_window {
+        if seq > *window {
             // Advance the window
-            let shift = seq - self.recv_window;
+            let shift = seq - *window;
             if shift < 128 {
-                self.recv_bitmap <<= shift;
-                self.recv_bitmap |= 1;
+                *bitmap <<= shift;
+                *bitmap |= 1;
             } else {
-                self.recv_bitmap = 1;
+                *bitmap = 1;
             }
-            self.recv_window = seq;
+            *window = seq;
             Ok(())
         } else {
-            let diff = self.recv_window - seq;
+            let diff = *window - seq;
             if diff >= REPLAY_WINDOW {
                 return Err(Error::Replay("sequence number too old".into()));
             }
             let bit = 1u128 << diff;
-            if self.recv_bitmap & bit != 0 {
+            if *bitmap & bit != 0 {
                 return Err(Error::Replay("duplicate sequence number".into()));
             }
-            self.recv_bitmap |= bit;
+            *bitmap |= bit;
             Ok(())
         }
     }
@@ -237,6 +323,10 @@ pub struct PeerLink {
     identity: std::sync::Arc<Keypair>,
     /// Negotiated KEM algorithm for rekey exchanges.
     rekey_kem_algo: KemAlgo,
+    /// Initiator-side ephemeral KEM key for an in-flight rekey, paired with the
+    /// `send_seq` at which it was started (a message-counter clock used to
+    /// abandon a rekey that never gets a response). `None` when idle.
+    pending_rekey: tokio::sync::Mutex<Option<(KemKeypair, u64)>>,
     /// Negotiated wire protocol version for this link.
     negotiated_version: u8,
     _drain_task: tokio::task::JoinHandle<()>,
@@ -452,6 +542,7 @@ impl PeerLink {
             remote_signing_pubkey: peer_hello.signing_pubkey,
             is_initiator: true,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
+            pending_rekey: tokio::sync::Mutex::new(None),
             negotiated_version,
             identity: std::sync::Arc::new(
                 Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
@@ -649,6 +740,7 @@ impl PeerLink {
             remote_signing_pubkey: peer_hello.signing_pubkey,
             is_initiator: false,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
+            pending_rekey: tokio::sync::Mutex::new(None),
             negotiated_version,
             identity: std::sync::Arc::new(
                 Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
@@ -796,6 +888,24 @@ impl PeerLink {
         data: &[u8],
         remote: PeerId,
     ) -> Result<()> {
+        // Enforce the frame-size contract at the one send chokepoint. A message
+        // larger than MAX_LINK_MESSAGE would encrypt to a frame that overflows
+        // the peer's recv buffer (tearing down the link) and whose wire LEN
+        // field would silently truncate. Reject it here instead of emitting a
+        // frame the peer cannot receive.
+        if data.len() > MAX_LINK_MESSAGE {
+            log::warn!(
+                "refusing to send {}-byte message to {:?}: exceeds max link message {}",
+                data.len(),
+                remote,
+                MAX_LINK_MESSAGE
+            );
+            return Err(Error::Wire(format!(
+                "message {} bytes exceeds max link message {}",
+                data.len(),
+                MAX_LINK_MESSAGE
+            )));
+        }
         let padded = Self::pad(data);
         let encrypted = crypto.encrypt(&padded);
         match tx.try_send(encrypted) {
@@ -832,7 +942,7 @@ impl PeerLink {
 
     /// Receive and decrypt a message from the link.
     pub async fn recv_message(&self) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; 65536 + 24 + SEQ_SIZE + TAG_SIZE];
+        let mut buf = vec![0u8; MAX_LINK_FRAME];
         let n = tokio::time::timeout(RECV_STALL_TIMEOUT, self.transport.recv(&mut buf))
             .await
             .map_err(|_| Error::Wire("link recv stalled".into()))??;
@@ -863,96 +973,144 @@ impl PeerLink {
         self.transport_name
     }
 
+    /// Largest encoded wire message that fits this link's transport in a single
+    /// frame, after link encryption overhead. Senders that build oversized
+    /// payloads (e.g. route advertisements) must pre-split to this size; the
+    /// send path rejects anything larger. Bounded by both the transport MTU
+    /// (which carries the encrypted frame: nonce ‖ seq ‖ ciphertext ‖ tag) and
+    /// the link's own plaintext ceiling. Shrinks automatically for small-MTU
+    /// datagram transports (e.g. UDP).
+    pub fn max_wire_message(&self) -> usize {
+        const FRAME_OVERHEAD: usize = NONCE_SIZE + SEQ_SIZE + TAG_SIZE;
+        self.transport
+            .mtu()
+            .saturating_sub(FRAME_OVERHEAD)
+            .min(MAX_LINK_MESSAGE)
+    }
+
     /// Negotiated wire protocol version for this link.
     pub fn negotiated_version(&self) -> u8 {
         self.negotiated_version
     }
 
-    /// Check if a re-key is needed based on messages sent.
+    /// Check if a re-key is warranted based on traffic in either direction.
     pub async fn needs_rekey(&self) -> bool {
-        self.crypto.lock().await.send_count() >= REKEY_INTERVAL
+        self.crypto.lock().await.should_rekey()
     }
 
-    /// Perform re-keying using the negotiated KEM algorithm.
+    /// Begin an in-band rekey by sending our ephemeral KEM public key.
     ///
-    /// The KEM type owns the entire key exchange — no bare X25519 overlay.
-    /// Initiator: generates ephemeral KEM keypair, sends pubkey, receives ciphertext.
-    /// Responder: receives pubkey, encapsulates, sends ciphertext back.
-    pub async fn rekey(&self) -> Result<()> {
-        let kem_algo = self.rekey_kem_algo;
+    /// Only the link *initiator* drives rekeys; the responder answers via
+    /// [`handle_rekey_msg`]. This keeps roles unambiguous (no simultaneous
+    /// two-sided initiation) and keeps the new key derivation directionally
+    /// consistent with the original handshake.
+    ///
+    /// Unlike a blocking handshake, this does not read from the transport —
+    /// the response arrives as an ordinary message and is fed to
+    /// [`handle_rekey_msg`] by the node's receive loop. Safe to call while that
+    /// loop is running. No-op if a rekey is already in flight.
+    pub async fn rekey_initiate(&self) -> Result<()> {
+        if !self.is_initiator {
+            return Ok(());
+        }
 
-        if self.is_initiator {
-            let eph_kem = KemKeypair::generate_ephemeral(kem_algo);
+        let send_seq = self.crypto.lock().await.send_count();
 
-            let mut rekey_msg = RekeyMsg {
-                kem_algo: kem_algo as u8,
-                kem_pubkey: eph_kem.kem_pubkey_bytes(),
-                kem_ciphertext: Vec::new(),
-                signature: Vec::new(),
-            };
-            rekey_msg.signature = self.identity.sign(&rekey_msg.signable_bytes());
-
-            self.send_message(&rekey_msg.to_wire().encode()).await?;
-
-            // Receive responder's rekey (contains KEM ciphertext)
-            let response_data = self.recv_message().await?;
-            let wire = WireMessage::decode(&response_data)?;
-            let peer_rekey = RekeyMsg::from_bytes(&wire.payload)?;
-
-            if !identity::verify(
-                self.remote_signing_algo,
-                &self.remote_signing_pubkey,
-                &peer_rekey.signable_bytes(),
-                &peer_rekey.signature,
-            ) {
-                return Err(Error::Crypto("rekey signature invalid".into()));
+        let mut pending = self.pending_rekey.lock().await;
+        if let Some((_, started_at)) = pending.as_ref() {
+            // A rekey is already outstanding. Only abandon and retry once a full
+            // interval of messages has gone by with no response (message-count
+            // clock — no wall clock needed); otherwise let it complete.
+            if send_seq.wrapping_sub(*started_at) < REKEY_INTERVAL {
+                return Ok(());
             }
+        }
 
-            let kem_ss = eph_kem
-                .decapsulate(&peer_rekey.kem_ciphertext)
-                .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
+        let eph_kem = KemKeypair::generate_ephemeral(self.rekey_kem_algo);
+        let mut rekey_msg = RekeyMsg {
+            kem_algo: self.rekey_kem_algo as u8,
+            kem_pubkey: eph_kem.kem_pubkey_bytes(),
+            kem_ciphertext: Vec::new(),
+            signature: Vec::new(),
+        };
+        rekey_msg.signature = self.identity.sign(&rekey_msg.signable_bytes());
+        *pending = Some((eph_kem, send_seq));
+        // Send while holding the pending lock so a concurrent caller can't slip
+        // a second init in between.
+        self.send_message(&rekey_msg.to_wire().encode()).await?;
+        log::debug!("Rekey initiated with {:?}", self.remote_peer);
+        Ok(())
+    }
 
-            let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
-            let new_crypto = LinkCrypto::derive(&new_shared, true);
-            *self.crypto.lock().await = new_crypto;
-        } else {
-            // Responder: receive first, then send
-            let response_data = self.recv_message().await?;
-            let wire = WireMessage::decode(&response_data)?;
-            let peer_rekey = RekeyMsg::from_bytes(&wire.payload)?;
+    /// Handle an inbound rekey message, dispatched from the node receive loop.
+    ///
+    /// A message carrying a KEM *pubkey* is a rekey request: we encapsulate to
+    /// it and reply with the ciphertext, then install the new keys. A message
+    /// carrying a *ciphertext* is the response to a rekey we initiated: we
+    /// decapsulate and install. The new recv key is installed alongside the old
+    /// one (retained briefly) so the directional switchover has no lossy gap.
+    pub async fn handle_rekey_msg(&self, peer_rekey: &RekeyMsg) -> Result<()> {
+        // Authenticate against the peer's static signing key. (The frame is
+        // already link-authenticated by AEAD; this binds it to the peer's
+        // long-term identity, matching the handshake.)
+        if !identity::verify(
+            self.remote_signing_algo,
+            &self.remote_signing_pubkey,
+            &peer_rekey.signable_bytes(),
+            &peer_rekey.signature,
+        ) {
+            return Err(Error::Crypto("rekey signature invalid".into()));
+        }
 
-            if !identity::verify(
-                self.remote_signing_algo,
-                &self.remote_signing_pubkey,
-                &peer_rekey.signable_bytes(),
-                &peer_rekey.signature,
-            ) {
-                return Err(Error::Crypto("rekey signature invalid".into()));
-            }
-
+        if !peer_rekey.kem_pubkey.is_empty() {
+            // Rekey request → encapsulate, reply, then install.
             let peer_kem_algo = KemAlgo::from_u8(peer_rekey.kem_algo)
                 .map_err(|e| Error::Crypto(format!("unknown rekey KEM algo: {}", e)))?;
             let (kem_ss, kem_ct) =
                 KemKeypair::encapsulate_to(&peer_rekey.kem_pubkey, peer_kem_algo)
                     .map_err(|e| Error::Crypto(format!("rekey KEM encapsulate failed: {}", e)))?;
 
-            let mut rekey_msg = RekeyMsg {
-                kem_algo: kem_algo as u8,
+            let mut reply = RekeyMsg {
+                kem_algo: self.rekey_kem_algo as u8,
                 kem_pubkey: Vec::new(),
                 kem_ciphertext: kem_ct,
                 signature: Vec::new(),
             };
-            rekey_msg.signature = self.identity.sign(&rekey_msg.signable_bytes());
+            reply.signature = self.identity.sign(&reply.signable_bytes());
 
-            self.send_message(&rekey_msg.to_wire().encode()).await?;
-
+            // The reply MUST go out under the current (old) key — the peer can
+            // only decrypt it before it switches. Send first, install after.
+            self.send_message(&reply.to_wire().encode()).await?;
             let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
-            let new_crypto = LinkCrypto::derive(&new_shared, false);
-            *self.crypto.lock().await = new_crypto;
+            self.crypto
+                .lock()
+                .await
+                .install_rekey(&new_shared, self.is_initiator);
+            log::debug!("Re-keyed link with {:?} (answered request)", self.remote_peer);
+            Ok(())
+        } else if !peer_rekey.kem_ciphertext.is_empty() {
+            // Response to a rekey we initiated.
+            let eph_kem = match self.pending_rekey.lock().await.take() {
+                Some((eph_kem, _)) => eph_kem,
+                None => {
+                    return Err(Error::Crypto(
+                        "unexpected rekey response (no rekey in flight)".into(),
+                    ))
+                }
+            };
+            let kem_ss = eph_kem
+                .decapsulate(&peer_rekey.kem_ciphertext)
+                .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
+            let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
+            self.crypto
+                .lock()
+                .await
+                .install_rekey(&new_shared, self.is_initiator);
+            log::debug!("Re-keyed link with {:?} (initiated)", self.remote_peer);
+            Ok(())
+        } else {
+            Err(Error::Crypto("empty rekey message".into()))
         }
-
-        log::info!("Re-keyed link with {:?}", self.remote_peer);
-        Ok(())
     }
 }
 
@@ -1030,6 +1188,92 @@ mod tests {
         assert_eq!(crypto.send_count(), 1);
         crypto.encrypt(b"msg2");
         assert_eq!(crypto.send_count(), 2);
+    }
+
+    #[test]
+    fn rekey_basic_roundtrip() {
+        let shared = [42u8; 32];
+        let mut init = LinkCrypto::derive(&shared, true);
+        let mut resp = LinkCrypto::derive(&shared, false);
+
+        let d = init.encrypt(b"pre-rekey");
+        assert_eq!(resp.decrypt(&d).unwrap(), b"pre-rekey");
+
+        let new_shared = [99u8; 32];
+        resp.install_rekey(&new_shared, false);
+        init.install_rekey(&new_shared, true);
+
+        // Both directions work under the new keys, seq counters reset.
+        let a = init.encrypt(b"post-i2r");
+        assert_eq!(resp.decrypt(&a).unwrap(), b"post-i2r");
+        let b = resp.encrypt(b"post-r2i");
+        assert_eq!(init.decrypt(&b).unwrap(), b"post-r2i");
+    }
+
+    #[test]
+    fn rekey_transition_overlap_is_lossless() {
+        // Models the real switchover: the responder installs new keys when it
+        // receives the rekey request, but the initiator keeps sending under the
+        // old key until it gets the response. Those in-flight frames must still
+        // decrypt via the responder's retained previous key.
+        let shared = [7u8; 32];
+        let mut init = LinkCrypto::derive(&shared, true);
+        let mut resp = LinkCrypto::derive(&shared, false);
+
+        let d = init.encrypt(b"old-i2r");
+        assert_eq!(resp.decrypt(&d).unwrap(), b"old-i2r");
+
+        let new_shared = [9u8; 32];
+
+        // Responder switches first.
+        resp.install_rekey(&new_shared, false);
+
+        // Initiator still on old send key — straggler must survive.
+        let straggler = init.encrypt(b"straggler");
+        assert_eq!(resp.decrypt(&straggler).unwrap(), b"straggler");
+
+        // Initiator switches; subsequent frames use the new key.
+        init.install_rekey(&new_shared, true);
+        let fresh = init.encrypt(b"new-i2r");
+        assert_eq!(resp.decrypt(&fresh).unwrap(), b"new-i2r");
+
+        // Reverse direction works too.
+        let r = resp.encrypt(b"new-r2i");
+        assert_eq!(init.decrypt(&r).unwrap(), b"new-r2i");
+    }
+
+    #[test]
+    fn rekey_retains_previous_key_until_next_rekey() {
+        // The previous-epoch key is retained for the whole new epoch (so a
+        // reordered straggler that arrives *after* a new-key frame still
+        // decrypts), and is only rotated out at the next rekey — no indefinite
+        // acceptance window across more than one epoch.
+        let shared = [3u8; 32];
+        let mut init = LinkCrypto::derive(&shared, true);
+        let mut resp = LinkCrypto::derive(&shared, false);
+
+        let old_frame = init.encrypt(b"under-old"); // epoch 0, OLD key
+        let new_shared = [5u8; 32];
+        resp.install_rekey(&new_shared, false);
+        init.install_rekey(&new_shared, true);
+
+        // A new-key frame decrypts under the current key...
+        let new_frame = init.encrypt(b"under-new"); // epoch 1, seq 0
+        assert_eq!(resp.decrypt(&new_frame).unwrap(), b"under-new");
+
+        // ...and a straggler from epoch 0, arriving *after* it (as reordering
+        // would produce), still decrypts via the retained previous key.
+        assert_eq!(resp.decrypt(&old_frame).unwrap(), b"under-old");
+
+        // After a second rekey the epoch-0 key is rotated out (bounded
+        // retention: at most one previous epoch). A fresh frame under the
+        // original epoch-0 key no longer decrypts.
+        let newer_shared = [7u8; 32];
+        resp.install_rekey(&newer_shared, false);
+        init.install_rekey(&newer_shared, true);
+        let mut epoch0 = LinkCrypto::derive(&shared, true);
+        let epoch0_frame = epoch0.encrypt(b"ancient");
+        assert!(resp.decrypt(&epoch0_frame).is_err());
     }
 
     #[test]

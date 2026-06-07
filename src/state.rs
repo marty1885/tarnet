@@ -23,7 +23,12 @@ impl Default for StorageLimits {
             max_total_bytes: 16 * 1024 * 1024,
             max_records_per_key: 16,
             max_bytes_per_key: 256 * 1024,
-            max_value_bytes: 64 * 1024,
+            // Must leave room for the DhtPut wire envelope (~2 KB worst case:
+            // 64-byte key + 256-byte bloom + Falcon+Ed25519 signature & pubkey +
+            // fixed fields) so a stored record always fits MAX_PAYLOAD (65535)
+            // and can be forwarded. A record that can't be forwarded is useless
+            // and would silently fail to propagate, so reject it at store time.
+            max_value_bytes: 60 * 1024,
         }
     }
 }
