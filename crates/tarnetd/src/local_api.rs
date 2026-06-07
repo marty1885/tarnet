@@ -624,6 +624,13 @@ impl ServiceApi for LocalServiceApi {
     async fn tns_remove_label(&self, identity: Option<&str>, label: &str) -> ApiResult<()> {
         let id_key = self.identity_db_key(identity).await?;
         self.db.label_remove(&id_key, label).map_err(map_err)?;
+        // Drop the label from the zone root and republish it, so a removed name
+        // actually stops resolving (the root holds the zone's whole label set;
+        // it would otherwise persist until the root's TTL lapses).
+        let zone_keypair = self.keypair_for_identity(identity).await?;
+        tns::unpublish(&self.node, &zone_keypair, label, 3600)
+            .await
+            .map_err(map_err)?;
         self.tns_cache_clear().await;
         Ok(())
     }

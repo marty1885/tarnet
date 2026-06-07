@@ -484,6 +484,17 @@ pub struct Node {
     started_at: std::time::Instant,
     /// TNS resolution cache: avoids repeated DHT lookups for recently resolved names.
     tns_cache: Arc<Mutex<crate::tns::TnsCache>>,
+    /// In-memory working set of each owned zone's published records, keyed by
+    /// zone ServiceId then label (serialized TnsRecord set). The durable source
+    /// of truth a zone root is rebuilt and re-signed from on every change; the
+    /// single funnel for ALL publishers (user labels, hidden-service intro/peer)
+    /// so the rebuilt root always carries the whole zone. Write-through to the
+    /// `tns_zone_records` table when a db is present; hydrated lazily per zone.
+    zone_published: Arc<
+        Mutex<
+            HashMap<tarnet_api::types::ServiceId, std::collections::BTreeMap<String, Vec<u8>>>,
+        >,
+    >,
     /// RouteProbe reverse-path table: nonce → (sender, timestamp).
     /// Used to forward RouteProbeFound replies back to the originator.
     probe_reverse: Arc<Mutex<HashMap<[u8; 16], (PeerId, Instant)>>>,
@@ -714,6 +725,7 @@ impl Node {
             bandwidth: Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0)),
             started_at: std::time::Instant::now(),
             tns_cache: Arc::new(Mutex::new(crate::tns::TnsCache::new())),
+            zone_published: Arc::new(Mutex::new(HashMap::new())),
             probe_reverse: Arc::new(Mutex::new(HashMap::new())),
             probe_seen: Arc::new(Mutex::new(HashMap::new())),
             pending_probes: Arc::new(Mutex::new(HashMap::new())),

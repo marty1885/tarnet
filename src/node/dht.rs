@@ -378,6 +378,86 @@ impl Node {
         Ok(())
     }
 
+    /// Publish a self-addressed TNS zone root: signed by the zone key at
+    /// `zone_root_key(zone_sid)`. Only the zone owner can write there (the ingest
+    /// gate enforces it), so the location carries no foreign-signer flood surface.
+    /// `value` is the caller's already-sealed root blob, stored verbatim.
+    pub async fn dht_put_zone_root(
+        &self,
+        zone_keypair: &crate::identity::Keypair,
+        value: &[u8],
+        sequence: u64,
+        ttl_secs: u32,
+    ) -> Result<()> {
+        let record = crate::dht::VerifiedRecord::new_zone_root(
+            zone_keypair,
+            value,
+            sequence,
+            Duration::from_secs(ttl_secs as u64),
+        );
+        let params = self.dht_query_params().await;
+        self.dht_publish(record, params).await;
+        log::info!("TNS zone root put for {:?}", zone_keypair.identity.service_id());
+        Ok(())
+    }
+
+    /// Update one label in an owned zone's published working set and return the
+    /// full current map (`label → serialized TnsRecord set`) together with a fresh
+    /// monotonic sequence. `records = Some(..)` upserts the label; `None` removes
+    /// it. The map is the durable source of truth the zone root is rebuilt from;
+    /// it is hydrated lazily from the `tns_zone_records` table on first touch and
+    /// written through on change, so it survives restart and accumulates across
+    /// every publisher path.
+    ///
+    /// The sequence is allocated *inside* the same critical section as the
+    /// snapshot, so a higher sequence always corresponds to a same-or-newer
+    /// snapshot. Without this, two concurrent publishers (e.g. a hidden service's
+    /// "intro" and "peer") could invert — a stale, smaller snapshot winning with a
+    /// higher sequence and silently dropping the other label from the root.
+    pub(crate) async fn zone_published_update(
+        &self,
+        zone_sid: &tarnet_api::types::ServiceId,
+        label: &str,
+        records: Option<Vec<u8>>,
+    ) -> (std::collections::BTreeMap<String, Vec<u8>>, u64) {
+        let mut map = self.zone_published.lock().await;
+        // Lazy hydrate from the DB the first time we touch this zone.
+        if !map.contains_key(zone_sid) {
+            let mut loaded = std::collections::BTreeMap::new();
+            if let Some(db) = &self.db {
+                if let Ok(rows) = db.zone_record_list(zone_sid.as_bytes()) {
+                    loaded.extend(rows);
+                }
+            }
+            map.insert(*zone_sid, loaded);
+        }
+        let entry = map.get_mut(zone_sid).expect("hydrated above");
+        match &records {
+            Some(blob) => {
+                entry.insert(label.to_string(), blob.clone());
+            }
+            None => {
+                entry.remove(label);
+            }
+        }
+        let snapshot = entry.clone();
+        // Allocate the sequence under the map lock so seq and snapshot can't
+        // invert across concurrent publishers.
+        let sequence = self.next_signed_content_sequence().await;
+        // Write through to durable storage (best-effort; the in-memory copy is
+        // authoritative for this process either way).
+        if let Some(db) = &self.db {
+            let res = match &records {
+                Some(blob) => db.zone_record_set(zone_sid.as_bytes(), label, blob),
+                None => db.zone_record_remove(zone_sid.as_bytes(), label),
+            };
+            if let Err(e) = res {
+                log::warn!("zone_published_update: db write failed: {}", e);
+            }
+        }
+        (snapshot, sequence)
+    }
+
     /// Get all non-expired records at an arbitrary DHT key from local store.
     pub async fn dht_get_records_at_key(&self, key: &DhtId) -> Vec<crate::dht::DhtRecord> {
         self.dht_store

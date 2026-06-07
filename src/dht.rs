@@ -8,6 +8,7 @@ use rand::{Rng, RngCore};
 use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::state::{PersistedRecord, StorageLimits};
 use crate::types::{DhtId, PeerId, RecordType, Result};
+use tarnet_api::types::ServiceId;
 
 /// 64-byte XOF hash.
 fn hash_64(input: &[u8]) -> [u8; 64] {
@@ -253,6 +254,17 @@ pub fn verify_incoming_record(
     if crate::identity::peer_id_from_signing_pubkey(signer_pubkey) != PeerId(*signer) {
         return Err("signer pubkey does not match signer PeerId");
     }
+    // Self-addressed records (zone roots) must live at the hash of their own
+    // signer's ServiceId. This is the anti-flood / anti-squat invariant: a
+    // record at `zone_root_key(sid)` is accepted only if its signer's pubkey
+    // hashes to `sid`, so only the zone-key holder can ever write there and no
+    // foreign signer can pile junk at the location to evict the real record.
+    if record_type.is_self_addressed() {
+        let expected = zone_root_key(&ServiceId::from_signing_pubkey(signer_pubkey));
+        if expected.as_bytes() != key {
+            return Err("self-addressed record not stored at its own key");
+        }
+    }
     let signable = record_signable(key, record_type, sequence, value);
     if !crate::identity::verify(algo, signer_pubkey, &signable, signature) {
         return Err("invalid signature");
@@ -379,6 +391,30 @@ impl VerifiedRecord {
         ))
     }
 
+    /// Mint a self-addressed TNS zone-root record. Stored at `zone_root_key(sid)`
+    /// where `sid` is `zone_keypair`'s ServiceId, and signed by `zone_keypair`
+    /// itself — so the ingest gate's self-address check passes only because the
+    /// signer's pubkey hashes to `sid`. `value` is the caller's already-sealed
+    /// zone-root blob (see the TNS layer); it is stored verbatim. Because the
+    /// key is fixed by `sid` and the signer is the zone key, only the zone owner
+    /// can ever write here — there is no foreign-signer flood surface.
+    pub fn new_zone_root(
+        zone_keypair: &Keypair,
+        value: &[u8],
+        sequence: u64,
+        ttl: Duration,
+    ) -> Self {
+        let key = zone_root_key(&zone_keypair.identity.service_id());
+        Self(sign_record(
+            zone_keypair,
+            key,
+            RecordType::ZoneRoot,
+            sequence,
+            value.to_vec(),
+            ttl,
+        ))
+    }
+
     /// Mint a Hello record at the identity-addressed key for `identity`. The
     /// serialized hello bytes are wrapped with [`signed_record_encrypt`] under
     /// the key so storage nodes see only a blob, then signed by `identity`.
@@ -492,6 +528,13 @@ impl DhtStore {
             RecordType::SignedContent => {
                 // Different signers are supplemental; same signer replaces if >= sequence
                 upsert_by_signer(entries, record, true)
+            }
+            RecordType::ZoneRoot => {
+                // Self-addressed: the ingest gate guarantees the signer's ServiceId
+                // hashes to this key, so every record here shares one signer — the
+                // zone owner. Same signer + strictly higher sequence replaces; no
+                // foreign signer can ever append, so there is no eviction race.
+                upsert_by_signer(entries, record, false)
             }
             RecordType::Content => {
                 // Keep up to N candidates to resist poisoning attacks.
@@ -1287,6 +1330,24 @@ pub fn identity_address_key(peer_id: &PeerId) -> DhtId {
     dht_id_from_peer_id(peer_id)
 }
 
+/// Self-addressed DHT key for a TNS zone root: a 64-byte XOF hash of a domain
+/// separator and the zone's ServiceId. A resolver computes this from the name's
+/// ServiceId alone; the ingest gate ([`verify_incoming_record`]) recomputes it
+/// from a record's signer pubkey and rejects any zone-root record not stored
+/// here, so the location is writable only by the holder of the zone key.
+///
+/// Domain-separated from per-label/content/identity keys so a zone root can
+/// never collide with another record class's location.
+pub fn zone_root_key(sid: &ServiceId) -> DhtId {
+    let mut out = [0u8; 64];
+    blake3::Hasher::new()
+        .update(b"tarnet tns zone-root v1")
+        .update(sid.as_bytes())
+        .finalize_xof()
+        .fill(&mut out);
+    DhtId(out)
+}
+
 /// Encrypt the value of a signed or hello DHT record so that storage nodes
 /// cannot read the content.  The encryption key is derived from the DHT
 /// lookup key (which the querier already knows).
@@ -1410,6 +1471,47 @@ mod tests {
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
             Some("signer pubkey does not match signer PeerId")
+        );
+    }
+
+    #[test]
+    fn zone_root_accepts_owner_at_self_address() {
+        // A zone root signed by the zone key and stored at zone_root_key(its sid)
+        // passes the gate — the legitimate publish path.
+        let zone = Keypair::generate();
+        let key = zone_root_key(&zone.identity.service_id());
+        let rec = signed_record(&zone, key, RecordType::ZoneRoot, 1, b"root".to_vec());
+        assert!(VerifiedRecord::verify_incoming(rec).is_ok());
+    }
+
+    #[test]
+    fn zone_root_rejects_foreign_signer_flood() {
+        // The anti-flood invariant: an attacker who knows the victim's zone sid
+        // computes zone_root_key(sid) and tries to plant junk there, signed by
+        // their OWN key. The gate rejects it — the location is writable only by
+        // the holder of the zone key, so there is no foreign-signer record to
+        // accumulate and no per-key eviction race (Finding 1, closed).
+        let victim = Keypair::generate();
+        let attacker = Keypair::generate();
+        let victim_root = zone_root_key(&victim.identity.service_id());
+        // Attacker signs a record for the victim's zone-root location.
+        let rec = signed_record(&attacker, victim_root, RecordType::ZoneRoot, 99, b"junk".to_vec());
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("self-addressed record not stored at its own key")
+        );
+    }
+
+    #[test]
+    fn zone_root_rejects_owner_at_wrong_key() {
+        // Even the real zone key cannot place a zone root anywhere but its own
+        // self-address — prevents a root from masquerading at another zone's slot.
+        let zone = Keypair::generate();
+        let wrong = zone_root_key(&Keypair::generate().identity.service_id());
+        let rec = signed_record(&zone, wrong, RecordType::ZoneRoot, 1, b"root".to_vec());
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("self-addressed record not stored at its own key")
         );
     }
 
