@@ -1232,10 +1232,7 @@ async fn circuit_build_through_relay() {
 
     assert!(circuit_id > 0);
 
-    // Send data through the circuit
-    a.send_circuit_data(circuit_id, b"relay test data")
-        .await
-        .unwrap();
+    assert!(a.send_circuit_data(circuit_id, b"no stream").await.is_err());
 
     a.destroy_circuit(circuit_id).await.unwrap();
 }

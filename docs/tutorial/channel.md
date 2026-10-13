@@ -17,7 +17,19 @@ The default mode is `reliable-ordered`, suitable for most use cases. Use `unreli
 
 Only reliable modes (`ro`, `ru`) can detect a broken link. They track ACKs and declare the channel dead after 60 seconds without a response. Unreliable modes (`uu`, `su`) have no acknowledgements, so they cannot tell whether the other side is still there - packets simply stop arriving with no notification.
 
-Tarnet builds resilience at two layers. At the link layer, multiple transports to the same peer (e.g., TCP and WebRTC) are kept on standby - if the active link drops, the next-best is promoted automatically. At the circuit layer, tarnet maintains backup circuits through node-disjoint paths where possible, so a failure anywhere along one path doesn't take down the connection. If the primary circuit dies, a backup is promoted instantly. In reliable modes, any packets lost during a switch are retransmitted - the channel survives transport and path failures without the application noticing.
+At the link layer, multiple transports to the same peer (e.g., TCP and WebRTC) can be kept on standby. Reliable channels recover lost packets while their circuit remains usable, including losses during a link transport switch. An explicitly destroyed circuit closes its connection; automatic migration of an established channel to a replacement circuit is not guaranteed.
+
+## Reliability over circuits
+
+Circuit connections use the same `Channel` sequencing, acknowledgements, deduplication, and retransmission machinery as tunnel channels. A circuit is a datagram carrier: its crypto handles authenticity, nonce uniqueness, and replay protection, not delivery or ordering. Links carry opaque cells over whichever transport is available and do not track end-to-end acknowledgements.
+
+Each reliable channel retains its unacknowledged packets within a bounded sending window. An acknowledgement includes a cumulative sequence position and selective acknowledgements for out-of-order packets. If an acknowledgement is lost, a duplicate packet is acknowledged again without being delivered twice. Retransmissions keep their channel sequence number but are encrypted as new circuit cells with fresh crypto nonces.
+
+For circuit connections, final EOF is also sequenced and acknowledged. It closes only the sending direction, after earlier data has arrived; the opposite direction can continue. Circuit destruction is an abrupt failure instead. Unreliable connections have no delivery acknowledgements or retransmissions.
+
+Channel DATA and ACKs are inside the onion-encrypted, fixed-size cells and follow the circuit, so intermediate relays cannot read delivery metadata. Nonce origin domains are blinded at each onion layer rather than exposing an identical domain along the path. This does not eliminate traffic analysis of timing and volume.
+
+These circuit framing and nonce changes require wire protocol version **3**. All participating nodes must be upgraded; version 2 is incompatible.
 
 ## Using Modes
 

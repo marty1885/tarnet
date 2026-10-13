@@ -271,6 +271,13 @@ impl Connection {
         let mut rx = self.rx.lock().await;
         rx.recv().await.ok_or(ApiError::NotConnected)
     }
+
+    /// Split the application endpoints. Dropping the sender half closes the
+    /// sending direction after queued data; the receiver can still drain replies.
+    /// This does not expose circuit, crypto, or transport state.
+    pub fn into_split(self) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        (self.tx, self.rx.into_inner())
+    }
 }
 
 impl std::fmt::Debug for Connection {

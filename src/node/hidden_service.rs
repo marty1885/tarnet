@@ -32,6 +32,11 @@ impl Node {
         port: &str,
         intro_points: &[(PeerId, u8, Vec<u8>)],
     ) -> Result<tarnet_api::service::Connection> {
+        if intro_points.is_empty() {
+            return Err(Error::Protocol(
+                "no introduction points for rendezvous".into(),
+            ));
+        }
         let connected = self.connected_peers().await;
         if connected.is_empty() {
             return Err(Error::Protocol("no connected peers for rendezvous".into()));
@@ -48,6 +53,7 @@ impl Node {
         let rend_circuit_id = self
             .build_circuit(rendezvous_peer, vec![rendezvous_peer])
             .await?;
+        let mut rend_attempt = self.circuit_attempt_guard(rend_circuit_id);
 
         // Send RendezvousEstablish(cookie)
         let establish_cell = RelayCell {
@@ -57,17 +63,20 @@ impl Node {
         };
         {
             let mut circuits = self.circuits.outbound.lock().await;
-            let circuit = circuits.get_mut(&rend_circuit_id).unwrap();
+            let circuit = circuits
+                .get_mut(&rend_circuit_id)
+                .ok_or_else(|| Error::Protocol("rendezvous circuit disappeared".into()))?;
             let (fh, cid, cell) = circuit.send_relay_cell(&establish_cell);
             drop(circuits);
 
             let encoded = encode_circuit_relay_cell(cid, &cell);
-            self.send_to_peer(&fh, &encoded).await?;
+            self.send_to_peer_critical(&fh, &encoded).await?;
         }
 
         // Build circuit to an intro point
         let (intro_peer, kem_algo_byte, ref kem_pubkey) = intro_points[0];
         let intro_circuit_id = self.build_circuit(intro_peer, vec![intro_peer]).await?;
+        let _intro_attempt = self.circuit_attempt_guard(intro_circuit_id);
 
         // KEM encapsulate to the service's KEM public key.
         // Only the real service can decapsulate to recover the shared secret.
@@ -107,12 +116,14 @@ impl Node {
         };
         {
             let mut circuits = self.circuits.outbound.lock().await;
-            let circuit = circuits.get_mut(&intro_circuit_id).unwrap();
+            let circuit = circuits
+                .get_mut(&intro_circuit_id)
+                .ok_or_else(|| Error::Protocol("introduction circuit disappeared".into()))?;
             let (fh, cid, cell) = circuit.send_relay_cell(&introduce_cell);
             drop(circuits);
 
             let encoded = encode_circuit_relay_cell(cid, &cell);
-            self.send_to_peer(&fh, &encoded).await?;
+            self.send_to_peer_critical(&fh, &encoded).await?;
         }
         // Wait for IntroduceAck
         let _ack = tokio::time::timeout(Duration::from_secs(10), ack_rx)
@@ -128,11 +139,14 @@ impl Node {
         let e2e_hop = crate::circuit::HopKey::from_shared_secret(&shared_secret);
         {
             let mut circuits = self.circuits.outbound.lock().await;
-            let circuit = circuits.get_mut(&rend_circuit_id).unwrap();
+            let circuit = circuits
+                .get_mut(&rend_circuit_id)
+                .ok_or_else(|| Error::Protocol("rendezvous circuit disappeared".into()))?;
             // Replace all hop keys with only the e2e key. The rendezvous point
             // bridges the two circuits at the cell level (Forward with no crypto),
             // so circuit-level encryption must be removed.
             circuit.hop_keys = vec![e2e_hop];
+            circuit.nonce_domain = rand::random();
         }
 
         log::info!(
@@ -141,80 +155,18 @@ impl Node {
             rend_circuit_id,
         );
 
-        // The rendezvous circuit is now bridged — set up data channels.
-        // Set up data channels for the Connection.
-        let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
-
-        self.endpoints
-            .data_txs
-            .lock()
-            .await
-            .insert(rend_circuit_id, circuit_tx);
-
-        let rend_sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuits
-            .sendme_notify
-            .lock()
-            .await
-            .insert(rend_circuit_id, rend_sendme_notify.clone());
-
-        let node_circuits = self.circuits.outbound.clone();
-        let node_links = self.links.clone();
-        tokio::spawn(async move {
-            let mut rx = circuit_rx;
-            while let Some(data) = rx.recv().await {
-                // Wait until congestion window allows sending.
-                loop {
-                    let can_send = {
-                        let mut circuits = node_circuits.lock().await;
-                        if let Some(c) = circuits.get_mut(&rend_circuit_id) {
-                            c.congestion.check_stall();
-                            c.congestion.can_send()
-                        } else {
-                            false
-                        }
-                    };
-                    if can_send {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = rend_sendme_notify.notified() => {}
-                        _ = tokio::time::sleep(SENDME_STALL_TIMEOUT) => {}
-                    }
-                }
-
-                let mut circuits = node_circuits.lock().await;
-                if let Some(circuit) = circuits.get_mut(&rend_circuit_id) {
-                    let relay_cell = RelayCell {
-                        command: RelayCellCommand::Data,
-                        stream_id: 0,
-                        data,
-                    };
-                    let (first_hop, cid, cell) = circuit.send_relay_cell(&relay_cell);
-                    circuit.congestion.on_send();
-                    drop(circuits);
-
-                    let encoded = encode_circuit_relay_cell(cid, &cell);
-                    let links = node_links.lock().await;
-                    if let Some(link) = links.get(&first_hop) {
-                        let _ = link.send_message(&encoded).await;
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-
-        let conn = tarnet_api::service::Connection::new(
-            service_id,
-            mode,
-            port.to_string(),
+        let conn = self
+            .circuit_connection(service_id, mode, port, rend_circuit_id)
+            .await;
+        self.wait_stream_connected(
             rend_circuit_id,
-            app_tx,
-            app_rx,
-        );
-
+            RelayCellCommand::RendezvousReady,
+            Vec::new(),
+        )
+        .await?;
+        // The introduction circuit is only needed for the handshake.
+        self.destroy_circuit(intro_circuit_id).await?;
+        rend_attempt.armed = false;
         Ok(conn)
     }
 
@@ -387,7 +339,7 @@ impl Node {
                 drop(circuits);
 
                 let encoded = encode_circuit_relay_cell(cid, &cell);
-                self.send_to_peer(&fh, &encoded).await?;
+                self.send_to_peer_critical(&fh, &encoded).await?;
             }
 
             // Wait for IntroRegistered
@@ -761,114 +713,53 @@ impl Node {
                 return;
             }
         };
+        let mut attempt = self.circuit_attempt_guard(circuit_id);
 
-        // Send RendezvousJoin(cookie) BEFORE adding the e2e hop, because the
-        // rendezvous point needs to read this cell (it only has circuit-level crypto).
+        let (ready_tx, ready_rx) = oneshot::channel();
+        self.circuits
+            .pending_extends
+            .lock()
+            .await
+            .insert(circuit_id, ready_tx);
+
+        // Encode JOIN with the rendezvous keys, but install the e2e receiver
+        // before sending it: the client may answer immediately.
         let join_cell = RelayCell {
             command: RelayCellCommand::RendezvousJoin,
             stream_id: 0,
             data: cookie.to_vec(),
         };
-        {
+        let (fh, cid, cell) = {
             let mut circuits = self.circuits.outbound.lock().await;
-            if let Some(circuit) = circuits.get_mut(&circuit_id) {
-                let (fh, cid, cell) = circuit.send_relay_cell(&join_cell);
-                drop(circuits);
-
-                let encoded = encode_circuit_relay_cell(cid, &cell);
-                if let Err(e) = self.send_to_peer(&fh, &encoded).await {
-                    log::debug!("Failed to send RendezvousJoin: {}", e);
-                    return;
-                }
-            } else {
-                log::debug!("Circuit disappeared during rendezvous join");
+            let Some(circuit) = circuits.get_mut(&circuit_id) else {
                 return;
-            }
+            };
+            let encoded = circuit.send_relay_cell(&join_cell);
+            circuit.hop_keys = vec![crate::circuit::HopKey::from_shared_secret_responder(
+                &shared_secret,
+            )];
+            circuit.nonce_domain = rand::random();
+            encoded
+        };
+        let conn = self
+            .circuit_connection(service_sid, mode, &port, circuit_id)
+            .await;
+        let encoded = encode_circuit_relay_cell(cid, &cell);
+        if let Err(e) = self.send_to_peer_critical(&fh, &encoded).await {
+            log::debug!("Failed to send RendezvousJoin: {}", e);
+            return;
         }
 
-        // Now add e2e HopKey and replace all hop keys with only the e2e key.
-        // The rendezvous point bridges the two circuits at the cell level
-        // (Forward with no crypto), so circuit-level encryption must be removed.
-        let e2e_hop = crate::circuit::HopKey::from_shared_secret_responder(&shared_secret);
-        {
-            let mut circuits = self.circuits.outbound.lock().await;
-            if let Some(circuit) = circuits.get_mut(&circuit_id) {
-                circuit.hop_keys = vec![e2e_hop];
-            }
+        // Do not expose the backend until the client has installed e2e keys
+        // and its receive channel. Ready is retried and acknowledged by the client.
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(60), ready_rx).await,
+            Ok(Ok(_))
+        ) {
+            log::debug!("Hidden-service client did not become ready");
+            return;
         }
-
-        log::info!(
-            "Service sent RendezvousJoin on circuit_id={} (e2e encrypted)",
-            circuit_id,
-        );
-
-        // Set up data channels for the incoming rendezvous connection.
-        let (app_tx, circuit_rx) = mpsc::channel::<Vec<u8>>(256);
-        let (circuit_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
-
-        self.endpoints
-            .data_txs
-            .lock()
-            .await
-            .insert(circuit_id, circuit_tx);
-
-        let svc_sendme_notify = Arc::new(tokio::sync::Notify::new());
-        self.circuits
-            .sendme_notify
-            .lock()
-            .await
-            .insert(circuit_id, svc_sendme_notify.clone());
-
-        let node_circuits = self.circuits.outbound.clone();
-        let node_links = self.links.clone();
-        tokio::spawn(async move {
-            let mut rx = circuit_rx;
-            while let Some(data) = rx.recv().await {
-                // Wait until congestion window allows sending.
-                loop {
-                    let can_send = {
-                        let mut circuits = node_circuits.lock().await;
-                        if let Some(c) = circuits.get_mut(&circuit_id) {
-                            c.congestion.check_stall();
-                            c.congestion.can_send()
-                        } else {
-                            false
-                        }
-                    };
-                    if can_send {
-                        break;
-                    }
-                    tokio::select! {
-                        _ = svc_sendme_notify.notified() => {}
-                        _ = tokio::time::sleep(SENDME_STALL_TIMEOUT) => {}
-                    }
-                }
-
-                let mut circuits = node_circuits.lock().await;
-                if let Some(circuit) = circuits.get_mut(&circuit_id) {
-                    let relay_cell = RelayCell {
-                        command: RelayCellCommand::Data,
-                        stream_id: 0,
-                        data,
-                    };
-                    let (first_hop, cid, cell) = circuit.send_relay_cell(&relay_cell);
-                    circuit.congestion.on_send();
-                    drop(circuits);
-
-                    let encoded = encode_circuit_relay_cell(cid, &cell);
-                    let links = node_links.lock().await;
-                    if let Some(link) = links.get(&first_hop) {
-                        let _ = link.send_message(&encoded).await;
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-
-        let conn = tarnet_api::service::Connection::new(
-            service_sid, mode, port, circuit_id, app_tx, app_rx,
-        );
+        attempt.armed = false;
         let port_name = conn.port.clone();
         match self
             .dispatch_incoming_connection(service_sid, mode, &port_name, conn)

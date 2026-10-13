@@ -21,7 +21,7 @@ use crate::types::{Error, PeerId, Result};
 /// Per-hop Poly1305 tag size.
 const HOP_MAC_SIZE: usize = 16;
 /// Explicit nonce size in the cell trailer.
-const CELL_NONCE_SIZE: usize = 8;
+pub const CELL_NONCE_SIZE: usize = 24;
 /// Size of the encrypted body within a cell (before nonce + hop MAC).
 pub const CELL_BODY_SIZE: usize = 1400;
 /// Full cell size on the wire: encrypted body + nonce + per-hop MAC.
@@ -73,7 +73,7 @@ pub enum CryptoOp {
 /// Per-hop crypto state stored in a circuit forwarding entry.
 /// Relays use this to peel/add one onion layer as cells pass through.
 ///
-/// The nonce is carried explicitly in the cell trailer (8 bytes) rather than
+/// The nonce is carried explicitly in the cell trailer (24 bytes) rather than
 /// tracked as an implicit counter. This allows the scheme to survive
 /// unreliable (UDP-like) transports where cells may be dropped or reordered.
 /// A sliding-window bitmap rejects replayed cells.
@@ -87,63 +87,68 @@ pub struct HopCrypto {
     pub nonce_prefix: [u8; 16],
     pub op: CryptoOp,
     /// Replay window for this hop (only meaningful for Decrypt).
-    pub replay: ReplayWindow,
+    pub replay: CellReplayWindow,
 }
 
 impl HopCrypto {
     /// Process a cell through this hop's crypto layer.
     ///
-    /// The 8-byte nonce is read from `cell[CELL_BODY_SIZE..CELL_BODY_SIZE+8]`.
+    /// The 24-byte nonce is read from the cell trailer.
     ///
     /// **Decrypt** (relay peeling a forward layer / initiator peeling backward):
     ///   - Reads the nonce from the cell trailer.
     ///   - Checks the replay window; returns `false` if replayed/too old.
     ///   - Verifies the hop MAC; returns `false` if it doesn't match.
-    ///   - Decrypts the body in place and zeros the nonce+MAC trailer.
+    ///   - Decrypts the body, zeros the MAC, and peels the nonce-domain mask.
     ///   - Returns `true` on success.
-    ///   - Note: inner onion layers will always fail MAC because the outermost
-    ///     hop's MAC overwrites theirs — callers that are not the outermost
-    ///     hop should ignore the return value.
+    ///   - Inner tags are overwritten by onion wrapping. A zero tag marks a
+    ///     peeled layer; endpoint integrity is checked with the relay digest.
+    ///     Callers must respect rejection, including replay rejection.
     ///
     /// **Encrypt** (relay adding a backward layer):
     ///   - Reads the nonce from the cell trailer (set by the sender/previous hop).
-    ///   - Encrypts the body, then writes the hop MAC. Nonce is preserved.
-    ///   - Always returns `true`.
+    ///   - Blinds the nonce domain, encrypts the body, then writes the hop MAC.
+    ///   - Rejects repeated nonces before encryption.
     pub fn process_cell(&mut self, cell: &mut [u8; CELL_SIZE]) -> bool {
         let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(&self.nonce_prefix, nonce_val);
         let aead = XChaCha20Poly1305::new((&self.key).into());
         match self.op {
             CryptoOp::Decrypt => {
-                if !self.replay.accept(nonce_val) {
-                    return false;
-                }
+                let nonce = build_nonce(&self.nonce_prefix, &nonce_val);
                 let mac_start = CELL_BODY_SIZE + CELL_NONCE_SIZE;
                 let tag: [u8; 16] = cell[mac_start..].try_into().unwrap();
-                let ok = aead
-                    .decrypt_in_place_detached(
-                        (&nonce).into(),
-                        b"",
-                        &mut cell[..CELL_BODY_SIZE],
-                        (&tag).into(),
-                    )
-                    .is_ok();
-                if !ok {
-                    // Inner onion layer: tag was overwritten by outer hop.
-                    // AEAD decrypt didn't modify the buffer, so apply
-                    // keystream directly (ChaCha20 encrypt == decrypt).
+                let ok = if tag == [0; 16] {
+                    // Inner tags are explicitly cleared by the previous hop.
                     let _ = aead.encrypt_in_place_detached(
                         (&nonce).into(),
                         b"",
                         &mut cell[..CELL_BODY_SIZE],
                     );
+                    true
+                } else {
+                    aead.decrypt_in_place_detached(
+                        (&nonce).into(),
+                        b"",
+                        &mut cell[..CELL_BODY_SIZE],
+                        (&tag).into(),
+                    )
+                    .is_ok()
+                };
+                if !ok || !self.replay.accept(nonce_val) {
+                    return false;
                 }
                 // Zero the tag but preserve the nonce — relays forward
-                // the cell to the next hop which needs the same nonce.
+                // the counter, peeling this hop's blinding from the domain.
                 cell[mac_start..].fill(0);
+                blind_cell_domain(cell, &self.nonce_prefix);
                 ok
             }
             CryptoOp::Encrypt => {
+                if !self.replay.accept(nonce_val) {
+                    return false;
+                }
+                blind_cell_domain(cell, &self.nonce_prefix);
+                let nonce = build_nonce(&self.nonce_prefix, &cell_nonce(cell));
                 let tag = aead
                     .encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE])
                     .expect("AEAD encryption should not fail");
@@ -211,7 +216,7 @@ impl CircuitTable {
         loop {
             let raw: u32 = rng.gen();
             let id = if we_initiated_link { raw | 1 } else { raw & !1 };
-            if id != 0 && !is_taken(id) {
+            if id != 0 && !self.entries.keys().any(|key| key.circuit_id == id) && !is_taken(id) {
                 return id;
             }
         }
@@ -318,26 +323,69 @@ impl CircuitTable {
 // Nonce construction
 // ---------------------------------------------------------------------------
 
-/// Build a 24-byte XChaCha20 nonce from a per-circuit prefix and counter.
-/// Format: prefix (16) || counter_le (8)
-fn build_nonce(prefix: &[u8; 16], counter: u64) -> [u8; 24] {
-    let mut nonce = [0u8; 24];
-    nonce[..16].copy_from_slice(prefix);
-    nonce[16..].copy_from_slice(&counter.to_le_bytes());
+/// Build an XChaCha20 nonce from the hop-blinded domain and counter.
+fn build_nonce(prefix: &[u8; 16], transmitted: &[u8; 24]) -> [u8; 24] {
+    let mut nonce = *transmitted;
+    for (byte, mask) in nonce[..16].iter_mut().zip(prefix) {
+        *byte ^= mask;
+    }
     nonce
 }
 
-/// Read the 8-byte explicit nonce from a cell's trailer.
-fn cell_nonce(cell: &[u8; CELL_SIZE]) -> u64 {
-    let bytes: [u8; 8] = cell[CELL_BODY_SIZE..CELL_BODY_SIZE + CELL_NONCE_SIZE]
-        .try_into()
-        .unwrap();
-    u64::from_le_bytes(bytes)
+/// Each onion layer changes the visible domain using a hop-private mask.
+/// Non-adjacent relays must not see an identical circuit-wide origin marker.
+/// XOR is reversible, and domains remain stable within a hop's replay window.
+fn blind_cell_domain(cell: &mut [u8; CELL_SIZE], mask: &[u8; 16]) {
+    for (byte, mask) in cell[CELL_BODY_SIZE..CELL_BODY_SIZE + 16]
+        .iter_mut()
+        .zip(mask)
+    {
+        *byte ^= mask;
+    }
 }
 
-/// Write the 8-byte explicit nonce into a cell's trailer.
-fn set_cell_nonce(cell: &mut [u8; CELL_SIZE], nonce: u64) {
-    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + CELL_NONCE_SIZE].copy_from_slice(&nonce.to_le_bytes());
+/// Domain separation: an origin's domain must not equal its hop blinding mask.
+/// Otherwise a locally originated cell would expose a constant zero domain.
+pub(crate) fn backward_nonce_domain(prefix: &[u8; 16]) -> [u8; 16] {
+    let material = blake3::derive_key("tarnet backward cell origin v3", prefix);
+    material[..16].try_into().unwrap()
+}
+
+/// Read the explicit origin domain and counter from a cell's trailer.
+pub fn cell_nonce(cell: &[u8; CELL_SIZE]) -> [u8; 24] {
+    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + CELL_NONCE_SIZE]
+        .try_into()
+        .unwrap()
+}
+
+/// Write the origin domain and counter into a cell's trailer.
+pub fn set_cell_nonce(cell: &mut [u8; CELL_SIZE], origin: &[u8; 16], counter: u64) {
+    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + 16].copy_from_slice(origin);
+    cell[CELL_BODY_SIZE + 16..CELL_BODY_SIZE + CELL_NONCE_SIZE]
+        .copy_from_slice(&counter.to_le_bytes());
+}
+
+/// Each backward origin has its own 128-bit nonce domain. Keep old domains
+/// instead of resetting replay protection when the circuit gains another hop.
+#[derive(Debug, Clone, Default)]
+pub struct CellReplayWindow {
+    domains: HashMap<[u8; 16], ReplayWindow>,
+}
+
+impl CellReplayWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn accept(&mut self, nonce: [u8; 24]) -> bool {
+        let domain = nonce[..16].try_into().unwrap();
+        if !self.domains.contains_key(&domain) && self.domains.len() >= 128 {
+            return false;
+        }
+        self.domains
+            .entry(domain)
+            .or_insert_with(ReplayWindow::new)
+            .accept(u64::from_le_bytes(nonce[16..].try_into().unwrap()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +501,8 @@ pub enum RelayCellCommand {
     StreamRefused = 0x0F,
     /// Circuit keepalive: sent end-to-end, echoed back by endpoint.
     Padding = 0x10,
+    StreamAck = 0x11,
+    RendezvousReady = 0x12,
 }
 
 impl RelayCellCommand {
@@ -474,6 +524,8 @@ impl RelayCellCommand {
             0x0E => Ok(Self::StreamConnected),
             0x0F => Ok(Self::StreamRefused),
             0x10 => Ok(Self::Padding),
+            0x11 => Ok(Self::StreamAck),
+            0x12 => Ok(Self::RendezvousReady),
             _ => Err(Error::Wire(format!("unknown relay cell command: {:#x}", v))),
         }
     }
@@ -644,10 +696,11 @@ impl HopKey {
 
     /// Encrypt one onion layer (forward direction).
     /// Reads the nonce from the cell trailer, encrypts the body,
-    /// then computes and writes the hop tag. Nonce is preserved.
+    /// then writes the hop tag. The domain is blinded; the counter is preserved.
     pub fn encrypt_forward(&self, cell: &mut [u8; CELL_SIZE]) {
+        blind_cell_domain(cell, &self.nonce_prefix);
         let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(&self.nonce_prefix, nonce_val);
+        let nonce = build_nonce(&self.nonce_prefix, &nonce_val);
         let aead = XChaCha20Poly1305::new((&self.forward_key).into());
         let tag = aead
             .encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE])
@@ -659,17 +712,33 @@ impl HopKey {
     /// Decrypt one onion layer (backward direction).
     /// Reads the nonce from the cell trailer, decrypts the body.
     /// Only the outermost layer's tag survives; inner tags are overwritten.
-    pub fn decrypt_backward(&self, cell: &mut [u8; CELL_SIZE]) {
+    pub fn decrypt_backward(&self, cell: &mut [u8; CELL_SIZE]) -> bool {
         let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(&self.nonce_prefix, nonce_val);
+        let nonce = build_nonce(&self.nonce_prefix, &nonce_val);
         let aead = XChaCha20Poly1305::new((&self.backward_key).into());
         // Use encrypt_in_place_detached for decryption: ChaCha20 is a
         // symmetric stream cipher (encrypt == decrypt). This avoids
         // AEAD tag verification, which would fail for inner onion layers
         // whose tags are overwritten by outer layers.
-        let _ = aead.encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE]);
+        let tag: [u8; 16] = cell[CELL_BODY_SIZE + CELL_NONCE_SIZE..].try_into().unwrap();
+        if tag == [0; 16] {
+            let _ =
+                aead.encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE]);
+        } else if aead
+            .decrypt_in_place_detached(
+                (&nonce).into(),
+                b"",
+                &mut cell[..CELL_BODY_SIZE],
+                (&tag).into(),
+            )
+            .is_err()
+        {
+            return false;
+        }
         // Zero the tag but preserve the nonce for multi-hop decryption.
         cell[CELL_BODY_SIZE + CELL_NONCE_SIZE..].fill(0);
+        blind_cell_domain(cell, &self.nonce_prefix);
+        true
     }
 }
 
@@ -697,21 +766,30 @@ pub struct OutboundCircuit {
     pub state: CircuitState,
     /// Waypoints this circuit routes through (the originator's view, not actual hops).
     pub waypoints: Vec<PeerId>,
-    /// Flow control state.
-    pub congestion: CongestionWindow,
     /// Last time we received any relay cell on this circuit.
     pub last_activity: Instant,
     /// Forward nonce counter — one counter shared by all hops for a given cell.
     pub forward_nonce: u64,
+    pub nonce_domain: [u8; 16],
+    pub backward_replay: CellReplayWindow,
 }
 
 impl OutboundCircuit {
+    fn next_forward_nonce(&mut self) -> ([u8; 16], u64) {
+        // Rotate the domain before the counter can wrap and reuse a nonce.
+        if self.forward_nonce == u64::MAX {
+            self.nonce_domain = rand::random();
+            self.forward_nonce = 0;
+        }
+        let nonce = self.forward_nonce;
+        self.forward_nonce += 1;
+        (self.nonce_domain, nonce)
+    }
     /// Wrap a relay cell in all onion layers for sending through the circuit.
     /// Sets the explicit nonce in the cell trailer before encrypting.
     pub fn wrap_forward(&mut self, cell: &mut [u8; CELL_SIZE]) {
-        let nonce = self.forward_nonce;
-        self.forward_nonce += 1;
-        set_cell_nonce(cell, nonce);
+        let (domain, nonce) = self.next_forward_nonce();
+        set_cell_nonce(cell, &domain, nonce);
         // Encrypt in reverse hop order: innermost (endpoint) first, outermost (hop 1) last.
         for hop in self.hop_keys.iter().rev() {
             hop.encrypt_forward(cell);
@@ -721,11 +799,14 @@ impl OutboundCircuit {
     /// Unwrap all onion layers from a cell received through the circuit (backward direction).
     /// The nonce is read from the cell trailer (set by the endpoint).
     /// Returns the plaintext cell bytes — caller should parse with `RelayCell::from_cell()`.
-    pub fn unwrap_backward(&self, cell: &mut [u8; CELL_SIZE]) {
+    pub fn unwrap_backward(&self, cell: &mut [u8; CELL_SIZE]) -> bool {
         // Decrypt in forward hop order: outermost (hop 1) first, innermost (endpoint) last.
         for hop in self.hop_keys.iter() {
-            hop.decrypt_backward(cell);
+            if !hop.decrypt_backward(cell) {
+                return false;
+            }
         }
+        true
     }
 
     /// Send a relay cell through this circuit. Returns (first_hop, circuit_id, encrypted_cell).
@@ -748,9 +829,8 @@ impl OutboundCircuit {
         let body = write_cell_body(RelayCellCommand::Data, 0, data, &digest_key);
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-        let nonce = self.forward_nonce;
-        self.forward_nonce += 1;
-        set_cell_nonce(&mut cell, nonce);
+        let (domain, nonce) = self.next_forward_nonce();
+        set_cell_nonce(&mut cell, &domain, nonce);
         for hop in self.hop_keys[..=last].iter().rev() {
             hop.encrypt_forward(&mut cell);
         }
@@ -775,9 +855,8 @@ impl OutboundCircuit {
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
         // Set the explicit nonce and encrypt layers from hop_index down to 0.
-        let nonce = self.forward_nonce;
-        self.forward_nonce += 1;
-        set_cell_nonce(&mut cell, nonce);
+        let (domain, nonce) = self.next_forward_nonce();
+        set_cell_nonce(&mut cell, &domain, nonce);
         for hop in self.hop_keys[..=hop_index].iter().rev() {
             hop.encrypt_forward(&mut cell);
         }
@@ -786,13 +865,24 @@ impl OutboundCircuit {
 
     /// Receive and decrypt a relay cell from a specific intermediate hop.
     /// The nonce is read from the cell trailer.
-    pub fn recv_from_hop(&self, cell: &mut [u8; CELL_SIZE], hop_index: usize) -> Result<RelayCell> {
+    pub fn recv_from_hop(
+        &mut self,
+        cell: &mut [u8; CELL_SIZE],
+        hop_index: usize,
+    ) -> Result<RelayCell> {
+        let nonce = cell_nonce(cell);
         for hop in self.hop_keys[..=hop_index].iter() {
-            hop.decrypt_backward(cell);
+            if !hop.decrypt_backward(cell) {
+                return Err(Error::Crypto("backward cell MAC mismatch".into()));
+            }
         }
         let digest_key = self.hop_keys[hop_index].backward_digest;
         let body: &[u8; CELL_BODY_SIZE] = cell[..CELL_BODY_SIZE].try_into().unwrap();
-        RelayCell::from_cell(body, &digest_key)
+        let relay = RelayCell::from_cell(body, &digest_key)?;
+        if !self.backward_replay.accept(nonce) {
+            return Err(Error::Crypto("backward cell replay".into()));
+        }
+        Ok(relay)
     }
 }
 
@@ -882,7 +972,10 @@ impl CongestionWindow {
         let stalled = match self.last_sendme_at {
             Some(t) => t.elapsed() >= SENDME_STALL_TIMEOUT,
             // Never received a SENDME — use a generous timeout for initial slow start.
-            None => false,
+            None => {
+                self.last_sendme_at = Some(Instant::now());
+                false
+            }
         };
         if stalled {
             self.on_loss();
@@ -1470,21 +1563,21 @@ mod tests {
             digest_key: keys1.forward_digest,
             nonce_prefix: keys1.nonce_prefix,
             op: CryptoOp::Decrypt,
-            replay: ReplayWindow::new(),
+            replay: CellReplayWindow::new(),
         };
         let mut relay2_fwd = HopCrypto {
             key: keys2.forward_key,
             digest_key: keys2.forward_digest,
             nonce_prefix: keys2.nonce_prefix,
             op: CryptoOp::Decrypt,
-            replay: ReplayWindow::new(),
+            replay: CellReplayWindow::new(),
         };
         let mut relay3_fwd = HopCrypto {
             key: keys3.forward_key,
             digest_key: keys3.forward_digest,
             nonce_prefix: keys3.nonce_prefix,
             op: CryptoOp::Decrypt,
-            replay: ReplayWindow::new(),
+            replay: CellReplayWindow::new(),
         };
 
         // Initiator builds and wraps a cell
@@ -1501,7 +1594,7 @@ mod tests {
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
 
         // Set the explicit nonce (initiator picks nonce 0 for this cell)
-        set_cell_nonce(&mut cell, 0);
+        set_cell_nonce(&mut cell, &[1; 16], 0);
 
         // Wrap: encrypt with each hop in reverse (3, 2, 1)
         // All hops read the same nonce from the cell trailer.
@@ -1537,7 +1630,7 @@ mod tests {
         let mut cell = [0u8; CELL_SIZE];
         cell[..CELL_BODY_SIZE].copy_from_slice(&body);
         // Set the explicit backward nonce (endpoint picks nonce 0)
-        set_cell_nonce(&mut cell, 0);
+        set_cell_nonce(&mut cell, &[1; 16], 0);
 
         // Endpoint (hop3) encrypts backward, then each relay adds a layer.
         // All read the same nonce from the cell trailer.
@@ -1546,21 +1639,21 @@ mod tests {
             digest_key: bkeys3.backward_digest,
             nonce_prefix: bkeys3.nonce_prefix,
             op: CryptoOp::Encrypt,
-            replay: ReplayWindow::new(),
+            replay: CellReplayWindow::new(),
         };
         let mut r2_bwd = HopCrypto {
             key: bkeys2.backward_key,
             digest_key: bkeys2.backward_digest,
             nonce_prefix: bkeys2.nonce_prefix,
             op: CryptoOp::Encrypt,
-            replay: ReplayWindow::new(),
+            replay: CellReplayWindow::new(),
         };
         let mut r1_bwd = HopCrypto {
             key: bkeys1.backward_key,
             digest_key: bkeys1.backward_digest,
             nonce_prefix: bkeys1.nonce_prefix,
             op: CryptoOp::Encrypt,
-            replay: ReplayWindow::new(),
+            replay: CellReplayWindow::new(),
         };
 
         r3_bwd.process_cell(&mut cell);

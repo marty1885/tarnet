@@ -20,15 +20,15 @@ use tarnet_api::types::{KemAlgo, SigningAlgo};
 
 /// Outbound cells buffered per link before dropping.
 /// When the drain task can't keep up (slow peer / congested link),
-/// new cells are silently dropped — end-to-end flow control reacts
-/// via missing SENDMEs.
+/// new cells are silently dropped. Reliable end-to-end Channels retain their
+/// packets until acknowledged and retransmit them; links do not track delivery.
 const OUTBOUND_QUEUE_SIZE: usize = 4096;
 
 /// Minimum size for all link-layer frames after padding.
-/// Matches a CircuitRelay message: HEADER(5) + circuit_id(4) + CELL_SIZE(1424) = 1433.
+/// Matches a CircuitRelay message: HEADER + circuit_id + CELL_SIZE.
 /// All smaller messages are padded to this size before encryption so an observer
 /// cannot classify messages by ciphertext length.
-const LINK_PAD_SIZE: usize = 1433;
+const LINK_PAD_SIZE: usize = HEADER_SIZE + 4 + crate::circuit::CELL_SIZE;
 
 /// Maximum time a deferred (non-critical) message waits before being flushed,
 /// even if no high-priority message arrives to piggyback on.
@@ -928,7 +928,7 @@ impl PeerLink {
     ///
     /// Messages are padded to [`LINK_PAD_SIZE`] before encryption.
     /// If the queue is full (peer is congested), the cell is silently
-    /// dropped — end-to-end flow control handles recovery.
+    /// dropped — reliable end-to-end Channels handle recovery.
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
         let mut crypto = self.crypto.lock().await;
         Self::encrypt_and_enqueue(&mut crypto, &self.outbound_tx, data, self.remote_peer)
@@ -941,7 +941,7 @@ impl PeerLink {
     /// one-shot request/replies with no retransmission — a silent drop turns
     /// link congestion into a hard connect failure, so backpressure is the
     /// correct policy for them. Bulk stream data keeps using
-    /// [`send_message`], where drops are recovered by end-to-end flow control.
+    /// [`send_message`], where reliable Channels recover dropped packets.
     pub async fn send_message_critical(&self, data: &[u8]) -> Result<()> {
         // The crypto lock is held across the awaited enqueue so frames enter
         // the queue in seq order even when this send has to wait. The drain

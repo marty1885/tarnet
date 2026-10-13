@@ -41,6 +41,136 @@ fn make_pubkey_cache(kp: &Keypair) -> PubkeyCache {
 
 const TEST_MODE: PortMode = PortMode::ReliableOrdered;
 
+async fn lossy_circuit_transfer(mode: PortMode) {
+    use tarnet::firewall::{Action, Firewall, Match};
+    let server = Arc::new(Node::new(Keypair::generate()));
+    let client = Arc::new(Node::new(Keypair::generate()));
+    let discovery = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let address = discovery.local_addrs()[0].to_string();
+    let listener = server
+        .circuit_listen(ServiceId::ALL, mode, "loss", ListenerOptions::default())
+        .await
+        .unwrap();
+    let task_server = server.clone();
+    tokio::spawn(async move {
+        task_server
+            .run(Box::new(discovery), vec![], vec![])
+            .await
+            .ok();
+    });
+    let discovery = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let task_client = client.clone();
+    tokio::spawn(async move {
+        task_client
+            .run(Box::new(discovery), vec![address], vec![])
+            .await
+            .ok();
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !client.connected_peers().await.contains(&server.peer_id()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let client_conn = client
+        .circuit_connect(
+            server.default_service_id().await,
+            mode,
+            "loss",
+            Some(server.peer_id()),
+            None,
+        )
+        .await
+        .unwrap();
+    let server_conn = server.circuit_accept(listener.id).await.unwrap();
+
+    let firewall = |probability| {
+        let mut fw = Firewall::default();
+        fw.add_rule(
+            Match::All(vec![
+                Match::MsgType(MessageType::CircuitRelay),
+                Match::Probability(probability),
+            ]),
+            Action::Drop,
+        );
+        fw
+    };
+    // Guaranteed loss of the initial window in both directions.
+    client.set_firewall(firewall(1.0)).await;
+    server.set_firewall(firewall(1.0)).await;
+    let count = 96u32; // exceeds Channel's send window
+    let payload = |index: u32| {
+        let mut data = vec![(index % 251) as u8; 1000];
+        data[..4].copy_from_slice(&index.to_be_bytes());
+        data
+    };
+    for i in 0..count {
+        client_conn.send(&payload(i)).await.unwrap();
+        server_conn.send(&payload(i)).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // DATA and ACK loss now continue throughout the transfer.
+    client.set_firewall(firewall(0.2)).await;
+    server.set_firewall(firewall(0.2)).await;
+    let receive = |conn: tarnet_api::service::Connection| async move {
+        let mut seen = std::collections::HashSet::new();
+        for position in 0..count {
+            let data = conn.recv().await.unwrap();
+            let index = u32::from_be_bytes(data[..4].try_into().unwrap());
+            assert!(index < count);
+            assert!(seen.insert(index), "duplicate delivery");
+            assert_eq!(data, payload(index));
+            if mode == PortMode::ReliableOrdered {
+                assert_eq!(index, position);
+            }
+        }
+        conn
+    };
+    let (client_conn, server_conn) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(receive(client_conn), receive(server_conn))
+    })
+    .await
+    .expect("reliable circuit did not recover dropped DATA/ACKs");
+    server.set_firewall(Firewall::default()).await;
+    client.set_firewall(Firewall::default()).await;
+    // Closing the request direction must not close the response direction.
+    let (client_tx, mut client_rx) = client_conn.into_split();
+    drop(client_tx);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(20), server_conn.recv())
+            .await
+            .expect("request half-close did not arrive")
+            .is_err()
+    );
+    client.set_firewall(firewall(1.0)).await;
+    let tail = vec![77; 8192];
+    server_conn.send(&tail).await.unwrap();
+    drop(server_conn);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    client.set_firewall(Firewall::default()).await;
+    let received = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut data = Vec::new();
+        while let Some(chunk) = client_rx.recv().await {
+            data.extend(chunk);
+        }
+        data
+    })
+    .await
+    .expect("lost final data/FIN did not recover");
+    assert_eq!(received, tail);
+}
+
+#[tokio::test]
+async fn circuit_reliable_ordered_recovers_data_ack_and_fin_loss() {
+    lossy_circuit_transfer(PortMode::ReliableOrdered).await;
+}
+
+#[tokio::test]
+async fn circuit_reliable_unordered_recovers_data_ack_and_fin_loss() {
+    lossy_circuit_transfer(PortMode::ReliableUnordered).await;
+}
+
 /// Test that peer link handshake completes over TCP.
 #[tokio::test]
 async fn peer_link_handshake() {
@@ -915,11 +1045,11 @@ async fn circuit_build_two_hop() {
 
     assert!(circuit_id > 0);
 
-    // Send data through the circuit
-    node_a
-        .send_circuit_data(circuit_id, b"hello through circuit")
+    // Bare circuits cannot bypass channel delivery semantics.
+    assert!(node_a
+        .send_circuit_data(circuit_id, b"no stream")
         .await
-        .expect("send_circuit_data failed");
+        .is_err());
 
     // Destroy the circuit
     node_a
@@ -965,11 +1095,10 @@ async fn circuit_build_one_hop() {
 
     assert!(circuit_id > 0);
 
-    // Send data and destroy
-    node_a
-        .send_circuit_data(circuit_id, b"one hop data")
+    assert!(node_a
+        .send_circuit_data(circuit_id, b"no stream")
         .await
-        .expect("send failed");
+        .is_err());
 
     node_a.destroy_circuit(circuit_id).await.unwrap();
 }
@@ -1032,8 +1161,11 @@ async fn circuit_connect_accept_bidi() {
 
     // Spawn accept on B in the background
     let nb2 = node_b.clone();
-    let accept_handle =
-        tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
+    let accept_handle = tokio::spawn(async move {
+        let conn = nb2.circuit_accept(listener_b.id).await.unwrap();
+        conn.send(b"server greeting").await.unwrap();
+        conn
+    });
 
     // Start A, connected to B
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
@@ -1065,6 +1197,12 @@ async fn circuit_connect_accept_bidi() {
     assert_eq!(conn_b.port, "80");
     assert_eq!(conn_b.mode, TEST_MODE);
 
+    let greeting = tokio::time::timeout(Duration::from_secs(5), conn_a.recv())
+        .await
+        .expect("server greeting was lost during stream setup")
+        .unwrap();
+    assert_eq!(greeting, b"server greeting");
+
     // A sends data to B
     conn_a.send(b"hello from A").await.unwrap();
 
@@ -1074,6 +1212,18 @@ async fn circuit_connect_accept_bidi() {
         .expect("recv timed out")
         .expect("recv failed");
     assert_eq!(received, b"hello from A");
+
+    conn_b.send(b"reply from B").await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), conn_a.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply, b"reply from B");
+    drop(conn_b);
+    assert!(tokio::time::timeout(Duration::from_secs(5), conn_a.recv())
+        .await
+        .expect("closed backend left client connected")
+        .is_err());
 }
 
 /// Integration test: hidden service rendezvous protocol.
@@ -1227,6 +1377,39 @@ async fn hidden_service_rendezvous() {
         .expect("recv at client timed out")
         .expect("recv at client failed");
     assert_eq!(received_at_client, b"hello from service");
+
+    // A normal TCP read (8192 bytes) exceeds the relay-cell payload limit.
+    // Both hidden-service sender paths must chunk it without panicking.
+    let bulk: Vec<u8> = (0..8192).map(|i| (i % 251) as u8).collect();
+    client_conn.send(&bulk).await.unwrap();
+    let mut received = Vec::new();
+    while received.len() < bulk.len() {
+        received.extend(
+            tokio::time::timeout(Duration::from_secs(5), service_conn.recv())
+                .await
+                .expect("hidden-service bulk upload stalled")
+                .unwrap(),
+        );
+    }
+    assert_eq!(received, bulk);
+    service_conn.send(&bulk).await.unwrap();
+    let mut received = Vec::new();
+    while received.len() < bulk.len() {
+        received.extend(
+            tokio::time::timeout(Duration::from_secs(5), client_conn.recv())
+                .await
+                .expect("hidden-service bulk download stalled")
+                .unwrap(),
+        );
+    }
+    assert_eq!(received, bulk);
+    drop(service_conn);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), client_conn.recv())
+            .await
+            .expect("hidden-service close did not reach client")
+            .is_err()
+    );
 
     log::info!("Rendezvous e2e data exchange verified");
 }

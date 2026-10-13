@@ -82,8 +82,9 @@ struct ReliableState {
     send_buf: BTreeMap<u32, Vec<u8>>,
     /// Per-packet first-send timestamp for RTO calculation.
     send_times: BTreeMap<u32, Instant>,
-    /// Current retransmission timeout (exponential backoff).
-    rto_ms: u64,
+    /// Per-packet retransmission timeout. Retrying a batch must not postpone
+    /// other packets that are already due.
+    send_rtos: BTreeMap<u32, u64>,
     /// Last time we received any ACK (for death detection).
     last_ack_at: Instant,
     /// When this channel was created (for death detection before first ACK).
@@ -105,7 +106,7 @@ impl ReliableState {
             send_window: window,
             send_buf: BTreeMap::new(),
             send_times: BTreeMap::new(),
-            rto_ms: INITIAL_RTO_MS,
+            send_rtos: BTreeMap::new(),
             last_ack_at: now,
             created_at: now,
             recv_next: 0,
@@ -172,10 +173,15 @@ impl Channel {
                 vec![(seq, data)]
             }
             ChannelState::ReliableUnordered(state) | ChannelState::ReliableOrdered(state) => {
+                if state.send_buf.is_empty() {
+                    state.last_ack_at = Instant::now();
+                    state.created_at = state.last_ack_at;
+                }
                 let seq = state.send_seq;
                 state.send_seq = state.send_seq.wrapping_add(1);
                 state.send_buf.insert(seq, data.clone());
                 state.send_times.insert(seq, Instant::now());
+                state.send_rtos.insert(seq, INITIAL_RTO_MS);
                 vec![(seq, data)]
             }
         }
@@ -274,6 +280,9 @@ impl Channel {
             None => return vec![],
         };
         let mut acked = Vec::new();
+        if seq_after(ack_seq, state.send_seq) {
+            return acked;
+        }
 
         // Cumulative ACK: everything before ack_seq is acknowledged
         // (wrapping-safe: ack_seq is strictly after seq)
@@ -286,21 +295,24 @@ impl Channel {
         for seq in to_remove {
             state.send_buf.remove(&seq);
             state.send_times.remove(&seq);
+            state.send_rtos.remove(&seq);
             acked.push(seq);
         }
 
         // Selective ACKs
         for &seq in selective_acks {
+            if !seq_after(state.send_seq, seq) {
+                continue;
+            }
             if state.send_buf.remove(&seq).is_some() {
                 state.send_times.remove(&seq);
+                state.send_rtos.remove(&seq);
                 acked.push(seq);
             }
         }
 
         if !acked.is_empty() {
             state.last_ack_at = Instant::now();
-            // Reset RTO on successful ACK
-            state.rto_ms = INITIAL_RTO_MS;
         }
 
         acked
@@ -334,22 +346,22 @@ impl Channel {
             None => return vec![],
         };
         let now = Instant::now();
-        let rto = Duration::from_millis(state.rto_ms);
         let mut due = Vec::new();
         for (&seq, data) in &state.send_buf {
             if due.len() >= MAX_RETRANSMIT_BATCH {
                 break;
             }
             if let Some(&sent_at) = state.send_times.get(&seq) {
+                let rto = Duration::from_millis(state.send_rtos[&seq]);
                 if now.duration_since(sent_at) >= rto {
                     due.push((seq, data.clone()));
                 }
             }
         }
-        if !due.is_empty() {
+        for &(seq, _) in &due {
             // Exponential backoff with jitter (±25%) to desynchronize
             // retransmits across channels/nodes that hit the same loss event.
-            let base = state.rto_ms * 2;
+            let base = state.send_rtos[&seq] * 2;
             let jitter_range = base / 4;
             let jittered = if jitter_range > 0 {
                 let offset = rand::thread_rng().gen_range(0..=jitter_range * 2);
@@ -357,11 +369,8 @@ impl Channel {
             } else {
                 base
             };
-            state.rto_ms = jittered.min(MAX_RTO_MS);
-            // Reset send times for retransmitted packets
-            for &(seq, _) in &due {
-                state.send_times.insert(seq, now);
-            }
+            state.send_rtos.insert(seq, jittered.min(MAX_RTO_MS));
+            state.send_times.insert(seq, now);
         }
         due
     }
@@ -396,11 +405,10 @@ impl Channel {
         if state.send_buf.is_empty() {
             return None;
         }
-        let rto = Duration::from_millis(state.rto_ms);
         state
             .send_times
-            .values()
-            .map(|&sent_at| sent_at + rto)
+            .iter()
+            .map(|(seq, &sent_at)| sent_at + Duration::from_millis(state.send_rtos[seq]))
             .min()
     }
 
@@ -410,5 +418,93 @@ impl Channel {
             Some(state) => state.recv_ready.drain(..).collect(),
             None => vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+
+    #[test]
+    fn lost_data_and_ack_recover_without_duplicate_delivery() {
+        let mut sender = Channel::new(0, [0; 32], true, true);
+        let mut receiver = Channel::new(0, [0; 32], true, true);
+        let first = sender.prepare_send(b"first".to_vec()).remove(0);
+        let second = sender.prepare_send(b"second".to_vec()).remove(0);
+        assert!(receiver.receive_data(second.0, second.1.clone()).is_empty());
+        let (ack, selective) = receiver.generate_ack().unwrap();
+        sender.process_ack(ack, &selective);
+        assert_eq!(sender.pending_retransmit().len(), 1);
+        assert_eq!(
+            receiver.receive_data(first.0, first.1.clone()),
+            vec![b"first".to_vec(), b"second".to_vec()]
+        );
+        // Lose that ACK: a retry is deduplicated and produces the same ACK.
+        assert!(receiver.receive_data(first.0, first.1).is_empty());
+        let (ack, selective) = receiver.generate_ack().unwrap();
+        sender.process_ack(ack, &selective);
+        assert!(sender.pending_retransmit().is_empty());
+    }
+
+    #[test]
+    fn future_ack_cannot_discard_pending_data() {
+        let mut channel = Channel::new(0, [0; 32], true, true);
+        channel.prepare_send(vec![1]);
+        assert!(channel.process_ack(100, &[0]).is_empty());
+        assert_eq!(channel.pending_retransmit().len(), 1);
+        channel.process_ack(0, &[100]);
+        assert_eq!(channel.pending_retransmit().len(), 1);
+    }
+
+    #[test]
+    fn idle_channel_gets_a_fresh_ack_deadline() {
+        let mut channel = Channel::new(0, [0; 32], true, true);
+        let state = channel.state.reliable_state_mut().unwrap();
+        state.last_ack_at -= Duration::from_secs(120);
+        state.created_at = state.last_ack_at;
+        channel.prepare_send(vec![1]);
+        assert!(!channel.is_dead());
+    }
+
+    #[test]
+    fn retransmission_preserves_sequence_and_payload() {
+        let mut channel = Channel::new(0, [0; 32], true, true);
+        let packet = channel.prepare_send(vec![7, 8]).remove(0);
+        *channel
+            .state
+            .reliable_state_mut()
+            .unwrap()
+            .send_times
+            .get_mut(&packet.0)
+            .unwrap() -= Duration::from_secs(2);
+        assert_eq!(channel.retransmit_due(), vec![packet]);
+        assert!(channel.retransmit_due().is_empty());
+    }
+
+    #[test]
+    fn retrying_a_batch_does_not_postpone_other_due_packets() {
+        let mut channel = Channel::new(0, [0; 32], true, true);
+        for _ in 0..32 {
+            channel.prepare_send(vec![1]);
+        }
+        for sent in channel
+            .state
+            .reliable_state_mut()
+            .unwrap()
+            .send_times
+            .values_mut()
+        {
+            *sent -= Duration::from_secs(2);
+        }
+        let mut retried = HashSet::new();
+        for _ in 0..4 {
+            let batch = channel.retransmit_due();
+            assert_eq!(batch.len(), 8);
+            for (seq, _) in batch {
+                assert!(retried.insert(seq));
+            }
+        }
+        assert_eq!(retried.len(), 32);
+        assert!(channel.retransmit_due().is_empty());
     }
 }
