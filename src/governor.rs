@@ -39,6 +39,11 @@ pub struct GovernorConfig {
     pub circuit_creates_per_window: u32,
     /// Max new DHT query tokens accepted from one link peer per window.
     pub dht_queries_per_window: u32,
+    /// Max DHT records (PUT, GET-response, watch-notify) accepted from one
+    /// link peer per window. Each costs a signature check and possibly storage.
+    pub dht_ingest_records_per_window: u32,
+    /// Max DHT record payload bytes accepted from one link peer per window.
+    pub dht_ingest_bytes_per_window: usize,
     /// Total circuit capacity of this node (for pressure calculation).
     pub max_circuits: usize,
     /// Pressure level below which no enforcement happens (0.0–1.0).
@@ -57,6 +62,8 @@ impl Default for GovernorConfig {
             max_circuits_per_peer: 100,
             circuit_creates_per_window: 20,
             dht_queries_per_window: 256,
+            dht_ingest_records_per_window: 2048,
+            dht_ingest_bytes_per_window: 8 * 1024 * 1024,
             max_circuits: 10_000,
             pressure_threshold: 0.75,
             throttle_strikes: 3,
@@ -145,6 +152,10 @@ struct PeerBudget {
     circuit_creates: u32,
     /// New DHT query tokens charged to this peer in the current window.
     dht_queries: u32,
+    /// DHT records ingested from this peer in the current window.
+    dht_ingest_records: u32,
+    /// DHT record bytes ingested from this peer in the current window.
+    dht_ingest_bytes: usize,
     /// Start of the current rate-limit window.
     window_start: Instant,
 }
@@ -157,6 +168,8 @@ impl PeerBudget {
             last_strike: None,
             circuit_creates: 0,
             dht_queries: 0,
+            dht_ingest_records: 0,
+            dht_ingest_bytes: 0,
             window_start: Instant::now(),
         }
     }
@@ -166,6 +179,8 @@ impl PeerBudget {
         if self.window_start.elapsed() >= RESOURCE_RATE_WINDOW {
             self.circuit_creates = 0;
             self.dht_queries = 0;
+            self.dht_ingest_records = 0;
+            self.dht_ingest_bytes = 0;
             self.window_start = Instant::now();
         }
     }
@@ -186,6 +201,24 @@ impl PeerBudget {
             return false;
         }
         self.dht_queries += 1;
+        true
+    }
+
+    fn try_dht_ingest(
+        &mut self,
+        records: u32,
+        bytes: usize,
+        record_limit: u32,
+        byte_limit: usize,
+    ) -> bool {
+        self.maybe_reset_window();
+        let records_after = self.dht_ingest_records.saturating_add(records);
+        let bytes_after = self.dht_ingest_bytes.saturating_add(bytes);
+        if records_after > record_limit || bytes_after > byte_limit {
+            return false;
+        }
+        self.dht_ingest_records = records_after;
+        self.dht_ingest_bytes = bytes_after;
         true
     }
 
@@ -358,6 +391,24 @@ impl Governor {
             return false;
         };
         budget.try_dht_query(self.config.dht_queries_per_window)
+    }
+
+    /// Charge `records` DHT records totalling `bytes` delivered by `from`
+    /// (a PUT, a GET response, or a watch notification). Charged before any
+    /// signature is checked, so it bounds verification CPU as well as storage
+    /// churn. Always active, like [`charge_dht_query`](Self::charge_dht_query).
+    /// Over-budget traffic is dropped without a strike: a link-up store sync
+    /// can legitimately burst.
+    pub fn charge_dht_ingest(&mut self, from: &PeerId, records: u32, bytes: usize) -> bool {
+        let Some(budget) = self.budgets.get_mut(from) else {
+            return false;
+        };
+        budget.try_dht_ingest(
+            records,
+            bytes,
+            self.config.dht_ingest_records_per_window,
+            self.config.dht_ingest_bytes_per_window,
+        )
     }
 
     // ── Maintenance ──
@@ -575,6 +626,26 @@ mod tests {
         assert!(gov.charge_dht_query(&peer));
         assert!(gov.charge_dht_query(&peer));
         assert!(!gov.charge_dht_query(&peer));
+    }
+
+    #[test]
+    fn dht_ingest_charge_bounds_records_and_bytes() {
+        let mut config = GovernorConfig::default();
+        config.dht_ingest_records_per_window = 3;
+        config.dht_ingest_bytes_per_window = 100;
+        let mut gov = Governor::new(config);
+        let peer = test_peer(1);
+        gov.peer_connected(peer);
+
+        assert!(gov.charge_dht_ingest(&peer, 2, 40));
+        // Record budget: 2 + 2 > 3.
+        assert!(!gov.charge_dht_ingest(&peer, 2, 10));
+        // A refused charge consumes nothing.
+        assert!(gov.charge_dht_ingest(&peer, 1, 10));
+        // Byte budget: 50 + 60 > 100, even though records are exhausted anyway.
+        assert!(!gov.charge_dht_ingest(&peer, 0, 60));
+        // Unknown peers are refused.
+        assert!(!gov.charge_dht_ingest(&test_peer(2), 1, 1));
     }
 
     #[test]

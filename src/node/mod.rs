@@ -25,7 +25,7 @@ use crate::circuit::{
 };
 use crate::dht::{
     is_k_closest, probabilistic_select, random_select, BloomFilter, DhtQueryParams, DhtRecord,
-    DhtStore, DhtWatchTable, KBucketTable, DHT_K,
+    DhtStore, DhtWatchTable, KBucketTable, RecordSource, DHT_K,
 };
 use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::identity_store::IdentityStore;
@@ -79,6 +79,14 @@ const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const KEY_EXCHANGE_MAX_DRIFT: u64 = 60;
 /// How long seen nonces are cached for replay protection.
 const NONCE_CACHE_TTL: Duration = Duration::from_secs(120);
+/// Store sync sent to a newly linked peer: at most this many records / bytes,
+/// and at most once per peer per [`DHT_SYNC_MIN_INTERVAL`]. Without the caps a
+/// cheap reconnect loop pulls the whole store (up to 16 MB) every time. The
+/// record cap sits well under the receiver's per-link ingest budget so a sync
+/// is never shed on arrival.
+const DHT_SYNC_MAX_RECORDS: usize = 1024;
+const DHT_SYNC_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DHT_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(600);
 /// Hard ceiling on anonymous reverse-path state. Per-peer admission in the
 /// governor is the primary control; this cap is the final global invariant.
 const MAX_QUERY_TOKENS: usize = 65_536;
@@ -438,6 +446,9 @@ pub struct Node {
     /// `Drop` can deregister synchronously (RAII cancel).
     dht_searches:
         Arc<std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<crate::dht::VerifiedRecord>>>>,
+    /// When each peer last received a link-up store sync, for
+    /// [`DHT_SYNC_MIN_INTERVAL`] rate limiting.
+    dht_sync_sent: Mutex<HashMap<PeerId, Instant>>,
     /// Monotonically increasing sequence number for signed content records.
     signed_content_sequence: Arc<Mutex<u64>>,
     circuits: CircuitState,
@@ -701,6 +712,7 @@ impl Node {
             kbucket: Arc::new(Mutex::new(KBucketTable::new(&peer_id))),
             query_tokens: Arc::new(Mutex::new(HashMap::new())),
             dht_searches: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            dht_sync_sent: Mutex::new(HashMap::new()),
             signed_content_sequence: Arc::new(Mutex::new(sc_seq)),
             circuits: CircuitState::new(),
             circuit_drop_tx,
@@ -2128,14 +2140,46 @@ impl Node {
             }
         }
 
-        // Also forward any DHT records we have to the new peer
-        {
-            let store = self.dht_store.lock().await;
+        // Sync a bounded slice of our store to the new peer: our own records
+        // first (we are their authority), then a random sample of the rest.
+        // Rate-limited per peer so reconnecting does not re-pull the store.
+        let sync_due = {
+            let mut sent = self.dht_sync_sent.lock().await;
+            let now = Instant::now();
+            sent.retain(|_, at| now.duration_since(*at) < DHT_SYNC_MIN_INTERVAL);
+            if sent.contains_key(&peer_id) {
+                false
+            } else {
+                sent.insert(peer_id, now);
+                true
+            }
+        };
+        if sync_due {
+            let puts: Vec<Vec<u8>> = {
+                use rand::seq::SliceRandom;
+                let store = self.dht_store.lock().await;
+                let (ours, mut others) = store.records_by_origin();
+                others.shuffle(&mut rand::thread_rng());
+                let mut puts = Vec::new();
+                let mut bytes = 0usize;
+                for record in ours.into_iter().chain(others) {
+                    if puts.len() >= DHT_SYNC_MAX_RECORDS {
+                        break;
+                    }
+                    let put = record.to_put_msg(&self.peer_id(), DhtPutMsg::DEFAULT_HOP_LIMIT);
+                    let encoded = put.to_wire().encode();
+                    if bytes + encoded.len() > DHT_SYNC_MAX_BYTES {
+                        continue;
+                    }
+                    bytes += encoded.len();
+                    puts.push(encoded);
+                }
+                puts
+            };
             let link = self.links.lock().await.get(&peer_id).cloned();
             if let Some(link) = link {
-                for record in store.all_records() {
-                    let put = record.to_put_msg(&self.peer_id(), DhtPutMsg::DEFAULT_HOP_LIMIT);
-                    let _ = link.send_deferred(&put.to_wire().encode()).await;
+                for encoded in puts {
+                    let _ = link.send_deferred(&encoded).await;
                 }
             }
         }
@@ -2530,8 +2574,22 @@ impl Node {
                 }
             }
             MessageType::DhtPut => {
+                // Charge before parsing further or verifying: the budget bounds
+                // signature-check CPU as well as store churn.
+                if !self
+                    .governor
+                    .lock()
+                    .await
+                    .charge_dht_ingest(&from, 1, msg.payload.len())
+                {
+                    log::debug!("DHT ingest budget exhausted for {:?}, dropping PUT", from);
+                    return Ok(());
+                }
                 let mut put = DhtPutMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(put.key);
+                // `ttl` is unsigned: never store or forward more than the
+                // per-type ceiling, whatever the sender claimed.
+                put.ttl = crate::dht::clamp_ttl_secs(put.record_type, put.ttl);
 
                 // Clamp the attacker-controlled ingress hop_limit (raw u8 off the
                 // wire, up to 255) to this node's L2NSE-derived budget *before*
@@ -2575,7 +2633,11 @@ impl Node {
                 // Keep a copy for the local-watch notification below; the
                 // VerifiedRecord itself is moved into the store.
                 let live = record.record().clone();
-                let accepted = self.dht_store.lock().await.put(record.clone());
+                let accepted = self
+                    .dht_store
+                    .lock()
+                    .await
+                    .put_from(record.clone(), RecordSource::Peer(from));
                 if accepted {
                     self.db_upsert_dht_record(record.record());
                 }
@@ -2680,18 +2742,36 @@ impl Node {
                     return Ok(());
                 }
 
-                // Respond with local records, routed back via query_token
-                let store = self.dht_store.lock().await;
-                let records = store.get(&key);
-                // `to_response_record` copies every signed field (incl. the signer
-                // pubkey the requester must verify against) and the remaining TTL —
-                // no per-call hand-copy that can silently drop a field.
-                let response_records: Vec<DhtResponseRecord> = records
-                    .iter()
-                    .filter(|r| !r.is_expired())
-                    .map(|r| r.to_response_record())
-                    .collect();
-                drop(store);
+                // Respond with local records, routed back via query_token.
+                // The response must fit one message: owner-bound records (the
+                // zone root / hello the key exists for) go first, then a random
+                // sample of the rest, skipping any that would overflow. Junk
+                // piled onto a key can then never push the real record out of
+                // the reply or make the reply unsendable.
+                let response_records: Vec<DhtResponseRecord> = {
+                    use rand::seq::SliceRandom;
+                    let store = self.dht_store.lock().await;
+                    let mut records = store.get(&key);
+                    records.shuffle(&mut rand::thread_rng());
+                    records.sort_by_key(|r| {
+                        !matches!(r.record_type, RecordType::Hello | RecordType::ZoneRoot)
+                    });
+                    let mut size = 32 + 64 + 2; // token + key + count
+                    let mut out = Vec::new();
+                    for r in records {
+                        // `to_response_record` copies every signed field (incl.
+                        // the signer pubkey the requester must verify against)
+                        // and the remaining TTL.
+                        let rec = r.to_response_record();
+                        let rec_len = rec.to_bytes().len();
+                        if size + rec_len > MAX_PAYLOAD {
+                            continue;
+                        }
+                        size += rec_len;
+                        out.push(rec);
+                    }
+                    out
+                };
 
                 if !response_records.is_empty() {
                     let response = DhtGetResponseMsg {
@@ -2699,9 +2779,14 @@ impl Node {
                         key: get.key,
                         records: response_records,
                     };
-                    // Send response back toward the requester via previous hop
-                    self.send_to_peer_deferred(&from, &response.to_wire().encode())
-                        .await?;
+                    // Send response back toward the requester via previous hop.
+                    // A failed reply must not stop the query from travelling on.
+                    if let Err(e) = self
+                        .send_to_peer_deferred(&from, &response.to_wire().encode())
+                        .await
+                    {
+                        log::debug!("DHT GET reply to {:?} failed: {}", from, e);
+                    }
                 }
 
                 // Forward the GET onward (exactly once — duplicate arrivals
@@ -2720,9 +2805,44 @@ impl Node {
                 }
             }
             MessageType::DhtGetResponse => {
-                let resp = DhtGetResponseMsg::from_bytes(&msg.payload)?;
+                let mut resp = DhtGetResponseMsg::from_bytes(&msg.payload)?;
+                if !self.governor.lock().await.charge_dht_ingest(
+                    &from,
+                    resp.records.len() as u32,
+                    msg.payload.len(),
+                ) {
+                    log::debug!("DHT ingest budget exhausted for {:?}, dropping response", from);
+                    return Ok(());
+                }
 
-                // Store records locally — each must clear the trust gate first.
+                // Only responses to a query we issued or relayed are accepted.
+                // An unsolicited response is a free write into our store.
+                let prev_hop = self
+                    .query_tokens
+                    .lock()
+                    .await
+                    .get(&resp.query_token)
+                    .map(|(peer, _)| *peer);
+                let Some(prev) = prev_hop else {
+                    log::debug!("DhtGetResponse with unknown query_token from {:?}, dropping", from);
+                    return Ok(());
+                };
+                for rec in &mut resp.records {
+                    rec.ttl = crate::dht::clamp_ttl_secs(rec.record_type, rec.ttl);
+                }
+
+                if prev != self.peer_id() {
+                    // Relay toward the originator, who verifies. Relays don't
+                    // cache: holding results for someone else's lookup only
+                    // records what passed through.
+                    self.send_to_peer_deferred(&prev, &resp.to_wire().encode())
+                        .await?;
+                    return Ok(());
+                }
+
+                // We originated this query: verify, keep in memory for the
+                // waiting search, but don't persist — fetched records are not
+                // ours to keep across restarts.
                 let resp_key = DhtId(resp.key);
                 for rec in &resp.records {
                     let record =
@@ -2746,30 +2866,10 @@ impl Node {
                             let _ = tx.try_send(record.clone());
                         }
                     }
-                    let accepted = self.dht_store.lock().await.put(record.clone());
-                    if accepted {
-                        self.db_upsert_dht_record(record.record());
-                    }
-                }
-
-                // Route response back via query_token hop-by-hop
-                let prev_hop = self
-                    .query_tokens
-                    .lock()
-                    .await
-                    .get(&resp.query_token)
-                    .map(|(peer, _)| *peer);
-                if let Some(prev) = prev_hop {
-                    if prev == self.peer_id() {
-                        // We originated this query — records already stored above
-                        log::debug!("DhtGetResponse arrived for our query");
-                    } else {
-                        // Forward response back toward originator
-                        self.send_to_peer_deferred(&prev, &resp.to_wire().encode())
-                            .await?;
-                    }
-                } else {
-                    log::debug!("DhtGetResponse with unknown query_token, storing locally only");
+                    self.dht_store
+                        .lock()
+                        .await
+                        .put_from(record, RecordSource::Peer(from));
                 }
             }
             MessageType::TunnelKeyExchange => {
@@ -2857,7 +2957,17 @@ impl Node {
                 watches.set_watch(watch.key, watch.query_token, from, watch.expiration_secs);
             }
             MessageType::DhtWatchNotify => {
-                let notify = DhtWatchNotifyMsg::from_bytes(&msg.payload)?;
+                if !self
+                    .governor
+                    .lock()
+                    .await
+                    .charge_dht_ingest(&from, 1, msg.payload.len())
+                {
+                    log::debug!("DHT ingest budget exhausted for {:?}, dropping notify", from);
+                    return Ok(());
+                }
+                let mut notify = DhtWatchNotifyMsg::from_bytes(&msg.payload)?;
+                notify.put.ttl = crate::dht::clamp_ttl_secs(notify.put.record_type, notify.put.ttl);
                 let key = DhtId(notify.put.key);
 
                 // Run through the shared trust gate (pubkey present + bound to
@@ -2878,12 +2988,13 @@ impl Node {
                     .await
                     .contains_key(&notify.put.key)
                 {
-                    // Store the record locally
+                    // Keep it in memory for readers; like GET results, a
+                    // watched record is fetched, not ours to persist.
                     let live = record.record().clone();
-                    let accepted = self.dht_store.lock().await.put(record.clone());
-                    if accepted {
-                        self.db_upsert_dht_record(record.record());
-                    }
+                    self.dht_store
+                        .lock()
+                        .await
+                        .put_from(record, RecordSource::Peer(from));
                     let _ = self.dht_watch_tx.send((key, live)).await;
                 } else {
                     // Route notification back via query_token hop-by-hop

@@ -946,7 +946,9 @@ impl DhtGetResponseMsg {
         let query_token = r.read_array::<32>()?;
         let key = r.read_array::<64>()?;
         let record_count = r.read_u16()? as usize;
-        let mut records = Vec::with_capacity(record_count);
+        // Bound the pre-allocation by what the payload can actually hold (52 is
+        // the minimum encoded record), not by the attacker-supplied count.
+        let mut records = Vec::with_capacity(record_count.min(r.remaining() / 52));
         for _ in 0..record_count {
             let (record, consumed) = DhtResponseRecord::from_bytes(&data[r.pos..])?;
             records.push(record);
@@ -1516,14 +1518,14 @@ impl HelloRecord {
         let signaling_secret = r.read_array::<16>()?;
         let transport_count = r.read_u16()? as usize;
 
-        let mut transports = Vec::with_capacity(transport_count);
+        let mut transports = Vec::with_capacity(transport_count.min(r.remaining() / 2));
         for _ in 0..transport_count {
             transports.push(TransportType::from_u16(r.read_u16()?));
         }
 
         let introducer_count = r.read_u16()? as usize;
 
-        let mut introducers = Vec::with_capacity(introducer_count);
+        let mut introducers = Vec::with_capacity(introducer_count.min(r.remaining() / 32));
         for _ in 0..introducer_count {
             let id = r.read_array::<32>()?;
             introducers.push(PeerId(id));
@@ -1531,7 +1533,7 @@ impl HelloRecord {
 
         let addr_count = r.read_u16()? as usize;
 
-        let mut global_addresses = Vec::with_capacity(addr_count);
+        let mut global_addresses = Vec::with_capacity(addr_count.min(r.remaining() / 5));
         for _ in 0..addr_count {
             let (addr, consumed) = ScopedAddress::from_bytes(&data[r.pos..])?;
             // Only keep known transports and Global scope

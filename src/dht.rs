@@ -265,6 +265,15 @@ pub fn verify_incoming_record(
             return Err("self-addressed record not stored at its own key");
         }
     }
+    // Hellos are identity-addressed: every hello this node mints lives at
+    // `identity_address_key(signer)`. Holding foreign hellos to the same rule
+    // stops anyone stacking hellos at another peer's key to crowd its real one
+    // out (the store also never evicts a hello for other records at its key).
+    if record_type == RecordType::Hello
+        && identity_address_key(&PeerId(*signer)).as_bytes() != key
+    {
+        return Err("hello not stored at its signer's identity key");
+    }
     let signable = record_signable(key, record_type, sequence, value);
     if !crate::identity::verify(algo, signer_pubkey, &signable, signature) {
         return Err("invalid signature");
@@ -417,7 +426,8 @@ impl VerifiedRecord {
 
     /// Mint a Hello record at the identity-addressed key for `identity`. The
     /// serialized hello bytes are wrapped with [`signed_record_encrypt`] under
-    /// the key so storage nodes see only a blob, then signed by `identity`.
+    /// the key (readable by anyone holding the record — hellos are public by
+    /// design), then signed by `identity`.
     pub fn new_hello(identity: &Keypair, hello_bytes: &[u8], sequence: u64, ttl: Duration) -> Self {
         let key = identity_address_key(&identity.peer_id());
         let encrypted = signed_record_encrypt(&key, hello_bytes);
@@ -487,8 +497,53 @@ impl VerifiedRecord {
 }
 
 /// Local DHT storage. Supports multiple records per key (supplemental).
+/// Who handed this node a stored record. Eviction is fair-shared across
+/// sources, so a flood arriving over one link can only displace that link's
+/// own share of the store, never everyone else's records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RecordSource {
+    /// Minted by this node, or reloaded from its own database.
+    Local,
+    /// Delivered by this direct link peer.
+    Peer(PeerId),
+}
+
+#[derive(Debug, Clone)]
+struct StoredRecord {
+    record: DhtRecord,
+    source: RecordSource,
+}
+
+/// Longest lifetime any record may hold in the store. `ttl` is not covered by
+/// the signature (see [`record_signable`]), so an inbound value is
+/// attacker-chosen; without a ceiling a replayed old record could be pinned for
+/// up to `u32::MAX` seconds.
+pub const MAX_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
+
+/// Ceiling for hello records, which are republished every few minutes and
+/// carry reachability data that goes stale quickly.
+pub const MAX_HELLO_TTL: Duration = Duration::from_secs(3600);
+
+/// The TTL ceiling for a record type.
+pub fn max_ttl(record_type: RecordType) -> Duration {
+    match record_type {
+        RecordType::Hello => MAX_HELLO_TTL,
+        _ => MAX_RECORD_TTL,
+    }
+}
+
+/// Clamp a wire `ttl` (seconds) to the ceiling for its record type, so a
+/// forwarded message never carries a longer lifetime than we would store.
+pub fn clamp_ttl_secs(record_type: RecordType, ttl: u32) -> u32 {
+    ttl.min(max_ttl(record_type).as_secs() as u32)
+}
+
+/// Content candidates kept per key. Storage cannot tell the authentic blob
+/// from junk (only a reader holding the inner hash can), so it keeps several.
+const MAX_CONTENT_CANDIDATES: usize = 5;
+
 pub struct DhtStore {
-    records: HashMap<[u8; 64], Vec<DhtRecord>>,
+    records: HashMap<[u8; 64], Vec<StoredRecord>>,
     local_id: DhtId,
     limits: StorageLimits,
 }
@@ -506,16 +561,27 @@ impl DhtStore {
         }
     }
 
-    /// Store a record locally with type-aware replacement policy.
-    /// - Hello: same signer + higher sequence replaces existing.
-    /// - SignedContent: add if new signer (supplemental), same signer replaces.
-    /// - Content: first write wins (single record per key).
+    /// Store a record this node minted or reloaded itself. See [`put_from`](Self::put_from).
     pub fn put(&mut self, record: VerifiedRecord) -> bool {
-        let record = record.into_inner();
+        self.put_from(record, RecordSource::Local)
+    }
+
+    /// Store a record with type-aware replacement policy, attributing it to
+    /// `source` for fair-share eviction.
+    /// - Hello / ZoneRoot / Unknown: same signer + higher sequence replaces.
+    /// - SignedContent: add if new signer (supplemental), same signer replaces.
+    /// - Content: up to [`MAX_CONTENT_CANDIDATES`] distinct blobs; when full, a
+    ///   random candidate makes room, so whoever fills the slots first cannot
+    ///   lock the authentic blob out.
+    ///
+    /// The stored TTL is clamped to [`max_ttl`] for the record type.
+    pub fn put_from(&mut self, record: VerifiedRecord, source: RecordSource) -> bool {
+        let mut record = record.into_inner();
         self.expire();
         if record.value.len() > self.limits.max_value_bytes {
             return false;
         }
+        record.ttl = record.ttl.min(max_ttl(record.record_type));
 
         let key = *record.key.as_bytes();
         let entries = self.records.entry(key).or_default();
@@ -523,36 +589,42 @@ impl DhtStore {
         let stored = match record.record_type {
             RecordType::Hello => {
                 // Same signer + strictly higher sequence replaces
-                upsert_by_signer(entries, record, false)
+                upsert_by_signer(entries, record, source, false)
             }
             RecordType::SignedContent => {
                 // Different signers are supplemental; same signer replaces if >= sequence
-                upsert_by_signer(entries, record, true)
+                upsert_by_signer(entries, record, source, true)
             }
             RecordType::ZoneRoot => {
                 // Self-addressed: the ingest gate guarantees the signer's ServiceId
                 // hashes to this key, so every record here shares one signer — the
-                // zone owner. Same signer + strictly higher sequence replaces; no
-                // foreign signer can ever append, so there is no eviction race.
-                upsert_by_signer(entries, record, false)
+                // zone owner. Same signer + strictly higher sequence replaces.
+                upsert_by_signer(entries, record, source, false)
             }
             RecordType::Content => {
-                // Keep up to N candidates to resist poisoning attacks.
-                // The authentic record is identified at retrieval time via
-                // content-address decryption; storage nodes cannot verify.
-                const MAX_CONTENT_CANDIDATES: usize = 5;
-                if entries.len() < MAX_CONTENT_CANDIDATES
-                    && !entries.iter().any(|r| r.value == record.value)
+                let candidates: Vec<usize> = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.record.record_type == RecordType::Content)
+                    .map(|(i, _)| i)
+                    .collect();
+                if candidates
+                    .iter()
+                    .any(|&i| entries[i].record.value == record.value)
                 {
-                    entries.push(record);
-                    true
-                } else {
                     false
+                } else {
+                    if candidates.len() >= MAX_CONTENT_CANDIDATES {
+                        let victim = candidates[rand::thread_rng().gen_range(0..candidates.len())];
+                        entries.remove(victim);
+                    }
+                    entries.push(StoredRecord { record, source });
+                    true
                 }
             }
             RecordType::Unknown(_) => {
                 // Best-effort store-and-relay: same signer + strictly higher sequence replaces
-                upsert_by_signer(entries, record, false)
+                upsert_by_signer(entries, record, source, false)
             }
         };
 
@@ -566,7 +638,11 @@ impl DhtStore {
     /// Retrieve all non-expired records at a key.
     pub fn get(&self, key: &DhtId) -> Vec<&DhtRecord> {
         match self.records.get(key.as_bytes()) {
-            Some(entries) => entries.iter().filter(|r| !r.is_expired()).collect(),
+            Some(entries) => entries
+                .iter()
+                .map(|e| &e.record)
+                .filter(|r| !r.is_expired())
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -574,7 +650,7 @@ impl DhtStore {
     /// Remove expired records.
     pub fn expire(&mut self) {
         for entries in self.records.values_mut() {
-            entries.retain(|r| !r.is_expired());
+            entries.retain(|e| !e.record.is_expired());
         }
         self.records.retain(|_, v| !v.is_empty());
     }
@@ -592,7 +668,7 @@ impl DhtStore {
     pub fn key_count(&self) -> usize {
         self.records
             .iter()
-            .filter(|(_, v)| v.iter().any(|r| !r.is_expired()))
+            .filter(|(_, v)| v.iter().any(|e| !e.record.is_expired()))
             .count()
     }
 
@@ -601,7 +677,7 @@ impl DhtStore {
         self.records
             .values()
             .flat_map(|v| v.iter())
-            .filter(|r| !r.is_expired())
+            .filter(|e| !e.record.is_expired())
             .count()
     }
 
@@ -610,8 +686,27 @@ impl DhtStore {
         self.records
             .values()
             .flat_map(|entries| entries.iter())
+            .map(|e| &e.record)
             .filter(|r| !r.is_expired())
             .collect()
+    }
+
+    /// Non-expired records split by origin: `(ours, everyone else's)`, where
+    /// "ours" are those with source [`RecordSource::Local`].
+    pub fn records_by_origin(&self) -> (Vec<&DhtRecord>, Vec<&DhtRecord>) {
+        let mut ours = Vec::new();
+        let mut theirs = Vec::new();
+        for e in self.records.values().flat_map(|entries| entries.iter()) {
+            if e.record.is_expired() {
+                continue;
+            }
+            if e.source == RecordSource::Local {
+                ours.push(&e.record);
+            } else {
+                theirs.push(&e.record);
+            }
+        }
+        (ours, theirs)
     }
 
     pub fn export_records(&self) -> Vec<PersistedRecord> {
@@ -649,23 +744,33 @@ impl DhtStore {
         self.records
             .values()
             .flat_map(|entries| entries.iter())
-            .map(record_cost)
+            .map(|e| record_cost(&e.record))
             .sum()
     }
 
+    /// Bring one key back within its record/byte budget. Owner-bound records
+    /// (a zone root, or a hello at its signer's own key — the only places those
+    /// types can be stored) are never evicted to make room for other records at
+    /// the same key: they are the reason the key exists, and foreign records
+    /// piling onto it must not be able to push them out.
     fn enforce_key_limits(&mut self, key: &[u8; 64]) {
         let max_records_per_key = self.limits.max_records_per_key;
         let max_bytes_per_key = self.limits.max_bytes_per_key;
 
         if let Some(entries) = self.records.get_mut(key) {
-            let mut byte_total: usize = entries.iter().map(record_cost).sum();
+            let mut byte_total: usize = entries.iter().map(|e| record_cost(&e.record)).sum();
             while entries.len() > max_records_per_key || byte_total > max_bytes_per_key {
-                if let Some(idx) = oldest_record_index(entries) {
-                    byte_total -= record_cost(&entries[idx]);
-                    entries.remove(idx);
-                } else {
+                let victim = fair_share_victim(
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, e)| !is_owner_bound(e.record.record_type)),
+                );
+                let Some(idx) = victim else {
                     break;
-                }
+                };
+                byte_total -= record_cost(&entries[idx].record);
+                entries.remove(idx);
             }
         }
 
@@ -677,11 +782,14 @@ impl DhtStore {
         let mut byte_count = self.total_bytes();
 
         while record_count > self.limits.max_records || byte_count > self.limits.max_total_bytes {
-            let Some((key, idx)) = self.oldest_record_location() else {
+            let victim = fair_share_victim(self.records.iter().flat_map(|(key, entries)| {
+                entries.iter().enumerate().map(move |(idx, e)| ((*key, idx), e))
+            }));
+            let Some((key, idx)) = victim else {
                 break;
             };
             if let Some(entries) = self.records.get_mut(&key) {
-                byte_count -= record_cost(&entries[idx]);
+                byte_count -= record_cost(&entries[idx].record);
                 entries.remove(idx);
                 record_count -= 1;
                 if entries.is_empty() {
@@ -690,30 +798,46 @@ impl DhtStore {
             }
         }
     }
+}
 
-    fn oldest_record_location(&self) -> Option<([u8; 64], usize)> {
-        self.records
-            .iter()
-            .flat_map(|(key, entries)| {
-                entries
-                    .iter()
-                    .enumerate()
-                    .map(move |(idx, record)| (*key, idx, record.stored_at))
-            })
-            .min_by_key(|(_, _, stored_at)| *stored_at)
-            .map(|(key, idx, _)| (key, idx))
+/// Record types that only the key's owner can write (enforced at ingest by
+/// [`verify_incoming_record`]).
+fn is_owner_bound(record_type: RecordType) -> bool {
+    matches!(record_type, RecordType::Hello | RecordType::ZoneRoot)
+}
+
+/// Pick the record to evict: the oldest record from whichever source holds the
+/// most of the candidates. Under normal load this approximates oldest-first;
+/// under a flood from one link it evicts that link's records before anyone
+/// else's.
+fn fair_share_victim<'a, I: Copy>(
+    candidates: impl Iterator<Item = (I, &'a StoredRecord)> + Clone,
+) -> Option<I> {
+    let mut counts: HashMap<RecordSource, usize> = HashMap::new();
+    for (_, e) in candidates.clone() {
+        *counts.entry(e.source).or_default() += 1;
     }
+    let heaviest = counts.into_iter().max_by_key(|(_, n)| *n)?.0;
+    candidates
+        .filter(|(_, e)| e.source == heaviest)
+        .min_by_key(|(_, e)| e.record.stored_at)
+        .map(|(id, _)| id)
 }
 
 /// Upsert a record by signer: if a record with the same signer exists, replace it
 /// if the new sequence is higher (or equal when `allow_equal` is true); otherwise append.
 /// Returns whether the record was stored.
-fn upsert_by_signer(entries: &mut Vec<DhtRecord>, record: DhtRecord, allow_equal: bool) -> bool {
-    if let Some(existing) = entries.iter_mut().find(|r| r.signer == record.signer) {
+fn upsert_by_signer(
+    entries: &mut Vec<StoredRecord>,
+    record: DhtRecord,
+    source: RecordSource,
+    allow_equal: bool,
+) -> bool {
+    if let Some(existing) = entries.iter_mut().find(|e| e.record.signer == record.signer) {
         // A strictly higher sequence is a genuinely newer record (sequence is
         // signed, so only the owner can produce one) — take it wholesale.
-        if record.sequence > existing.sequence {
-            *existing = record;
+        if record.sequence > existing.record.sequence {
+            *existing = StoredRecord { record, source };
             return true;
         }
         // Equal-sequence replace exists ONLY to refresh `stored_at` for
@@ -721,32 +845,23 @@ fn upsert_by_signer(entries: &mut Vec<DhtRecord>, record: DhtRecord, allow_equal
         // the signed bytes (it is rewritten per hop as remaining-ttl, see
         // `to_put_msg`), so a replayed equal-sequence record can carry an
         // attacker-chosen `ttl` — `ttl=0` would otherwise force-expire a healthy
-        // copy. Keep the later deadline: a refresh may extend (bounded by the
-        // original fixed deadline, since remaining-ttl only decays within a
-        // sequence, so this can't resurrect immortality) but can never cut life
-        // short. This is where lifetime integrity lives, since the signature
-        // cannot cover the mutable `ttl`.
-        if allow_equal && record.sequence == existing.sequence {
-            let existing_remaining = existing.remaining_ttl();
-            *existing = record;
-            if existing_remaining > existing.ttl {
-                existing.ttl = existing_remaining;
+        // copy. Keep the later deadline: a refresh may extend (bounded by
+        // [`max_ttl`], which `put_from` applies before we get here) but can never
+        // cut life short. The source is kept: a refresh does not transfer
+        // ownership of the slot.
+        if allow_equal && record.sequence == existing.record.sequence {
+            let existing_remaining = existing.record.remaining_ttl();
+            existing.record = record;
+            if existing_remaining > existing.record.ttl {
+                existing.record.ttl = existing_remaining;
             }
             return true;
         }
         false
     } else {
-        entries.push(record);
+        entries.push(StoredRecord { record, source });
         true
     }
-}
-
-fn oldest_record_index(entries: &[DhtRecord]) -> Option<usize> {
-    entries
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, record)| record.stored_at)
-        .map(|(idx, _)| idx)
 }
 
 fn record_cost(record: &DhtRecord) -> usize {
@@ -1270,9 +1385,17 @@ pub fn content_address_put(value: &[u8]) -> (DhtId, Vec<u8>) {
     // Derive 32-byte encryption key from inner hash
     let enc_key: [u8; 32] = *blake3::hash(&inner_hash).as_bytes();
 
-    // Encrypt value with XChaCha20-Poly1305
+    // Encrypt value with XChaCha20-Poly1305 under a nonce derived from the
+    // content. The key is itself derived from the plaintext, so it only ever
+    // seals this one plaintext and a fixed nonce leaks nothing. Making the blob a
+    // pure function of the content means honest copies from every publisher are
+    // byte-identical, so storage dedupes them into one candidate slot instead of
+    // letting each fresh nonce consume another.
+    let mut nonce_seed = Vec::with_capacity(32 + 64);
+    nonce_seed.extend_from_slice(b"tarnet content-address nonce v1");
+    nonce_seed.extend_from_slice(&inner_hash);
     let mut nonce = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    nonce.copy_from_slice(&hash_64(&nonce_seed)[..24]);
 
     let cipher = XChaCha20Poly1305::new((&enc_key).into());
     let ciphertext = cipher
@@ -1348,9 +1471,11 @@ pub fn zone_root_key(sid: &ServiceId) -> DhtId {
     DhtId(out)
 }
 
-/// Encrypt the value of a signed or hello DHT record so that storage nodes
-/// cannot read the content.  The encryption key is derived from the DHT
-/// lookup key (which the querier already knows).
+/// Encrypt the value of a signed or hello DHT record under a key derived from
+/// the DHT lookup key. This is obfuscation, not confidentiality: anyone who
+/// holds the record also holds its key (and for hellos, the signer's PeerId the
+/// key is derived from), so storage nodes can read it. It only keeps the value
+/// opaque to observers who see neither.
 ///
 /// Layout of the returned blob: `nonce (24 bytes) || ciphertext+tag`.
 pub fn signed_record_encrypt(dht_key: &DhtId, value: &[u8]) -> Vec<u8> {
@@ -1500,6 +1625,128 @@ mod tests {
             VerifiedRecord::verify_incoming(rec).err(),
             Some("self-addressed record not stored at its own key")
         );
+    }
+
+    #[test]
+    fn hello_rejected_at_foreign_identity_key() {
+        let victim = Keypair::generate();
+        let attacker = Keypair::generate();
+        let victim_key = identity_address_key(&victim.peer_id());
+        let rec = signed_record(&attacker, victim_key, RecordType::Hello, 1, b"junk".to_vec());
+        assert_eq!(
+            VerifiedRecord::verify_incoming(rec).err(),
+            Some("hello not stored at its signer's identity key")
+        );
+        // The owner's own hello at its own key passes.
+        let own = signed_record(&victim, victim_key, RecordType::Hello, 1, b"hi".to_vec());
+        assert!(VerifiedRecord::verify_incoming(own).is_ok());
+    }
+
+    // ── Store: eviction and slot policy ──
+
+    fn small_limits() -> StorageLimits {
+        StorageLimits {
+            max_records: 6,
+            max_total_bytes: 1 << 20,
+            max_records_per_key: 4,
+            max_bytes_per_key: 1 << 20,
+            max_value_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn owner_bound_record_survives_flood_at_its_key() {
+        let owner = Keypair::generate();
+        let key = zone_root_key(&owner.identity.service_id());
+        let mut store = DhtStore::with_limits(&PeerId([1; 32]), small_limits());
+        let root = signed_record(&owner, key, RecordType::ZoneRoot, 1, b"root".to_vec());
+        store.put_from(VerifiedRecord::verify_incoming(root).unwrap(), RecordSource::Peer(PeerId([2; 32])));
+
+        // A flood of foreign SignedContent at the same key, each newer than the root.
+        for _ in 0..10 {
+            let junk = signed_record(&Keypair::generate(), key, RecordType::SignedContent, 1, b"junk".to_vec());
+            store.put_from(VerifiedRecord::verify_incoming(junk).unwrap(), RecordSource::Peer(PeerId([3; 32])));
+        }
+        let at_key = store.get(&key);
+        assert_eq!(at_key.len(), 4);
+        assert!(at_key.iter().any(|r| r.record_type == RecordType::ZoneRoot));
+    }
+
+    #[test]
+    fn global_eviction_targets_the_flooding_source() {
+        let mut store = DhtStore::with_limits(&PeerId([1; 32]), small_limits());
+        let honest = RecordSource::Peer(PeerId([2; 32]));
+        let flooder = RecordSource::Peer(PeerId([3; 32]));
+        let rec = |i: u8| DhtRecord {
+            key: DhtId([i; 64]),
+            record_type: RecordType::Unknown(9),
+            sequence: 1,
+            signer: [i; 32],
+            signer_algo: 1,
+            signer_pubkey: vec![],
+            value: vec![i; 8],
+            ttl: Duration::from_secs(600),
+            stored_at: Instant::now(),
+            signature: vec![0u8; 64],
+        };
+        // Honest records arrive first, so oldest-first eviction would drop them.
+        for i in 0..2 {
+            store.put_from(VerifiedRecord::locally_trusted(rec(i)), honest);
+        }
+        for i in 10..30 {
+            store.put_from(VerifiedRecord::locally_trusted(rec(i)), flooder);
+        }
+        assert_eq!(store.all_records().len(), 6);
+        for i in 0..2 {
+            assert_eq!(store.get(&DhtId([i; 64])).len(), 1, "honest record {} evicted", i);
+        }
+    }
+
+    #[test]
+    fn full_content_slots_still_admit_a_new_candidate() {
+        let mut store = DhtStore::new(&PeerId([1; 32]));
+        let (genuine, _) = VerifiedRecord::new_content(b"the real thing", Duration::from_secs(600));
+        let key = genuine.record().key;
+        for i in 0..MAX_CONTENT_CANDIDATES as u8 {
+            put(&mut store, DhtRecord {
+                key,
+                record_type: RecordType::Content,
+                sequence: 0,
+                signer: [0; 32],
+                signer_algo: 0,
+                signer_pubkey: vec![],
+                value: vec![i; 48],
+                ttl: Duration::from_secs(600),
+                stored_at: Instant::now(),
+                signature: vec![],
+            });
+        }
+        assert!(store.put(genuine.clone()));
+        let at_key = store.get(&key);
+        assert_eq!(at_key.len(), MAX_CONTENT_CANDIDATES);
+        assert!(at_key.iter().any(|r| r.value == genuine.record().value));
+    }
+
+    #[test]
+    fn content_blob_is_deterministic() {
+        let (k1, b1) = content_address_put(b"same bytes");
+        let (k2, b2) = content_address_put(b"same bytes");
+        assert_eq!(k1, k2);
+        assert_eq!(b1, b2);
+        assert_eq!(content_address_get(&hash_64(b"same bytes"), &b1).unwrap(), b"same bytes");
+    }
+
+    #[test]
+    fn stored_ttl_is_clamped_per_type() {
+        let mut store = DhtStore::new(&PeerId([1; 32]));
+        let kp = Keypair::generate();
+        let mut hello = signed_record(&kp, identity_address_key(&kp.peer_id()), RecordType::Hello, 1, b"h".to_vec());
+        hello.ttl = Duration::from_secs(u32::MAX as u64);
+        store.put(VerifiedRecord::verify_incoming(hello).unwrap());
+        let stored = store.all_records()[0].ttl;
+        assert_eq!(stored, MAX_HELLO_TTL);
+        assert_eq!(clamp_ttl_secs(RecordType::ZoneRoot, u32::MAX), MAX_RECORD_TTL.as_secs() as u32);
+        assert_eq!(clamp_ttl_secs(RecordType::Hello, 600), 600);
     }
 
     #[test]
@@ -1960,8 +2207,9 @@ mod tests {
 
         // Keys must be identical (same content)
         assert_eq!(key1, key2);
-        // Blobs differ (different random nonces)
-        assert_ne!(blob1, blob2);
+        // Blobs are identical too: the nonce is derived from the content, so
+        // honest copies dedupe in storage.
+        assert_eq!(blob1, blob2);
 
         let mut store = DhtStore::new(&PeerId([0u8; 32]));
         put(&mut store, DhtRecord {

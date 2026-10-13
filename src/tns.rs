@@ -387,7 +387,8 @@ pub fn deserialize_record_set(data: &[u8]) -> Result<Vec<TnsRecord>> {
         return Err(Error::Wire("TNSrecord set: too short".into()));
     }
     let count = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let mut records = Vec::with_capacity(count);
+    // Cap by the bytes present, not the claimed count (each record is >= 1 byte).
+    let mut records = Vec::with_capacity(count.min(data.len() - 2));
     let mut offset = 2;
     for _ in 0..count {
         let (record, consumed) = tns_record_from_bytes(&data[offset..])?;
@@ -1190,7 +1191,7 @@ fn open_zone_root_value(sid: &ServiceId, blob: &[u8]) -> Result<HashMap<[u8; 32]
         return Err(Error::Wire("zone root: truncated count".into()));
     }
     let count = u16::from_be_bytes([pt[0], pt[1]]) as usize;
-    let mut map = HashMap::with_capacity(count);
+    let mut map = HashMap::with_capacity(count.min((pt.len() - 2) / (32 + 2)));
     let mut off = 2;
     for _ in 0..count {
         if pt.len() < off + 32 + 2 {
