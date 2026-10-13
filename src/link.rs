@@ -387,6 +387,9 @@ impl PeerLink {
         let mut buf = vec![0u8; 8192];
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
+        if wire.msg_type != crate::wire::MessageType::HandshakeHello {
+            return Err(Error::Wire("expected HandshakeHello".into()));
+        }
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
 
         // Negotiate wire protocol version
@@ -467,6 +470,9 @@ impl PeerLink {
         // Receive and verify peer auth
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
+        if wire.msg_type != crate::wire::MessageType::HandshakeAuth {
+            return Err(Error::Wire("expected HandshakeAuth".into()));
+        }
         let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
 
         let peer_transcript = Self::compute_transcript(
@@ -513,6 +519,9 @@ impl PeerLink {
         // Receive and verify peer's (responder) confirm
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
+        if wire.msg_type != crate::wire::MessageType::HandshakeConfirm {
+            return Err(Error::Wire("expected HandshakeConfirm".into()));
+        }
         let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, false);
         if peer_confirm
@@ -572,6 +581,9 @@ impl PeerLink {
         let mut buf = vec![0u8; 8192];
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
+        if wire.msg_type != crate::wire::MessageType::HandshakeHello {
+            return Err(Error::Wire("expected HandshakeHello".into()));
+        }
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
 
         // Negotiate wire protocol version
@@ -622,6 +634,9 @@ impl PeerLink {
         // Receive peer auth (contains both static + ephemeral KEM ciphertexts)
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
+        if wire.msg_type != crate::wire::MessageType::HandshakeAuth {
+            return Err(Error::Wire("expected HandshakeAuth".into()));
+        }
         let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
 
         // KEM decapsulate static: recover shared secret from initiator's ciphertext
@@ -705,6 +720,9 @@ impl PeerLink {
         // Key confirmation: receive and verify peer's (initiator) confirm
         let n = transport.recv(&mut buf).await?;
         let wire = WireMessage::decode(&buf[..n])?;
+        if wire.msg_type != crate::wire::MessageType::HandshakeConfirm {
+            return Err(Error::Wire("expected HandshakeConfirm".into()));
+        }
         let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
 
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, true);

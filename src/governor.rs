@@ -296,12 +296,6 @@ impl Governor {
         msg_type: MessageType,
         circuits_for_peer: usize,
     ) -> Verdict {
-        // ── Generous by default ──
-        // Below the pressure threshold, skip all checks.
-        if self.pressure.level < self.config.pressure_threshold {
-            return Verdict::Allow;
-        }
-
         let config = &self.config;
 
         let budget = match self.budgets.get_mut(from) {
@@ -338,6 +332,14 @@ impl Governor {
                 );
                 return Verdict::Shed;
             }
+        }
+
+        // ── Generous by default ──
+        // Below the pressure threshold, circuit admission limits above remain
+        // active because they bound attacker-controlled state. Other traffic
+        // skips pressure-driven shedding.
+        if self.pressure.level < self.config.pressure_threshold {
+            return Verdict::Allow;
         }
 
         // ── Throttled: shed non-essential traffic ──
@@ -425,15 +427,28 @@ mod tests {
     }
 
     #[test]
-    fn no_enforcement_below_threshold() {
+    fn first_circuit_create_allowed_below_threshold() {
         let mut gov = Governor::new(GovernorConfig::default());
         let peer = test_peer(1);
         gov.peer_connected(peer);
-        // Pressure is 0.0 (below threshold) — everything allowed.
+        // Pressure is 0.0, but the first create is within its always-on budget.
         assert_eq!(
             gov.evaluate(&peer, MessageType::CircuitCreate, 0),
             Verdict::Allow
         );
+    }
+
+    #[test]
+    fn circuit_rate_limit_is_enforced_below_pressure_threshold() {
+        let mut config = GovernorConfig::default();
+        config.circuit_creates_per_window = 2;
+        let mut gov = Governor::new(config);
+        let peer = test_peer(1);
+        gov.peer_connected(peer);
+
+        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, 0), Verdict::Allow);
+        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, 0), Verdict::Allow);
+        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, 0), Verdict::Shed);
     }
 
     #[test]

@@ -101,6 +101,9 @@ const KEEPALIVE_DEAD_TIMEOUT: Duration = Duration::from_secs(180);
 /// is drawn uniformly from [0, this] so heartbeat packets don't form a
 /// fingerprintable fixed-size class on the wire.
 const HEARTBEAT_MAX_PADDING: usize = 256;
+/// Maximum messages waiting for one circuit's FIFO worker.  A peer that can
+/// outpace circuit processing must not be able to grow memory without bound.
+const CIRCUIT_QUEUE_SIZE: usize = 256;
 /// How often to check circuit liveness.
 const CIRCUIT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Send circuit padding if no activity within this duration.
@@ -255,7 +258,7 @@ pub struct CircuitState {
     /// Per-circuit message queues: ensures control and data on the same circuit are
     /// processed in FIFO order rather than racing in spawned tasks.
     /// Key: (circuit_id, from_peer) → sender into that circuit's processing task.
-    pub relay_queues: Arc<Mutex<HashMap<(u32, PeerId), mpsc::UnboundedSender<WireMessage>>>>,
+    pub relay_queues: Arc<Mutex<HashMap<(u32, PeerId), mpsc::Sender<WireMessage>>>>,
     /// Multipath circuit groups: destination → CircuitGroup.
     pub groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
 }
@@ -1857,10 +1860,66 @@ impl Node {
                             msg.payload[2],
                             msg.payload[3],
                         ]);
+
+                        // CREATE introduces circuit state, so there is no
+                        // pre-existing per-circuit FIFO to attach to. Process it
+                        // inline: allocating a queue first would let a peer
+                        // create permanent queues with arbitrary IDs even when
+                        // the CREATE is later rejected.
+                        if msg.msg_type == MessageType::CircuitCreate {
+                            if let Err(e) = self.handle_message(from, msg_link_id, msg).await {
+                                log::warn!(
+                                    "Error handling circuit create from {:?}: {}",
+                                    from,
+                                    e
+                                );
+                            }
+                            continue;
+                        }
+
                         let queue_key = (circuit_id, from);
+
+                        // Do not let arbitrary circuit IDs allocate an
+                        // unbounded FIFO and a permanent task. CREATE is the
+                        // only message allowed to introduce a new ID; every
+                        // other circuit message must refer to state already
+                        // owned by this peer.
+                        let key = CircuitKey {
+                            circuit_id,
+                            from_peer: from,
+                        };
+                        let admitted = if self.circuits.table.lock().await.lookup(&key).is_some() {
+                            true
+                        } else if self
+                            .circuits
+                            .outbound
+                            .lock()
+                            .await
+                            .get(&circuit_id)
+                            .is_some_and(|c| c.first_hop == from)
+                        {
+                            true
+                        } else {
+                            self.circuits
+                                .pending_create_peers
+                                .lock()
+                                .await
+                                .get(&circuit_id)
+                                == Some(&from)
+                        };
+                        if !admitted {
+                            log::debug!(
+                                "Dropping {:?} for unknown circuit {} from {:?}",
+                                msg.msg_type,
+                                circuit_id,
+                                from
+                            );
+                            continue;
+                        }
+
                         let mut queues = self.circuits.relay_queues.lock().await;
                         let tx = queues.entry(queue_key).or_insert_with(|| {
-                            let (tx, mut rx) = mpsc::unbounded_channel::<WireMessage>();
+                            let (tx, mut rx) = mpsc::channel::<WireMessage>(CIRCUIT_QUEUE_SIZE);
                             let node = node_arc.clone();
                             tokio::spawn(async move {
                                 while let Some(msg) = rx.recv().await {
@@ -1877,9 +1936,19 @@ impl Node {
                             });
                             tx
                         });
-                        if tx.send(msg).is_err() {
-                            // Receiver task exited — remove stale entry.
-                            queues.remove(&queue_key);
+                        match tx.try_send(msg) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                log::warn!(
+                                    "Circuit queue {} from {:?} is full; dropping message",
+                                    circuit_id,
+                                    from
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                // Receiver task exited — remove stale entry.
+                                queues.remove(&queue_key);
+                            }
                         }
                     } else {
                         let node = node_arc.clone();

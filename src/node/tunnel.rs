@@ -131,13 +131,13 @@ impl Node {
     ) -> Result<()> {
         let kr = TunnelKeyResponseMsg::from_bytes(payload)?;
 
-        // Look up pending exchange by our initiator nonce
-        if let Some((kex, notifier, dest, _created)) = self
-            .pending_key_exchanges
-            .lock()
-            .await
-            .remove(&kr.initiator_nonce)
-        {
+        // Authenticate and complete the response before consuming the pending
+        // exchange.  The nonce is visible in the routed handshake envelope, so
+        // an on-path peer can race a forged response; removing first would let
+        // that invalid response cancel the legitimate exchange.
+        let mut pending = self.pending_key_exchanges.lock().await;
+        if let Some((kex, _, dest, _created)) = pending.get(&kr.initiator_nonce) {
+            let dest = *dest;
             // Verify the response is from the expected peer
             if kr.responder_peer_id != dest {
                 log::warn!(
@@ -176,6 +176,13 @@ impl Node {
             }
 
             let shared_bytes = kex.complete(&kr.ciphertext)?;
+
+            // Authentication and decapsulation both succeeded.  Only now is it
+            // safe to consume the one-shot state and notifier.
+            let (_, notifier, _, _) = pending
+                .remove(&kr.initiator_nonce)
+                .expect("pending tunnel exchange disappeared while locked");
+            drop(pending);
 
             let tunnel = Tunnel::new(dest, &shared_bytes, true);
             self.tunnel_table.lock().await.add(tunnel);
@@ -246,6 +253,15 @@ impl Node {
         match msg.msg_type {
             MessageType::ChannelOpen => {
                 let open = ChannelOpenMsg::from_bytes(&msg.payload)?;
+                if let Some((owner, _)) = channels.get(&open.channel_id) {
+                    log::warn!(
+                        "Rejecting channel {} from {:?}: already owned by {:?}",
+                        open.channel_id,
+                        from,
+                        owner
+                    );
+                    return Ok(());
+                }
                 let ch = Channel::new(open.channel_id, open.port, open.reliable, open.ordered);
                 channels.insert(open.channel_id, (from, ch));
                 log::debug!("Channel {} opened from {:?}", open.channel_id, from);
@@ -264,7 +280,15 @@ impl Node {
             }
             MessageType::ChannelData => {
                 let data = ChannelDataMsg::from_bytes(&msg.payload)?;
-                if let Some((_, ch)) = channels.get_mut(&data.channel_id) {
+                if let Some((owner, ch)) = channels.get_mut(&data.channel_id) {
+                    if *owner != from {
+                        log::warn!(
+                            "Rejecting channel data for {} from non-owner {:?}",
+                            data.channel_id,
+                            from
+                        );
+                        return Ok(());
+                    }
                     let delivered = ch.receive_data(data.sequence, data.data);
 
                     // Check if this channel has a data handler
@@ -314,12 +338,31 @@ impl Node {
             }
             MessageType::ChannelAck => {
                 let ack = ChannelAckMsg::from_bytes(&msg.payload)?;
-                if let Some((_, ch)) = channels.get_mut(&ack.channel_id) {
+                if let Some((owner, ch)) = channels.get_mut(&ack.channel_id) {
+                    if *owner != from {
+                        log::warn!(
+                            "Rejecting channel ACK for {} from non-owner {:?}",
+                            ack.channel_id,
+                            from
+                        );
+                        return Ok(());
+                    }
                     ch.process_ack(ack.ack_seq, &ack.selective_acks);
                 }
             }
             MessageType::ChannelClose => {
                 let close = ChannelCloseMsg::from_bytes(&msg.payload)?;
+                if !channels
+                    .get(&close.channel_id)
+                    .is_some_and(|(owner, _)| *owner == from)
+                {
+                    log::warn!(
+                        "Rejecting channel close for {} from non-owner {:?}",
+                        close.channel_id,
+                        from
+                    );
+                    return Ok(());
+                }
                 channels.remove(&close.channel_id);
                 self.channel_state
                     .data_handlers
@@ -554,16 +597,18 @@ impl Node {
         ordered: bool,
     ) -> Result<u32> {
         use rand::Rng;
-        let channel_id: u32 = rand::thread_rng().gen();
         let port = crate::wire::hash_port_name(port_name);
-        let ch = Channel::new(channel_id, port, reliable, ordered);
-
-        // Register locally
-        self.channel_state
-            .channels
-            .lock()
-            .await
-            .insert(channel_id, (*dest, ch));
+        let channel_id = {
+            let mut channels = self.channel_state.channels.lock().await;
+            loop {
+                let candidate: u32 = rand::thread_rng().gen();
+                if !channels.contains_key(&candidate) {
+                    let ch = Channel::new(candidate, port, reliable, ordered);
+                    channels.insert(candidate, (*dest, ch));
+                    break candidate;
+                }
+            }
+        };
 
         // Send ChannelOpen through the tunnel
         let open = ChannelOpenMsg {
@@ -586,14 +631,17 @@ impl Node {
         ordered: bool,
     ) -> Result<u32> {
         use rand::Rng;
-        let channel_id: u32 = rand::thread_rng().gen();
-        let ch = Channel::new(channel_id, port, reliable, ordered);
-
-        self.channel_state
-            .channels
-            .lock()
-            .await
-            .insert(channel_id, (*dest, ch));
+        let channel_id = {
+            let mut channels = self.channel_state.channels.lock().await;
+            loop {
+                let candidate: u32 = rand::thread_rng().gen();
+                if !channels.contains_key(&candidate) {
+                    let ch = Channel::new(candidate, port, reliable, ordered);
+                    channels.insert(candidate, (*dest, ch));
+                    break candidate;
+                }
+            }
+        };
 
         let open = ChannelOpenMsg {
             channel_id,
