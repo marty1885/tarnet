@@ -1047,9 +1047,7 @@ mod tests {
             signature: Vec::new(),
             signer_algo: kp.identity.signing_algo() as u8,
             signer_pubkey: kp.identity.signing.signing_pubkey_bytes(),
-            hop_count: 0,
-            hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-            bloom: [0u8; 256],
+            walk: Default::default(),
         };
         put.signature = kp.sign(&put.signable_bytes());
 
@@ -1091,9 +1089,7 @@ mod tests {
             signature: loaded.signature.clone(),
             signer_algo: loaded.signer_algo,
             signer_pubkey: loaded.signer_pubkey.clone(),
-            hop_count: 0,
-            hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-            bloom: [0u8; 256],
+            walk: Default::default(),
         };
 
         let algo = SigningAlgo::from_u8(forwarded_put.signer_algo).unwrap();

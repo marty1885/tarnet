@@ -1,27 +1,23 @@
 //! Adversarial transport wrapper for testing.
 //!
 //! Wraps any `Transport` + `Discovery` and applies configurable packet-level
-//! disruption: random drops, random delays, or both.  Sits below the link
-//! crypto layer so the disruption looks like a flaky network to the node.
+//! disruption: random drops, random per-packet delays (which reorder), or
+//! both.  Sits below the link crypto layer so the disruption looks like a
+//! flaky network to the node.
 //!
-//! A warmup period lets the initial handshake complete undisturbed — the
-//! link handshake has no retransmission and cannot survive packet loss.
+//! The policy applies from the first packet: the link handshake retransmits
+//! on unreliable transports and must survive it like everything else.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use rand::prelude::*;
 use rand::rngs::StdRng;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use super::{Discovery, Transport};
-use crate::types::Result;
-
-/// Number of send/recv calls to let through unmolested so the link
-/// handshake can complete.  The handshake is ~3-4 messages per direction;
-/// 20 gives comfortable margin for keepalives and route advertisements.
-const DEFAULT_WARMUP: u64 = 20;
+use crate::types::{Error, Result};
 
 /// What the firewall does to each packet.
 #[derive(Clone, Debug)]
@@ -35,99 +31,145 @@ pub enum FirewallPolicy {
 }
 
 /// Wraps a `Transport`, applying a `FirewallPolicy` to both send and recv.
-/// The first `warmup` send+recv calls pass through unmodified.
+///
+/// Every packet is delayed independently (its own timer), so packets overtake
+/// each other the way they do on a real multi-path network: delays reorder,
+/// they don't just add latency.
 pub struct FirewallTransport {
-    inner: Box<dyn Transport>,
+    inner: Arc<dyn Transport>,
+    shared: Arc<Shared>,
+    /// Packets received from `inner` that survived the policy, in the order
+    /// their delays expired.
+    inbound: Mutex<mpsc::Receiver<Result<Vec<u8>>>>,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+struct Shared {
     policy: FirewallPolicy,
-    rng: Mutex<StdRng>,
-    /// Counts down to zero; policy kicks in once this reaches 0.
-    warmup_remaining: AtomicU64,
+    rng: std::sync::Mutex<StdRng>,
+}
+
+/// Largest packet the recv pump will read from the wrapped transport.
+const PUMP_BUFFER: usize = 1 << 20;
+
+impl Shared {
+    /// `None` to drop the packet, else how long to hold it.
+    fn verdict(&self) -> Option<Duration> {
+        let (rate, max) = match &self.policy {
+            FirewallPolicy::Drop { rate } => (*rate, Duration::ZERO),
+            FirewallPolicy::Delay { max } => (0.0, *max),
+            FirewallPolicy::DropAndDelay {
+                drop_rate,
+                max_delay,
+            } => (*drop_rate, *max_delay),
+        };
+        let mut rng = self.rng.lock().unwrap();
+        if rate > 0.0 && rng.gen::<f64>() < rate {
+            return None;
+        }
+        if max.is_zero() {
+            return Some(Duration::ZERO);
+        }
+        Some(Duration::from_millis(
+            rng.gen_range(0..=max.as_millis() as u64),
+        ))
+    }
 }
 
 impl FirewallTransport {
     pub fn new(inner: Box<dyn Transport>, policy: FirewallPolicy, seed: u64) -> Self {
+        let inner: Arc<dyn Transport> = Arc::from(inner);
+        let shared = Arc::new(Shared {
+            policy,
+            rng: std::sync::Mutex::new(StdRng::seed_from_u64(seed)),
+        });
+        let (tx, rx) = mpsc::channel(1024);
+        let pump = tokio::spawn(Self::pump(inner.clone(), shared.clone(), tx));
         Self {
             inner,
-            policy,
-            rng: Mutex::new(StdRng::seed_from_u64(seed)),
-            warmup_remaining: AtomicU64::new(DEFAULT_WARMUP),
+            shared,
+            inbound: Mutex::new(rx),
+            pump,
         }
     }
 
-    /// Check (and decrement) warmup counter. Returns true if still warming up.
-    fn is_warming_up(&self) -> bool {
-        let prev = self.warmup_remaining.load(Ordering::Relaxed);
-        if prev == 0 {
-            return false;
+    /// Read from the wrapped transport and release each surviving packet
+    /// after its own delay.
+    async fn pump(
+        inner: Arc<dyn Transport>,
+        shared: Arc<Shared>,
+        tx: mpsc::Sender<Result<Vec<u8>>>,
+    ) {
+        let mut buf = vec![0u8; PUMP_BUFFER];
+        loop {
+            let n = match inner.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            };
+            let Some(delay) = shared.verdict() else {
+                continue; // dropped
+            };
+            let packet = buf[..n].to_vec();
+            if delay.is_zero() {
+                if tx.send(Ok(packet)).await.is_err() {
+                    return;
+                }
+            } else {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let _ = tx.send(Ok(packet)).await;
+                });
+            }
         }
-        // Best-effort decrement; races are fine — worst case a few extra
-        // messages get through, which is harmless.
-        self.warmup_remaining
-            .compare_exchange(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
-            .ok();
-        true
     }
+}
 
-    /// Returns true if this packet should be dropped.
-    async fn should_drop(&self) -> bool {
-        let rate = match &self.policy {
-            FirewallPolicy::Drop { rate } => *rate,
-            FirewallPolicy::DropAndDelay { drop_rate, .. } => *drop_rate,
-            FirewallPolicy::Delay { .. } => 0.0,
-        };
-        if rate <= 0.0 {
-            return false;
-        }
-        self.rng.lock().await.gen::<f64>() < rate
-    }
-
-    /// Returns the delay to apply (zero if none).
-    async fn pick_delay(&self) -> Duration {
-        let max = match &self.policy {
-            FirewallPolicy::Delay { max } => *max,
-            FirewallPolicy::DropAndDelay { max_delay, .. } => *max_delay,
-            FirewallPolicy::Drop { .. } => return Duration::ZERO,
-        };
-        if max.is_zero() {
-            return Duration::ZERO;
-        }
-        let ms = self.rng.lock().await.gen_range(0..=max.as_millis() as u64);
-        Duration::from_millis(ms)
+impl Drop for FirewallTransport {
+    fn drop(&mut self) {
+        self.pump.abort();
     }
 }
 
 #[async_trait]
 impl Transport for FirewallTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
-        if self.is_warming_up() {
-            return self.inner.send(data).await;
-        }
-        if self.should_drop().await {
+        let Some(delay) = self.shared.verdict() else {
             // Silently eat the packet — looks like network loss
             return Ok(());
+        };
+        if delay.is_zero() {
+            return self.inner.send(data).await;
         }
-        let delay = self.pick_delay().await;
-        if !delay.is_zero() {
+        let inner = self.inner.clone();
+        let data = data.to_vec();
+        tokio::spawn(async move {
             tokio::time::sleep(delay).await;
-        }
-        self.inner.send(data).await
+            let _ = inner.send(&data).await;
+        });
+        Ok(())
     }
 
     async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-        loop {
-            let n = self.inner.recv(buf).await?;
-            if self.is_warming_up() {
-                return Ok(n);
-            }
-            if self.should_drop().await {
-                continue; // dropped — wait for next
-            }
-            let delay = self.pick_delay().await;
-            if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
-            }
-            return Ok(n);
+        let packet = self
+            .inbound
+            .lock()
+            .await
+            .recv()
+            .await
+            .unwrap_or_else(|| Err(Error::Wire("firewall transport closed".into())))?;
+        if packet.len() > buf.len() {
+            return Err(Error::Wire(format!(
+                "message {} bytes exceeds buffer {}",
+                packet.len(),
+                buf.len()
+            )));
         }
+        buf[..packet.len()].copy_from_slice(&packet);
+        Ok(packet.len())
     }
 
     fn mtu(&self) -> usize {

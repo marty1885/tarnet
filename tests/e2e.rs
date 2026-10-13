@@ -101,6 +101,37 @@ where
     false
 }
 
+/// Search the DHT for content until found or `timeout`.
+async fn search_content(node: &Node, inner_hash: &[u8; 64], timeout: Duration) -> bool {
+    let mut search = node
+        .dht_search_content(inner_hash, std::time::Instant::now() + timeout)
+        .await;
+    loop {
+        if node.dht_get_content(inner_hash).await.is_some() {
+            return true;
+        }
+        if search.next().await.is_none() {
+            return false;
+        }
+    }
+}
+
+/// Search the DHT for signed content until at least one valid record is found
+/// or `timeout`.
+async fn search_signed_content(node: &Node, inner_hash: &[u8; 64], timeout: Duration) -> bool {
+    let mut search = node
+        .dht_search_content(inner_hash, std::time::Instant::now() + timeout)
+        .await;
+    loop {
+        if !node.dht_get_signed_content(inner_hash).await.is_empty() {
+            return true;
+        }
+        if search.next().await.is_none() {
+            return false;
+        }
+    }
+}
+
 /// Wait until node has a route to peer_id.
 async fn wait_route(node: &Node, peer_id: tarnet::types::PeerId, timeout: Duration) -> bool {
     wait_for(timeout, || {
@@ -613,11 +644,7 @@ async fn dht_get_from_remote_node() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let found = wait_for(Duration::from_secs(5), || {
-        let c = c.clone();
-        async move { c.dht_get_content(&inner_hash).await.is_some() }
-    })
-    .await;
+    let found = search_content(c, &inner_hash, Duration::from_secs(6)).await;
 
     assert!(found, "Node C should find content put by Node A");
     let retrieved = c.dht_get_content(&inner_hash).await.unwrap();
@@ -635,11 +662,7 @@ async fn signed_content_cross_node() {
     let inner_hash = a.dht_put_signed_content(topic, 600).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let found = wait_for(Duration::from_secs(5), || {
-        let c = c.clone();
-        async move { !c.dht_get_signed_content(&inner_hash).await.is_empty() }
-    })
-    .await;
+    let found = search_signed_content(c, &inner_hash, Duration::from_secs(6)).await;
 
     assert!(found, "Node C should find signed content from Node A");
     let results = c.dht_get_signed_content(&inner_hash).await;
@@ -915,9 +938,7 @@ fn dht_signature_validation() {
         signature: vec![0xFF; 64], // garbage
         signer_algo: 1,
         signer_pubkey: pubkey.clone(),
-        hop_count: 0,
-        hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-        bloom: [0; 256],
+        walk: Default::default(),
     };
 
     // Bad signature fails verification
@@ -961,9 +982,7 @@ fn dht_wrong_signer_rejected() {
         signature: Vec::new(),
         signer_algo: 1,
         signer_pubkey: fake_pubkey.clone(),
-        hop_count: 0,
-        hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-        bloom: [0; 256],
+        walk: Default::default(),
     };
     put.signature = real_kp.sign(&put.signable_bytes()); // Signed by real_kp
 
@@ -1057,11 +1076,7 @@ async fn dht_content_self_authenticating() {
     let inner_hash = a.dht_put_content(data).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let found = wait_for(Duration::from_secs(3), || {
-        let b = b.clone();
-        async move { b.dht_get_content(&inner_hash).await.is_some() }
-    })
-    .await;
+    let found = search_content(b, &inner_hash, Duration::from_secs(6)).await;
     assert!(found);
     assert_eq!(b.dht_get_content(&inner_hash).await.unwrap(), data);
 
@@ -1531,14 +1546,7 @@ async fn cross_algo_dht_signed_records() {
     let hash = a.node.dht_put_signed_content(value, 600).await;
 
     // B (falcon_ed25519) should be able to retrieve and verify it
-    let result = wait_for(Duration::from_secs(5), || {
-        let b = b.node.clone();
-        async move {
-            let records = b.dht_get_signed_content(&hash).await;
-            !records.is_empty()
-        }
-    })
-    .await;
+    let result = search_signed_content(&b.node, &hash, Duration::from_secs(6)).await;
     assert!(
         result,
         "falcon_ed25519 node should verify ed25519-signed DHT record"
@@ -1549,14 +1557,7 @@ async fn cross_algo_dht_signed_records() {
     let hash2 = b.node.dht_put_signed_content(value2, 600).await;
 
     // A (ed25519) should be able to retrieve and verify it
-    let result2 = wait_for(Duration::from_secs(5), || {
-        let a = a.node.clone();
-        async move {
-            let records = a.dht_get_signed_content(&hash2).await;
-            !records.is_empty()
-        }
-    })
-    .await;
+    let result2 = search_signed_content(&a.node, &hash2, Duration::from_secs(6)).await;
     assert!(
         result2,
         "ed25519 node should verify falcon_ed25519-signed DHT record"
@@ -2108,26 +2109,75 @@ async fn verify_prng_stream(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Firewall tests: nuisance nodes that drop / delay traffic
+// Firewall tests: nuisance nodes that drop / delay / reorder traffic
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Two adversarial modes:
-//   1. Dropper  — Node.set_firewall() with a Probability(0.5)→Drop rule:
-//      the node silently drops 50 % of decoded wire messages *after*
-//      link crypto, so the link handshake still succeeds but
-//      application traffic is lossy.
-//   2. Delayer  — FirewallDiscovery wraps the transport and injects random
-//      delays up to 2 s on every send/recv *after* a warmup window that
-//      lets the handshake complete.
+// These are the worst-case gate: nothing may assume a clean network. Loss is
+// on from the first message, so the link handshake, tunnel key exchange,
+// ChannelOpen, circuit CREATE, routing, DHT, keepalives and rekeys all run
+// under it too.
 //
-// Both are applied to the server (B).  The client (A) has a clean link.
+// Two adversarial layers:
+//   1. Dropper  — Node.set_firewall() with a Probability→Drop rule: the node
+//      silently drops that share of decoded inbound wire messages *after*
+//      link crypto (control plane included).
+//   2. Network  — FirewallDiscovery wraps the transport: random drops and an
+//      independent random delay per packet, so packets also arrive out of
+//      order. This starts with the first packet, so the link handshake is
+//      under it too.
 
-/// Helper: spin up A ↔ B, establish a circuit connection, return both ends.
-/// `drop_pct`: inbound drop rate to set on B (0 = none).
-/// `delay_policy`: optional transport-level delay policy for B.
+fn drop_firewall(pct: u32) -> Firewall {
+    let mut fw = Firewall::default();
+    fw.add_rule(Match::Probability(pct as f64 / 100.0), Action::Drop);
+    fw
+}
+
+/// Start A → B linked over TCP. `drop_a` / `drop_b` are node-level inbound
+/// drop rates (0 = none), enabled before the nodes start; `net_b` wraps B's
+/// transport.
+async fn lossy_pair(
+    drop_a: u32,
+    drop_b: u32,
+    net_b: Option<FirewallPolicy>,
+) -> (Arc<Node>, Arc<Node>) {
+    let node_b = Arc::new(Node::new(Keypair::generate()));
+    let node_a = Arc::new(Node::new(Keypair::generate()));
+    let pid_b = node_b.peer_id();
+    if drop_a > 0 {
+        node_a.set_firewall(drop_firewall(drop_a)).await;
+    }
+    if drop_b > 0 {
+        node_b.set_firewall(drop_firewall(drop_b)).await;
+    }
+
+    let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let addr_b = disc_b.local_addrs()[0].to_string();
+    let disc_b: Box<dyn tarnet::transport::Discovery> = match net_b {
+        Some(policy) => Box::new(FirewallDiscovery::new(Box::new(disc_b), policy)),
+        None => Box::new(disc_b),
+    };
+    let nb = node_b.clone();
+    tokio::spawn(async move { nb.run(disc_b, vec![], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let na = node_a.clone();
+    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
+
+    // The link handshake itself runs under any network-level loss.
+    let linked = wait_for(Duration::from_secs(30), || {
+        let c = node_a.clone();
+        async move { c.connected_peers().await.contains(&pid_b) }
+    })
+    .await;
+    assert!(linked, "A could not link to B");
+    (node_a, node_b)
+}
+
+/// `lossy_pair` plus a circuit connection A → B, built under the loss.
 async fn firewall_pair(
-    drop_pct: u32,
-    delay_policy: Option<FirewallPolicy>,
+    drop_b: u32,
+    net_b: Option<FirewallPolicy>,
 ) -> (
     tarnet_api::service::Connection,
     tarnet_api::service::Connection,
@@ -2136,11 +2186,13 @@ async fn firewall_pair(
     let node_a = Arc::new(Node::new(Keypair::generate()));
     let pid_b = node_b.peer_id();
     let service_id = node_b.default_service_id().await;
+    if drop_b > 0 {
+        node_b.set_firewall(drop_firewall(drop_b)).await;
+    }
 
-    // Server B
     let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let addr_b = disc_b.local_addrs()[0].to_string();
-    let disc_b: Box<dyn tarnet::transport::Discovery> = match delay_policy {
+    let disc_b: Box<dyn tarnet::transport::Discovery> = match net_b {
         Some(policy) => Box::new(FirewallDiscovery::new(Box::new(disc_b), policy)),
         None => Box::new(disc_b),
     };
@@ -2155,12 +2207,10 @@ async fn firewall_pair(
     let accept_handle =
         tokio::spawn(async move { nb2.circuit_accept(listener_b.id).await.unwrap() });
 
-    // Client A — plain TCP
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let na = node_a.clone();
     tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
 
-    // Wait for link
     let connected = wait_for(Duration::from_secs(10), || {
         let c = node_a.clone();
         let pid = pid_b;
@@ -2169,223 +2219,224 @@ async fn firewall_pair(
     .await;
     assert!(connected, "A could not link to B");
 
-    // Establish circuit BEFORE enabling drops — the circuit handshake
-    // (CREATE/CREATED/EXTEND) has no retransmission either.
     let conn_a = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(60),
         node_a.circuit_connect(service_id, TEST_MODE, "80", Some(pid_b), None),
     )
     .await
     .expect("circuit connect timed out")
     .expect("circuit connect failed");
 
-    let conn_b = tokio::time::timeout(Duration::from_secs(10), accept_handle)
+    let conn_b = tokio::time::timeout(Duration::from_secs(60), accept_handle)
         .await
         .expect("accept timed out")
         .expect("accept failed");
 
-    // NOW enable the node-level firewall — from here on, B drops messages
-    if drop_pct > 0 {
-        let mut fw = Firewall::default();
-        fw.add_rule(Match::Probability(drop_pct as f64 / 100.0), Action::Drop);
-        node_b.set_firewall(fw).await;
-    }
-
     (conn_a, conn_b)
 }
 
-/// Helper: spin up A ↔ B with a tunnel + channel, enable drops, return
-/// (node_a, node_b, channel_id).  Caller uses channel_send / app_rx.
-/// Drops are enabled AFTER the channel is established so the handshake
-/// and ChannelOpen succeed on a clean path.
-async fn channel_pair_with_drops(drop_pct: u32, port: &str) -> (Arc<Node>, Arc<Node>, u32) {
-    let node_b = Arc::new(Node::new(Keypair::generate()));
-    let node_a = Arc::new(Node::new(Keypair::generate()));
+/// Tunnel + reliable ordered channel A → B, both negotiated under the loss.
+async fn lossy_channel(node_a: &Arc<Node>, node_b: &Arc<Node>, port: &str) -> u32 {
     let pid_b = node_b.peer_id();
-
-    let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
-    let addr_b = disc_b.local_addrs()[0].to_string();
-    let nb = node_b.clone();
-    tokio::spawn(async move { nb.run(Box::new(disc_b), vec![], vec![]).await.ok() });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
-    let na = node_a.clone();
-    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
-
-    // Wait for link
-    let linked = wait_for(Duration::from_secs(5), || {
-        let c = node_a.clone();
-        async move { c.connected_peers().await.contains(&pid_b) }
-    })
-    .await;
-    assert!(linked, "A could not link to B");
-
-    // Establish tunnel
     let rx = node_a.create_tunnel(pid_b).await.unwrap();
-    let established = tokio::time::timeout(Duration::from_secs(5), rx)
+    let established = tokio::time::timeout(Duration::from_secs(30), rx)
         .await
         .expect("tunnel timed out")
         .expect("tunnel failed");
     assert_eq!(established, pid_b);
-
-    // Open channel (reliable, ordered) — on the clean path
-    let ch_id = node_a.channel_open(&pid_b, port, true, true).await.unwrap();
-    // Give ChannelOpen time to arrive and be processed
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // NOW enable drops — channel is already established on both sides
-    if drop_pct > 0 {
-        let mut fw = Firewall::default();
-        fw.add_rule(Match::Probability(drop_pct as f64 / 100.0), Action::Drop);
-        node_b.set_firewall(fw).await;
-    }
-
-    (node_a, node_b, ch_id)
+    node_a.channel_open(&pid_b, port, true, true).await.unwrap()
 }
 
-/// 50 % inbound drop on B: channel-based reliable delivery should
-/// retransmit lost messages and deliver all data to B's app receiver.
+/// Send `count` paced messages over `ch_id` and assert B's app receives all
+/// of them, in order, within `timeout`.
+async fn assert_channel_delivers(
+    node_a: &Arc<Node>,
+    node_b: &Arc<Node>,
+    ch_id: u32,
+    tag: &str,
+    count: usize,
+    pace: Duration,
+    timeout: Duration,
+) {
+    let mut app_rx = node_b.take_app_receiver().await.unwrap();
+    let sender = node_a.clone();
+    let send_tag = tag.to_string();
+    let send_handle = tokio::spawn(async move {
+        for i in 0..count {
+            sender
+                .channel_send(ch_id, format!("{send_tag}:{i}").as_bytes())
+                .await
+                .unwrap();
+            tokio::time::sleep(pace).await;
+        }
+    });
+
+    let mut received = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    while received.len() < count {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, app_rx.recv()).await {
+            Ok(Some((_peer, data))) => received.push(String::from_utf8(data).unwrap()),
+            Ok(None) => break,
+            Err(_) => panic!(
+                "recv timed out after receiving {}/{} messages",
+                received.len(),
+                count
+            ),
+        }
+    }
+    send_handle.await.unwrap();
+
+    assert_eq!(received.len(), count, "not all messages delivered");
+    for (i, got) in received.iter().enumerate() {
+        assert_eq!(*got, format!("{tag}:{i}"), "wrong at position {i}");
+    }
+}
+
+/// 50 % inbound drop on B from the start: tunnel, ChannelOpen and data all
+/// recover by retransmission, and arrive complete and in order.
 #[tokio::test]
 async fn firewall_channel_50pct_drop() {
     init_log();
-    let (node_a, node_b, ch_id) = channel_pair_with_drops(50, "test").await;
-    let mut app_rx = node_b.take_app_receiver().await.unwrap();
-
-    let msg_count: usize = 20;
-
-    let sender = node_a.clone();
-    let send_handle = tokio::spawn(async move {
-        for i in 0..msg_count {
-            sender
-                .channel_send(ch_id, format!("drop:{i}").as_bytes())
-                .await
-                .unwrap();
-            // Pace sends so we don't overrun the window
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    });
-
-    let recv_handle = tokio::spawn(async move {
-        let timeout = Duration::from_secs(60);
-        let mut received = Vec::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        while received.len() < msg_count {
-            let remaining = deadline - tokio::time::Instant::now();
-            match tokio::time::timeout(remaining, app_rx.recv()).await {
-                Ok(Some((_peer, data))) => {
-                    received.push(String::from_utf8(data).unwrap());
-                }
-                Ok(None) => break,
-                Err(_) => panic!(
-                    "recv timed out after receiving {}/{} messages",
-                    received.len(),
-                    msg_count
-                ),
-            }
-        }
-        received
-    });
-
-    send_handle.await.unwrap();
-    let received = recv_handle.await.unwrap();
-
-    assert_eq!(received.len(), msg_count, "not all messages delivered");
-    for i in 0..msg_count {
-        assert_eq!(received[i], format!("drop:{i}"), "wrong at position {i}");
-    }
+    let (node_a, node_b) = lossy_pair(0, 50, None).await;
+    let ch_id = lossy_channel(&node_a, &node_b, "test").await;
+    assert_channel_delivers(
+        &node_a,
+        &node_b,
+        ch_id,
+        "drop",
+        20,
+        Duration::from_millis(100),
+        Duration::from_secs(60),
+    )
+    .await;
 }
 
-/// Transport-level delay (up to 2 s) via FirewallDiscovery: circuit
-/// connections should tolerate delays since TCP still delivers everything.
+/// 50 % drop in *both* directions, with link rekeys forced mid-transfer: a
+/// lost Rekey request or reply must neither stall nor desync the link.
+#[tokio::test]
+async fn firewall_channel_50pct_drop_both_ways_with_rekey() {
+    init_log();
+    let (node_a, node_b) = lossy_pair(50, 50, None).await;
+    let pid_a = node_a.peer_id();
+    let pid_b = node_b.peer_id();
+    let ch_id = lossy_channel(&node_a, &node_b, "rekey").await;
+
+    // A initiated the link, so A drives the rekeys.
+    let rekeyer = node_a.clone();
+    let rekey_handle = tokio::spawn(async move {
+        for _ in 0..2 {
+            let before = rekeyer.link_key_epoch(&pid_b).await.unwrap();
+            rekeyer.request_link_rekey().await;
+            let done = wait_for(Duration::from_secs(30), || {
+                let n = rekeyer.clone();
+                async move { n.link_key_epoch(&pid_b).await.unwrap() > before }
+            })
+            .await;
+            assert!(done, "rekey did not complete under loss");
+        }
+    });
+
+    assert_channel_delivers(
+        &node_a,
+        &node_b,
+        ch_id,
+        "rekey",
+        20,
+        Duration::from_millis(200),
+        Duration::from_secs(90),
+    )
+    .await;
+    rekey_handle.await.unwrap();
+
+    // B switches over on the first frame it gets from A under the new keys;
+    // keep A talking until one survives the loss.
+    let switched = wait_for(Duration::from_secs(10), || {
+        let a = node_a.clone();
+        let b = node_b.clone();
+        async move {
+            let _ = a.channel_send(ch_id, b"nudge").await;
+            b.link_key_epoch(&pid_a).await.unwrap_or(0) >= 2
+        }
+    })
+    .await;
+    assert!(switched, "B never switched to the new link keys");
+}
+
+/// Transport-level delay up to 2 s per packet, independently drawn, so the
+/// circuit sees heavy reordering as well as latency.
 #[tokio::test]
 async fn firewall_circuit_delay_2s() {
     init_log();
-
     let policy = FirewallPolicy::Delay {
         max: Duration::from_secs(2),
     };
     let (conn_a, conn_b) = firewall_pair(0, Some(policy)).await;
+    assert_circuit_delivers(conn_a, conn_b, "delayed", 10).await;
+}
 
-    let msg_count: usize = 10;
+/// 50 % inbound drop on B from the start: the circuit is built (CREATE
+/// resent) and carries data under the loss.
+#[tokio::test]
+async fn firewall_circuit_50pct_drop() {
+    init_log();
+    let (conn_a, conn_b) = firewall_pair(50, None).await;
+    assert_circuit_delivers(conn_a, conn_b, "cdrop", 10).await;
+}
+
+async fn assert_circuit_delivers(
+    conn_a: tarnet_api::service::Connection,
+    conn_b: tarnet_api::service::Connection,
+    tag: &str,
+    count: usize,
+) {
     let timeout = Duration::from_secs(60);
-
+    let send_tag = tag.to_string();
     let send_handle = tokio::spawn(async move {
-        for i in 0..msg_count {
+        for i in 0..count {
             conn_a
-                .send(format!("delayed:{i}").as_bytes())
+                .send(format!("{send_tag}:{i}").as_bytes())
                 .await
                 .unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        conn_a
     });
 
-    let recv_handle = tokio::spawn(async move {
-        let mut received = Vec::new();
-        for _ in 0..msg_count {
-            let data = tokio::time::timeout(timeout, conn_b.recv())
-                .await
-                .expect("recv timed out")
-                .expect("recv failed");
-            received.push(String::from_utf8(data).unwrap());
-        }
-        received
-    });
+    let mut received = Vec::new();
+    for _ in 0..count {
+        let data = tokio::time::timeout(timeout, conn_b.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv failed");
+        received.push(String::from_utf8(data).unwrap());
+    }
+    let _conn_a = send_handle.await.unwrap();
 
-    send_handle.await.unwrap();
-    let received = recv_handle.await.unwrap();
-
-    for i in 0..msg_count {
-        assert_eq!(received[i], format!("delayed:{i}"));
+    for (i, got) in received.iter().enumerate() {
+        assert_eq!(*got, format!("{tag}:{i}"));
     }
 }
 
-/// Combined: 50 % node-level drop + channel-based reliable transport.
+/// Network-level loss *and* reordering on B's transport: 50 % of packets
+/// dropped each way, survivors delayed independently by up to 2 s.
 #[tokio::test]
 async fn firewall_channel_drop_and_delay() {
     init_log();
-    let (node_a, node_b, ch_id) = channel_pair_with_drops(50, "chaos").await;
-    let mut app_rx = node_b.take_app_receiver().await.unwrap();
-
-    let msg_count: usize = 10;
-
-    let sender = node_a.clone();
-    let send_handle = tokio::spawn(async move {
-        for i in 0..msg_count {
-            sender
-                .channel_send(ch_id, format!("chaos:{i}").as_bytes())
-                .await
-                .unwrap();
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    });
-
-    let recv_handle = tokio::spawn(async move {
-        let timeout = Duration::from_secs(90);
-        let mut received = Vec::new();
-        let deadline = tokio::time::Instant::now() + timeout;
-        while received.len() < msg_count {
-            let remaining = deadline - tokio::time::Instant::now();
-            match tokio::time::timeout(remaining, app_rx.recv()).await {
-                Ok(Some((_peer, data))) => {
-                    received.push(String::from_utf8(data).unwrap());
-                }
-                Ok(None) => break,
-                Err(_) => panic!(
-                    "recv timed out after receiving {}/{} messages",
-                    received.len(),
-                    msg_count
-                ),
-            }
-        }
-        received
-    });
-
-    send_handle.await.unwrap();
-    let received = recv_handle.await.unwrap();
-
-    assert_eq!(received.len(), msg_count);
-    for i in 0..msg_count {
-        assert_eq!(received[i], format!("chaos:{i}"));
-    }
+    let policy = FirewallPolicy::DropAndDelay {
+        drop_rate: 0.5,
+        max_delay: Duration::from_secs(2),
+    };
+    let (node_a, node_b) = lossy_pair(0, 0, Some(policy)).await;
+    let ch_id = lossy_channel(&node_a, &node_b, "chaos").await;
+    assert_channel_delivers(
+        &node_a,
+        &node_b,
+        ch_id,
+        "chaos",
+        10,
+        Duration::from_millis(200),
+        Duration::from_secs(90),
+    )
+    .await;
 }

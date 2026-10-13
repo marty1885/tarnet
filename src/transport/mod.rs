@@ -17,6 +17,11 @@ pub trait Transport: Send + Sync {
     /// Send a complete message.
     async fn send(&self, data: &[u8]) -> Result<()>;
     /// Receive a complete message into the buffer. Returns bytes written.
+    ///
+    /// Not required to be cancel-safe: dropping an in-progress `recv` may
+    /// lose stream framing (TCP reads a length prefix, then the body). Callers
+    /// must let a started `recv` finish unless they are abandoning the
+    /// transport.
     async fn recv(&self, buf: &mut [u8]) -> Result<usize>;
     /// Maximum transmission unit (payload size per message).
     fn mtu(&self) -> usize;

@@ -8,6 +8,7 @@ use rand::{Rng, RngCore};
 use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::state::{PersistedRecord, StorageLimits};
 use crate::types::{DhtId, PeerId, RecordType, Result};
+use crate::wire::{walk_flags, WalkHeader};
 use tarnet_api::types::ServiceId;
 
 /// 64-byte XOF hash.
@@ -25,67 +26,146 @@ pub const DHT_K: usize = 20;
 /// Maximum entries per k-bucket.
 pub const KBUCKET_SIZE: usize = 20;
 
-/// Hops a query random-walks before switching to greedy convergence.
-///
-/// Kept deliberately small and constant: its only job is to decorrelate a
-/// query from its originator (the R5N anonymity property). It is *not* a
-/// coverage mechanism — greedy convergence reaches the k-closest, and
-/// forward-once dedup bounds the cost. The earlier design random-walked for
-/// ~L2NSE hops and left only ~2 for convergence, which never actually
-/// converged; it worked only because forwarding was undeduplicated and the
-/// query flooded. Now that each node relays a query at most once, the budget
-/// must fund real convergence, so the random prefix shrinks to this constant.
-pub const RANDOM_WALK_HOPS: u8 = 2;
+/// Probability that a node receiving a walking message ends the random phase
+/// (spec: *q*). Mean random-phase length is 1/q hops.
+pub const WALK_END_PROBABILITY: f64 = 1.0 / 3.0;
 
-/// Application-tunable parameters for DHT queries.
-#[derive(Debug, Clone, Copy)]
-pub struct DhtQueryParams {
-    /// Maximum hops a PUT/GET will travel.
-    pub hop_limit: u8,
-    /// Number of peers to forward to at each hop.
-    pub fan_out: usize,
-    /// Hops of random walk before greedy convergence kicks in. Must match the
-    /// threshold the forwarder uses, so it travels in the params rather than
-    /// being recomputed from L2NSE at each site (where it could drift).
-    pub random_hops: u8,
+/// Greedy steps a walk may take after its random phase. Greedy steps strictly
+/// approach the key, so this only bounds `DELIVER` detours and misbehaving
+/// peers.
+pub const GREEDY_BUDGET: u8 = 32;
+
+/// Upper bound on walks per PUT, and per GET/WATCH round.
+pub const MAX_WALKS: usize = 32;
+
+/// Number of independent walks for one PUT, or one GET/WATCH round (spec: ρ).
+///
+/// With greedy routing over direct links a key has about N/(d+1) local minima.
+/// ρ PUT walks and ρ GET walks meet with probability ≈ 1 − e^(−ρ²(d+1)/N), so
+/// ρ = √(3N/(d+1)) targets ≈ 95% per round.
+pub fn walk_count(network_size: usize, degree: usize) -> usize {
+    let n = network_size.max(1) as f64;
+    let d = degree.max(1) as f64;
+    ((3.0 * n / (d + 1.0)).sqrt().ceil() as usize).clamp(2, MAX_WALKS)
 }
 
-impl Default for DhtQueryParams {
-    fn default() -> Self {
+/// A direct link as the DHT sees it.
+#[derive(Debug, Clone, Copy)]
+pub struct DhtNeighbor {
+    pub peer: PeerId,
+    pub id: DhtId,
+    /// Whether the neighbour stores records for others (from its `DhtNeighbor`
+    /// message; assumed true until one arrives).
+    pub stores: bool,
+}
+
+impl DhtNeighbor {
+    pub fn new(peer: PeerId, stores: bool) -> Self {
         Self {
-            hop_limit: 10,
-            fan_out: DHT_K,
-            random_hops: RANDOM_WALK_HOPS,
+            peer,
+            id: dht_id_from_peer_id(&peer),
+            stores,
         }
     }
 }
 
-impl DhtQueryParams {
-    /// Compute query parameters from an L2NSE (log₂ network size estimate).
-    ///
-    /// The hop budget is `random_hops + greedy_hops`: a short fixed random
-    /// prefix ([`RANDOM_WALK_HOPS`]) for originator decorrelation, then ~L2NSE
-    /// greedy hops — the depth a recursive lookup needs to converge on the
-    /// k-closest. `fan_out` is DHT_K for small networks and scales up slowly
-    /// for large ones.
-    pub fn from_l2nse(l2nse: f64) -> Self {
-        let random_hops = RANDOM_WALK_HOPS;
-        // Greedy convergence needs ~log₂(N) = L2NSE hops; clamp so tiny
-        // networks still get a couple and huge ones stay within a u8 budget.
-        let greedy_hops = l2nse.ceil().clamp(2.0, 22.0);
-        let hop_limit = (random_hops as f64 + greedy_hops).clamp(4.0, 24.0) as u8;
-        let fan_out = if l2nse < 5.0 {
-            DHT_K
-        } else {
-            (l2nse * 2.0)
-                .round()
-                .clamp(DHT_K as f64, (DHT_K * 2) as f64) as usize
-        };
-        Self {
-            hop_limit,
-            fan_out,
-            random_hops,
+/// What a node does with a walk it received. See `docs/spec/dht.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalkStep {
+    /// This node is the end of the walk.
+    End,
+    /// Forward to the peer with the updated header.
+    Forward(PeerId, WalkHeader),
+    /// No usable neighbour; the walk stops here without an end node.
+    Drop,
+}
+
+/// Decide the next step of a PUT/GET/WATCH walk at `local`, which received it
+/// from `from`.
+pub fn walk_step<R: Rng + ?Sized>(
+    local: &PeerId,
+    local_stores: bool,
+    key: &DhtId,
+    header: &WalkHeader,
+    from: &PeerId,
+    neighbors: &[DhtNeighbor],
+    rng: &mut R,
+) -> WalkStep {
+    use rand::seq::SliceRandom;
+
+    let mut h = *header;
+    if h.walking() {
+        // A node whose only neighbour is the sender ends the random phase:
+        // bouncing back adds traffic on that one link and no mixing.
+        if !rng.gen_bool(WALK_END_PROBABILITY) {
+            let others: Vec<&DhtNeighbor> = neighbors.iter().filter(|n| n.peer != *from).collect();
+            if let Some(n) = others.choose(rng) {
+                return WalkStep::Forward(n.peer, h);
+            }
         }
+        h.flags &= !walk_flags::WALKING;
+        h.greedy_budget = GREEDY_BUDGET;
+    }
+
+    if h.deliver() {
+        if local_stores {
+            return WalkStep::End;
+        }
+        return deliver_step(local, key, h, neighbors, rng);
+    }
+
+    if h.greedy_budget == 0 {
+        return if local_stores { WalkStep::End } else { WalkStep::Drop };
+    }
+    let local_dist = dht_id_from_peer_id(local).xor_distance(key);
+    if let Some(best) = neighbors.iter().min_by_key(|n| n.id.xor_distance(key)) {
+        if best.id.xor_distance(key) < local_dist {
+            h.greedy_budget -= 1;
+            return WalkStep::Forward(best.peer, h);
+        }
+    }
+    if local_stores {
+        return WalkStep::End;
+    }
+    // A relay-only local minimum hands the walk to its closest storing
+    // neighbour, the same one whichever side the walk came from.
+    h.flags |= walk_flags::DELIVER;
+    deliver_step(local, key, h, neighbors, rng)
+}
+
+/// `DELIVER` forwarding at a relay-only node: record ourselves in the bloom and
+/// pass to the closest storing neighbour not yet visited (else the closest
+/// unvisited neighbour).
+fn deliver_step<R: Rng + ?Sized>(
+    local: &PeerId,
+    key: &DhtId,
+    mut h: WalkHeader,
+    neighbors: &[DhtNeighbor],
+    rng: &mut R,
+) -> WalkStep {
+    if h.greedy_budget == 0 {
+        return WalkStep::Drop;
+    }
+    h.greedy_budget -= 1;
+    if h.bloom == [0u8; 256] {
+        h.bloom_salt = rng.gen();
+    }
+    let mut bloom = BloomFilter::from_bytes(h.bloom);
+    bloom.insert(h.bloom_salt, local);
+    h.bloom = bloom.to_bytes();
+
+    let unvisited = || {
+        neighbors
+            .iter()
+            .filter(|n| n.peer != *local && !bloom.contains(h.bloom_salt, &n.peer))
+    };
+    let target = unvisited()
+        .filter(|n| n.stores)
+        .min_by_key(|n| n.id.xor_distance(key))
+        .or_else(|| unvisited().min_by_key(|n| n.id.xor_distance(key)));
+    match target {
+        Some(n) => WalkStep::Forward(n.peer, h),
+        None => WalkStep::Drop,
     }
 }
 
@@ -149,10 +229,9 @@ impl DhtRecord {
     /// pressure regardless of TTL). The record reaches its deadline and expires
     /// unless the owner republishes with a higher sequence (pool lease refresh,
     /// hello/peer/intro maintenance, TNS republish).
-    pub fn to_put_msg(&self, originator: &PeerId, hop_limit: u8) -> crate::wire::DhtPutMsg {
-        let mut bloom = BloomFilter::new();
-        bloom.insert(originator);
+    pub fn to_put_msg(&self) -> crate::wire::DhtPutMsg {
         crate::wire::DhtPutMsg {
+            walk: WalkHeader::origin(),
             key: *self.key.as_bytes(),
             record_type: self.record_type,
             sequence: self.sequence,
@@ -162,9 +241,6 @@ impl DhtRecord {
             signature: self.signature.clone(),
             signer_algo: self.signer_algo,
             signer_pubkey: self.signer_pubkey.clone(),
-            hop_count: 0,
-            hop_limit,
-            bloom: bloom.to_bytes(),
         }
     }
 
@@ -885,7 +961,7 @@ pub struct DhtWatch {
 /// dht_watch). 1 hour gives ample slack over that cadence while bounding how
 /// long an abandoned/forged watch can squat memory after its via_peer goes
 /// quiet — without it, a u32::MAX request would pin an entry for ~136 years.
-const MAX_WATCH_EXPIRATION_SECS: u32 = 3600;
+pub const MAX_WATCH_EXPIRATION_SECS: u32 = 3600;
 
 /// Per-via_peer cap on distinct watches. A single neighbor proxies many local
 /// app watches (one query_token per watched key), but 256 distinct keys from one
@@ -1003,6 +1079,19 @@ impl DhtWatchTable {
                 self.per_peer_count.remove(peer);
             }
         }
+    }
+
+    /// Whether a live watch with this token is registered for `key`.
+    pub fn has_token(&self, key: &[u8; 64], query_token: &[u8; 32]) -> bool {
+        self.via_for_token(key, query_token).is_some()
+    }
+
+    /// The previous hop a watch walk with this token arrived from.
+    pub fn via_for_token(&self, key: &[u8; 64], query_token: &[u8; 32]) -> Option<PeerId> {
+        let now = Instant::now();
+        self.watches.get(key)?.iter().find_map(|w| {
+            (w.query_token == *query_token && w.expires_at > now).then_some(w.via_peer)
+        })
     }
 
     /// Get all non-expired watchers for a key: returns (query_token, via_peer).
@@ -1171,57 +1260,6 @@ impl KBucketTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Estimate log₂ of network size from k-bucket occupancy.
-    ///
-    /// In a Kademlia-style DHT with uniformly distributed IDs, bucket `i`
-    /// is expected to hold `N / 2^(512−i)` peers.  We scan from the highest
-    /// bucket downward: the first non-full bucket gives the best estimate
-    /// because full buckets are capped by `KBUCKET_SIZE` and lose information.
-    ///
-    /// With very few peers the bucket-based estimate is unreliable — two
-    /// random peers land in bucket ~511, producing l2nse ≈ 512 which
-    /// overflows u8 casts and `2u64.pow()`.  We use the number of
-    /// *populated* buckets as a confidence bound: in a network of N
-    /// uniformly-distributed nodes we expect ~log₂(N) distinct occupied
-    /// buckets, so the bucket-based estimate should never vastly exceed
-    /// the populated count.  This naturally constrains the estimate at
-    /// startup while converging to the accurate bucket-based value once
-    /// enough peers are known.
-    ///
-    /// Returns at least 1.0 (a network of two: us and one peer).
-    pub fn estimate_l2nse(&self) -> f64 {
-        let total_peers = self.len();
-        if total_peers == 0 {
-            return 1.0;
-        }
-
-        // Confidence bound: the number of distinct occupied buckets tracks
-        // log₂(N) and is immune to the "few peers in high buckets" problem.
-        let populated = self.buckets.iter().filter(|b| !b.is_empty()).count() as f64;
-
-        // Walk from the top bucket down to find the best estimator.
-        let raw = 'estimate: {
-            for i in (0..self.buckets.len()).rev() {
-                let count = self.buckets[i].len();
-                if count == 0 {
-                    continue;
-                }
-                if count < KBUCKET_SIZE {
-                    // Partially filled: log₂(N) ≈ (i + 1) + log₂(count)
-                    break 'estimate (i + 1) as f64 + (count as f64).log2();
-                }
-                // Full bucket — lower bound only.
-                break 'estimate (i + 1) as f64 + (KBUCKET_SIZE as f64).log2();
-            }
-            1.0
-        };
-
-        // The bucket-based estimate refines within-bucket counts but can be
-        // wildly off when only a handful of high buckets are populated.
-        // Cap it to populated_count + small margin, then hard-clamp.
-        raw.min(populated + 3.0).clamp(1.0, 30.0)
-    }
 }
 
 // ── Bloom Filter ──
@@ -1241,18 +1279,26 @@ impl BloomFilter {
         Self { bits: bytes }
     }
 
-    /// Insert a PeerId into the bloom filter.
-    pub fn insert(&mut self, peer: &PeerId) {
-        let hash: [u8; 64] = hash_64(peer.as_bytes());
+    fn peer_hash(salt: u32, peer: &PeerId) -> [u8; 64] {
+        let mut input = Vec::with_capacity(19 + 4 + 32);
+        input.extend_from_slice(b"tarnet dht bloom v1");
+        input.extend_from_slice(&salt.to_be_bytes());
+        input.extend_from_slice(peer.as_bytes());
+        hash_64(&input)
+    }
+
+    /// Insert a PeerId into the bloom filter under `salt`.
+    pub fn insert(&mut self, salt: u32, peer: &PeerId) {
+        let hash = Self::peer_hash(salt, peer);
         for i in 0..4 {
             let idx = u16::from_be_bytes([hash[i * 2], hash[i * 2 + 1]]) as usize % 2048;
             self.bits[idx / 8] |= 1 << (idx % 8);
         }
     }
 
-    /// Check if a PeerId might be in the bloom filter.
-    pub fn contains(&self, peer: &PeerId) -> bool {
-        let hash: [u8; 64] = hash_64(peer.as_bytes());
+    /// Check if a PeerId might be in the bloom filter under `salt`.
+    pub fn contains(&self, salt: u32, peer: &PeerId) -> bool {
+        let hash = Self::peer_hash(salt, peer);
         for i in 0..4 {
             let idx = u16::from_be_bytes([hash[i * 2], hash[i * 2 + 1]]) as usize % 2048;
             if self.bits[idx / 8] & (1 << (idx % 8)) == 0 {
@@ -1271,106 +1317,6 @@ impl Default for BloomFilter {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Check if a peer is among the k closest to a key.
-pub fn is_k_closest(peer: &PeerId, key: &DhtId, peers: &[(PeerId, DhtId)], k: usize) -> bool {
-    k_closest(key, peers, k).contains(peer)
-}
-
-/// Find the k closest peers to a key from a list of known peers.
-pub fn k_closest(key: &DhtId, peers: &[(PeerId, DhtId)], k: usize) -> Vec<PeerId> {
-    let mut with_dist: Vec<_> = peers
-        .iter()
-        .map(|(pid, did)| (pid, key.xor_distance(did)))
-        .collect();
-    with_dist.sort_by(|a, b| a.1.cmp(&b.1));
-    with_dist.into_iter().take(k).map(|(pid, _)| *pid).collect()
-}
-
-/// Probabilistic forwarding: select up to `k` peers from the `3k` closest,
-/// weighted by inverse XOR distance. Peers closer to the key are more likely
-/// to be selected, but any peer in the candidate set has a chance. This gives
-/// plausible deniability — an observer can't tell if a forward was targeted or
-/// random — while still converging toward the key in O(log n) hops.
-pub fn probabilistic_select(
-    key: &DhtId,
-    peers: &[(PeerId, DhtId)],
-    k: usize,
-) -> Vec<(PeerId, DhtId)> {
-    if peers.is_empty() {
-        return Vec::new();
-    }
-
-    // Gather 3k candidates sorted by distance
-    let candidate_pool = k * 3;
-    let mut candidates: Vec<(PeerId, DhtId, DhtId)> = peers
-        .iter()
-        .map(|(pid, did)| (*pid, *did, key.xor_distance(did)))
-        .collect();
-    candidates.sort_by(|a, b| a.2.cmp(&b.2));
-    candidates.truncate(candidate_pool);
-
-    if candidates.len() <= k {
-        return candidates
-            .into_iter()
-            .map(|(pid, did, _)| (pid, did))
-            .collect();
-    }
-
-    // Weight by inverse rank^2: rank 1 gets weight 1.0, rank 2 gets 0.25, etc.
-    // This biases heavily toward closer peers while still giving further peers a shot.
-    let weights: Vec<f64> = candidates
-        .iter()
-        .enumerate()
-        .map(|(i, _)| 1.0 / ((i + 1) as f64).powi(2))
-        .collect();
-    let mut total_weight: f64 = weights.iter().sum();
-
-    let mut rng = rand::thread_rng();
-    let mut selected = Vec::with_capacity(k);
-    let mut used = vec![false; candidates.len()];
-
-    for _ in 0..k {
-        if total_weight <= 0.0 {
-            break;
-        }
-        let mut r: f64 = rng.gen::<f64>() * total_weight;
-        let mut pick = 0;
-        for (i, &w) in weights.iter().enumerate() {
-            if used[i] {
-                continue;
-            }
-            r -= w;
-            if r <= 0.0 {
-                pick = i;
-                break;
-            }
-            pick = i;
-        }
-        if !used[pick] {
-            used[pick] = true;
-            total_weight -= weights[pick];
-            let (pid, did, _) = &candidates[pick];
-            selected.push((*pid, *did));
-        }
-    }
-
-    selected
-}
-
-/// Random peer selection for the random-walk phase of R5N-style routing.
-/// Picks up to `k` peers uniformly at random from the full peer set.
-pub fn random_select(peers: &[(PeerId, DhtId)], k: usize) -> Vec<(PeerId, DhtId)> {
-    if peers.len() <= k {
-        return peers.to_vec();
-    }
-    use rand::seq::SliceRandom;
-    let mut rng = rand::thread_rng();
-    let mut shuffled = peers.to_vec();
-    shuffled.shuffle(&mut rng);
-    shuffled.truncate(k);
-    shuffled
 }
 
 /// Content-addressed PUT: key = BLAKE3(BLAKE3(value)), stored value = XChaCha20-Poly1305(value, key=BLAKE3(value))
@@ -1881,10 +1827,9 @@ mod tests {
         let kp = Keypair::generate();
         let key = DhtId([0x0B; 64]);
         let rec = signed_record(&kp, key, RecordType::SignedContent, 1, b"put".to_vec());
-        let put = rec.to_put_msg(&PeerId([0x77; 32]), 5);
+        let put = rec.to_put_msg();
 
         assert!(!put.signer_pubkey.is_empty(), "put msg must carry the signer pubkey");
-        assert_eq!(put.hop_limit, 5);
         // Signing side (wire) and verifying side (dht) must agree on the bytes.
         assert_eq!(
             put.signable_bytes(),
@@ -1906,7 +1851,7 @@ mod tests {
         rec.ttl = Duration::from_secs(100);
         rec.stored_at = Instant::now() - Duration::from_secs(60);
 
-        let put = rec.to_put_msg(&PeerId([0x88; 32]), 5);
+        let put = rec.to_put_msg();
         // ~40s remaining, never the full 100s. Allow a second of slack for the
         // elapsed() call between construction and measurement.
         assert!(
@@ -1938,19 +1883,6 @@ mod tests {
         let (_key, blob) = content_address_put(data);
         let wrong_hash = [0u8; 64];
         assert!(content_address_get(&wrong_hash, &blob).is_err());
-    }
-
-    #[test]
-    fn k_closest_ordering() {
-        let target = DhtId([0u8; 64]);
-        let mut peers = Vec::new();
-        for i in 0..10u8 {
-            let pid = PeerId([i; 32]);
-            let did = dht_id_from_peer_id(&pid);
-            peers.push((pid, did));
-        }
-        let closest = k_closest(&target, &peers, 3);
-        assert_eq!(closest.len(), 3);
     }
 
     #[test]
@@ -2642,112 +2574,321 @@ mod tests {
         assert!(store.get(&DhtId([0; 64])).is_empty());
     }
 
-    // ── L2NSE tests ──
+    // ── Walk routing ──
 
-    #[test]
-    fn l2nse_empty_table() {
-        let kp = Keypair::generate();
-        let kb = KBucketTable::new(&kp.peer_id());
-        assert_eq!(kb.estimate_l2nse(), 1.0);
+    fn neighbors(peers: &[(PeerId, bool)]) -> Vec<DhtNeighbor> {
+        peers.iter().map(|(p, s)| DhtNeighbor::new(*p, *s)).collect()
+    }
+
+    fn greedy() -> WalkHeader {
+        WalkHeader {
+            flags: 0,
+            greedy_budget: GREEDY_BUDGET,
+            bloom_salt: 0,
+            bloom: [0u8; 256],
+        }
+    }
+
+    /// Peers sorted by distance to `key`, closest first.
+    fn by_distance(key: &DhtId, n: usize) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = (0..n).map(|_| Keypair::generate().peer_id()).collect();
+        peers.sort_by_key(|p| dht_id_from_peer_id(p).xor_distance(key));
+        peers
     }
 
     #[test]
-    fn l2nse_single_peer() {
-        let kp = Keypair::generate();
-        let mut kb = KBucketTable::new(&kp.peer_id());
-        let other = Keypair::generate();
-        kb.insert(other.peer_id(), dht_id_from_peer_id(&other.peer_id()));
-        let est = kb.estimate_l2nse();
-        // With 1 peer in a single bucket, the estimate should be modest.
-        assert!(est >= 1.0, "l2nse should be at least 1.0, got {}", est);
+    fn walk_count_grows_with_size_and_shrinks_with_degree() {
+        assert_eq!(walk_count(1, 0), 2);
+        assert_eq!(walk_count(30, 4), 5); // ceil(sqrt(18))
+        assert!(walk_count(1000, 8) > walk_count(1000, 32));
+        assert_eq!(walk_count(10_000_000, 1), MAX_WALKS);
     }
 
     #[test]
-    fn l2nse_grows_with_peers() {
-        let kp = Keypair::generate();
-        let mut kb = KBucketTable::new(&kp.peer_id());
-
-        // Insert 5 peers and record estimate
-        for _ in 0..5 {
-            let other = Keypair::generate();
-            kb.insert(other.peer_id(), dht_id_from_peer_id(&other.peer_id()));
+    fn greedy_forwards_to_strictly_closer_neighbor() {
+        let key = DhtId([0x11; 64]);
+        let p = by_distance(&key, 3);
+        let (closest, local, far) = (p[0], p[1], p[2]);
+        let step = walk_step(&local, true, &key, &greedy(), &far, &neighbors(&[(far, true), (closest, true)]), &mut rand::thread_rng());
+        match step {
+            WalkStep::Forward(to, h) => {
+                assert_eq!(to, closest);
+                assert_eq!(h.greedy_budget, GREEDY_BUDGET - 1);
+                assert_eq!(h.bloom, [0u8; 256], "greedy hops never enter the bloom");
+            }
+            other => panic!("expected forward, got {other:?}"),
         }
-        let est_5 = kb.estimate_l2nse();
+    }
 
-        // Insert 50 more peers
-        for _ in 0..50 {
-            let other = Keypair::generate();
-            kb.insert(other.peer_id(), dht_id_from_peer_id(&other.peer_id()));
+    #[test]
+    fn storing_local_minimum_ends_the_walk() {
+        let key = DhtId([0x22; 64]);
+        let p = by_distance(&key, 3);
+        let step = walk_step(&p[0], true, &key, &greedy(), &p[1], &neighbors(&[(p[1], true), (p[2], true)]), &mut rand::thread_rng());
+        assert_eq!(step, WalkStep::End);
+    }
+
+    #[test]
+    fn relay_only_minimum_hands_off_to_same_storer_from_either_side() {
+        let key = DhtId([0x33; 64]);
+        let p = by_distance(&key, 4);
+        // p[0] is a relay-only local minimum; its neighbours p[1] (stores) and
+        // p[2] (stores) and p[3] (relay-only).
+        let local = p[0];
+        let nbrs = neighbors(&[(p[1], true), (p[2], true), (p[3], false)]);
+        for from in [p[1], p[2], p[3]] {
+            let step = walk_step(&local, false, &key, &greedy(), &from, &nbrs, &mut rand::thread_rng());
+            match step {
+                WalkStep::Forward(to, h) => {
+                    assert_eq!(to, p[1], "always the closest storing neighbour");
+                    assert!(h.deliver());
+                    let bloom = BloomFilter::from_bytes(h.bloom);
+                    assert!(bloom.contains(h.bloom_salt, &local));
+                    assert!(!bloom.contains(h.bloom_salt, &from), "only relay-only detour nodes are recorded");
+                }
+                other => panic!("expected deliver forward, got {other:?}"),
+            }
         }
-        let est_55 = kb.estimate_l2nse();
+    }
 
-        assert!(
-            est_55 > est_5,
-            "l2nse should grow with more peers: {} vs {}",
-            est_55,
-            est_5
+    #[test]
+    fn deliver_ends_at_first_storer_and_skips_visited_relays() {
+        let key = DhtId([0x44; 64]);
+        let p = by_distance(&key, 3);
+        let mut h = greedy();
+        h.flags = walk_flags::DELIVER;
+        // A storing node receiving DELIVER is the end, even if not a minimum.
+        assert_eq!(
+            walk_step(&p[2], true, &key, &h, &p[0], &neighbors(&[(p[0], false), (p[1], true)]), &mut rand::thread_rng()),
+            WalkStep::End
         );
+        // A relay-only node on the detour skips relays already in the bloom.
+        let mut bloom = BloomFilter::new();
+        h.bloom_salt = 7;
+        bloom.insert(7, &p[0]);
+        h.bloom = bloom.to_bytes();
+        let step = walk_step(&p[2], false, &key, &h, &p[0], &neighbors(&[(p[0], false), (p[1], false)]), &mut rand::thread_rng());
+        assert!(matches!(step, WalkStep::Forward(to, _) if to == p[1]));
+        // Nowhere left to go: dropped.
+        bloom.insert(7, &p[1]);
+        h.bloom = bloom.to_bytes();
+        let step = walk_step(&p[2], false, &key, &h, &p[0], &neighbors(&[(p[0], false), (p[1], false)]), &mut rand::thread_rng());
+        assert_eq!(step, WalkStep::Drop);
     }
 
     #[test]
-    fn dht_query_params_from_l2nse_small_network() {
-        let params = DhtQueryParams::from_l2nse(1.0);
-        assert_eq!(params.hop_limit, 4); // floor
-        assert_eq!(params.fan_out, DHT_K); // floor
-    }
-
-    #[test]
-    fn dht_query_params_from_l2nse_medium_network() {
-        let params = DhtQueryParams::from_l2nse(10.0);
-        assert_eq!(params.hop_limit, 12);
-        assert_eq!(params.fan_out, 20); // 10*2 = 20 = DHT_K
-    }
-
-    #[test]
-    fn dht_query_params_from_l2nse_large_network() {
-        let params = DhtQueryParams::from_l2nse(18.0);
-        assert_eq!(params.hop_limit, 20); // cap
-        assert_eq!(params.fan_out, 36); // 18*2 = 36
-    }
-
-    #[test]
-    fn random_select_returns_k_or_fewer() {
-        let peers: Vec<(PeerId, DhtId)> = (0..10u8)
-            .map(|i| {
-                let pid = PeerId([i; 32]);
-                let did = dht_id_from_peer_id(&pid);
-                (pid, did)
-            })
-            .collect();
-
-        let selected = random_select(&peers, 5);
-        assert_eq!(selected.len(), 5);
-
-        // When k >= peers.len(), return all
-        let selected = random_select(&peers, 20);
-        assert_eq!(selected.len(), 10);
-    }
-
-    #[test]
-    fn l2nse_few_peers_bounded() {
-        // Two random peers land in high buckets (~511).  The estimate
-        // must stay bounded and not overflow u8 casts or 2^x.
-        let local = Keypair::generate();
-        let mut kb = KBucketTable::new(&local.peer_id());
-        for _ in 0..2 {
-            let kp = Keypair::generate();
-            let pid = kp.peer_id();
-            let did = dht_id_from_peer_id(&pid);
-            kb.insert(pid, did);
+    fn walking_phase_ends_with_probability_q_and_never_touches_bloom() {
+        let key = DhtId([0x55; 64]);
+        let p = by_distance(&key, 4);
+        let nbrs = neighbors(&[(p[0], true), (p[1], true), (p[3], true)]);
+        let mut rng = rand::thread_rng();
+        let mut walked = 0;
+        let trials = 3000;
+        for _ in 0..trials {
+            match walk_step(&p[2], true, &key, &WalkHeader::origin(), &p[3], &nbrs, &mut rng) {
+                WalkStep::Forward(to, h) if h.walking() => {
+                    walked += 1;
+                    assert_ne!(to, p[3], "random phase avoids the sender when it can");
+                    assert_eq!(h.bloom, [0u8; 256]);
+                }
+                // Ended the random phase here: greedy from p[2] goes to p[0].
+                WalkStep::Forward(to, h) => {
+                    assert_eq!(to, p[0]);
+                    assert_eq!(h.greedy_budget, GREEDY_BUDGET - 1);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
         }
-        let l2nse = kb.estimate_l2nse();
-        assert!(l2nse >= 1.0, "l2nse too low: {l2nse}");
-        assert!(l2nse <= 10.0, "l2nse too high for 2 peers: {l2nse}");
-        // Verify downstream consumers don't overflow
-        let hop_phase = l2nse.round().min(255.0) as u8;
-        assert!(hop_phase > 0, "random walk phase must not wrap to 0");
-        let nse = 2u64.saturating_pow(l2nse.round().min(63.0) as u32);
-        assert!(nse > 0, "nse display must not overflow to 0");
+        let frac = walked as f64 / trials as f64;
+        assert!((frac - (1.0 - WALK_END_PROBABILITY)).abs() < 0.05, "continue fraction {frac}");
+    }
+
+    #[test]
+    fn exhausted_budget_ends_at_storer_and_drops_at_relay() {
+        let key = DhtId([0x66; 64]);
+        let p = by_distance(&key, 2);
+        let mut h = greedy();
+        h.greedy_budget = 0;
+        let nbrs = neighbors(&[(p[0], true)]);
+        assert_eq!(walk_step(&p[1], true, &key, &h, &p[0], &nbrs, &mut rand::thread_rng()), WalkStep::End);
+        assert_eq!(walk_step(&p[1], false, &key, &h, &p[0], &nbrs, &mut rand::thread_rng()), WalkStep::Drop);
+    }
+
+    /// Graph-level check of the walk rules: a PUT from one node and up to
+    /// three rounds of GET walks from another meet (GET walks answer from any
+    /// node holding the record, including the publisher itself).
+    struct SimGraph {
+        peers: Vec<PeerId>,
+        stores: Vec<bool>,
+        adj: Vec<Vec<usize>>,
+    }
+
+    impl SimGraph {
+        fn new(n: usize) -> Self {
+            Self {
+                peers: (0..n).map(|_| Keypair::generate().peer_id()).collect(),
+                stores: vec![true; n],
+                adj: vec![Vec::new(); n],
+            }
+        }
+
+        fn link(&mut self, a: usize, b: usize) {
+            if a != b && !self.adj[a].contains(&b) {
+                self.adj[a].push(b);
+                self.adj[b].push(a);
+            }
+        }
+
+        fn index(&self, p: &PeerId) -> usize {
+            self.peers.iter().position(|q| q == p).unwrap()
+        }
+
+        /// Run one walk starting with the hop origin → first. Returns the nodes
+        /// visited after the origin and the end node, if any.
+        fn walk(&self, key: &DhtId, origin: usize, first: usize, rng: &mut impl Rng) -> (Vec<usize>, Option<usize>) {
+            let mut header = WalkHeader::origin();
+            let (mut from, mut at) = (origin, first);
+            let mut visited = vec![at];
+            for _ in 0..256 {
+                let nbrs: Vec<DhtNeighbor> = self.adj[at]
+                    .iter()
+                    .map(|&i| DhtNeighbor::new(self.peers[i], self.stores[i]))
+                    .collect();
+                match walk_step(&self.peers[at], self.stores[at], key, &header, &self.peers[from], &nbrs, rng) {
+                    WalkStep::End => return (visited, Some(at)),
+                    WalkStep::Drop => return (visited, None),
+                    WalkStep::Forward(next, h) => {
+                        header = h;
+                        from = at;
+                        at = self.index(&next);
+                        visited.push(at);
+                    }
+                }
+            }
+            panic!("walk did not terminate");
+        }
+
+        fn launch(&self, key: &DhtId, origin: usize, count: usize, rng: &mut impl Rng) -> Vec<(Vec<usize>, Option<usize>)> {
+            use rand::seq::SliceRandom;
+            let mut first = self.adj[origin].clone();
+            first.shuffle(rng);
+            (0..count).map(|i| self.walk(key, origin, first[i % first.len()], rng)).collect()
+        }
+
+        fn rho(&self, origin: usize) -> usize {
+            walk_count(self.peers.len(), self.adj[origin].len())
+        }
+
+        /// Success rate of PUT-then-GET over `trials` random (key, publisher, reader).
+        fn success_rate(&self, trials: usize, rng: &mut impl Rng) -> f64 {
+            let n = self.peers.len();
+            let mut ok = 0;
+            for _ in 0..trials {
+                let mut kb = [0u8; 64];
+                rng.fill_bytes(&mut kb);
+                let key = DhtId(kb);
+                let publisher = rng.gen_range(0..n);
+                let reader = loop {
+                    let r = rng.gen_range(0..n);
+                    if r != publisher {
+                        break r;
+                    }
+                };
+                let mut holders = vec![publisher];
+                for (_, end) in self.launch(&key, publisher, self.rho(publisher), rng) {
+                    holders.extend(end);
+                }
+                let found = (0..3).any(|_| {
+                    self.launch(&key, reader, self.rho(reader), rng)
+                        .iter()
+                        .any(|(visited, _)| visited.iter().any(|v| holders.contains(v)))
+                });
+                if found {
+                    ok += 1;
+                }
+            }
+            ok as f64 / trials as f64
+        }
+    }
+
+    #[test]
+    fn walks_meet_on_random_graph_with_relay_only_nodes() {
+        let mut rng = rand::thread_rng();
+        let n = 200;
+        let mut g = SimGraph::new(n);
+        // Connected backbone plus random chords: average degree ≈ 4.
+        for i in 1..n {
+            let j = rng.gen_range(0..i);
+            g.link(i, j);
+        }
+        for _ in 0..n {
+            let (a, b) = (rng.gen_range(0..n), rng.gen_range(0..n));
+            g.link(a, b);
+        }
+        for i in 0..n {
+            g.stores[i] = rng.gen_bool(0.8);
+        }
+        let rate = g.success_rate(300, &mut rng);
+        eprintln!("random graph rendezvous rate: {rate}");
+        assert!(rate >= 0.9, "PUT/GET rendezvous rate {rate}");
+    }
+
+    #[test]
+    fn walks_meet_across_relay_only_chains() {
+        // Research-cluster shape: 8 storing machines, mostly joined through
+        // chains of two relay-only boxes, a couple of direct links.
+        let mut rng = rand::thread_rng();
+        let machines = 8;
+        let mut g = SimGraph::new(machines + 2 * 10);
+        let mut next = machines;
+        let chains = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7), (7, 0), (0, 4), (2, 6)];
+        for (a, b) in chains {
+            let (r1, r2) = (next, next + 1);
+            next += 2;
+            g.stores[r1] = false;
+            g.stores[r2] = false;
+            g.link(a, r1);
+            g.link(r1, r2);
+            g.link(r2, b);
+        }
+        g.link(1, 5);
+        g.link(3, 7);
+        // Only machines publish and read.
+        let mut ok = 0;
+        let trials = 300;
+        for _ in 0..trials {
+            let mut kb = [0u8; 64];
+            rng.fill_bytes(&mut kb);
+            let key = DhtId(kb);
+            let publisher = rng.gen_range(0..machines);
+            let reader = (publisher + rng.gen_range(1..machines)) % machines;
+            let mut holders = vec![publisher];
+            for (_, end) in g.launch(&key, publisher, g.rho(publisher), &mut rng) {
+                if let Some(e) = end {
+                    assert!(g.stores[e], "walks only end at storing nodes");
+                    holders.push(e);
+                }
+            }
+            if (0..3).any(|_| {
+                g.launch(&key, reader, g.rho(reader), &mut rng)
+                    .iter()
+                    .any(|(visited, _)| visited.iter().any(|v| holders.contains(v)))
+            }) {
+                ok += 1;
+            }
+        }
+        let rate = ok as f64 / trials as f64;
+        eprintln!("relay-chain rendezvous rate: {rate}");
+        assert!(rate >= 0.95, "PUT/GET rendezvous rate {rate}");
+    }
+
+    #[test]
+    fn bloom_membership_depends_on_salt() {
+        let peer = PeerId([9; 32]);
+        let mut bloom = BloomFilter::new();
+        bloom.insert(1, &peer);
+        assert!(bloom.contains(1, &peer));
+        assert!(!bloom.contains(2, &peer));
     }
 
     #[test]

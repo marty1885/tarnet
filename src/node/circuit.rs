@@ -1,5 +1,12 @@
 use super::*;
 
+/// How long the initiator waits for CircuitCreated, resending CREATE every
+/// `CREATE_RESEND_INTERVAL` meanwhile.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(8);
+const CREATE_RESEND_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a hop keeps its CircuitCreated reply for answering resent CREATEs.
+const CREATED_REPLY_TTL: Duration = Duration::from_secs(30);
+
 /// Failed or cancelled handshakes must not leave circuits and waiters behind.
 pub(super) struct CircuitAttemptGuard {
     circuit_id: u32,
@@ -1135,6 +1142,28 @@ impl Node {
             return Err(Error::Wire("CircuitCreate payload too short".into()));
         }
 
+        // A resend of a CREATE we already answered: the initiator never saw our
+        // reply. Answer identically; fresh keys would not match theirs.
+        let create_hash = *blake3::hash(&msg.encrypted_payload).as_bytes();
+        let key = CircuitKey {
+            circuit_id: msg.circuit_id,
+            from_peer: from,
+        };
+        let cached = self
+            .circuits
+            .created_replies
+            .lock()
+            .await
+            .get(&key)
+            .filter(|(hash, _, _)| *hash == create_hash)
+            .map(|(_, reply, _)| reply.clone());
+        if let Some(reply) = cached {
+            if self.circuits.table.lock().await.lookup(&key).is_some() {
+                log::debug!("CircuitCreate {} resent by {:?}, replaying reply", msg.circuit_id, from);
+                return self.send_to_peer_critical(&from, &reply).await;
+            }
+        }
+
         // Parse KEM algo and initiator's ephemeral public key.
         let offer_algo = tarnet_api::types::KemAlgo::from_u8(msg.encrypted_payload[0])
             .map_err(|e| Error::Wire(format!("CircuitCreate unknown KEM algo: {}", e)))?;
@@ -1202,8 +1231,14 @@ impl Node {
             circuit_id: msg.circuit_id,
             encrypted_reply: build_extended_payload(offer_algo as u8, &reply_ciphertext),
         };
-        self.send_to_peer_critical(&from, &reply.to_wire().encode())
-            .await
+        let reply = reply.to_wire().encode();
+        {
+            let mut cache = self.circuits.created_replies.lock().await;
+            let now = Instant::now();
+            cache.retain(|_, (_, _, at)| now.duration_since(*at) < CREATED_REPLY_TTL);
+            cache.insert(key, (create_hash, reply.clone(), now));
+        }
+        self.send_to_peer_critical(&from, &reply).await
     }
 
     /// Handle CircuitCreated — confirmation that a circuit hop was set up.
@@ -1281,6 +1316,13 @@ impl Node {
             return Ok(());
         }
         drop(expected);
+        // Hop 1 is already built (the partial circuit is stored before any
+        // EXTEND waiter is registered under the same id): this is a duplicate
+        // reply to a resent CREATE and must not reach an EXTEND waiter.
+        if self.circuits.outbound.lock().await.contains_key(&msg.circuit_id) {
+            log::trace!("Duplicate CircuitCreated for circuit {}", msg.circuit_id);
+            return Ok(());
+        }
         let mut pending = self.circuits.pending_extends.lock().await;
         if let Some(tx) = pending.remove(&msg.circuit_id) {
             let _ = tx.send(msg.encrypted_reply);
@@ -1763,14 +1805,31 @@ impl Node {
             circuit_id,
             encrypted_payload: create_payload,
         };
-        self.send_to_peer_critical(&first_hop, &create.to_wire().encode())
-            .await?;
+        let create = create.to_wire().encode();
+        self.send_to_peer_critical(&first_hop, &create).await?;
 
-        // Wait for CircuitCreated
-        let reply = tokio::time::timeout(Duration::from_secs(5), rx)
-            .await
-            .map_err(|_| Error::Protocol("circuit create timed out".into()))?
-            .map_err(|_| Error::Protocol("circuit create channel dropped".into()))?;
+        // Wait for CircuitCreated, resending the identical CREATE meanwhile:
+        // either message may be lost, and the hop answers a repeat with the
+        // same reply.
+        let deadline = tokio::time::Instant::now() + CREATE_TIMEOUT;
+        let mut rx = rx;
+        let reply = loop {
+            let wait = CREATE_RESEND_INTERVAL
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            match tokio::time::timeout(wait, &mut rx).await {
+                Ok(r) => {
+                    break r.map_err(|_| Error::Protocol("circuit create channel dropped".into()))?
+                }
+                Err(_) if tokio::time::Instant::now() >= deadline => {
+                    self.circuits.pending_extends.lock().await.remove(&circuit_id);
+                    return Err(Error::Protocol("circuit create timed out".into()));
+                }
+                Err(_) => {
+                    log::debug!("CircuitCreate {} to {:?} resent", circuit_id, first_hop);
+                    self.send_to_peer_critical(&first_hop, &create).await?;
+                }
+            }
+        };
 
         let (_reached, _reply_algo, hop_ciphertext) = parse_extended_payload(&reply)?;
         let shared_bytes = kex.complete(&hop_ciphertext)?;

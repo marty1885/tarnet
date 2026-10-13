@@ -265,7 +265,7 @@ impl Node {
         sequence
     }
 
-    /// Publish our hello record to the local DHT store and flood it to neighbors.
+    /// Publish our hello record to the local DHT store and send PUT walks.
     pub async fn publish_hello(&self) {
         let hello = self.create_hello_record().await;
         let sequence = self.next_hello_sequence().await;
@@ -275,8 +275,7 @@ impl Node {
             sequence,
             Duration::from_secs(HELLO_TTL as u64),
         );
-        let params = self.dht_query_params().await;
-        self.dht_publish(record, params).await;
+        self.dht_publish(record).await;
         log::info!(
             "Published hello record ({} global addrs, {} introducers)",
             hello.global_addresses.len(),
@@ -308,36 +307,26 @@ impl Node {
         None
     }
 
-    /// Request a hello record from neighbors via DHT GET.
+    /// A peer's hello record: from the local store, else searched for in the
+    /// DHT until `timeout`.
+    pub async fn find_hello(&self, peer_id: &PeerId, timeout: Duration) -> Option<HelloRecord> {
+        if let Some(hello) = self.lookup_hello(peer_id).await {
+            return Some(hello);
+        }
+        let mut search = self.dht_search_hello(peer_id, Instant::now() + timeout).await;
+        loop {
+            if let Some(hello) = self.lookup_hello(peer_id).await {
+                return Some(hello);
+            }
+            search.next().await?;
+        }
+    }
+
+    /// Send GET walks for a peer's hello record.
     /// Uses anonymous query token routing for reply privacy.
     pub async fn request_hello(&self, target: &PeerId) -> Result<()> {
         let key = crate::dht::identity_address_key(target);
-        let mut bloom = BloomFilter::new();
-        bloom.insert(&self.peer_id());
-        let mut query_token = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut query_token);
-        // Record ourselves as the originator for this token
-        self.query_tokens
-            .lock()
-            .await
-            .insert(query_token, (self.peer_id(), Instant::now()));
-        let params = self.dht_query_params().await;
-        let get = DhtGetMsg {
-            key: *key.as_bytes(),
-            query_token,
-            hop_count: 0,
-            hop_limit: params.hop_limit,
-            bloom: bloom.to_bytes(),
-        };
-        let encoded = get.to_wire().encode();
-
-        // Send to all direct neighbors (multipath)
-        let links = self.links.lock().await;
-        for (peer_id, link) in links.iter() {
-            if let Err(e) = link.send_deferred(&encoded).await {
-                log::warn!("Failed to send DHT GET to {:?}: {}", peer_id, e);
-            }
-        }
+        self.dht_walker.launch_get(key.as_bytes(), None).await;
         Ok(())
     }
 }

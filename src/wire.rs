@@ -128,6 +128,7 @@ enum_with_u16! {
         DhtGetResponse = 0x0202,
         DhtWatch = 0x0203,
         DhtWatchNotify = 0x0204,
+        DhtNeighbor = 0x0205,
         // Tunnel (0x03xx) — stateless key exchange
         TunnelKeyExchange = 0x0300,
         TunnelKeyResponse = 0x0301,
@@ -657,9 +658,99 @@ impl RouteProbeFoundMsg {
     }
 }
 
-/// DhtPut: key(64) || record_type(u8) || sequence(u64 BE) || signer(32) || ttl(u32 BE) || value_len(u16 BE) || value || sig_len(u16 BE) || signature || signer_algo(u8) || signer_pk_len(u16 BE) || signer_pubkey || hop_count(u8) || hop_limit(u8) || bloom(256)
+/// Current DHT protocol version, the first byte of every walk header and of
+/// `DhtNeighbor`. Messages with any other version are dropped.
+pub const DHT_VERSION: u8 = 1;
+
+/// Walk-header flag bits. Unknown bits are sent as zero and ignored.
+pub mod walk_flags {
+    /// Random-walk phase: forward to a random neighbour until a coin flip ends it.
+    pub const WALKING: u8 = 0x01;
+    /// Detour around a relay-only local minimum: the first storing node to
+    /// receive the message is the end of the walk.
+    pub const DELIVER: u8 = 0x02;
+}
+
+/// Routing state carried by every DHT PUT, GET and WATCH walk.
+///
+/// Deliberately has no hop counter, originator-chosen hop limit or replication
+/// count: nothing here distinguishes the originator of a walking message from
+/// a node forwarding someone else's walk. See `docs/spec/dht.md`.
+///
+/// Wire: version(u8) || flags(u8) || greedy_budget(u8) || bloom_salt(u32 BE) || bloom(256)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalkHeader {
+    pub flags: u8,
+    /// Greedy steps left. Set by the node that ends the random phase; unused
+    /// while `WALKING` is set.
+    pub greedy_budget: u8,
+    /// Salt for the bloom hash, chosen by the first node that inserts into it.
+    pub bloom_salt: u32,
+    /// Relay-only nodes visited on a `DELIVER` detour. Nobody else is inserted.
+    pub bloom: [u8; 256],
+}
+
+impl WalkHeader {
+    pub const LEN: usize = 1 + 1 + 1 + 4 + 256;
+
+    /// The header an originator sends: walking, empty bloom.
+    pub fn origin() -> Self {
+        Self {
+            flags: walk_flags::WALKING,
+            greedy_budget: 0,
+            bloom_salt: 0,
+            bloom: [0u8; 256],
+        }
+    }
+
+    pub fn walking(&self) -> bool {
+        self.flags & walk_flags::WALKING != 0
+    }
+
+    pub fn deliver(&self) -> bool {
+        self.flags & walk_flags::DELIVER != 0
+    }
+
+    fn write(&self, buf: &mut Vec<u8>) {
+        buf.push(DHT_VERSION);
+        buf.push(self.flags & (walk_flags::WALKING | walk_flags::DELIVER));
+        buf.push(self.greedy_budget);
+        buf.extend_from_slice(&self.bloom_salt.to_be_bytes());
+        buf.extend_from_slice(&self.bloom);
+    }
+
+    fn read(r: &mut Reader) -> Result<Self> {
+        let version = r.read_u8()?;
+        if version != DHT_VERSION {
+            return Err(Error::Wire(format!("unsupported DHT version {}", version)));
+        }
+        let flags = r.read_u8()? & (walk_flags::WALKING | walk_flags::DELIVER);
+        let greedy_budget = r.read_u8()?;
+        let bloom_salt = r.read_u32()?;
+        let bloom = r.read_array::<256>()?;
+        Ok(Self {
+            flags,
+            greedy_budget,
+            bloom_salt,
+            bloom,
+        })
+    }
+}
+
+impl Default for WalkHeader {
+    fn default() -> Self {
+        Self::origin()
+    }
+}
+
+/// DhtPut: walk_header || record
+///
+/// record: key(64) || record_type(u8) || sequence(u64) || signer(32) || ttl(u32)
+///   || value_len(u16) || value || sig_len(u16) || signature || signer_algo(u8)
+///   || pk_len(u16) || signer_pubkey
 #[derive(Debug, Clone)]
 pub struct DhtPutMsg {
+    pub walk: WalkHeader,
     pub key: [u8; 64],
     pub record_type: RecordType,
     pub sequence: u64,
@@ -669,16 +760,9 @@ pub struct DhtPutMsg {
     pub signature: Vec<u8>,
     pub signer_algo: u8,
     pub signer_pubkey: Vec<u8>,
-    /// Number of hops this message has already traversed (incremented by each forwarder).
-    pub hop_count: u8,
-    pub hop_limit: u8,
-    pub bloom: [u8; 256],
 }
 
 impl DhtPutMsg {
-    /// Default hop limit for DHT PUT messages.
-    pub const DEFAULT_HOP_LIMIT: u8 = 10;
-
     /// The bytes covered by the signature: key || record_type || sequence || value
     pub fn signable_bytes(&self) -> Vec<u8> {
         // Single source of truth, shared with the verify gate.
@@ -686,21 +770,38 @@ impl DhtPutMsg {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            64 + 1
-                + 8
-                + 32
-                + 4
-                + 2
-                + self.value.len()
-                + 2
-                + self.signature.len()
-                + 1
-                + 2
-                + self.signer_pubkey.len()
-                + 2
-                + 256,
-        );
+        let mut buf = Vec::with_capacity(WalkHeader::LEN + self.record_len());
+        self.walk.write(&mut buf);
+        self.write_record(&mut buf);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let walk = WalkHeader::read(&mut r)?;
+        Self::read_record(&mut r, walk)
+    }
+
+    fn record_len(&self) -> usize {
+        64 + 1 + 8 + 32 + 4 + 2 + self.value.len() + 2 + self.signature.len() + 1 + 2
+            + self.signer_pubkey.len()
+    }
+
+    /// Encode only the signed record (no walk header), as carried by
+    /// `DhtWatchNotify`.
+    pub fn record_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.record_len());
+        self.write_record(&mut buf);
+        buf
+    }
+
+    /// Decode a bare record (no walk header); the walk header is set to
+    /// [`WalkHeader::origin`].
+    pub fn from_record_bytes(data: &[u8]) -> Result<Self> {
+        Self::read_record(&mut Reader::new(data), WalkHeader::origin())
+    }
+
+    fn write_record(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.key);
         buf.push(self.record_type.as_u8());
         buf.extend_from_slice(&self.sequence.to_be_bytes());
@@ -713,18 +814,13 @@ impl DhtPutMsg {
         buf.push(self.signer_algo);
         buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.signer_pubkey);
-        buf.push(self.hop_count);
-        buf.push(self.hop_limit);
-        buf.extend_from_slice(&self.bloom);
-        buf
     }
 
-    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+    fn read_record(r: &mut Reader, walk: WalkHeader) -> Result<Self> {
         // Minimum: 64 + 1 + 8 + 32 + 4 + 2 + 0 + 2 + 0 + 1 + 2 + 0 = 116
-        if data.len() < 116 {
+        if r.remaining() < 116 {
             return Err(Error::Wire("DhtPut too short".into()));
         }
-        let mut r = Reader::new(data);
         let key = r.read_array::<64>()?;
         let record_type = RecordType::from_u8(r.read_u8()?);
         let sequence = r.read_u64()?;
@@ -737,26 +833,8 @@ impl DhtPutMsg {
         let signer_algo = r.read_u8()?;
         let signer_pk_len = r.read_u16()? as usize;
         let signer_pubkey = r.read_bytes(signer_pk_len)?;
-
-        // New format: hop_count(u8) || hop_limit(u8) || bloom(256) = 258 bytes
-        // Old format: hop_limit(u8) || bloom(256) = 257 bytes
-        let (hop_count, hop_limit, bloom) = if r.remaining() >= 258 {
-            let hop_count = r.read_u8()?;
-            let hop_limit = r.read_u8()?;
-            let bloom = r.read_array::<256>()?;
-            (hop_count, hop_limit, bloom)
-        } else if r.remaining() > 0 {
-            let hop_limit = r.read_u8()?;
-            let mut bloom = [0u8; 256];
-            if r.remaining() >= 256 {
-                bloom = r.read_array::<256>()?;
-            }
-            (0, hop_limit, bloom)
-        } else {
-            (0, Self::DEFAULT_HOP_LIMIT, [0u8; 256])
-        };
-
         Ok(Self {
+            walk,
             key,
             record_type,
             sequence,
@@ -766,9 +844,6 @@ impl DhtPutMsg {
             signature,
             signer_algo,
             signer_pubkey,
-            hop_count,
-            hop_limit,
-            bloom,
         })
     }
 
@@ -777,60 +852,35 @@ impl DhtPutMsg {
     }
 }
 
-/// DhtGet: key(64) || query_token(32) || hop_count(u8) || hop_limit(u8) || bloom(256)
+/// DhtGet: walk_header || key(64) || query_token(32)
 #[derive(Debug, Clone)]
 pub struct DhtGetMsg {
+    pub walk: WalkHeader,
     pub key: [u8; 64],
-    /// Ephemeral token for anonymous reply routing. Each forwarder maps
+    /// Ephemeral per-walk token for anonymous reply routing. Each forwarder maps
     /// query_token → previous_hop so responses route back hop-by-hop
     /// without revealing the originator.
     pub query_token: [u8; 32],
-    /// Number of hops this message has already traversed (incremented by each forwarder).
-    pub hop_count: u8,
-    pub hop_limit: u8,
-    pub bloom: [u8; 256],
 }
 
 impl DhtGetMsg {
-    /// Default hop limit for DHT GET messages.
-    pub const DEFAULT_HOP_LIMIT: u8 = 10;
-
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(64 + 32 + 2 + 256);
+        let mut buf = Vec::with_capacity(WalkHeader::LEN + 64 + 32);
+        self.walk.write(&mut buf);
         buf.extend_from_slice(&self.key);
         buf.extend_from_slice(&self.query_token);
-        buf.push(self.hop_count);
-        buf.push(self.hop_limit);
-        buf.extend_from_slice(&self.bloom);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 96 {
-            return Err(Error::Wire("DhtGet too short".into()));
-        }
         let mut r = Reader::new(data);
+        let walk = WalkHeader::read(&mut r)?;
         let key = r.read_array::<64>()?;
         let query_token = r.read_array::<32>()?;
-        // New format: hop_count(u8) || hop_limit(u8) || bloom(256) = 258 remaining
-        // Old format: hop_limit(u8) || bloom(256) = 257 remaining
-        let (hop_count, hop_limit) = if r.remaining() >= 258 {
-            (r.read_u8()?, r.read_u8()?)
-        } else if r.remaining() > 0 {
-            (0, r.read_u8()?)
-        } else {
-            (0, Self::DEFAULT_HOP_LIMIT)
-        };
-        let mut bloom = [0u8; 256];
-        if r.remaining() >= 256 {
-            bloom = r.read_array::<256>()?;
-        }
         Ok(Self {
+            walk,
             key,
             query_token,
-            hop_count,
-            hop_limit,
-            bloom,
         })
     }
 
@@ -1554,11 +1604,13 @@ impl HelloRecord {
     }
 }
 
-/// DhtWatch: key(64) || query_token(32) || expiration(u32 BE seconds, 0 = cancel)
-/// The query_token is used for anonymous notification routing — the storing
-/// node never learns the watcher's identity, only a token to route through.
+/// DhtWatch: walk_header || key(64) || query_token(32) || expiration_secs(u32)
+///
+/// Travels like a GET walk; every node on the walk registers the watch with the
+/// previous hop as the notification return path.
 #[derive(Debug, Clone)]
 pub struct DhtWatchMsg {
+    pub walk: WalkHeader,
     pub key: [u8; 64],
     pub query_token: [u8; 32],
     pub expiration_secs: u32,
@@ -1566,7 +1618,8 @@ pub struct DhtWatchMsg {
 
 impl DhtWatchMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(100);
+        let mut buf = Vec::with_capacity(WalkHeader::LEN + 100);
+        self.walk.write(&mut buf);
         buf.extend_from_slice(&self.key);
         buf.extend_from_slice(&self.query_token);
         buf.extend_from_slice(&self.expiration_secs.to_be_bytes());
@@ -1574,14 +1627,13 @@ impl DhtWatchMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 100 {
-            return Err(Error::Wire("DhtWatch too short".into()));
-        }
         let mut r = Reader::new(data);
+        let walk = WalkHeader::read(&mut r)?;
         let key = r.read_array::<64>()?;
         let query_token = r.read_array::<32>()?;
         let expiration_secs = r.read_u32()?;
         Ok(Self {
+            walk,
             key,
             query_token,
             expiration_secs,
@@ -1593,7 +1645,7 @@ impl DhtWatchMsg {
     }
 }
 
-/// DhtWatchNotify: query_token(32) || DhtPutMsg bytes
+/// DhtWatchNotify: query_token(32) || record (DhtPut without the walk header)
 /// The query_token routes the notification back to the watcher hop-by-hop.
 #[derive(Debug, Clone)]
 pub struct DhtWatchNotifyMsg {
@@ -1603,10 +1655,10 @@ pub struct DhtWatchNotifyMsg {
 
 impl DhtWatchNotifyMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let put_bytes = self.put.to_bytes();
-        let mut buf = Vec::with_capacity(32 + put_bytes.len());
+        let record = self.put.record_bytes();
+        let mut buf = Vec::with_capacity(32 + record.len());
         buf.extend_from_slice(&self.query_token);
-        buf.extend_from_slice(&put_bytes);
+        buf.extend_from_slice(&record);
         buf
     }
 
@@ -1616,12 +1668,49 @@ impl DhtWatchNotifyMsg {
         }
         let mut r = Reader::new(data);
         let query_token = r.read_array::<32>()?;
-        let put = DhtPutMsg::from_bytes(&data[r.pos..])?;
+        let put = DhtPutMsg::from_record_bytes(&data[r.pos..])?;
         Ok(Self { query_token, put })
     }
 
     pub fn to_wire(&self) -> WireMessage {
         WireMessage::new(MessageType::DhtWatchNotify, self.to_bytes())
+    }
+}
+
+/// Flag bits of [`DhtNeighborMsg`].
+pub mod dht_neighbor_flags {
+    /// The sender stores DHT records for others. Relay-only nodes clear it.
+    pub const STORES: u8 = 0x01;
+}
+
+/// DhtNeighbor: version(u8) || flags(u8). Sent once to each neighbour on
+/// link-up so relay-only nodes can steer `DELIVER` detours to a storing node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DhtNeighborMsg {
+    pub flags: u8,
+}
+
+impl DhtNeighborMsg {
+    pub fn stores(&self) -> bool {
+        self.flags & dht_neighbor_flags::STORES != 0
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        vec![DHT_VERSION, self.flags & dht_neighbor_flags::STORES]
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let version = r.read_u8()?;
+        if version != DHT_VERSION {
+            return Err(Error::Wire(format!("unsupported DHT version {}", version)));
+        }
+        let flags = r.read_u8()? & dht_neighbor_flags::STORES;
+        Ok(Self { flags })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::DhtNeighbor, self.to_bytes())
     }
 }
 
@@ -1875,9 +1964,12 @@ mod tests {
             signature: vec![0xCC; 64],
             signer_algo: 1,
             signer_pubkey: vec![0xEE; 32],
-            hop_count: 3,
-            hop_limit: 7,
-            bloom: [0xDD; 256],
+            walk: WalkHeader {
+                flags: walk_flags::DELIVER,
+                greedy_budget: 7,
+                bloom_salt: 0xDEADBEEF,
+                bloom: [0xDD; 256],
+            },
         };
         let bytes = put.to_bytes();
         let decoded = DhtPutMsg::from_bytes(&bytes).unwrap();
@@ -1890,9 +1982,7 @@ mod tests {
         assert_eq!(decoded.signature, put.signature);
         assert_eq!(decoded.signer_algo, 1);
         assert_eq!(decoded.signer_pubkey, vec![0xEE; 32]);
-        assert_eq!(decoded.hop_count, 3);
-        assert_eq!(decoded.hop_limit, 7);
-        assert_eq!(decoded.bloom, [0xDD; 256]);
+        assert_eq!(decoded.walk, put.walk);
     }
 
     #[test]
@@ -1907,9 +1997,7 @@ mod tests {
             signature: vec![0; 64],
             signer_algo: 0,
             signer_pubkey: vec![],
-            hop_count: 0,
-            hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-            bloom: [0; 256],
+            walk: Default::default(),
         };
         let signable = put.signable_bytes();
         // signable = key(64) || record_type(1) || sequence(8) || value(4) = 77 bytes
@@ -2084,9 +2172,7 @@ mod tests {
             signature: vec![0xCC; 64],
             signer_algo: 0,
             signer_pubkey: vec![],
-            hop_count: 0,
-            hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-            bloom: [0; 256],
+            walk: Default::default(),
         };
         let bytes = put.to_bytes();
         let decoded = DhtPutMsg::from_bytes(&bytes).unwrap();
@@ -2135,6 +2221,7 @@ mod tests {
     #[test]
     fn dht_watch_msg_roundtrip() {
         let watch = DhtWatchMsg {
+            walk: WalkHeader::origin(),
             key: [0xAA; 64],
             query_token: [0x11; 32],
             expiration_secs: 300,
@@ -2149,6 +2236,7 @@ mod tests {
     #[test]
     fn dht_watch_msg_cancel() {
         let watch = DhtWatchMsg {
+            walk: WalkHeader::origin(),
             key: [0xBB; 64],
             query_token: [0x22; 32],
             expiration_secs: 0,
@@ -2174,9 +2262,7 @@ mod tests {
                 signature: vec![0xEE; 64],
                 signer_algo: 1,
                 signer_pubkey: vec![0xDD; 32],
-                hop_count: 0,
-                hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-                bloom: [0; 256],
+                walk: Default::default(),
             },
         };
         let bytes = notify.to_bytes();
@@ -2186,6 +2272,50 @@ mod tests {
         assert_eq!(decoded.put.record_type, RecordType::Hello);
         assert_eq!(decoded.put.sequence, 5);
         assert_eq!(decoded.put.value, b"notify data");
+    }
+
+    #[test]
+    fn dht_get_msg_roundtrip() {
+        let get = DhtGetMsg {
+            walk: WalkHeader {
+                flags: 0,
+                greedy_budget: 9,
+                bloom_salt: 1,
+                bloom: [0x5A; 256],
+            },
+            key: [0x42; 64],
+            query_token: [0x24; 32],
+        };
+        let decoded = DhtGetMsg::from_bytes(&get.to_bytes()).unwrap();
+        assert_eq!(decoded.walk, get.walk);
+        assert_eq!(decoded.key, get.key);
+        assert_eq!(decoded.query_token, get.query_token);
+    }
+
+    #[test]
+    fn walk_header_rejects_other_versions_and_masks_reserved_flags() {
+        let get = DhtGetMsg {
+            walk: WalkHeader::origin(),
+            key: [0; 64],
+            query_token: [0; 32],
+        };
+        let mut bytes = get.to_bytes();
+        bytes[1] = 0xFF; // reserved flag bits set by a future sender
+        let decoded = DhtGetMsg::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.walk.flags, walk_flags::WALKING | walk_flags::DELIVER);
+
+        bytes[0] = DHT_VERSION + 1;
+        assert!(DhtGetMsg::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn dht_neighbor_msg_roundtrip() {
+        for flags in [0, dht_neighbor_flags::STORES] {
+            let msg = DhtNeighborMsg { flags };
+            let decoded = DhtNeighborMsg::from_bytes(&msg.to_bytes()).unwrap();
+            assert_eq!(decoded, msg);
+        }
+        assert!(!DhtNeighborMsg::from_bytes(&[DHT_VERSION, 0xFE]).unwrap().stores());
     }
 
     #[test]

@@ -276,7 +276,7 @@ impl Node {
 
         // Look up peer's hello record to derive the signaling port
         let hello = self
-            .lookup_hello(&peer_id)
+            .find_hello(&peer_id, Duration::from_secs(5))
             .await
             .ok_or_else(|| Error::Protocol("no hello record for WebRTC target".into()))?;
         let port_hash = Self::webrtc_port_hash_for_peer(&hello);

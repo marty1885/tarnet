@@ -91,6 +91,7 @@ async fn main() {
     let mut node = Node::with_db(identity, db.clone(), StorageLimits::default());
     node.set_link_limits(opts.max_inbound, opts.max_outbound);
     node.set_bandwidth_limits(opts.upload_limit, opts.download_limit);
+    node.set_dht_store(opts.dht_store);
 
     let tcp_discovery = TcpDiscovery::bind(&opts.listen_addrs)
         .await

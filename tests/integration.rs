@@ -588,27 +588,25 @@ fn bloom_filter_dedup() {
     let peer_a = PeerId([0x11; 32]);
     let peer_b = PeerId([0x22; 32]);
     let peer_c = PeerId([0x33; 32]);
+    let salt = 0x1234_5678;
 
-    bloom.insert(&peer_a);
-    bloom.insert(&peer_b);
+    bloom.insert(salt, &peer_a);
+    bloom.insert(salt, &peer_b);
 
-    assert!(bloom.contains(&peer_a));
-    assert!(bloom.contains(&peer_b));
-    // peer_c was not inserted — might be false positive, but very unlikely
-    // We just check that the bloom filter works at all
-    // (false positive rate for 2 insertions in 2048 bits is very low)
+    assert!(bloom.contains(salt, &peer_a));
+    assert!(bloom.contains(salt, &peer_b));
 
     // Verify roundtrip through bytes
     let bytes = bloom.to_bytes();
     let bloom2 = BloomFilter::from_bytes(bytes);
-    assert!(bloom2.contains(&peer_a));
-    assert!(bloom2.contains(&peer_b));
+    assert!(bloom2.contains(salt, &peer_a));
+    assert!(bloom2.contains(salt, &peer_b));
     assert_eq!(bloom.to_bytes(), bloom2.to_bytes());
 
     // Empty bloom should not contain anything
     let empty = BloomFilter::new();
-    assert!(!empty.contains(&peer_a));
-    assert!(!empty.contains(&peer_c));
+    assert!(!empty.contains(salt, &peer_a));
+    assert!(!empty.contains(salt, &peer_c));
 }
 
 /// Test handshake with anti-replay protection (timestamp + challenge).
@@ -673,9 +671,9 @@ async fn link_sequence_anti_replay() {
     }
 }
 
-/// Test DHT PUT hop limit enforcement.
+/// A PUT walk from one end of a line and GET walks from the other meet.
 #[tokio::test]
-async fn dht_put_hop_limit() {
+async fn dht_put_and_get_walks_meet_across_a_line() {
     let _ = env_logger::builder().is_test(true).try_init();
 
     let node_a = Arc::new(Node::new(Keypair::generate()));
@@ -710,15 +708,18 @@ async fn dht_put_hop_limit() {
     assert!(node_a.connected_peers().await.contains(&node_b.peer_id()));
     assert!(node_b.connected_peers().await.contains(&node_c.peer_id()));
 
-    // Node A puts content — should propagate through network with hop limit
-    let data = b"hop limit test data";
+    // Node A puts content; its walks end at some storing local minimum.
+    let data = b"walk test data";
     let inner_hash = node_a.dht_put_content(data).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Node B should have the data (1 hop from A)
-    let result_b = node_b.dht_get_content(&inner_hash).await;
-    assert!(result_b.is_some(), "Node B should have the content");
-    assert_eq!(result_b.unwrap(), data);
+    // Node C's GET walks find it.
+    let mut search = node_c
+        .dht_search_content(&inner_hash, std::time::Instant::now() + Duration::from_secs(6))
+        .await;
+    assert!(search.next().await.is_some(), "C's GET walks should reach a node holding A's PUT");
+    let result_c = node_c.dht_get_content(&inner_hash).await;
+    assert_eq!(result_c.as_deref(), Some(&data[..]));
 }
 
 /// Test signature rejection on DHT GET response.
@@ -737,9 +738,7 @@ fn signature_validation_on_get_response() {
         signature: vec![0xFF; 64], // invalid signature
         signer_algo: 1,
         signer_pubkey: pubkey.clone(),
-        hop_count: 0,
-        hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-        bloom: [0; 256],
+        walk: Default::default(),
     };
 
     // Verify that signature check fails
@@ -762,9 +761,7 @@ fn signature_validation_on_get_response() {
         signature: vec![0u8; 64],
         signer_algo: 1,
         signer_pubkey: pubkey.clone(),
-        hop_count: 0,
-        hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-        bloom: [0; 256],
+        walk: Default::default(),
     };
     put_valid.signature = kp.sign(&put_valid.signable_bytes());
     let valid = identity::verify(
@@ -776,27 +773,31 @@ fn signature_validation_on_get_response() {
     assert!(valid, "Valid signature should verify");
 }
 
-/// Test DhtGetMsg with hop_limit and bloom roundtrip.
+/// Test DhtGetMsg walk header roundtrip.
 #[test]
 fn dht_get_msg_new_fields_roundtrip() {
     let mut bloom = BloomFilter::new();
-    bloom.insert(&PeerId([0x11; 32]));
+    bloom.insert(7, &PeerId([0x11; 32]));
 
     let get = DhtGetMsg {
         key: [0xCC; 64],
         query_token: [0x99; 32],
-        hop_count: 2,
-        hop_limit: 5,
-        bloom: bloom.to_bytes(),
+        walk: tarnet::wire::WalkHeader {
+            flags: tarnet::wire::walk_flags::DELIVER,
+            greedy_budget: 5,
+            bloom_salt: 7,
+            bloom: bloom.to_bytes(),
+        },
     };
     let bytes = get.to_bytes();
     let decoded = DhtGetMsg::from_bytes(&bytes).unwrap();
     assert_eq!(decoded.key, [0xCC; 64]);
     assert_eq!(decoded.query_token, [0x99; 32]);
-    assert_eq!(decoded.hop_limit, 5);
+    assert_eq!(decoded.walk.greedy_budget, 5);
+    assert!(decoded.walk.deliver());
 
-    let bloom_decoded = BloomFilter::from_bytes(decoded.bloom);
-    assert!(bloom_decoded.contains(&PeerId([0x11; 32])));
+    let bloom_decoded = BloomFilter::from_bytes(decoded.walk.bloom);
+    assert!(bloom_decoded.contains(decoded.walk.bloom_salt, &PeerId([0x11; 32])));
 }
 
 /// Test DhtGetResponseMsg with query_token roundtrip.
@@ -907,8 +908,16 @@ async fn signed_content_multi_publisher() {
     // Wait for propagation
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Client retrieves signed content — should find both providers
-    let results = client.dht_get_signed_content(&inner_hash_a).await;
+    // Client searches for the signed content until both providers turn up.
+    let mut search = client
+        .dht_search_content(&inner_hash_a, std::time::Instant::now() + Duration::from_secs(6))
+        .await;
+    let results = loop {
+        let results = client.dht_get_signed_content(&inner_hash_a).await;
+        if results.len() >= 2 || search.next().await.is_none() {
+            break results;
+        }
+    };
 
     // Collect signer PeerIds
     let signer_pids: Vec<PeerId> = results.iter().map(|(pid, _)| *pid).collect();

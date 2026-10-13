@@ -13,7 +13,8 @@ use crate::identity::{self, peer_id_from_signing_pubkey, KemKeypair, Keypair};
 use crate::transport::Transport;
 use crate::types::{Error, PeerId, Result};
 use crate::wire::{
-    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, RekeyMsg, WireMessage, HEADER_SIZE,
+    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, MessageType, RekeyMsg, WireMessage,
+    HEADER_SIZE,
     MAX_PAYLOAD, WIRE_VERSION_MAX, WIRE_VERSION_MIN,
 };
 use tarnet_api::types::{KemAlgo, SigningAlgo};
@@ -87,6 +88,22 @@ struct LinkCrypto {
     prev_recv_window: u64,
     #[zeroize(skip)]
     prev_recv_bitmap: u128,
+    /// Responder side of a rekey: keys for a request we answered but the
+    /// initiator has not yet confirmed. We keep sending under the current key
+    /// until the first frame decrypts under `pending_recv`, so a reply lost on
+    /// the way back costs nothing — the initiator retries and we resend it.
+    pending_send: Option<[u8; 32]>,
+    pending_recv: Option<[u8; 32]>,
+    /// Identifies the request `pending_*` answers (hash of its KEM pubkey).
+    #[zeroize(skip)]
+    pending_tag: Option<[u8; 32]>,
+    /// Tag of the last request whose keys were confirmed and installed, so a
+    /// late duplicate of that request is ignored rather than re-answered.
+    #[zeroize(skip)]
+    completed_tag: Option<[u8; 32]>,
+    /// Number of key installs on this link (0 = handshake keys).
+    #[zeroize(skip)]
+    epoch: u64,
 }
 
 impl LinkCrypto {
@@ -109,6 +126,11 @@ impl LinkCrypto {
             recv_bitmap: 0,
             prev_recv_window: 0,
             prev_recv_bitmap: 0,
+            pending_send: None,
+            pending_recv: None,
+            pending_tag: None,
+            completed_tag: None,
+            epoch: 0,
         }
     }
 
@@ -122,6 +144,11 @@ impl LinkCrypto {
     /// peer tolerates the overlap symmetrically via its own retained previous key.
     fn install_rekey(&mut self, new_shared: &[u8; 32], is_initiator: bool) {
         let fresh = Self::derive(new_shared, is_initiator);
+        self.install_keys(fresh.send_enc_key, fresh.recv_enc_key);
+        // `fresh` drops here; ZeroizeOnDrop wipes its own key copies.
+    }
+
+    fn install_keys(&mut self, send: [u8; 32], recv: [u8; 32]) {
         if let Some(mut old) = self.prev_recv_key.take() {
             old.zeroize();
         }
@@ -129,12 +156,33 @@ impl LinkCrypto {
         self.prev_recv_window = self.recv_window;
         self.prev_recv_bitmap = self.recv_bitmap;
 
-        self.send_enc_key = fresh.send_enc_key;
-        self.recv_enc_key = fresh.recv_enc_key;
+        self.send_enc_key = send;
+        self.recv_enc_key = recv;
         self.send_seq = 0;
         self.recv_window = 0;
         self.recv_bitmap = 0;
-        // `fresh` drops here; ZeroizeOnDrop wipes its own key copies.
+        self.epoch += 1;
+    }
+
+    /// Responder: hold the keys for an answered rekey request until the
+    /// initiator proves it has them (see `pending_recv`). A newer request
+    /// replaces an unconfirmed older one.
+    fn stage_rekey(&mut self, new_shared: &[u8; 32], is_initiator: bool, tag: [u8; 32]) {
+        let fresh = Self::derive(new_shared, is_initiator);
+        self.clear_pending();
+        self.pending_send = Some(fresh.send_enc_key);
+        self.pending_recv = Some(fresh.recv_enc_key);
+        self.pending_tag = Some(tag);
+    }
+
+    fn clear_pending(&mut self) {
+        if let Some(mut k) = self.pending_send.take() {
+            k.zeroize();
+        }
+        if let Some(mut k) = self.pending_recv.take() {
+            k.zeroize();
+        }
+        self.pending_tag = None;
     }
 
     /// True once either direction has sent/received enough messages to warrant
@@ -213,6 +261,18 @@ impl LinkCrypto {
                 Ok(plaintext)
             }
             Err(current_err) => {
+                // The initiator's first frame under keys we staged for its
+                // rekey: that confirms it installed them, so switch over.
+                if let Some(pending) = self.pending_recv {
+                    if let Ok((plaintext, seq)) = Self::aead_open(&pending, data) {
+                        let send = self.pending_send.take().expect("staged with recv");
+                        self.pending_recv = None;
+                        self.completed_tag = self.pending_tag.take();
+                        self.install_keys(send, pending);
+                        Self::check_replay_at(&mut self.recv_window, &mut self.recv_bitmap, seq)?;
+                        return Ok(plaintext);
+                    }
+                }
                 // During a rekey overlap, the peer may still be sending under
                 // the old key. Fall back to it before declaring failure.
                 if let Some(prev) = self.prev_recv_key {
@@ -266,10 +326,29 @@ impl LinkCrypto {
         }
     }
 
-    /// Get current send count (for re-key decisions).
+    /// Get current send count.
+    #[cfg(test)]
     fn send_count(&self) -> u64 {
         self.send_seq
     }
+}
+
+/// Initiator-side state of a rekey awaiting its reply.
+struct PendingRekey {
+    eph_kem: KemKeypair,
+    /// The encoded request. A retry resends exactly this, never a fresh
+    /// ephemeral key: every reply in flight then decapsulates to the same
+    /// secret, so a late or duplicated reply can never install the wrong keys.
+    request: Vec<u8>,
+    sent_at: std::time::Instant,
+}
+
+/// How long the initiator waits for a rekey reply before resending the request.
+/// Rekey and its reply are ordinary link messages and may be lost.
+pub const REKEY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+fn rekey_tag(kem_pubkey: &[u8]) -> [u8; 32] {
+    blake3::derive_key("tarnet rekey request", kem_pubkey)
 }
 
 /// Compute key confirmation hash via BLAKE3 derive_key (directional).
@@ -303,6 +382,118 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// First handshake retransmission timeout, doubling up to the max. Longer on
+/// transports that claim reliability, where a resend is only ever needed if
+/// something between the two ends drops after all.
+const HS_RTO_LOSSY: Duration = Duration::from_millis(500);
+const HS_RTO_RELIABLE: Duration = Duration::from_secs(1);
+const HS_RTO_MAX: Duration = Duration::from_secs(4);
+/// Handshake frames are well under this.
+const HS_BUF: usize = 8192;
+
+/// Lockstep handshake I/O that survives loss, duplication and reordering.
+///
+/// Every message is kept byte-for-byte as sent. The initiator resends its last
+/// message when the next one doesn't arrive in time; either side answers a
+/// stale handshake message from the peer (a sign our last reply was lost) by
+/// resending its last message. The responder never sends unprompted. This
+/// runs whatever the transport claims: one end's transport being "reliable"
+/// says nothing about what happens on the path.
+struct HandshakeIo<'a> {
+    transport: &'a dyn Transport,
+    last_sent: Vec<u8>,
+    /// Raw bytes of the message `expect` last returned.
+    last_received: Vec<u8>,
+    is_initiator: bool,
+    rto_initial: Duration,
+    rto: Duration,
+}
+
+impl<'a> HandshakeIo<'a> {
+    fn new(transport: &'a dyn Transport, is_initiator: bool) -> Self {
+        let rto_initial = if transport.is_reliable() {
+            HS_RTO_RELIABLE
+        } else {
+            HS_RTO_LOSSY
+        };
+        Self {
+            transport,
+            last_sent: Vec::new(),
+            last_received: Vec::new(),
+            is_initiator,
+            rto_initial,
+            rto: rto_initial,
+        }
+    }
+
+    async fn send(&mut self, msg: Vec<u8>) -> Result<()> {
+        self.transport.send(&msg).await?;
+        self.last_sent = msg;
+        self.rto = self.rto_initial;
+        Ok(())
+    }
+
+    async fn resend(&mut self) -> Result<()> {
+        if self.last_sent.is_empty() {
+            return Ok(());
+        }
+        self.transport.send(&self.last_sent).await
+    }
+
+    /// Next raw frame from the peer, resending our last message on timeout.
+    ///
+    /// The receive is never cancelled: a transport `recv` need not be
+    /// cancel-safe (TCP reads a length prefix, then the body; abandoning it in
+    /// between desyncs the stream for good). The timer runs beside it.
+    async fn recv_raw(&mut self) -> Result<Vec<u8>> {
+        let transport = self.transport;
+        let recv = async move {
+            let mut buf = vec![0u8; HS_BUF];
+            let n = transport.recv(&mut buf).await?;
+            buf.truncate(n);
+            Ok::<_, Error>(buf)
+        };
+        tokio::pin!(recv);
+        loop {
+            if !self.is_initiator || self.last_sent.is_empty() {
+                return recv.await;
+            }
+            tokio::select! {
+                r = &mut recv => return r,
+                _ = tokio::time::sleep(self.rto) => {
+                    self.rto = (self.rto * 2).min(HS_RTO_MAX);
+                    self.resend().await?;
+                }
+            }
+        }
+    }
+
+    /// Wait for the next handshake message of type `want`.
+    async fn expect(&mut self, want: MessageType) -> Result<WireMessage> {
+        loop {
+            let raw = self.recv_raw().await?;
+            match WireMessage::decode(&raw) {
+                Ok(w) if w.msg_type == want => {
+                    self.last_received = raw;
+                    return Ok(w);
+                }
+                Ok(w) if is_handshake_type(w.msg_type) => {
+                    // A repeat of an earlier step: the peer missed our reply.
+                    self.resend().await?;
+                }
+                _ => {} // stray or garbled frame
+            }
+        }
+    }
+}
+
+fn is_handshake_type(t: MessageType) -> bool {
+    matches!(
+        t,
+        MessageType::HandshakeHello | MessageType::HandshakeAuth | MessageType::HandshakeConfirm
+    )
+}
+
 /// Authenticated encrypted link to a direct neighbor.
 ///
 /// Outbound messages are encrypted and placed into a bounded channel.
@@ -323,15 +514,26 @@ pub struct PeerLink {
     identity: std::sync::Arc<Keypair>,
     /// Negotiated KEM algorithm for rekey exchanges.
     rekey_kem_algo: KemAlgo,
-    /// Initiator-side ephemeral KEM key for an in-flight rekey, paired with the
-    /// `send_seq` at which it was started (a message-counter clock used to
-    /// abandon a rekey that never gets a response). `None` when idle.
-    pending_rekey: tokio::sync::Mutex<Option<(KemKeypair, u64)>>,
+    /// Initiator side of an in-flight rekey. `None` when idle.
+    pending_rekey: tokio::sync::Mutex<Option<PendingRekey>>,
+    /// Responder side: the reply we sent for the latest request, keyed by the
+    /// request's tag, so a retried request gets the identical answer.
+    rekey_reply: tokio::sync::Mutex<Option<([u8; 32], Vec<u8>)>>,
+    /// Rekey on the next sweep regardless of message counts (tests).
+    force_rekey: std::sync::atomic::AtomicBool,
     /// Negotiated wire protocol version for this link.
     negotiated_version: u8,
     _drain_task: tokio::task::JoinHandle<()>,
     /// Transport name captured at construction for status display.
     transport_name: &'static str,
+    /// Initiator: link frames that arrived before the responder's
+    /// HandshakeConfirm (reordered, or the confirm was lost). Delivered first.
+    early_frames: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    /// Responder: (initiator's HandshakeConfirm, our HandshakeConfirm) until
+    /// the initiator is known to be done. A repeat of its confirm means ours
+    /// was lost; we answer it so the initiator can finish instead of leaving
+    /// us holding a link the other side gave up on.
+    handshake_tail: std::sync::Mutex<Option<(Vec<u8>, Vec<u8>)>>,
 }
 
 impl PeerLink {
@@ -380,16 +582,11 @@ impl PeerLink {
             min_version: WIRE_VERSION_MIN,
             max_version: WIRE_VERSION_MAX,
         };
-        let msg = my_hello.to_wire().encode();
-        transport.send(&msg).await?;
+        let mut io = HandshakeIo::new(transport.as_ref(), true);
+        io.send(my_hello.to_wire().encode()).await?;
 
         // Receive peer hello
-        let mut buf = vec![0u8; 8192];
-        let n = transport.recv(&mut buf).await?;
-        let wire = WireMessage::decode(&buf[..n])?;
-        if wire.msg_type != crate::wire::MessageType::HandshakeHello {
-            return Err(Error::Wire("expected HandshakeHello".into()));
-        }
+        let wire = io.expect(MessageType::HandshakeHello).await?;
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
 
         // Negotiate wire protocol version
@@ -465,14 +662,10 @@ impl PeerLink {
             kem_ciphertext: static_kem_ct,
             eph_kem_ciphertext: eph_kem_ct,
         };
-        transport.send(&auth.to_wire().encode()).await?;
+        io.send(auth.to_wire().encode()).await?;
 
         // Receive and verify peer auth
-        let n = transport.recv(&mut buf).await?;
-        let wire = WireMessage::decode(&buf[..n])?;
-        if wire.msg_type != crate::wire::MessageType::HandshakeAuth {
-            return Err(Error::Wire("expected HandshakeAuth".into()));
-        }
+        let wire = io.expect(MessageType::HandshakeAuth).await?;
         let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
 
         let peer_transcript = Self::compute_transcript(
@@ -514,23 +707,39 @@ impl PeerLink {
         // Key confirmation: send initiator confirm hash
         let confirm_hash = compute_confirm_hash(&shared_bytes, true);
         let confirm = HandshakeConfirmMsg { confirm_hash };
-        transport.send(&confirm.to_wire().encode()).await?;
+        io.send(confirm.to_wire().encode()).await?;
 
-        // Receive and verify peer's (responder) confirm
-        let n = transport.recv(&mut buf).await?;
-        let wire = WireMessage::decode(&buf[..n])?;
-        if wire.msg_type != crate::wire::MessageType::HandshakeConfirm {
-            return Err(Error::Wire("expected HandshakeConfirm".into()));
-        }
-        let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
+        // Receive and verify the responder's confirm. Any frame that decrypts
+        // under the session keys proves the responder holds them just as well
+        // (it only sends link frames after its confirm), so it also completes
+        // the handshake — the confirm may have been lost or overtaken.
+        let mut crypto = crypto;
+        let mut early_frames = std::collections::VecDeque::new();
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, false);
-        if peer_confirm
-            .confirm_hash
-            .ct_eq(&expected_peer_confirm)
-            .unwrap_u8()
-            == 0
-        {
-            return Err(Error::Crypto("key confirmation failed".into()));
+        loop {
+            let raw = io.recv_raw().await?;
+            if raw.len() >= NONCE_SIZE + SEQ_SIZE + TAG_SIZE {
+                if let Ok(plaintext) = crypto.decrypt(&raw) {
+                    early_frames.push_back(plaintext);
+                    break;
+                }
+            }
+            match WireMessage::decode(&raw) {
+                Ok(w) if w.msg_type == MessageType::HandshakeConfirm => {
+                    let peer_confirm = HandshakeConfirmMsg::from_bytes(&w.payload)?;
+                    if peer_confirm
+                        .confirm_hash
+                        .ct_eq(&expected_peer_confirm)
+                        .unwrap_u8()
+                        == 0
+                    {
+                        return Err(Error::Crypto("key confirmation failed".into()));
+                    }
+                    break;
+                }
+                Ok(w) if is_handshake_type(w.msg_type) => io.resend().await?,
+                _ => {}
+            }
         }
 
         log::info!(
@@ -552,12 +761,16 @@ impl PeerLink {
             is_initiator: true,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
             pending_rekey: tokio::sync::Mutex::new(None),
+            rekey_reply: tokio::sync::Mutex::new(None),
+            force_rekey: std::sync::atomic::AtomicBool::new(false),
             negotiated_version,
             identity: std::sync::Arc::new(
                 Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
             ),
             _drain_task,
             transport_name,
+            early_frames: std::sync::Mutex::new(early_frames),
+            handshake_tail: std::sync::Mutex::new(None),
         })
     }
 
@@ -578,12 +791,8 @@ impl PeerLink {
         let eph_kem = KemKeypair::generate_ephemeral(my_kem_algo);
 
         // Receive peer hello
-        let mut buf = vec![0u8; 8192];
-        let n = transport.recv(&mut buf).await?;
-        let wire = WireMessage::decode(&buf[..n])?;
-        if wire.msg_type != crate::wire::MessageType::HandshakeHello {
-            return Err(Error::Wire("expected HandshakeHello".into()));
-        }
+        let mut io = HandshakeIo::new(transport.as_ref(), false);
+        let wire = io.expect(MessageType::HandshakeHello).await?;
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
 
         // Negotiate wire protocol version
@@ -625,18 +834,14 @@ impl PeerLink {
             min_version: WIRE_VERSION_MIN,
             max_version: WIRE_VERSION_MAX,
         };
-        transport.send(&my_hello.to_wire().encode()).await?;
+        io.send(my_hello.to_wire().encode()).await?;
 
         // Compute X25519 ephemeral shared secret
         let peer_eph = X25519Public::from(peer_hello.ephemeral_pubkey);
         let x25519_shared = eph_secret.diffie_hellman(&peer_eph);
 
         // Receive peer auth (contains both static + ephemeral KEM ciphertexts)
-        let n = transport.recv(&mut buf).await?;
-        let wire = WireMessage::decode(&buf[..n])?;
-        if wire.msg_type != crate::wire::MessageType::HandshakeAuth {
-            return Err(Error::Wire("expected HandshakeAuth".into()));
-        }
+        let wire = io.expect(MessageType::HandshakeAuth).await?;
         let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
 
         // KEM decapsulate static: recover shared secret from initiator's ciphertext
@@ -715,14 +920,11 @@ impl PeerLink {
             kem_ciphertext: Vec::new(),
             eph_kem_ciphertext: Vec::new(),
         };
-        transport.send(&auth.to_wire().encode()).await?;
+        io.send(auth.to_wire().encode()).await?;
 
         // Key confirmation: receive and verify peer's (initiator) confirm
-        let n = transport.recv(&mut buf).await?;
-        let wire = WireMessage::decode(&buf[..n])?;
-        if wire.msg_type != crate::wire::MessageType::HandshakeConfirm {
-            return Err(Error::Wire("expected HandshakeConfirm".into()));
-        }
+        let wire = io.expect(MessageType::HandshakeConfirm).await?;
+        let peer_confirm_frame = std::mem::take(&mut io.last_received);
         let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
 
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, true);
@@ -738,7 +940,9 @@ impl PeerLink {
         // Send our (responder) confirm
         let confirm_hash = compute_confirm_hash(&shared_bytes, false);
         let confirm = HandshakeConfirmMsg { confirm_hash };
-        transport.send(&confirm.to_wire().encode()).await?;
+        let our_confirm = confirm.to_wire().encode();
+        io.send(our_confirm.clone()).await?;
+        let handshake_tail = Some((peer_confirm_frame, our_confirm));
 
         log::info!(
             "Link established (responder) with {:?}, wire v{}",
@@ -759,12 +963,16 @@ impl PeerLink {
             is_initiator: false,
             rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
             pending_rekey: tokio::sync::Mutex::new(None),
+            rekey_reply: tokio::sync::Mutex::new(None),
+            force_rekey: std::sync::atomic::AtomicBool::new(false),
             negotiated_version,
             identity: std::sync::Arc::new(
                 Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
             ),
             _drain_task,
             transport_name,
+            early_frames: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            handshake_tail: std::sync::Mutex::new(handshake_tail),
         })
     }
 
@@ -985,15 +1193,48 @@ impl PeerLink {
 
     /// Receive and decrypt a message from the link.
     pub async fn recv_message(&self) -> Result<Vec<u8>> {
+        if let Some(early) = self.early_frames.lock().unwrap().pop_front() {
+            return Ok(early);
+        }
         let mut buf = vec![0u8; MAX_LINK_FRAME];
         let n = tokio::time::timeout(RECV_STALL_TIMEOUT, self.transport.recv(&mut buf))
             .await
             .map_err(|_| Error::Wire("link recv stalled".into()))??;
-        self.crypto.lock().await.decrypt(&buf[..n])
+        let result = self.crypto.lock().await.decrypt(&buf[..n]);
+        let tail = {
+            let mut tail = self.handshake_tail.lock().unwrap();
+            if result.is_ok() {
+                // The initiator only sends link frames once it has finished.
+                *tail = None;
+                None
+            } else {
+                tail.as_ref()
+                    .filter(|(theirs, _)| theirs.as_slice() == &buf[..n])
+                    .map(|(_, ours)| ours.clone())
+            }
+        };
+        if let Some(our_confirm) = tail {
+            log::debug!("Handshake confirm from {:?} repeated, resending ours", self.remote_peer);
+            self.transport.send(&our_confirm).await?;
+        }
+        result
     }
 
     pub fn remote_peer(&self) -> PeerId {
         self.remote_peer
+    }
+
+    /// Responder link that has not yet received a single link frame from the
+    /// initiator. Until it does, the initiator may
+    /// have given up on the handshake (its final confirm never arrived), so
+    /// this link must not be trusted as the way to reach the peer.
+    pub fn awaiting_peer(&self) -> bool {
+        self.handshake_tail.lock().unwrap().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_awaiting_peer(&self, awaiting: bool) {
+        *self.handshake_tail.lock().unwrap() = awaiting.then(|| (Vec::new(), Vec::new()));
     }
 
     /// Whether this side initiated the connection (outbound = true, inbound = false).
@@ -1036,12 +1277,31 @@ impl PeerLink {
         self.negotiated_version
     }
 
-    /// Check if a re-key is warranted based on traffic in either direction.
+    /// Check if a re-key is warranted based on traffic in either direction,
+    /// or one is still waiting for its reply.
     pub async fn needs_rekey(&self) -> bool {
-        self.crypto.lock().await.should_rekey()
+        self.force_rekey.load(std::sync::atomic::Ordering::Relaxed)
+            || self.pending_rekey.lock().await.is_some()
+            || self.crypto.lock().await.should_rekey()
     }
 
-    /// Begin an in-band rekey by sending our ephemeral KEM public key.
+    /// Ask for a rekey on the next sweep even if the message counts don't
+    /// call for one yet. Only meaningful on the initiator side.
+    pub fn request_rekey(&self) {
+        if self.is_initiator {
+            self.force_rekey
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Number of times this link's keys have been replaced since the handshake.
+    pub async fn key_epoch(&self) -> u64 {
+        self.crypto.lock().await.epoch
+    }
+
+    /// Begin an in-band rekey by sending our ephemeral KEM public key, or
+    /// resend the outstanding request once [`REKEY_RETRY_INTERVAL`] has passed
+    /// without a reply.
     ///
     /// Only the link *initiator* drives rekeys; the responder answers via
     /// [`handle_rekey_msg`]. This keeps roles unambiguous (no simultaneous
@@ -1051,22 +1311,28 @@ impl PeerLink {
     /// Unlike a blocking handshake, this does not read from the transport —
     /// the response arrives as an ordinary message and is fed to
     /// [`handle_rekey_msg`] by the node's receive loop. Safe to call while that
-    /// loop is running. No-op if a rekey is already in flight.
+    /// loop is running.
+    ///
+    /// Loss tolerance: neither side switches its send key before the other is
+    /// known to hold the new keys. The initiator switches on the reply (the
+    /// responder can already decrypt the new key); the responder switches on
+    /// the first frame it decrypts under the new key. A lost request or reply
+    /// only delays the rotation until the next retry.
     pub async fn rekey_initiate(&self) -> Result<()> {
         if !self.is_initiator {
             return Ok(());
         }
 
-        let send_seq = self.crypto.lock().await.send_count();
-
         let mut pending = self.pending_rekey.lock().await;
-        if let Some((_, started_at)) = pending.as_ref() {
-            // A rekey is already outstanding. Only abandon and retry once a full
-            // interval of messages has gone by with no response (message-count
-            // clock — no wall clock needed); otherwise let it complete.
-            if send_seq.wrapping_sub(*started_at) < REKEY_INTERVAL {
+        if let Some(p) = pending.as_mut() {
+            if p.sent_at.elapsed() < REKEY_RETRY_INTERVAL {
                 return Ok(());
             }
+            p.sent_at = std::time::Instant::now();
+            let request = p.request.clone();
+            self.send_message(&request).await?;
+            log::debug!("Rekey request to {:?} resent", self.remote_peer);
+            return Ok(());
         }
 
         let eph_kem = KemKeypair::generate_ephemeral(self.rekey_kem_algo);
@@ -1077,10 +1343,15 @@ impl PeerLink {
             signature: Vec::new(),
         };
         rekey_msg.signature = self.identity.sign(&rekey_msg.signable_bytes());
-        *pending = Some((eph_kem, send_seq));
+        let request = rekey_msg.to_wire().encode();
+        *pending = Some(PendingRekey {
+            eph_kem,
+            request: request.clone(),
+            sent_at: std::time::Instant::now(),
+        });
         // Send while holding the pending lock so a concurrent caller can't slip
         // a second init in between.
-        self.send_message(&rekey_msg.to_wire().encode()).await?;
+        self.send_message(&request).await?;
         log::debug!("Rekey initiated with {:?}", self.remote_peer);
         Ok(())
     }
@@ -1088,10 +1359,10 @@ impl PeerLink {
     /// Handle an inbound rekey message, dispatched from the node receive loop.
     ///
     /// A message carrying a KEM *pubkey* is a rekey request: we encapsulate to
-    /// it and reply with the ciphertext, then install the new keys. A message
-    /// carrying a *ciphertext* is the response to a rekey we initiated: we
-    /// decapsulate and install. The new recv key is installed alongside the old
-    /// one (retained briefly) so the directional switchover has no lossy gap.
+    /// it, stage the new keys and reply (keeping our current send key until
+    /// the initiator confirms). A repeated request gets the cached reply. A
+    /// message carrying a *ciphertext* is the response to a rekey we
+    /// initiated: we decapsulate and install; a duplicate is ignored.
     pub async fn handle_rekey_msg(&self, peer_rekey: &RekeyMsg) -> Result<()> {
         // Authenticate against the peer's static signing key. (The frame is
         // already link-authenticated by AEAD; this binds it to the peer's
@@ -1106,7 +1377,21 @@ impl PeerLink {
         }
 
         if !peer_rekey.kem_pubkey.is_empty() {
-            // Rekey request → encapsulate, reply, then install.
+            let tag = rekey_tag(&peer_rekey.kem_pubkey);
+            let mut cached = self.rekey_reply.lock().await;
+            if self.crypto.lock().await.completed_tag == Some(tag) {
+                // Late copy of a request whose keys are already in use.
+                return Ok(());
+            }
+            if let Some((cached_tag, reply)) = cached.as_ref() {
+                if *cached_tag == tag {
+                    // The initiator retried: our reply was lost or is slow.
+                    let reply = reply.clone();
+                    drop(cached);
+                    return self.send_message_critical(&reply).await;
+                }
+            }
+
             let peer_kem_algo = KemAlgo::from_u8(peer_rekey.kem_algo)
                 .map_err(|e| Error::Crypto(format!("unknown rekey KEM algo: {}", e)))?;
             let (kem_ss, kem_ct) =
@@ -1120,31 +1405,29 @@ impl PeerLink {
                 signature: Vec::new(),
             };
             reply.signature = self.identity.sign(&reply.signable_bytes());
+            let reply = reply.to_wire().encode();
 
-            // The reply MUST go out under the current (old) key — the peer can
-            // only decrypt it before it switches. Send first, install after.
-            // Non-droppable: we install the new send key right after, so a
-            // dropped reply would leave the peer unable to decrypt anything
-            // we send from then on.
-            self.send_message_critical(&reply.to_wire().encode()).await?;
             let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
             self.crypto
                 .lock()
                 .await
-                .install_rekey(&new_shared, self.is_initiator);
-            log::debug!("Re-keyed link with {:?} (answered request)", self.remote_peer);
+                .stage_rekey(&new_shared, self.is_initiator, tag);
+            *cached = Some((tag, reply.clone()));
+            drop(cached);
+            // Goes out under the current key, which stays our send key until
+            // the initiator's first new-key frame arrives.
+            self.send_message_critical(&reply).await?;
+            log::debug!("Answered rekey request from {:?}", self.remote_peer);
             Ok(())
         } else if !peer_rekey.kem_ciphertext.is_empty() {
             // Response to a rekey we initiated.
-            let eph_kem = match self.pending_rekey.lock().await.take() {
-                Some((eph_kem, _)) => eph_kem,
-                None => {
-                    return Err(Error::Crypto(
-                        "unexpected rekey response (no rekey in flight)".into(),
-                    ))
-                }
+            let Some(pending) = self.pending_rekey.lock().await.take() else {
+                // A duplicate reply to a retried request we already completed.
+                log::trace!("Ignoring duplicate rekey reply from {:?}", self.remote_peer);
+                return Ok(());
             };
-            let kem_ss = eph_kem
+            let kem_ss = pending
+                .eph_kem
                 .decapsulate(&peer_rekey.kem_ciphertext)
                 .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
             let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
@@ -1152,6 +1435,8 @@ impl PeerLink {
                 .lock()
                 .await
                 .install_rekey(&new_shared, self.is_initiator);
+            self.force_rekey
+                .store(false, std::sync::atomic::Ordering::Relaxed);
             log::debug!("Re-keyed link with {:?} (initiated)", self.remote_peer);
             Ok(())
         } else {
@@ -1320,6 +1605,292 @@ mod tests {
         let mut epoch0 = LinkCrypto::derive(&shared, true);
         let epoch0_frame = epoch0.encrypt(b"ancient");
         assert!(resp.decrypt(&epoch0_frame).is_err());
+    }
+
+    #[test]
+    fn staged_rekey_switches_on_first_new_key_frame() {
+        let shared = [11u8; 32];
+        let mut init = LinkCrypto::derive(&shared, true);
+        let mut resp = LinkCrypto::derive(&shared, false);
+        let new_shared = [12u8; 32];
+
+        // Responder answers and stages; it keeps sending under the old key,
+        // which the initiator can read whether or not it got the reply.
+        resp.stage_rekey(&new_shared, false, [1u8; 32]);
+        let r_old = resp.encrypt(b"still-old");
+        assert_eq!(init.decrypt(&r_old).unwrap(), b"still-old");
+        assert_eq!(resp.epoch, 0);
+
+        // Initiator gets the reply and installs. Old-key frames from the
+        // responder still decrypt via the retained previous key.
+        init.install_rekey(&new_shared, true);
+        let r_old2 = resp.encrypt(b"old-after-install");
+        assert_eq!(init.decrypt(&r_old2).unwrap(), b"old-after-install");
+
+        // First new-key frame from the initiator promotes the staged keys.
+        let i_new = init.encrypt(b"confirm");
+        assert_eq!(resp.decrypt(&i_new).unwrap(), b"confirm");
+        assert_eq!(resp.epoch, 1);
+        assert_eq!(resp.completed_tag, Some([1u8; 32]));
+        assert!(resp.pending_recv.is_none());
+        let r_new = resp.encrypt(b"new");
+        assert_eq!(init.decrypt(&r_new).unwrap(), b"new");
+    }
+
+    #[test]
+    fn restaged_rekey_replaces_unconfirmed_one() {
+        let shared = [13u8; 32];
+        let mut init = LinkCrypto::derive(&shared, true);
+        let mut resp = LinkCrypto::derive(&shared, false);
+        resp.stage_rekey(&[14u8; 32], false, [1u8; 32]);
+        resp.stage_rekey(&[15u8; 32], false, [2u8; 32]);
+        init.install_rekey(&[15u8; 32], true);
+        let f = init.encrypt(b"x");
+        assert_eq!(resp.decrypt(&f).unwrap(), b"x");
+        assert_eq!(resp.completed_tag, Some([2u8; 32]));
+    }
+
+    /// In-memory datagram transport that drops the sends whose index (per
+    /// side, counting from 0) is listed.
+    struct LossyMem {
+        tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
+        drop: Vec<usize>,
+        sent: std::sync::atomic::AtomicUsize,
+    }
+
+    fn lossy_pair(drop_a: &[usize], drop_b: &[usize]) -> (LossyMem, LossyMem) {
+        let (tx_a, rx_a) = tokio::sync::mpsc::unbounded_channel();
+        let (tx_b, rx_b) = tokio::sync::mpsc::unbounded_channel();
+        let mk = |tx, rx, drop: &[usize]| LossyMem {
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+            drop: drop.to_vec(),
+            sent: Default::default(),
+        };
+        (mk(tx_a, rx_b, drop_a), mk(tx_b, rx_a, drop_b))
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for LossyMem {
+        async fn send(&self, data: &[u8]) -> Result<()> {
+            let i = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.drop.contains(&i) {
+                let _ = self.tx.send(data.to_vec());
+            }
+            Ok(())
+        }
+        async fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+            let data = self.rx.lock().await.recv().await.ok_or(Error::NotFound)?;
+            buf[..data.len()].copy_from_slice(&data);
+            Ok(data.len())
+        }
+        fn mtu(&self) -> usize {
+            65536
+        }
+        fn is_reliable(&self) -> bool {
+            false
+        }
+        fn name(&self) -> &'static str {
+            "lossy-mem"
+        }
+    }
+
+    async fn handshake_over(a: LossyMem, b: LossyMem) -> (Arc<PeerLink>, Arc<PeerLink>) {
+        let (ia, ib) = (Keypair::generate(), Keypair::generate());
+        let (la, lb) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(
+                PeerLink::initiator(Box::new(a), &ia, None),
+                PeerLink::responder(Box::new(b), &ib)
+            )
+        })
+        .await
+        .expect("handshake hung");
+        (Arc::new(la.unwrap()), Arc::new(lb.unwrap()))
+    }
+
+    fn ping() -> Vec<u8> {
+        crate::wire::KeepaliveMsg {
+            timestamp_us: None,
+            padding: Vec::new(),
+        }
+        .to_wire()
+        .encode()
+    }
+
+    /// Next frame that decrypts, skipping bad ones as the node's receive loop
+    /// does (e.g. a late duplicate handshake message).
+    async fn recv_good(l: &PeerLink) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(m) = l.recv_message().await {
+                    return m;
+                }
+            }
+        })
+        .await
+        .expect("recv hung")
+    }
+
+    async fn assert_both_ways(a: &PeerLink, b: &PeerLink) {
+        a.send_message(&ping()).await.unwrap();
+        recv_good(b).await;
+        b.send_message(&ping()).await.unwrap();
+        recv_good(a).await;
+    }
+
+    /// Losing any single handshake message (and a few combinations) on a
+    /// lossy transport only delays the handshake.
+    #[tokio::test]
+    async fn handshake_survives_lost_messages() {
+        // Sends per side: 0 = Hello, 1 = Auth, 2 = Confirm (then retransmits).
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[0], &[]),
+            (&[1], &[]),
+            (&[2], &[]),
+            (&[], &[0]),
+            (&[], &[1]),
+            (&[0, 1, 2], &[]),
+            (&[], &[0, 1]),
+            (&[1], &[1]),
+        ];
+        for (drop_a, drop_b) in cases {
+            let (ta, tb) = lossy_pair(drop_a, drop_b);
+            let (a, b) = handshake_over(ta, tb).await;
+            assert_both_ways(&a, &b).await;
+        }
+    }
+
+    /// The responder's final confirm is lost while it is idle: the
+    /// initiator's repeated confirm reaches the established responder, which
+    /// answers it, so the initiator completes instead of leaving the
+    /// responder with a link nobody is on.
+    #[tokio::test]
+    async fn lost_final_confirm_is_answered_by_established_responder() {
+        let (ta, tb) = lossy_pair(&[], &[2]);
+        let (ia, ib) = (Keypair::generate(), Keypair::generate());
+        let responder = tokio::spawn(async move {
+            let b = Arc::new(PeerLink::responder(Box::new(tb), &ib).await.unwrap());
+            // The node's receive loop: bad frames are dropped, not fatal.
+            let reader = b.clone();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                loop {
+                    if let Ok(m) = reader.recv_message().await {
+                        let _ = tx.send(m);
+                    }
+                }
+            });
+            (b, async move { rx.recv().await })
+        });
+        let a = tokio::time::timeout(
+            Duration::from_secs(20),
+            PeerLink::initiator(Box::new(ta), &ia, None),
+        )
+        .await
+        .expect("initiator hung")
+        .unwrap();
+        let (b, b_next) = responder.await.unwrap();
+        a.send_message(&ping()).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), b_next)
+            .await
+            .unwrap()
+            .is_some());
+        b.send_message(&ping()).await.unwrap();
+        recv_good(&a).await;
+    }
+
+    /// The responder's confirm is lost but it starts sending right away: its
+    /// first link frame completes the initiator's handshake and is delivered.
+    #[tokio::test]
+    async fn link_frame_before_confirm_completes_initiator() {
+        let (ta, tb) = lossy_pair(&[], &[2]);
+        let (ia, ib) = (Keypair::generate(), Keypair::generate());
+        let responder = tokio::spawn(async move {
+            let b = PeerLink::responder(Box::new(tb), &ib).await.unwrap();
+            b.send_message(&ping()).await.unwrap();
+            b
+        });
+        let a = tokio::time::timeout(
+            Duration::from_secs(20),
+            PeerLink::initiator(Box::new(ta), &ia, None),
+        )
+        .await
+        .expect("initiator hung")
+        .unwrap();
+        let first = WireMessage::decode(&recv_good(&a).await).unwrap();
+        assert_eq!(first.msg_type, MessageType::Keepalive);
+        let b = responder.await.unwrap();
+        assert_both_ways(&a, &b).await;
+    }
+
+    /// Like TCP: `recv` takes a message, then spends a while "reading the
+    /// body". Cancelling it in between desyncs the stream for good.
+    struct SlowBody {
+        inner: LossyMem,
+        body_delay: Duration,
+        desynced: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DesyncOnDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+    impl Drop for DesyncOnDrop {
+        fn drop(&mut self) {
+            if let Some(flag) = self.0.take() {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for SlowBody {
+        async fn send(&self, d: &[u8]) -> Result<()> {
+            self.inner.send(d).await
+        }
+        async fn recv(&self, b: &mut [u8]) -> Result<usize> {
+            if self.desynced.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            let n = self.inner.recv(b).await?;
+            let mut guard = DesyncOnDrop(Some(self.desynced.clone()));
+            tokio::time::sleep(self.body_delay).await;
+            guard.0 = None;
+            Ok(n)
+        }
+        fn mtu(&self) -> usize {
+            65536
+        }
+        fn is_reliable(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "slow-body"
+        }
+    }
+
+    /// The initiator's retransmit timer must not cancel a receive in
+    /// progress: with a slow "body" longer than the retransmit timeout, the
+    /// handshake still completes and the stream stays in sync afterwards.
+    #[tokio::test]
+    async fn handshake_timer_never_cancels_a_receive() {
+        let (ta, tb) = lossy_pair(&[], &[]);
+        let desynced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let slow = |t| SlowBody {
+            inner: t,
+            body_delay: HS_RTO_RELIABLE + Duration::from_millis(300),
+            desynced: desynced.clone(),
+        };
+        let (ia, ib) = (Keypair::generate(), Keypair::generate());
+        let (a, b) = tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(
+                PeerLink::initiator(Box::new(slow(ta)), &ia, None),
+                PeerLink::responder(Box::new(slow(tb)), &ib)
+            )
+        })
+        .await
+        .expect("handshake hung");
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert!(!desynced.load(std::sync::atomic::Ordering::SeqCst));
+        assert_both_ways(&a, &b).await;
     }
 
     #[test]

@@ -24,8 +24,8 @@ use crate::circuit::{
     CELL_PAYLOAD_MAX, CELL_SIZE, EXTENDED_FLAG_REACHED,
 };
 use crate::dht::{
-    is_k_closest, probabilistic_select, random_select, BloomFilter, DhtQueryParams, DhtRecord,
-    DhtStore, DhtWatchTable, KBucketTable, RecordSource, DHT_K,
+    DhtNeighbor, DhtRecord, DhtStore, DhtWatchTable, KBucketTable, RecordSource, WalkStep,
+    MAX_WALKS,
 };
 use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::identity_store::IdentityStore;
@@ -69,7 +69,13 @@ fn jittered_interval(period: Duration) -> tokio::time::Interval {
 }
 const ROUTE_EXPIRY: Duration = Duration::from_secs(120);
 const DHT_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
-const REPLICATION_INTERVAL: Duration = Duration::from_secs(300);
+/// How often a node republishes the (non-hello) records it published itself.
+/// Owners republishing is what keeps DHT records alive.
+const OWN_RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs(1800);
+/// Minimum time between link-up-triggered republishes of our own records.
+const LINK_UP_REPUBLISH_MIN_INTERVAL: Duration = Duration::from_secs(60);
+/// How often local watches relaunch their walks.
+const WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Safety-net fallback for the retransmit task: maximum sleep when there are
 /// no unacked packets or when no notify arrives.  Replaces the old 250ms poll.
 const RETRANSMIT_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
@@ -79,32 +85,26 @@ const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const KEY_EXCHANGE_MAX_DRIFT: u64 = 60;
 /// How long seen nonces are cached for replay protection.
 const NONCE_CACHE_TTL: Duration = Duration::from_secs(120);
-/// Store sync sent to a newly linked peer: at most this many records / bytes,
-/// and at most once per peer per [`DHT_SYNC_MIN_INTERVAL`]. Without the caps a
-/// cheap reconnect loop pulls the whole store (up to 16 MB) every time. The
-/// record cap sits well under the receiver's per-link ingest budget so a sync
-/// is never shed on arrival.
-const DHT_SYNC_MAX_RECORDS: usize = 1024;
-const DHT_SYNC_MAX_BYTES: usize = 4 * 1024 * 1024;
-const DHT_SYNC_MIN_INTERVAL: Duration = Duration::from_secs(600);
 /// Hard ceiling on anonymous reverse-path state. Per-peer admission in the
 /// governor is the primary control; this cap is the final global invariant.
 const MAX_QUERY_TOKENS: usize = 65_536;
-/// How often the heartbeat / liveness scheduler wakes up. The per-link
-/// send cadence is a Poisson process clamped to [HEARTBEAT_MIN, HEARTBEAT_MAX]
-/// (currently 10s / 60s), so ticking faster than HEARTBEAT_MIN never fires
-/// anything — pure overhead. Ticking much slower than that starts
-/// quantising the Poisson draws into visible buckets, which would defeat
-/// the cover-traffic timing properties. The link-floor is the natural
-/// choice; if HEARTBEAT_MIN changes, this should follow.
-const HEARTBEAT_TICK: Duration = crate::peer_transport::HEARTBEAT_MIN;
-/// Declare a link dead if no message received within this duration. With
-/// heartbeats arriving on average every ~60s (clamped to [20s, 120s]), this
-/// gives ~3 expected beats per window — enough that 3 consecutive natural
-/// losses on a live link are very unlikely (false-positive rate ≈ p^3).
+/// How often the heartbeat / liveness scheduler wakes up. Fine enough that
+/// the Poisson heartbeat draws aren't quantised into visible buckets, and
+/// that a quiet link's liveness probes (every few seconds) go out on time.
+const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
+/// Declare a link dead if no message received within this duration. A link
+/// quiet for `peer_transport::PROBE_AFTER` is pinged every few seconds, so a
+/// live link gets ~25 ping/pong chances in the remaining window: even with
+/// half of all messages lost each way, a false positive is ≈ 0.75^25.
 /// Note: circuits have their own faster liveness loop
 /// (CIRCUIT_DEAD_TIMEOUT = 90s), so this isn't on the user-visible path.
 const KEEPALIVE_DEAD_TIMEOUT: Duration = Duration::from_secs(180);
+/// A responder link that hears nothing from the initiator this long after
+/// the handshake is dropped: the initiator gave up
+/// (its handshake times out after 30s), the link only black-holes traffic.
+const UNCONFIRMED_LINK_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often initiator links are checked for a due (or unanswered) rekey.
+const REKEY_SWEEP_TICK: Duration = Duration::from_millis(500);
 /// Maximum random padding bytes added to each heartbeat. The padding size
 /// is drawn uniformly from [0, this] so heartbeat packets don't form a
 /// fingerprintable fixed-size class on the wire.
@@ -259,6 +259,9 @@ pub struct CircuitState {
     /// When a relay sends CircuitCreate on behalf of an EXTEND, this maps the outbound
     /// circuit_id to the inbound circuit so the CircuitCreated reply can be routed back.
     pub relay_extend_pending: Arc<Mutex<HashMap<CircuitKey, (PeerId, u32, bool, Instant)>>>,
+    /// CircuitCreated replies we sent, with a hash of the CREATE they answer,
+    /// so a resent CREATE (the first reply was lost) gets the same reply.
+    pub created_replies: Arc<Mutex<HashMap<CircuitKey, ([u8; 32], Vec<u8>, Instant)>>>,
     /// Backward crypto keying material for circuit hops.
     /// Key: (circuit_id, from_peer) → (backward_key, backward_digest, nonce).
     /// Stored at CREATE time, used when converting Endpoint → Forward on EXTEND.
@@ -279,6 +282,7 @@ impl CircuitState {
             pending_extends: Arc::new(Mutex::new(HashMap::new())),
             pending_create_peers: Arc::new(Mutex::new(HashMap::new())),
             relay_extend_pending: Arc::new(Mutex::new(HashMap::new())),
+            created_replies: Arc::new(Mutex::new(HashMap::new())),
             hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
             relay_queues: Arc::new(Mutex::new(HashMap::new())),
             groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
@@ -428,10 +432,14 @@ pub struct Node {
     channel_event_rx: Mutex<Option<mpsc::Receiver<ChannelEvent>>>,
     /// Seen nonces for replay protection (nonce, when_seen)
     seen_nonces: Arc<Mutex<VecDeque<([u8; 32], Instant)>>>,
+    /// Responses we sent to tunnel key exchanges, by initiator nonce, so an
+    /// initiator retrying a lost exchange gets the same answer (and keys).
+    /// Expires with `seen_nonces`.
+    kex_responses: Arc<Mutex<HashMap<[u8; 32], (PeerId, Vec<u8>, Instant)>>>,
     /// Remote subscriptions: who wants notifications from us when a watched key changes.
     dht_watches: Arc<Mutex<DhtWatchTable>>,
     /// Keys we are watching locally.
-    local_watches: Arc<Mutex<HashMap<[u8; 64], HashMap<PeerId, [u8; 32]>>>>,
+    local_watches: Arc<Mutex<HashMap<[u8; 64], dht::LocalWatch>>>,
     /// Channel for delivering watch notifications to the application.
     dht_watch_tx: mpsc::Sender<(DhtId, DhtRecord)>,
     dht_watch_rx: Mutex<Option<mpsc::Receiver<(DhtId, DhtRecord)>>>,
@@ -446,9 +454,13 @@ pub struct Node {
     /// `Drop` can deregister synchronously (RAII cancel).
     dht_searches:
         Arc<std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<crate::dht::VerifiedRecord>>>>,
-    /// When each peer last received a link-up store sync, for
-    /// [`DHT_SYNC_MIN_INTERVAL`] rate limiting.
-    dht_sync_sent: Mutex<HashMap<PeerId, Instant>>,
+    /// Launches PUT/GET/WATCH walks; shares the link, routing and token tables.
+    dht_walker: dht::DhtWalker,
+    /// Whether this node stores DHT records for others. Relay-only nodes
+    /// (`false`) forward walks but never store, verify or cache them.
+    dht_stores: bool,
+    /// When our own records were last republished because a link came up.
+    dht_link_up_republish: Mutex<Option<Instant>>,
     /// Monotonically increasing sequence number for signed content records.
     signed_content_sequence: Arc<Mutex<u64>>,
     circuits: CircuitState,
@@ -681,12 +693,22 @@ impl Node {
         let (circuit_drop_tx, circuit_drop_rx) = mpsc::unbounded_channel();
         let mut dht_store = DhtStore::with_limits(&peer_id, storage_limits);
         dht_store.import_records(dht_records);
+        let links = Arc::new(Mutex::new(LinkTable::new()));
+        let routing_table = Arc::new(Mutex::new(RoutingTable::new(peer_id)));
+        let query_tokens = Arc::new(Mutex::new(HashMap::new()));
+        let dht_walker = dht::DhtWalker {
+            local: peer_id,
+            links: links.clone(),
+            routing_table: routing_table.clone(),
+            neighbor_stores: Arc::new(Mutex::new(HashMap::new())),
+            query_tokens: query_tokens.clone(),
+        };
         Self {
             identity: Arc::new(identity),
             max_inbound: 128,
             max_outbound: 48,
-            links: Arc::new(Mutex::new(LinkTable::new())),
-            routing_table: Arc::new(Mutex::new(RoutingTable::new(peer_id))),
+            links,
+            routing_table,
             dht_store: Arc::new(Mutex::new(dht_store)),
             tunnel_table: Arc::new(Mutex::new(TunnelTable::new())),
             channel_state: ChannelState::new(),
@@ -705,14 +727,17 @@ impl Node {
             channel_event_tx,
             channel_event_rx: Mutex::new(Some(channel_event_rx)),
             seen_nonces: Arc::new(Mutex::new(VecDeque::new())),
+            kex_responses: Arc::new(Mutex::new(HashMap::new())),
             dht_watches: Arc::new(Mutex::new(DhtWatchTable::new())),
             local_watches: Arc::new(Mutex::new(HashMap::new())),
             dht_watch_tx,
             dht_watch_rx: Mutex::new(Some(dht_watch_rx)),
             kbucket: Arc::new(Mutex::new(KBucketTable::new(&peer_id))),
-            query_tokens: Arc::new(Mutex::new(HashMap::new())),
+            query_tokens,
             dht_searches: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            dht_sync_sent: Mutex::new(HashMap::new()),
+            dht_walker,
+            dht_stores: true,
+            dht_link_up_republish: Mutex::new(None),
             signed_content_sequence: Arc::new(Mutex::new(sc_seq)),
             circuits: CircuitState::new(),
             circuit_drop_tx,
@@ -1271,12 +1296,22 @@ impl Node {
             loop {
                 interval.tick().await;
 
-                let (dead, due) = {
+                let (dead, unconfirmed, due) = {
                     let mut links = hb_links.lock().await;
                     let dead = links.dead_links(KEEPALIVE_DEAD_TIMEOUT);
+                    let unconfirmed = links.unconfirmed_links(UNCONFIRMED_LINK_TIMEOUT);
                     let due = links.heartbeat_due();
-                    (dead, due)
+                    (dead, unconfirmed, due)
                 };
+
+                for (peer, link_id) in unconfirmed {
+                    log::info!(
+                        "Link to {:?} (link_id={}) never confirmed by the peer, dropping",
+                        peer,
+                        link_id
+                    );
+                    let _ = hb_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
+                }
 
                 for (peer, link_id) in dead {
                     log::info!(
@@ -1286,30 +1321,6 @@ impl Node {
                         KEEPALIVE_DEAD_TIMEOUT.as_secs()
                     );
                     let _ = hb_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
-                }
-
-                // Rekey sweep: rotate session keys on any link that has carried
-                // REKEY_INTERVAL messages in either direction, giving long-lived
-                // links forward secrecy against key compromise. Only the link
-                // initiator drives this; the responder answers in-band.
-                let rekey_links: Vec<Arc<PeerLink>> = {
-                    let links = hb_links.lock().await;
-                    links
-                        .all_links()
-                        .into_iter()
-                        .filter(|l| l.is_initiator())
-                        .collect()
-                };
-                for link in rekey_links {
-                    if link.needs_rekey().await {
-                        if let Err(e) = link.rekey_initiate().await {
-                            log::debug!(
-                                "Rekey initiate to {:?} failed: {}",
-                                link.remote_peer(),
-                                e
-                            );
-                        }
-                    }
                 }
 
                 if due.is_empty() {
@@ -1343,6 +1354,39 @@ impl Node {
                     };
                     let encoded = ka_msg.to_wire().encode();
                     let _ = link.send_deferred(&encoded).await;
+                }
+            }
+        });
+
+        // Rekey sweep: rotate session keys on any link that has carried
+        // REKEY_INTERVAL messages in either direction, giving long-lived links
+        // forward secrecy against key compromise. Only the link initiator
+        // drives this; the responder answers in-band. Runs on its own short
+        // tick because it also resends requests whose reply was lost.
+        let rk_links = self.links.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(REKEY_SWEEP_TICK);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let rekey_links: Vec<Arc<PeerLink>> = {
+                    let links = rk_links.lock().await;
+                    links
+                        .all_links()
+                        .into_iter()
+                        .filter(|l| l.is_initiator())
+                        .collect()
+                };
+                for link in rekey_links {
+                    if link.needs_rekey().await {
+                        if let Err(e) = link.rekey_initiate().await {
+                            log::debug!(
+                                "Rekey initiate to {:?} failed: {}",
+                                link.remote_peer(),
+                                e
+                            );
+                        }
+                    }
                 }
             }
         });
@@ -1486,6 +1530,7 @@ impl Node {
         let tokens_ref = self.query_tokens.clone();
         let db_ref = self.db.clone();
         let nonces_ref = self.seen_nonces.clone();
+        let kex_resp_ref = self.kex_responses.clone();
         let relay_ext_ref = self.circuits.relay_extend_pending.clone();
         let pke_ref = self.pending_key_exchanges.clone();
         let rend_ref = self.hidden.rendezvous.clone();
@@ -1516,6 +1561,10 @@ impl Node {
                     }
                 }
                 drop(nonces);
+                kex_resp_ref
+                    .lock()
+                    .await
+                    .retain(|_, (_, _, at)| now.duration_since(*at) < NONCE_CACHE_TTL);
                 // Expire stale relay extend pending entries (10s — well beyond
                 // the 1.5s circuit extend timeout at the initiator).
                 relay_ext_ref.lock().await.retain(|_, (_, _, _, created)| {
@@ -1560,7 +1609,7 @@ impl Node {
                     let channels = retransmit_channels.lock().await;
                     channels
                         .values()
-                        .filter_map(|(_, ch)| ch.next_retransmit_at())
+                        .filter_map(|(_, ch)| ch.next_wakeup())
                         .min()
                 };
 
@@ -1584,15 +1633,26 @@ impl Node {
 
                 // Collect retransmit work and dead channels under the channels lock,
                 // then release it before doing I/O.
-                let (retransmits, dead_channels) = {
+                let (retransmits, dead_channels, reopens) = {
                     let mut channels = retransmit_channels.lock().await;
                     let mut retransmits: Vec<(u32, PeerId, Vec<(u32, Vec<u8>)>)> = Vec::new();
                     let mut dead: Vec<(u32, PeerId)> = Vec::new();
+                    let mut reopens: Vec<(PeerId, Vec<u8>)> = Vec::new();
+                    let now = Instant::now();
 
                     for (&channel_id, (remote_peer, ch)) in channels.iter_mut() {
                         if ch.is_dead() {
                             dead.push((channel_id, *remote_peer));
                             continue;
+                        }
+                        if ch.open_resend_due(now) {
+                            let open = ChannelOpenMsg {
+                                channel_id,
+                                port: ch.port,
+                                reliable: ch.reliable,
+                                ordered: ch.ordered,
+                            };
+                            reopens.push((*remote_peer, open.to_wire().encode()));
                         }
                         let due = ch.retransmit_due();
                         if !due.is_empty() {
@@ -1604,8 +1664,35 @@ impl Node {
                         channels.remove(&channel_id);
                     }
 
-                    (retransmits, dead)
+                    (retransmits, dead, reopens)
                 };
+
+                // Resend unconfirmed ChannelOpens ahead of the data behind them.
+                for (remote, inner) in reopens {
+                    let encrypted = {
+                        let mut tt = retransmit_tunnel_table.lock().await;
+                        match tt.get_mut(&remote).map(|t| t.encrypt(&inner)) {
+                            Some(Ok(data)) => data,
+                            _ => continue,
+                        }
+                    };
+                    let msg = EncryptedDataMsg {
+                        origin: retransmit_identity.peer_id(),
+                        destination: remote,
+                        ttl: 64,
+                        data: encrypted,
+                    };
+                    let encoded = msg.to_wire_encrypted().encode();
+                    let links = retransmit_links.lock().await;
+                    let hop = if links.get(&remote).is_some() {
+                        Some(remote)
+                    } else {
+                        retransmit_routing.lock().await.lookup(&remote).map(|r| r.next_hop)
+                    };
+                    if let Some(link) = hop.and_then(|h| links.get(&h)) {
+                        let _ = link.send_message(&encoded).await;
+                    }
+                }
 
                 // Notify app of dead channels
                 for (channel_id, remote_peer) in &dead_channels {
@@ -1687,127 +1774,33 @@ impl Node {
         });
 
         // Periodic hello record publishing
-        let hello_identity = self.identity.clone();
-        let hello_global_addrs = self.global_addrs.clone();
-        let hello_introducers = self.introducers.clone();
-        let hello_dht = self.dht_store.clone();
-        let hello_links = self.links.clone();
-        let hello_seq = self.hello_sequence.clone();
-        let hello_kbucket = self.kbucket.clone();
-        let hello_webrtc_enabled = self.webrtc_connector.is_some();
-        let hello_signaling_secret = self.signaling_secret;
+        let hello_node = node_arc.clone();
         tokio::spawn(async move {
             // Wait a bit for initial links to establish
             tokio::time::sleep(Duration::from_secs(2)).await;
             let mut interval = jittered_interval(HELLO_PUBLISH_INTERVAL);
             loop {
                 interval.tick().await;
-                let peer_id = hello_identity.peer_id();
-                let global_addrs = hello_global_addrs.lock().await.clone();
-                let introducers = hello_introducers.lock().await.clone();
-                let mut transports = collect_transport_types(&global_addrs);
-                if hello_webrtc_enabled && !transports.iter().any(|t| *t == TransportType::WebRtc) {
-                    transports.push(TransportType::WebRtc);
-                }
-                let hello = HelloRecord {
-                    peer_id,
-                    capabilities: capabilities::RELAY | capabilities::TUNNEL,
-                    signaling_secret: hello_signaling_secret,
-                    transports,
-                    introducers,
-                    global_addresses: global_addrs,
-                };
-
-                let sequence = {
-                    let mut seq = hello_seq.lock().await;
-                    *seq += 1;
-                    *seq
-                };
-                let record = crate::dht::VerifiedRecord::new_hello(
-                    &hello_identity,
-                    &hello.to_bytes(),
-                    sequence,
-                    Duration::from_secs(HELLO_TTL as u64),
-                );
-
-                // L2NSE-driven peer selection for hello propagation
-                let kb = hello_kbucket.lock().await;
-                let all_peers = kb.all_peers();
-                let l2nse = kb.estimate_l2nse();
-                drop(kb);
-                let params = DhtQueryParams::from_l2nse(l2nse);
-
-                let key = crate::dht::identity_address_key(&peer_id);
-                let put = record.record().to_put_msg(&peer_id, params.hop_limit);
-                let _ = hello_dht.lock().await.put(record);
-                let targets = probabilistic_select(&key, &all_peers, params.fan_out);
-
-                let encoded = put.to_wire().encode();
-                let links = hello_links.lock().await;
-                if targets.is_empty() {
-                    // Fallback: send to all neighbors
-                    for (_, link) in links.iter() {
-                        let _ = link.send_deferred(&encoded).await;
-                    }
-                } else {
-                    for (pid, _) in &targets {
-                        if let Some(link) = links.get(pid) {
-                            let _ = link.send_deferred(&encoded).await;
-                        }
-                    }
-                    // Also send to direct neighbors not in selected set
-                    for (pid, link) in links.iter() {
-                        if !targets.iter().any(|(p, _)| p == pid) {
-                            let _ = link.send_deferred(&encoded).await;
-                        }
-                    }
-                }
-                log::debug!("Refreshed hello record");
+                hello_node.publish_hello().await;
             }
         });
 
-        // Periodic replication maintenance
-        let repl_dht = self.dht_store.clone();
-        let repl_kbucket = self.kbucket.clone();
-        let repl_links = self.links.clone();
-        let repl_identity = self.identity.clone();
+        // Owners keep their records alive: republish our own records, and keep
+        // local watches' walks fresh as the topology changes.
+        let republish_node = node_arc.clone();
         tokio::spawn(async move {
-            let mut interval = jittered_interval(REPLICATION_INTERVAL);
+            let mut interval = jittered_interval(OWN_RECORD_REPUBLISH_INTERVAL);
             loop {
                 interval.tick().await;
-                let store = repl_dht.lock().await;
-                let records: Vec<DhtRecord> = store.all_records().into_iter().cloned().collect();
-                let local_id = *store.local_id();
-                drop(store);
-
-                let kb = repl_kbucket.lock().await;
-                let l2nse = kb.estimate_l2nse();
-                let repl_params = DhtQueryParams::from_l2nse(l2nse);
-                for record in &records {
-                    // Check if we're among the k-closest
-                    let closest = kb.closest_peers(&record.key, DHT_K);
-                    let our_dist = local_id.xor_distance(&record.key);
-                    let is_responsible = closest.len() < DHT_K
-                        || closest
-                            .iter()
-                            .any(|(_, did)| record.key.xor_distance(did) >= our_dist);
-
-                    if !is_responsible {
-                        continue;
-                    }
-
-                    let put = record.to_put_msg(&repl_identity.peer_id(), repl_params.hop_limit);
-                    let encoded = put.to_wire().encode();
-
-                    let links = repl_links.lock().await;
-                    for (pid, _) in &closest {
-                        if let Some(link) = links.get(pid) {
-                            let _ = link.send_deferred(&encoded).await;
-                        }
-                    }
-                }
-                drop(kb);
-                log::debug!("Replication maintenance complete");
+                republish_node.dht_republish_own().await;
+            }
+        });
+        let watch_node = node_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = jittered_interval(WATCH_REFRESH_INTERVAL);
+            loop {
+                interval.tick().await;
+                watch_node.dht_refresh_watches().await;
             }
         });
 
@@ -1829,6 +1822,7 @@ impl Node {
             match event {
                 NodeEvent::LinkUp(peer_id, link) => {
                     self.handle_link_up(peer_id, link).await;
+                    self.schedule_link_up_republish(&node_arc).await;
                 }
                 NodeEvent::LinkDown(peer_id, link_id) => {
                     self.handle_link_down(peer_id, link_id).await;
@@ -2109,111 +2103,47 @@ impl Node {
         // Triggered update: tell all OTHER neighbors about the new peer
         self.send_triggered_updates(&peer_id).await;
 
-        // Send our hello record to the new peer
-        {
-            let hello = self.create_hello_record().await;
-            let key = crate::dht::identity_address_key(&self.peer_id());
-            let value = crate::dht::signed_record_encrypt(&key, &hello.to_bytes());
-            let mut seq = self.hello_sequence.lock().await;
-            *seq += 1;
-            let sequence = *seq;
-            self.db_set_metadata("hello_sequence", sequence);
-            drop(seq);
-            let signer = *self.peer_id().as_bytes();
-            let mut put = DhtPutMsg {
-                key: *key.as_bytes(),
-                record_type: RecordType::Hello,
-                sequence,
-                signer,
-                ttl: HELLO_TTL,
-                value,
-                signature: Vec::new(),
-                signer_algo: self.identity.identity.signing.algo() as u8,
-                signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
-                hop_count: 0,
-                hop_limit: DhtPutMsg::DEFAULT_HOP_LIMIT,
-                bloom: [0u8; 256],
-            };
-            put.signature = self.identity.sign(&put.signable_bytes());
+        // Relay-only nodes say so, so a relay-only neighbour can steer DELIVER
+        // detours to a storing node. Storing is the assumed default, so a
+        // storing node sends nothing.
+        if !self.dht_stores {
+            let msg = crate::wire::DhtNeighborMsg { flags: 0 };
             if let Some(link) = self.links.lock().await.get(&peer_id) {
-                let _ = link.send_deferred(&put.to_wire().encode()).await;
+                let _ = link.send_deferred(&msg.to_wire().encode()).await;
             }
         }
+    }
 
-        // Sync a bounded slice of our store to the new peer: our own records
-        // first (we are their authority), then a random sample of the rest.
-        // Rate-limited per peer so reconnecting does not re-pull the store.
-        let sync_due = {
-            let mut sent = self.dht_sync_sent.lock().await;
+    /// A new link can move where walks for our keys end (and on startup it is
+    /// the first chance to place anything): republish our hello and our own
+    /// records and relaunch our watches — at most once per
+    /// [`LINK_UP_REPUBLISH_MIN_INTERVAL`], after a short delay so it stays off
+    /// the new link's handshake path and the routing table has started to fill.
+    async fn schedule_link_up_republish(&self, node: &Arc<Node>) {
+        let due = {
+            let mut last = self.dht_link_up_republish.lock().await;
             let now = Instant::now();
-            sent.retain(|_, at| now.duration_since(*at) < DHT_SYNC_MIN_INTERVAL);
-            if sent.contains_key(&peer_id) {
-                false
-            } else {
-                sent.insert(peer_id, now);
+            if last.map_or(true, |t| now.duration_since(t) >= LINK_UP_REPUBLISH_MIN_INTERVAL) {
+                *last = Some(now);
                 true
+            } else {
+                false
             }
         };
-        if sync_due {
-            let puts: Vec<Vec<u8>> = {
-                use rand::seq::SliceRandom;
-                let store = self.dht_store.lock().await;
-                let (ours, mut others) = store.records_by_origin();
-                others.shuffle(&mut rand::thread_rng());
-                let mut puts = Vec::new();
-                let mut bytes = 0usize;
-                for record in ours.into_iter().chain(others) {
-                    if puts.len() >= DHT_SYNC_MAX_RECORDS {
-                        break;
-                    }
-                    let put = record.to_put_msg(&self.peer_id(), DhtPutMsg::DEFAULT_HOP_LIMIT);
-                    let encoded = put.to_wire().encode();
-                    if bytes + encoded.len() > DHT_SYNC_MAX_BYTES {
-                        continue;
-                    }
-                    bytes += encoded.len();
-                    puts.push(encoded);
-                }
-                puts
-            };
-            let link = self.links.lock().await.get(&peer_id).cloned();
-            if let Some(link) = link {
-                for encoded in puts {
-                    let _ = link.send_deferred(&encoded).await;
-                }
-            }
+        if !due {
+            return;
         }
-
-        // Re-send DhtWatch for all local watches to the new peer
-        {
-            let keys: Vec<[u8; 64]> = self.local_watches.lock().await.keys().copied().collect();
-            if !keys.is_empty() {
-                let link = self.links.lock().await.get(&peer_id).cloned();
-                if let Some(link) = link {
-                    for key in keys {
-                        // Generate fresh token per watch per link
-                        let mut token = [0u8; 32];
-                        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut token);
-                        self.local_watches
-                            .lock()
-                            .await
-                            .entry(key)
-                            .or_default()
-                            .insert(peer_id, token);
-                        self.query_tokens
-                            .lock()
-                            .await
-                            .insert(token, (self.peer_id(), Instant::now()));
-                        let watch = DhtWatchMsg {
-                            key,
-                            query_token: token,
-                            expiration_secs: 300,
-                        };
-                        let _ = link.send_deferred(&watch.to_wire().encode()).await;
-                    }
-                }
-            }
-        }
+        let node = node.clone();
+        let delay = {
+            use rand::Rng;
+            Duration::from_millis(rand::thread_rng().gen_range(1000..3000))
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            node.publish_hello().await;
+            node.dht_republish_own().await;
+            node.dht_refresh_watches().await;
+        });
     }
 
     /// Forcibly disconnect a peer by removing all links.
@@ -2239,6 +2169,7 @@ impl Node {
             if peer_gone {
                 self.routing_table.lock().await.remove_next_hop(peer_id);
                 self.dht_watches.lock().await.remove_peer(peer_id);
+                self.dht_walker.neighbor_stores.lock().await.remove(peer_id);
                 self.cleanup_peer_circuits(*peer_id).await;
                 let _ = self
                     .channel_event_tx
@@ -2264,6 +2195,7 @@ impl Node {
             self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
+            self.dht_walker.neighbor_stores.lock().await.remove(&peer_id);
             self.cleanup_peer_circuits(peer_id).await;
             let _ = self
                 .channel_event_tx
@@ -2280,6 +2212,7 @@ impl Node {
             self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_table.lock().await.remove_next_hop(&peer_id);
             self.dht_watches.lock().await.remove_peer(&peer_id);
+            self.dht_walker.neighbor_stores.lock().await.remove(&peer_id);
             self.cleanup_peer_circuits(peer_id).await;
             // Notify application that this peer is gone
             let _ = self
@@ -2591,115 +2524,84 @@ impl Node {
                 // per-type ceiling, whatever the sender claimed.
                 put.ttl = crate::dht::clamp_ttl_secs(put.record_type, put.ttl);
 
-                // Clamp the attacker-controlled ingress hop_limit (raw u8 off the
-                // wire, up to 255) to this node's L2NSE-derived budget *before*
-                // decrementing, so a forged-large value cannot extend flood depth
-                // beyond what our network-size estimate justifies.
-                let params = self.dht_query_params().await;
-                if put.hop_limit > params.hop_limit {
-                    put.hop_limit = params.hop_limit;
-                }
-
-                // Hop limit enforcement
-                if put.hop_limit == 0 {
-                    log::debug!("DHT PUT hop limit reached, not forwarding");
-                    // Still process locally
-                } else {
-                    put.hop_limit -= 1;
-                }
-
-                // Pass the record through the trust gate before storing or
-                // propagating. The resulting VerifiedRecord is the only thing the
-                // store will accept, so an unverified PUT cannot be persisted.
-                let record = match crate::dht::VerifiedRecord::from_put_msg(&put) {
-                    Ok(verified) => verified,
-                    Err(reason) => {
-                        log::warn!("DHT PUT from {:?}: {}, dropping", from, reason);
-                        return Ok(());
-                    }
-                };
-
-                // Check if we already have this exact record (avoid re-flooding)
-                let is_new = {
-                    let store = self.dht_store.lock().await;
-                    let existing = store.get(&key);
-                    !existing.iter().any(|r| {
-                        r.signer == put.signer
-                            && r.sequence == put.sequence
-                            && r.record_type == put.record_type
-                    })
-                };
-
-                // Keep a copy for the local-watch notification below; the
-                // VerifiedRecord itself is moved into the store.
-                let live = record.record().clone();
-                let accepted = self
-                    .dht_store
-                    .lock()
-                    .await
-                    .put_from(record.clone(), RecordSource::Peer(from));
-                if accepted {
-                    self.db_upsert_dht_record(record.record());
-                }
-                log::debug!("DHT PUT from {:?} (type={:?})", from, put.record_type);
-
-                // Forward to targeted peers only if the record was both unseen
-                // (is_new) AND actually stored (accepted). Gating on is_new alone
-                // re-floods records the store rejected: a stale lower-sequence
-                // record from a known signer has no exact (signer, sequence, type)
-                // tuple match (is_new=true) yet is refused by upsert_by_signer
-                // (accepted=false). Since PUT's only flood brake is store-on-
-                // first-sight, a never-stored record never trips it and re-floods
-                // the whole network on every replay. Requiring `accepted` closes
-                // that; we still need `is_new` so an equal-sequence refresh (which
-                // upsert_by_signer accepts with allow_equal=true) doesn't re-flood.
-                if is_new && accepted && put.hop_limit > 0 {
-                    let old_bloom = put.bloom;
-                    let mut fwd_bloom = BloomFilter::new();
-                    fwd_bloom.insert(&self.peer_id());
-                    put.bloom = fwd_bloom.to_bytes();
-                    put.hop_count = put.hop_count.saturating_add(1);
-
-                    let encoded = put.to_wire().encode();
-                    self.dht_forward(&key, old_bloom, put.hop_count, &encoded, from)
-                        .await;
-
-                    // Notify remote watchers via query token routing
-                    let watchers = self.dht_watches.lock().await.get_watchers(&put.key);
-                    if !watchers.is_empty() {
-                        let links = self.links.lock().await;
-                        for (token, via_peer) in watchers {
-                            if via_peer != from {
-                                let notify = DhtWatchNotifyMsg {
-                                    query_token: token,
-                                    put: put.clone(),
-                                };
-                                let notify_encoded = notify.to_wire().encode();
-                                if let Some(link) = links.get(&via_peer) {
-                                    let _ = link.send_deferred(&notify_encoded).await;
+                match self.dht_walk_step(&key, &put.walk, &from).await {
+                    WalkStep::Forward(next, walk) => {
+                        // Nodes on the way neither verify nor store: only the
+                        // end of the walk does. Watchers registered here still
+                        // hear about it (they verify on arrival).
+                        put.walk = walk;
+                        if let Err(e) = self
+                            .send_to_peer_deferred(&next, &put.to_wire().encode())
+                            .await
+                        {
+                            log::debug!("DHT PUT forward to {:?} failed: {}", next, e);
+                        }
+                        self.notify_dht_watchers(&put, Some(&from)).await;
+                        // We watch this key ourselves: verify, keep in memory
+                        // (deduplicated against notifications) and tell the app.
+                        if self.local_watches.lock().await.contains_key(&put.key) {
+                            if let Ok(verified) = crate::dht::VerifiedRecord::from_put_msg(&put) {
+                                let live = verified.record().clone();
+                                let is_new = !self.dht_store.lock().await.get(&key).iter().any(|r| {
+                                    r.signer == live.signer
+                                        && r.sequence == live.sequence
+                                        && r.record_type == live.record_type
+                                });
+                                if is_new {
+                                    self.dht_store
+                                        .lock()
+                                        .await
+                                        .put_from(verified, RecordSource::Peer(from));
+                                    let _ = self.dht_watch_tx.send((key, live)).await;
                                 }
                             }
                         }
                     }
-
-                    // Notify local app if we're watching this key
-                    if self.local_watches.lock().await.contains_key(&put.key) {
-                        let _ = self.dht_watch_tx.send((key, live)).await;
+                    WalkStep::End => {
+                        // Pass the record through the trust gate before
+                        // storing. The resulting VerifiedRecord is the only
+                        // thing the store will accept.
+                        let record = match crate::dht::VerifiedRecord::from_put_msg(&put) {
+                            Ok(verified) => verified,
+                            Err(reason) => {
+                                log::warn!("DHT PUT from {:?}: {}, dropping", from, reason);
+                                return Ok(());
+                            }
+                        };
+                        let is_new = {
+                            let store = self.dht_store.lock().await;
+                            !store.get(&key).iter().any(|r| {
+                                r.signer == put.signer
+                                    && r.sequence == put.sequence
+                                    && r.record_type == put.record_type
+                            })
+                        };
+                        let live = record.record().clone();
+                        let accepted = self
+                            .dht_store
+                            .lock()
+                            .await
+                            .put_from(record.clone(), RecordSource::Peer(from));
+                        if accepted {
+                            self.db_upsert_dht_record(record.record());
+                        }
+                        log::debug!("DHT PUT stored from {:?} (type={:?})", from, put.record_type);
+                        // Several walks of one PUT can end here: notify once.
+                        if is_new && accepted {
+                            self.notify_dht_watchers(&put, Some(&from)).await;
+                            if self.local_watches.lock().await.contains_key(&put.key) {
+                                let _ = self.dht_watch_tx.send((key, live)).await;
+                            }
+                        }
+                    }
+                    WalkStep::Drop => {
+                        log::debug!("DHT PUT walk from {:?} has nowhere to go", from);
                     }
                 }
             }
             MessageType::DhtGet => {
                 let mut get = DhtGetMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(get.key);
-
-                // Clamp the attacker-controlled ingress hop_limit to our L2NSE
-                // budget, mirroring DhtPut. GET already converges via query_token
-                // dedup, but a clamp keeps a forged-large value from extending the
-                // forward depth past what the network size justifies.
-                let get_params = self.dht_query_params().await;
-                if get.hop_limit > get_params.hop_limit {
-                    get.hop_limit = get_params.hop_limit;
-                }
 
                 // Reverse-path forwarding with first-writer-wins dedup. The
                 // first neighbor to deliver a given query_token becomes this
@@ -2712,7 +2614,7 @@ impl Node {
                 // *after* it has received, it can never be its own forwarder's
                 // parent, so the parent graph is an acyclic tree rooted at the
                 // originator — replies walk it back without a loop bound.
-                let mut tokens = self.query_tokens.lock().await;
+                let tokens = self.query_tokens.lock().await;
                 if tokens.contains_key(&get.query_token) {
                     return Ok(());
                 }
@@ -2789,19 +2691,18 @@ impl Node {
                     }
                 }
 
-                // Forward the GET onward (exactly once — duplicate arrivals
-                // already returned above) if the hop budget allows.
-                if get.hop_limit > 0 {
-                    get.hop_limit -= 1;
-                    let old_bloom = get.bloom;
-                    let mut fwd_bloom = BloomFilter::new();
-                    fwd_bloom.insert(&self.peer_id());
-                    get.bloom = fwd_bloom.to_bytes();
-                    get.hop_count = get.hop_count.saturating_add(1);
-
-                    let encoded = get.to_wire().encode();
-                    self.dht_forward(&key, old_bloom, get.hop_count, &encoded, from)
-                        .await;
+                // Continue the walk (exactly once — duplicate arrivals of this
+                // token already returned above).
+                if let WalkStep::Forward(next, walk) =
+                    self.dht_walk_step(&key, &get.walk, &from).await
+                {
+                    get.walk = walk;
+                    if let Err(e) = self
+                        .send_to_peer_deferred(&next, &get.to_wire().encode())
+                        .await
+                    {
+                        log::debug!("DHT GET forward to {:?} failed: {}", next, e);
+                    }
                 }
             }
             MessageType::DhtGetResponse => {
@@ -2952,9 +2853,31 @@ impl Node {
                 // but the link scoring already gets RTT from the pong round-trip.
             }
             MessageType::DhtWatch => {
-                let watch = DhtWatchMsg::from_bytes(&msg.payload)?;
+                let mut watch = DhtWatchMsg::from_bytes(&msg.payload)?;
+                let key = DhtId(watch.key);
                 let mut watches = self.dht_watches.lock().await;
-                watches.set_watch(watch.key, watch.query_token, from, watch.expiration_secs);
+                if watch.expiration_secs == 0 {
+                    watches.set_watch(watch.key, watch.query_token, from, 0);
+                    return Ok(());
+                }
+                // A walk revisiting us must not re-point the return path (it
+                // would loop back through the later hops).
+                if watches.has_token(&watch.key, &watch.query_token) {
+                    return Ok(());
+                }
+                if !watches.set_watch(watch.key, watch.query_token, from, watch.expiration_secs) {
+                    log::debug!("DHT watch from {:?} refused (cap)", from);
+                    return Ok(());
+                }
+                drop(watches);
+                if let WalkStep::Forward(next, walk) =
+                    self.dht_walk_step(&key, &watch.walk, &from).await
+                {
+                    watch.walk = walk;
+                    let _ = self
+                        .send_to_peer_deferred(&next, &watch.to_wire().encode())
+                        .await;
+                }
             }
             MessageType::DhtWatchNotify => {
                 if !self
@@ -2970,24 +2893,32 @@ impl Node {
                 notify.put.ttl = crate::dht::clamp_ttl_secs(notify.put.record_type, notify.put.ttl);
                 let key = DhtId(notify.put.key);
 
-                // Run through the shared trust gate (pubkey present + bound to
-                // signer + valid signature) — same invariants as DhtPut /
-                // DhtGetResponse, enforced by the type the store accepts.
-                let record = match crate::dht::VerifiedRecord::from_put_msg(&notify.put) {
-                    Ok(verified) => verified,
-                    Err(reason) => {
-                        log::warn!("DhtWatchNotify from {:?}: {}, dropping", from, reason);
-                        return Ok(());
-                    }
-                };
-
-                // Check if we're the destination (we originated this watch)
-                if self
+                let ours = self
                     .local_watches
                     .lock()
                     .await
-                    .contains_key(&notify.put.key)
-                {
+                    .get(&notify.put.key)
+                    .is_some_and(|w| w.tokens.contains(&notify.query_token));
+                if ours {
+                    // Run through the shared trust gate (pubkey present + bound
+                    // to signer + valid signature) — same invariants as DhtPut /
+                    // DhtGetResponse, enforced by the type the store accepts.
+                    let record = match crate::dht::VerifiedRecord::from_put_msg(&notify.put) {
+                        Ok(verified) => verified,
+                        Err(reason) => {
+                            log::warn!("DhtWatchNotify from {:?}: {}, dropping", from, reason);
+                            return Ok(());
+                        }
+                    };
+                    // Several watch walks can report the same record: deliver once.
+                    let is_new = !self.dht_store.lock().await.get(&key).iter().any(|r| {
+                        r.signer == notify.put.signer
+                            && r.sequence == notify.put.sequence
+                            && r.record_type == notify.put.record_type
+                    });
+                    if !is_new {
+                        return Ok(());
+                    }
                     // Keep it in memory for readers; like GET results, a
                     // watched record is fetched, not ours to persist.
                     let live = record.record().clone();
@@ -2997,20 +2928,30 @@ impl Node {
                         .put_from(record, RecordSource::Peer(from));
                     let _ = self.dht_watch_tx.send((key, live)).await;
                 } else {
-                    // Route notification back via query_token hop-by-hop
+                    // Relay back along the watch walk without verifying; the
+                    // watcher verifies.
                     let prev_hop = self
-                        .query_tokens
+                        .dht_watches
                         .lock()
                         .await
-                        .get(&notify.query_token)
-                        .map(|(peer, _)| *peer);
+                        .via_for_token(&notify.put.key, &notify.query_token);
                     if let Some(prev) = prev_hop {
-                        self.send_to_peer_deferred(&prev, &notify.to_wire().encode())
-                            .await?;
+                        if prev != from {
+                            self.send_to_peer_deferred(&prev, &notify.to_wire().encode())
+                                .await?;
+                        }
                     } else {
                         log::debug!("DhtWatchNotify with unknown query_token, dropping");
                     }
                 }
+            }
+            MessageType::DhtNeighbor => {
+                let info = crate::wire::DhtNeighborMsg::from_bytes(&msg.payload)?;
+                self.dht_walker
+                    .neighbor_stores
+                    .lock()
+                    .await
+                    .insert(from, info.stores());
             }
             MessageType::CircuitRelay => {
                 self.handle_circuit_relay(from, &msg.payload).await?;
@@ -3107,6 +3048,21 @@ impl Node {
         link.send_deferred(data).await
     }
 
+    /// Rekey every link this node initiated on the next sweep (testing).
+    #[doc(hidden)]
+    pub async fn request_link_rekey(&self) {
+        for link in self.links.lock().await.all_links() {
+            link.request_rekey();
+        }
+    }
+
+    /// Key epoch of the active link to `peer` (testing).
+    #[doc(hidden)]
+    pub async fn link_key_epoch(&self, peer: &PeerId) -> Option<u64> {
+        let link = self.links.lock().await.get(peer).cloned()?;
+        Some(link.key_epoch().await)
+    }
+
     /// Get the list of connected peers.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.links.lock().await.keys().copied().collect()
@@ -3164,8 +3120,10 @@ impl Node {
             let store = self.dht_store.lock().await;
             let kb = self.kbucket.lock().await;
             let kbucket_peers = kb.len();
-            let l2nse = kb.estimate_l2nse();
             drop(kb);
+            // Network size as the DHT sizes its walks: routing-table
+            // destinations plus us.
+            let nse = self.routing_table.lock().await.len() as u64 + 1;
             let local_watches = self.local_watches.lock().await.len();
             let remote_watches = self.dht_watches.lock().await.watch_count();
             DhtStatus {
@@ -3174,7 +3132,7 @@ impl Node {
                 kbucket_peers,
                 local_watches,
                 remote_watches,
-                nse: 2u64.saturating_pow(l2nse.round().min(63.0) as u32),
+                nse,
             }
         };
 
@@ -3237,6 +3195,13 @@ impl Node {
             circuits,
             traffic,
         }
+    }
+
+    /// Choose whether this node stores DHT records for others. Relay-only nodes
+    /// (`false`, e.g. low-power relays) forward DHT walks but never store or
+    /// verify other nodes' records. Set before [`run`](Self::run).
+    pub fn set_dht_store(&mut self, stores: bool) {
+        self.dht_stores = stores;
     }
 
     /// Configure link limits. 0 = unlimited.

@@ -1,5 +1,11 @@
 use super::*;
 
+/// Tunnel key exchange resend schedule: first after this, doubling to the max,
+/// for as long as the pending exchange lives.
+const KEX_RETRY_INITIAL: Duration = Duration::from_millis(500);
+const KEX_RETRY_MAX: Duration = Duration::from_secs(1);
+const KEX_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
 impl Node {
     /// Handle incoming TunnelKeyExchange — routed to us as destination.
     pub(super) async fn handle_tunnel_key_exchange(
@@ -55,7 +61,20 @@ impl Node {
             return Ok(());
         }
 
-        // Check nonce replay
+        // Check nonce replay. A validly signed repeat of an exchange we
+        // already answered is the initiator retrying after a lost response:
+        // send the same response again rather than new keys.
+        let cached = self
+            .kex_responses
+            .lock()
+            .await
+            .get(&ke.nonce)
+            .filter(|(initiator, _, _)| *initiator == ke.initiator_peer_id)
+            .map(|(_, msg, _)| msg.clone());
+        if let Some(msg) = cached {
+            log::debug!("TunnelKeyExchange from {:?} retried, resending response", ke.initiator_peer_id);
+            return self.route_message(&ke.initiator_peer_id, &msg).await;
+        }
         {
             let nonces = self.seen_nonces.lock().await;
             if nonces.iter().any(|(n, _)| *n == ke.nonce) {
@@ -112,8 +131,12 @@ impl Node {
             ttl: 64,
             data: response.to_wire().encode(),
         };
-        self.route_message(&ke.initiator_peer_id, &msg.to_wire().encode())
-            .await?;
+        let encoded = msg.to_wire().encode();
+        self.kex_responses
+            .lock()
+            .await
+            .insert(ke.nonce, (ke.initiator_peer_id, encoded.clone(), Instant::now()));
+        self.route_message(&ke.initiator_peer_id, &encoded).await?;
 
         log::info!(
             "Tunnel established (responder) with {:?}",
@@ -254,6 +277,11 @@ impl Node {
             MessageType::ChannelOpen => {
                 let open = ChannelOpenMsg::from_bytes(&msg.payload)?;
                 if let Some((owner, _)) = channels.get(&open.channel_id) {
+                    if *owner == from {
+                        // The opener resends until it hears from us.
+                        log::trace!("Duplicate open for channel {}", open.channel_id);
+                        return Ok(());
+                    }
                     log::warn!(
                         "Rejecting channel {} from {:?}: already owned by {:?}",
                         open.channel_id,
@@ -289,6 +317,7 @@ impl Node {
                         );
                         return Ok(());
                     }
+                    ch.confirm_open();
                     let delivered = ch.receive_data(data.sequence, data.data);
 
                     // Check if this channel has a data handler
@@ -347,7 +376,13 @@ impl Node {
                         );
                         return Ok(());
                     }
+                    ch.confirm_open();
                     ch.process_ack(ack.ack_seq, &ack.selective_acks);
+                    // A SACK-revealed hole is due now; wake the retransmit task
+                    // rather than letting it sleep to the old deadline.
+                    if ch.has_fast_retransmit() {
+                        self.channel_state.retransmit_notify.notify_one();
+                    }
                 }
             }
             MessageType::ChannelClose => {
@@ -549,7 +584,36 @@ impl Node {
             .await
             .insert(nonce, (kex, tx, dest, Instant::now()));
 
-        self.route_message(&dest, &msg.to_wire().encode()).await?;
+        let encoded = msg.to_wire().encode();
+        self.route_message(&dest, &encoded).await?;
+
+        // The offer or its response may be lost: resend the identical offer
+        // (same nonce, same ephemeral key) until the response arrives. The
+        // responder answers a repeat with its cached response.
+        let pending = self.pending_key_exchanges.clone();
+        let links = self.links.clone();
+        let routing = self.routing_table.clone();
+        tokio::spawn(async move {
+            let mut wait = KEX_RETRY_INITIAL;
+            let give_up = Instant::now() + KEX_RETRY_WINDOW;
+            loop {
+                tokio::time::sleep(wait).await;
+                if Instant::now() >= give_up || !pending.lock().await.contains_key(&nonce) {
+                    return;
+                }
+                let links = links.lock().await;
+                let hop = if links.get(&dest).is_some() {
+                    Some(dest)
+                } else {
+                    routing.lock().await.lookup(&dest).map(|r| r.next_hop)
+                };
+                if let Some(link) = hop.and_then(|h| links.get(&h)) {
+                    let _ = link.send_message(&encoded).await;
+                    log::debug!("Tunnel key exchange to {:?} resent", dest);
+                }
+                wait = (wait * 2).min(KEX_RETRY_MAX);
+            }
+        });
 
         log::info!("Tunnel key exchange initiated to {:?}", dest);
         Ok(rx)
@@ -603,7 +667,8 @@ impl Node {
             loop {
                 let candidate: u32 = rand::thread_rng().gen();
                 if !channels.contains_key(&candidate) {
-                    let ch = Channel::new(candidate, port, reliable, ordered);
+                    let mut ch = Channel::new(candidate, port, reliable, ordered);
+                    ch.mark_opened_locally();
                     channels.insert(candidate, (*dest, ch));
                     break candidate;
                 }
@@ -636,7 +701,8 @@ impl Node {
             loop {
                 let candidate: u32 = rand::thread_rng().gen();
                 if !channels.contains_key(&candidate) {
-                    let ch = Channel::new(candidate, port, reliable, ordered);
+                    let mut ch = Channel::new(candidate, port, reliable, ordered);
+                    ch.mark_opened_locally();
                     channels.insert(candidate, (*dest, ch));
                     break candidate;
                 }

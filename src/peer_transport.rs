@@ -71,6 +71,19 @@ pub const HEARTBEAT_MEAN: Duration = Duration::from_secs(60);
 pub const HEARTBEAT_MIN: Duration = Duration::from_secs(20);
 pub const HEARTBEAT_MAX: Duration = Duration::from_secs(120);
 
+/// A link that has received nothing for this long is probed: its heartbeats
+/// come every [PROBE_MIN, PROBE_MAX] instead of on the slow Poisson schedule,
+/// so lost heartbeats (or lost replies) can't add up to a false link death.
+/// Probing starts well before `node::KEEPALIVE_DEAD_TIMEOUT`.
+pub const PROBE_AFTER: Duration = Duration::from_secs(60);
+pub const PROBE_MIN: Duration = Duration::from_secs(3);
+pub const PROBE_MAX: Duration = Duration::from_secs(6);
+
+fn next_probe_delay() -> Duration {
+    use rand::Rng;
+    rand::thread_rng().gen_range(PROBE_MIN..=PROBE_MAX)
+}
+
 /// Draw the next heartbeat delay from an exponential distribution clamped to
 /// [HEARTBEAT_MIN, HEARTBEAT_MAX].
 fn next_heartbeat_delay() -> Duration {
@@ -171,6 +184,20 @@ impl PeerTransport {
         if let Some(sl) = self.links.get_mut(&id) {
             sl.last_recv = Instant::now();
         }
+        // This link may just have been confirmed by the peer; if the active
+        // one still isn't, switch.
+        if self.active != Some(id) && self.active_link().is_some_and(|l| l.awaiting_peer()) {
+            self.recompute_active();
+        }
+    }
+
+    /// Links the peer never confirmed within `timeout` of the handshake.
+    fn unconfirmed_links(&self, timeout: Duration) -> Vec<LinkId> {
+        self.links
+            .iter()
+            .filter(|(_, sl)| sl.created_at.elapsed() >= timeout && sl.link.awaiting_peer())
+            .map(|(&id, _)| id)
+            .collect()
     }
 
     /// Return link IDs that haven't received any message within `timeout`.
@@ -190,8 +217,18 @@ impl PeerTransport {
         let now = Instant::now();
         let mut out = Vec::new();
         for (&id, sl) in self.links.iter_mut() {
+            let quiet = now.saturating_duration_since(sl.last_recv) >= PROBE_AFTER;
+            if quiet {
+                // Pull a far-off heartbeat in to probing cadence.
+                sl.next_heartbeat_at = sl.next_heartbeat_at.min(now + PROBE_MAX);
+            }
             if sl.next_heartbeat_at <= now {
-                sl.next_heartbeat_at = now + next_heartbeat_delay();
+                sl.next_heartbeat_at = now
+                    + if quiet {
+                        next_probe_delay()
+                    } else {
+                        next_heartbeat_delay()
+                    };
                 out.push((id, sl.link.clone()));
             }
         }
@@ -211,11 +248,12 @@ impl PeerTransport {
             return changed;
         }
 
-        // Find the best (lowest score) link
+        // Find the best (lowest score) link. A link the peer hasn't confirmed
+        // yet (see `PeerLink::awaiting_peer`) ranks behind every confirmed one.
         let best_id = *self
             .links
             .iter()
-            .min_by_key(|(_, sl)| sl.score.score())
+            .min_by_key(|(_, sl)| (sl.link.awaiting_peer(), sl.score.score()))
             .unwrap()
             .0;
 
@@ -232,9 +270,14 @@ impl PeerTransport {
             }
             Some(current_id) => {
                 // Hysteresis: standby must beat active by >20% to trigger promotion
+                // An unconfirmed active link yields to any confirmed one.
                 let current_score = self
                     .links
                     .get(&current_id)
+                    .filter(|sl| {
+                        !sl.link.awaiting_peer()
+                            || self.links[&best_id].link.awaiting_peer()
+                    })
                     .map(|sl| sl.score.score())
                     .unwrap_or(u64::MAX);
                 let best_score = self.links.get(&best_id).unwrap().score.score();
@@ -401,6 +444,18 @@ impl LinkTable {
         let mut result = Vec::new();
         for (&peer, pt) in &self.peers {
             for id in pt.dead_links(timeout) {
+                result.push((peer, id));
+            }
+        }
+        result
+    }
+
+    /// Links whose handshake the peer never confirmed within `timeout`: the
+    /// peer gave up on them, so they only black-hole traffic.
+    pub fn unconfirmed_links(&self, timeout: Duration) -> Vec<(PeerId, LinkId)> {
+        let mut result = Vec::new();
+        for (&peer, pt) in &self.peers {
+            for id in pt.unconfirmed_links(timeout) {
                 result.push((peer, id));
             }
         }
@@ -628,7 +683,133 @@ mod tests {
         assert_eq!(got.msg_type, MessageType::Keepalive);
     }
 
+    /// A rekey whose request and reply are each lost once still completes,
+    /// and the link carries traffic both ways throughout.
+    #[tokio::test]
+    async fn rekey_survives_lost_request_and_reply() {
+        use crate::wire::{KeepaliveMsg, MessageType, RekeyMsg, WireMessage};
+
+        let (a, b) = make_test_link_pair().await; // a = initiator
+        let frame = KeepaliveMsg {
+            timestamp_us: None,
+            padding: Vec::new(),
+        }
+        .to_wire()
+        .encode();
+        async fn recv_type(l: &PeerLink) -> WireMessage {
+            WireMessage::decode(&l.recv_message().await.unwrap()).unwrap()
+        }
+
+        // Request lost.
+        a.rekey_initiate().await.unwrap();
+        assert_eq!(recv_type(&b).await.msg_type, MessageType::Rekey);
+        // Too early to retry: no new request goes out.
+        a.rekey_initiate().await.unwrap();
+        a.send_message(&frame).await.unwrap();
+        assert_eq!(recv_type(&b).await.msg_type, MessageType::Keepalive);
+
+        // Retry after the interval: the identical request; b answers, but the
+        // reply is lost.
+        tokio::time::sleep(crate::link::REKEY_RETRY_INTERVAL).await;
+        a.rekey_initiate().await.unwrap();
+        let req = recv_type(&b).await;
+        let req = RekeyMsg::from_bytes(&req.payload).unwrap();
+        b.handle_rekey_msg(&req).await.unwrap();
+        assert_eq!(recv_type(&a).await.msg_type, MessageType::Rekey);
+
+        // b is still sending under the old key, so a hears it fine.
+        b.send_message(&frame).await.unwrap();
+        assert_eq!(recv_type(&a).await.msg_type, MessageType::Keepalive);
+        a.send_message(&frame).await.unwrap();
+        assert_eq!(recv_type(&b).await.msg_type, MessageType::Keepalive);
+
+        // Next retry: b resends the same reply, a installs.
+        tokio::time::sleep(crate::link::REKEY_RETRY_INTERVAL).await;
+        a.rekey_initiate().await.unwrap();
+        b.handle_rekey_msg(&RekeyMsg::from_bytes(&recv_type(&b).await.payload).unwrap())
+            .await
+            .unwrap();
+        let resp = recv_type(&a).await;
+        a.handle_rekey_msg(&RekeyMsg::from_bytes(&resp.payload).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(a.key_epoch().await, 1);
+        assert!(!a.needs_rekey().await);
+
+        // A duplicate reply is ignored.
+        a.handle_rekey_msg(&RekeyMsg::from_bytes(&resp.payload).unwrap())
+            .await
+            .unwrap();
+
+        // a's first new-key frame switches b over; both directions work.
+        a.send_message(&frame).await.unwrap();
+        assert_eq!(recv_type(&b).await.msg_type, MessageType::Keepalive);
+        assert_eq!(b.key_epoch().await, 1);
+        b.send_message(&frame).await.unwrap();
+        assert_eq!(recv_type(&a).await.msg_type, MessageType::Keepalive);
+
+        // A late copy of the request is ignored, not re-answered.
+        b.handle_rekey_msg(&req).await.unwrap();
+        assert_eq!(b.key_epoch().await, 1);
+    }
+
     // ── PeerTransport unit tests ──
+
+    /// A responder link the initiator never confirmed must not stay the way
+    /// we reach the peer once a working link exists, and gets reaped.
+    #[tokio::test]
+    async fn unconfirmed_link_yields_and_is_reaped() {
+        let (_, half_open) = make_test_link_pair().await;
+        let (_, second) = make_test_link_pair().await;
+        half_open.set_awaiting_peer(true);
+        second.set_awaiting_peer(true);
+
+        let mut pt = PeerTransport::new();
+        let (id0, _) = pt.add_link(half_open.clone());
+        let (id1, _) = pt.add_link(second.clone());
+        assert_eq!(pt.active, Some(id0));
+
+        // The redialled link hears from the peer: it takes over at once.
+        second.set_awaiting_peer(false);
+        pt.touch_recv(id1);
+        assert_eq!(pt.active, Some(id1));
+
+        // A confirmed link is preferred from the start over an unconfirmed one.
+        let mut pt2 = PeerTransport::new();
+        pt2.add_link(half_open.clone());
+        let (good, changed) = pt2.add_link(second.clone());
+        assert!(changed);
+        assert_eq!(pt2.active, Some(good));
+
+        assert_eq!(pt.unconfirmed_links(Duration::ZERO), vec![id0]);
+        assert!(pt.unconfirmed_links(Duration::from_secs(3600)).is_empty());
+    }
+
+    #[tokio::test]
+    async fn quiet_link_is_probed_quickly() {
+        let (link, _) = make_test_link_pair().await;
+        let mut pt = PeerTransport::new();
+        let (id, _) = pt.add_link(link);
+        let now = Instant::now();
+
+        // A link that just heard from its peer keeps its slow schedule.
+        pt.links.get_mut(&id).unwrap().next_heartbeat_at = now + HEARTBEAT_MAX;
+        assert!(pt.heartbeat_due().is_empty());
+        assert!(pt.links[&id].next_heartbeat_at > now + PROBE_MAX);
+
+        // Quiet past PROBE_AFTER: the next heartbeat is pulled in...
+        let Some(quiet_since) = now.checked_sub(PROBE_AFTER + Duration::from_secs(1)) else {
+            return; // monotonic clock too young to back-date
+        };
+        pt.links.get_mut(&id).unwrap().last_recv = quiet_since;
+        assert!(pt.heartbeat_due().is_empty());
+        assert!(pt.links[&id].next_heartbeat_at <= Instant::now() + PROBE_MAX);
+
+        // ...and once due, the following one is a probe interval away too.
+        pt.links.get_mut(&id).unwrap().next_heartbeat_at = Instant::now();
+        assert_eq!(pt.heartbeat_due().len(), 1);
+        assert!(pt.links[&id].next_heartbeat_at <= Instant::now() + PROBE_MAX);
+    }
 
     #[tokio::test]
     async fn add_two_links_first_is_active() {

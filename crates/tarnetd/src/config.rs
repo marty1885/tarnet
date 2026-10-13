@@ -157,6 +157,8 @@ pub struct CoreConfig {
     pub upload_limit: String,
     /// Download bandwidth limit (e.g. "50Mbps", "5MB/s"). Empty or "0" = unlimited.
     pub download_limit: String,
+    /// Store DHT records for other nodes. `false` makes this node relay-only.
+    pub dht_store: bool,
 }
 
 impl Default for CoreConfig {
@@ -166,6 +168,7 @@ impl Default for CoreConfig {
             max_outbound: 48,
             upload_limit: String::new(),
             download_limit: String::new(),
+            dht_store: true,
         }
     }
 }
@@ -241,6 +244,8 @@ pub struct ResolvedConfig {
     pub upload_limit: u64,
     /// Download bandwidth limit in bytes/sec. 0 = unlimited.
     pub download_limit: u64,
+    /// Store DHT records for other nodes (false = relay-only).
+    pub dht_store: bool,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub identity_path: PathBuf,
@@ -325,6 +330,7 @@ pub fn resolve(
         max_outbound,
         upload_limit,
         download_limit,
+        dht_store: config.core.dht_store,
         config_dir: config_dir.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
         identity_path: cli

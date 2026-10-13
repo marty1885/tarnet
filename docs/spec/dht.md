@@ -1,0 +1,142 @@
+# DHT protocol (v1)
+
+Status: wire format frozen with this revision. Everything under "Local policy"
+may change between releases without a compatibility break.
+
+## Model
+
+tarnet is a routing protocol with a DHT. The DHT follows R5N: each DHT hop is
+one overlay link, so it works in graphs that are not fully connected (e.g.
+machines joined only through relay boxes) and never pays a multi-link path for
+a single DHT hop.
+
+* **DHT neighbours** are the node's direct links. Each neighbour's DHT id is
+  `dht_id_from_peer_id(peer)`; distance is XOR against the 64-byte key.
+* **Storing vs relay-only nodes.** A node either stores DHT records for others
+  (default) or is relay-only (`store = false`, e.g. a Pi Zero). A relay-only
+  node forwards DHT messages but never stores, verifies or caches records for
+  others. It still keeps its own published records.
+* **Placement.** A record lives at the *ends of walks*: a storing node that is
+  closer to the key than every one of its neighbours (a local minimum). Nodes on
+  the way only forward. This bounds each node's share of the key space.
+
+## Walks
+
+Every PUT, GET and WATCH travels as one or more independent *walks*. A walk has
+two phases.
+
+1. **Random phase** (`WALKING` flag set). The originator always sends with
+   `WALKING`. Every node receiving a walking message ends the random phase with
+   probability *q*; otherwise it forwards to a uniformly random neighbour other
+   than the sender, keeping `WALKING`. A node whose only neighbour is the sender
+   always ends the random phase. A node that ends the random phase clears
+   `WALKING`, sets the greedy budget, and continues in the greedy phase from
+   itself.
+2. **Greedy phase.** At node *X* with distance *dX* to the key:
+   * If `DELIVER` is set: a storing *X* is the end of the walk. A relay-only *X*
+     inserts itself into the bloom and forwards (keeping `DELIVER`) to its
+     closest neighbour that is believed to store and is not in the bloom, else
+     to its closest neighbour not in the bloom, else drops.
+   * Otherwise, if some neighbour is strictly closer than *dX*: forward to the
+     closest one.
+   * Otherwise *X* is a local minimum. A storing *X* is the end of the walk. A
+     relay-only *X* inserts itself into the bloom, sets `DELIVER`, and forwards
+     to its closest neighbour believed to store (else its closest neighbour).
+   * Every greedy forward decrements `greedy_budget`; a message arriving with
+     budget 0 ends where it is (stored there if that node stores, else dropped).
+
+Greedy steps strictly decrease distance, so they cannot loop. The bloom is only
+needed for the `DELIVER` detour around relay-only nodes, and only those nodes
+are ever inserted. No originator, random-walk node, or greedy node appears in it.
+
+## What each message does at the end of a walk
+
+* **PUT**: the end node verifies and stores the record. Nodes on the way do not
+  verify, store or deduplicate; each hop forwards to exactly one neighbour.
+* **GET**: every node on the walk that holds records for the key answers along
+  the reverse path (`query_token` → previous hop, as before). The walk continues
+  to its end regardless. Each walk has its own `query_token`.
+* **WATCH**: every node on the walk registers `(key, query_token, previous hop,
+  expiry)`; a node that already holds the token drops the duplicate visit. When
+  such a node stores, publishes or forwards a PUT for the key it sends
+  `DhtWatchNotify` to the previous hop, which relays it back hop by hop using its
+  own registration for that token. Relays do not verify notifications; the
+  watcher does.
+
+## Wire format
+
+All multi-byte integers are big-endian.
+
+Walk header, shared by PUT, GET and WATCH:
+
+```
+dht_version(u8) = 1
+flags(u8)            bit0 WALKING, bit1 DELIVER; other bits reserved:
+                     sent as 0, ignored on receipt
+greedy_budget(u8)    meaningful only once WALKING is clear
+bloom_salt(u32)      chosen by whoever first inserts into the bloom
+bloom(256)           2048-bit filter, k = 4,
+                     index_i = u16(H("tarnet dht bloom v1" || salt || peer)[2i..2i+2]) mod 2048
+```
+
+Messages:
+
+```
+DhtPut         (0x0200)  walk_header || record
+DhtGet         (0x0201)  walk_header || key(64) || query_token(32)
+DhtGetResponse (0x0202)  query_token(32) || key(64) || count(u16) || records   (unchanged)
+DhtWatch       (0x0203)  walk_header || key(64) || query_token(32) || expiration_secs(u32)
+DhtWatchNotify (0x0204)  query_token(32) || record                               (DhtPut minus the walk header)
+DhtNeighbor    (0x0205)  dht_version(u8) || flags(u8)   bit0 STORES; sent on link-up by relay-only nodes
+```
+
+`record` is the unchanged signed record encoding: `key(64) || record_type(u8) ||
+sequence(u64) || signer(32) || ttl(u32) || value_len(u16) || value ||
+sig_len(u16) || signature || signer_algo(u8) || pk_len(u16) || signer_pubkey`.
+
+Messages with an unknown `dht_version` are dropped. There is no hop counter,
+originator-set hop limit, or replication count on the wire: a neighbour cannot
+tell from a walking message whether the sender started it.
+
+A neighbour that sends no `DhtNeighbor` message is assumed to store. A false
+claim only sends a `DELIVER` detour one hop further.
+
+Unknown record types are signature-checked generically (signer key, algorithm,
+signature over `key || type || sequence || value`) and kept newest-per-signer
+under the usual per-key and global caps, so future record types pass through
+older storing nodes.
+
+`DhtNeighbor` is a link message rather than a handshake field so the handshake
+transcript is untouched; it travels on the already-authenticated link.
+
+## Local policy (not part of the wire contract)
+
+| Parameter | Value |
+|---|---|
+| Random-phase end probability *q* | 1/3 |
+| Greedy budget | 32 |
+| Walks per PUT and per GET round, ρ | `max(2, ceil(sqrt(3 · N / (d + 1))))`, capped at 32 |
+| N (network size) | routing-table destinations + 1 |
+| d | number of direct links |
+| GET rounds | a search launches ρ fresh walks every 1.5 s, 3 rounds in total (keys can hold several records); dropping the search stops it |
+| Originator walks | spread over distinct random neighbours, cycling if ρ > d |
+| Republish | owners republish their own records (hello every 5 min, hidden-service intros every 4 min, TNS every 30 min, everything else a node published every 30 min); hello + own records republished and watches relaunched 1–3 s after a link-up, at most once per 60 s |
+| Watches | the watcher relaunches its watch walks every 60 s until the requested expiry; unwatch only drops local state, registrations along old walks expire |
+| Store caps | 4096 records / 16 MB, fair-share eviction by source, TTL caps (unchanged from phase 1) |
+| Ingest budget | per link, as in phase 1 |
+
+ρ follows R5N: with about N/(d+1) local minima per key, ρ PUT walks and ρ GET
+walks meet with probability ≈ 1 − e^(−ρ²(d+1)/N). The factor 3 targets ≈ 95%
+per round; relaunches make misses independent.
+
+Removed relative to the previous protocol: flooding (fan-out 20), storing at
+every hop, the 5-minute replication sweep, the full-store sync on link-up, the
+L2NSE estimate from the k-bucket, and `hop_count`/`hop_limit`.
+
+## Privacy notes
+
+* A walking message carries nothing tied to its originator. A neighbour still
+  sees timing and volume (ρ walks for one key leaving one node together).
+* Each hop knows its predecessor and successor. Hidden identities need DHT
+  operations carried over a circuit (planned; no change to this format).
+* Only relay-only nodes on a `DELIVER` detour enter the bloom.

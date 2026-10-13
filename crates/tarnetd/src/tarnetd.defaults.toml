@@ -52,6 +52,10 @@ upload_limit = ""
 # Download bandwidth limit. Same format as upload_limit.
 download_limit = ""
 
+# Store DHT records for other nodes. Set to false on low-power relays: they
+# still forward DHT lookups but never store or verify other nodes' records.
+dht_store = true
+
 [bootstrap]
 # Bootstrap peer transport URIs (repeatable)
 # Supports: tcp://host:port, ws://host/path, wss://host/path
