@@ -1823,7 +1823,7 @@ impl Node {
                     port.to_string(),
                     conn_id,
                     server_tx,
-                    client_rx,
+                    server_rx,
                 );
                 match self
                     .dispatch_incoming_connection(service_id, mode, port, server_conn)
@@ -1845,7 +1845,7 @@ impl Node {
                     port.to_string(),
                     conn_id,
                     client_tx,
-                    server_rx,
+                    client_rx,
                 ));
             }
         }

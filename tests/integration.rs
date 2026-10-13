@@ -974,6 +974,36 @@ async fn circuit_build_one_hop() {
     node_a.destroy_circuit(circuit_id).await.unwrap();
 }
 
+/// Local circuits must deliver each endpoint's bytes to the other endpoint.
+#[tokio::test]
+async fn circuit_loopback_connect_accept_bidi() {
+    let node = Node::new(Keypair::generate());
+    let sid = node.default_service_id().await;
+    let listener = node
+        .circuit_listen(sid, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    let client = node
+        .circuit_connect(sid, TEST_MODE, "80", None, None)
+        .await
+        .unwrap();
+    let server = node.circuit_accept(listener.id).await.unwrap();
+
+    client.send(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(1), server.recv())
+        .await
+        .expect("server did not receive client request")
+        .unwrap();
+    assert_eq!(request, b"GET / HTTP/1.1\r\n\r\n");
+
+    server.send(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), client.recv())
+        .await
+        .expect("client did not receive server response")
+        .unwrap();
+    assert_eq!(response, b"HTTP/1.1 200 OK\r\n\r\n");
+}
+
 /// Test connect() + accept() with bidirectional data exchange.
 #[tokio::test]
 async fn circuit_connect_accept_bidi() {
