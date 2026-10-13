@@ -25,8 +25,8 @@ pub const GOVERNOR_TICK_INTERVAL: Duration = Duration::from_secs(10);
 /// Strikes halve after this much time with no new strikes.
 const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Sliding window for circuit creation rate limiting.
-const CIRCUIT_RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Sliding window for per-peer protocol work accounting.
+const RESOURCE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -35,8 +35,10 @@ const CIRCUIT_RATE_WINDOW: Duration = Duration::from_secs(60);
 pub struct GovernorConfig {
     /// Hard cap on circuits involving any single link peer.
     pub max_circuits_per_peer: usize,
-    /// Max circuit creates per peer within [`CIRCUIT_RATE_WINDOW`].
+    /// Max circuit creates per peer within [`RESOURCE_RATE_WINDOW`].
     pub circuit_creates_per_window: u32,
+    /// Max new DHT query tokens accepted from one link peer per window.
+    pub dht_queries_per_window: u32,
     /// Total circuit capacity of this node (for pressure calculation).
     pub max_circuits: usize,
     /// Pressure level below which no enforcement happens (0.0–1.0).
@@ -54,6 +56,7 @@ impl Default for GovernorConfig {
         Self {
             max_circuits_per_peer: 100,
             circuit_creates_per_window: 20,
+            dht_queries_per_window: 256,
             max_circuits: 10_000,
             pressure_threshold: 0.75,
             throttle_strikes: 3,
@@ -140,6 +143,8 @@ struct PeerBudget {
     last_strike: Option<Instant>,
     /// Circuit creation count in the current window.
     circuit_creates: u32,
+    /// New DHT query tokens charged to this peer in the current window.
+    dht_queries: u32,
     /// Start of the current rate-limit window.
     window_start: Instant,
 }
@@ -151,14 +156,16 @@ impl PeerBudget {
             strikes: 0,
             last_strike: None,
             circuit_creates: 0,
+            dht_queries: 0,
             window_start: Instant::now(),
         }
     }
 
     /// Reset the rate window if it has expired.
     fn maybe_reset_window(&mut self) {
-        if self.window_start.elapsed() >= CIRCUIT_RATE_WINDOW {
+        if self.window_start.elapsed() >= RESOURCE_RATE_WINDOW {
             self.circuit_creates = 0;
+            self.dht_queries = 0;
             self.window_start = Instant::now();
         }
     }
@@ -170,6 +177,15 @@ impl PeerBudget {
             return false;
         }
         self.circuit_creates += 1;
+        true
+    }
+
+    fn try_dht_query(&mut self, limit: u32) -> bool {
+        self.maybe_reset_window();
+        if self.dht_queries >= limit {
+            return false;
+        }
+        self.dht_queries += 1;
         true
     }
 
@@ -330,6 +346,16 @@ impl Governor {
         }
 
         Verdict::Allow
+    }
+
+    /// Charge allocation and forwarding state for a previously unseen DHT query.
+    /// This limit is always active; circuit pressure is unrelated to DHT memory
+    /// consumption and must not disable the admission check.
+    pub fn charge_dht_query(&mut self, from: &PeerId) -> bool {
+        let Some(budget) = self.budgets.get_mut(from) else {
+            return false;
+        };
+        budget.try_dht_query(self.config.dht_queries_per_window)
     }
 
     // ── Maintenance ──
@@ -520,6 +546,20 @@ mod tests {
         assert_eq!(gov.peer_count(), 1);
         gov.peer_disconnected(&peer);
         assert_eq!(gov.peer_count(), 0);
+    }
+
+    #[test]
+    fn dht_query_charge_is_always_enforced() {
+        let mut config = GovernorConfig::default();
+        config.dht_queries_per_window = 2;
+        // Pressure remains zero: DHT admission must still be bounded.
+        let mut gov = Governor::new(config);
+        let peer = test_peer(1);
+        gov.peer_connected(peer);
+
+        assert!(gov.charge_dht_query(&peer));
+        assert!(gov.charge_dht_query(&peer));
+        assert!(!gov.charge_dht_query(&peer));
     }
 
     #[test]

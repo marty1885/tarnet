@@ -194,8 +194,8 @@ impl Node {
 
         if msg.destination == self.peer_id() {
             // We are the destination — decrypt via tunnel
-            let tt = self.tunnel_table.lock().await;
-            if let Some(tunnel) = tt.get(&msg.origin) {
+            let mut tt = self.tunnel_table.lock().await;
+            if let Some(tunnel) = tt.get_mut(&msg.origin) {
                 let plaintext = tunnel.decrypt(&msg.data)?;
                 let remote = tunnel.remote_peer;
                 drop(tt);
@@ -524,11 +524,11 @@ impl Node {
             return Ok(());
         }
 
-        let tt = self.tunnel_table.lock().await;
+        let mut tt = self.tunnel_table.lock().await;
         let tunnel = tt
-            .get(dest)
+            .get_mut(dest)
             .ok_or_else(|| Error::Protocol(format!("no tunnel to {:?}", dest)))?;
-        let encrypted = tunnel.encrypt(data);
+        let encrypted = tunnel.encrypt(data)?;
         drop(tt);
 
         let msg = EncryptedDataMsg {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
@@ -9,6 +9,9 @@ use crate::types::{Error, PeerId, Result};
 
 const NONCE_SIZE: usize = 24;
 const TAG_SIZE: usize = 16;
+const SEQ_SIZE: usize = 8;
+const REPLAY_WINDOW: u64 = 1024;
+const TUNNEL_DATA_CONTEXT: &[u8] = b"tarnet tunnel data v4";
 
 /// End-to-end encrypted tunnel to a remote peer.
 /// Identified by the remote PeerId — one tunnel per peer.
@@ -16,6 +19,9 @@ pub struct Tunnel {
     pub remote_peer: PeerId,
     enc_key: [u8; 32],
     dec_key: [u8; 32],
+    send_seq: u64,
+    recv_highest: Option<u64>,
+    recv_seen: BTreeSet<u64>,
 }
 
 impl Tunnel {
@@ -33,13 +39,25 @@ impl Tunnel {
             remote_peer,
             enc_key: enc,
             dec_key: dec,
+            send_seq: 0,
+            recv_highest: None,
+            recv_seen: BTreeSet::new(),
         }
     }
 
     /// Encrypt data for sending through the tunnel.
-    pub fn encrypt(&self, plaintext: &[u8]) -> Vec<u8> {
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let sequence = self.send_seq;
+        self.send_seq = self
+            .send_seq
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("tunnel sequence exhausted; rekey required".into()))?;
         let mut nonce = [0u8; NONCE_SIZE];
         rand::rngs::OsRng.fill_bytes(&mut nonce);
+
+        let mut aad = Vec::with_capacity(TUNNEL_DATA_CONTEXT.len() + SEQ_SIZE);
+        aad.extend_from_slice(TUNNEL_DATA_CONTEXT);
+        aad.extend_from_slice(&sequence.to_be_bytes());
 
         let cipher = XChaCha20Poly1305::new((&self.enc_key).into());
         let ciphertext = cipher
@@ -47,35 +65,67 @@ impl Tunnel {
                 (&nonce).into(),
                 Payload {
                     msg: plaintext,
-                    aad: b"",
+                    aad: &aad,
                 },
             )
             .expect("AEAD encryption should not fail");
 
-        let mut out = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
+        let mut out = Vec::with_capacity(SEQ_SIZE + NONCE_SIZE + ciphertext.len());
+        out.extend_from_slice(&sequence.to_be_bytes());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
-        out
+        Ok(out)
     }
 
     /// Decrypt data received through the tunnel.
-    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < NONCE_SIZE + TAG_SIZE {
+    pub fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < SEQ_SIZE + NONCE_SIZE + TAG_SIZE {
             return Err(Error::Crypto("tunnel ciphertext too short".into()));
         }
-        let nonce = &data[..NONCE_SIZE];
-        let ciphertext_with_tag = &data[NONCE_SIZE..];
+        let sequence = u64::from_be_bytes(data[..SEQ_SIZE].try_into().unwrap());
+        self.check_replay(sequence)?;
+        let nonce = &data[SEQ_SIZE..SEQ_SIZE + NONCE_SIZE];
+        let ciphertext_with_tag = &data[SEQ_SIZE + NONCE_SIZE..];
+
+        let mut aad = Vec::with_capacity(TUNNEL_DATA_CONTEXT.len() + SEQ_SIZE);
+        aad.extend_from_slice(TUNNEL_DATA_CONTEXT);
+        aad.extend_from_slice(&sequence.to_be_bytes());
 
         let cipher = XChaCha20Poly1305::new((&self.dec_key).into());
-        cipher
+        let plaintext = cipher
             .decrypt(
                 nonce.into(),
                 Payload {
                     msg: ciphertext_with_tag,
-                    aad: b"",
+                    aad: &aad,
                 },
             )
-            .map_err(|_| Error::Crypto("tunnel AEAD decryption failed".into()))
+            .map_err(|_| Error::Crypto("tunnel AEAD decryption failed".into()))?;
+
+        // Commit replay state only after authentication succeeds. A forged packet
+        // with a high sequence number must not advance the window.
+        self.record_sequence(sequence);
+        Ok(plaintext)
+    }
+
+    fn check_replay(&self, sequence: u64) -> Result<()> {
+        if self.recv_seen.contains(&sequence) {
+            return Err(Error::Replay("duplicate tunnel sequence".into()));
+        }
+        if let Some(highest) = self.recv_highest {
+            if sequence <= highest && highest - sequence >= REPLAY_WINDOW {
+                return Err(Error::Replay("tunnel sequence outside replay window".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_sequence(&mut self, sequence: u64) {
+        let highest = self.recv_highest.map_or(sequence, |h| h.max(sequence));
+        self.recv_highest = Some(highest);
+        self.recv_seen.insert(sequence);
+        let oldest = highest.saturating_sub(REPLAY_WINDOW - 1);
+        self.recv_seen = self.recv_seen.split_off(&oldest);
     }
 }
 
@@ -102,6 +152,10 @@ impl TunnelTable {
         self.tunnels.get(peer)
     }
 
+    pub fn get_mut(&mut self, peer: &PeerId) -> Option<&mut Tunnel> {
+        self.tunnels.get_mut(peer)
+    }
+
     /// Remove a tunnel by remote peer.
     pub fn remove(&mut self, peer: &PeerId) {
         self.tunnels.remove(peer);
@@ -115,16 +169,16 @@ mod tests {
     #[test]
     fn tunnel_encrypt_decrypt() {
         let shared = [42u8; 32];
-        let initiator = Tunnel::new(PeerId([2; 32]), &shared, true);
-        let responder = Tunnel::new(PeerId([1; 32]), &shared, false);
+        let mut initiator = Tunnel::new(PeerId([2; 32]), &shared, true);
+        let mut responder = Tunnel::new(PeerId([1; 32]), &shared, false);
 
         let msg = b"end-to-end encrypted data";
-        let encrypted = initiator.encrypt(msg);
+        let encrypted = initiator.encrypt(msg).unwrap();
         let decrypted = responder.decrypt(&encrypted).unwrap();
         assert_eq!(decrypted, msg);
 
         let response = b"response through tunnel";
-        let enc2 = responder.encrypt(response);
+        let enc2 = responder.encrypt(response).unwrap();
         let dec2 = initiator.decrypt(&enc2).unwrap();
         assert_eq!(dec2, response);
     }
@@ -132,12 +186,38 @@ mod tests {
     #[test]
     fn tunnel_tamper_detected() {
         let shared = [42u8; 32];
-        let initiator = Tunnel::new(PeerId([2; 32]), &shared, true);
-        let responder = Tunnel::new(PeerId([1; 32]), &shared, false);
+        let mut initiator = Tunnel::new(PeerId([2; 32]), &shared, true);
+        let mut responder = Tunnel::new(PeerId([1; 32]), &shared, false);
 
-        let mut encrypted = initiator.encrypt(b"data");
-        encrypted[NONCE_SIZE] ^= 0xff;
+        let mut encrypted = initiator.encrypt(b"data").unwrap();
+        encrypted[SEQ_SIZE + NONCE_SIZE] ^= 0xff;
         assert!(responder.decrypt(&encrypted).is_err());
+    }
+
+    #[test]
+    fn tunnel_accepts_reordering_and_rejects_replay() {
+        let shared = [7u8; 32];
+        let mut sender = Tunnel::new(PeerId([2; 32]), &shared, true);
+        let mut receiver = Tunnel::new(PeerId([1; 32]), &shared, false);
+        let first = sender.encrypt(b"first").unwrap();
+        let second = sender.encrypt(b"second").unwrap();
+
+        assert_eq!(receiver.decrypt(&second).unwrap(), b"second");
+        assert_eq!(receiver.decrypt(&first).unwrap(), b"first");
+        assert!(matches!(receiver.decrypt(&first), Err(Error::Replay(_))));
+    }
+
+    #[test]
+    fn unauthenticated_sequence_does_not_advance_replay_window() {
+        let shared = [8u8; 32];
+        let mut sender = Tunnel::new(PeerId([2; 32]), &shared, true);
+        let mut receiver = Tunnel::new(PeerId([1; 32]), &shared, false);
+        let valid = sender.encrypt(b"valid").unwrap();
+        let mut forged = valid.clone();
+        forged[..SEQ_SIZE].copy_from_slice(&u64::MAX.to_be_bytes());
+
+        assert!(matches!(receiver.decrypt(&forged), Err(Error::Crypto(_))));
+        assert_eq!(receiver.decrypt(&valid).unwrap(), b"valid");
     }
 
     #[test]

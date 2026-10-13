@@ -437,11 +437,11 @@ async fn send_on_channel(
 
         // Encrypt via tunnel
         let encrypted = {
-            let tt = tunnel_table.lock().await;
+            let mut tt = tunnel_table.lock().await;
             let tunnel = tt
-                .get(&dest)
+                .get_mut(&dest)
                 .ok_or_else(|| Error::Protocol(format!("no tunnel to {:?}", dest)))?;
-            tunnel.encrypt(&inner)
+            tunnel.encrypt(&inner)?
         };
 
         let enc_msg = EncryptedDataMsg {

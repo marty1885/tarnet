@@ -79,6 +79,9 @@ const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
 const KEY_EXCHANGE_MAX_DRIFT: u64 = 60;
 /// How long seen nonces are cached for replay protection.
 const NONCE_CACHE_TTL: Duration = Duration::from_secs(120);
+/// Hard ceiling on anonymous reverse-path state. Per-peer admission in the
+/// governor is the primary control; this cap is the final global invariant.
+const MAX_QUERY_TOKENS: usize = 65_536;
 /// How often the heartbeat / liveness scheduler wakes up. The per-link
 /// send cadence is a Poisson process clamped to [HEARTBEAT_MIN, HEARTBEAT_MAX]
 /// (currently 10s / 60s), so ticking faster than HEARTBEAT_MIN never fires
@@ -1606,8 +1609,8 @@ impl Node {
 
                 // Send retransmits — re-encrypt each via tunnel (fresh nonce)
                 for (channel_id, remote, packets) in retransmits {
-                    let tt = retransmit_tunnel_table.lock().await;
-                    let tunnel = match tt.get(&remote) {
+                    let mut tt = retransmit_tunnel_table.lock().await;
+                    let tunnel = match tt.get_mut(&remote) {
                         Some(t) => t,
                         None => continue,
                     };
@@ -1619,7 +1622,13 @@ impl Node {
                             data: data.clone(),
                         };
                         let inner = channel_data.to_wire().encode();
-                        let encrypted = tunnel.encrypt(&inner);
+                        let encrypted = match tunnel.encrypt(&inner) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                log::warn!("Tunnel encryption failed for {:?}: {}", remote, e);
+                                continue;
+                            }
+                        };
                         let msg = EncryptedDataMsg {
                             origin: retransmit_identity.peer_id(),
                             destination: remote,
@@ -2572,6 +2581,25 @@ impl Node {
                 // *after* it has received, it can never be its own forwarder's
                 // parent, so the parent graph is an acyclic tree rooted at the
                 // originator — replies walk it back without a loop bound.
+                let mut tokens = self.query_tokens.lock().await;
+                if tokens.contains_key(&get.query_token) {
+                    return Ok(());
+                }
+                if tokens.len() >= MAX_QUERY_TOKENS {
+                    log::debug!("Global DHT GET state limit reached");
+                    return Ok(());
+                }
+                drop(tokens);
+
+                if !self.governor.lock().await.charge_dht_query(&from) {
+                    log::debug!("DHT GET budget exhausted for {:?}", from);
+                    return Ok(());
+                }
+
+                // The main event loop serializes non-circuit messages, but use an
+                // entry check here as well so this remains correct if dispatch is
+                // parallelized later. A raced duplicate was already charged, which
+                // is conservative and still bounded.
                 let first_arrival = match self.query_tokens.lock().await.entry(get.query_token) {
                     std::collections::hash_map::Entry::Occupied(_) => false,
                     std::collections::hash_map::Entry::Vacant(slot) => {

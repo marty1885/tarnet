@@ -326,12 +326,12 @@ async fn tunnel_stateless_e2e() {
 
     // A and C share a key — tunnels are now peer-keyed, no relay state
     let shared = [99u8; 32];
-    let tunnel_a = Tunnel::new(PeerId([3; 32]), &shared, true);
-    let tunnel_c = Tunnel::new(PeerId([1; 32]), &shared, false);
+    let mut tunnel_a = Tunnel::new(PeerId([3; 32]), &shared, true);
+    let mut tunnel_c = Tunnel::new(PeerId([1; 32]), &shared, false);
 
     // A encrypts
     let plaintext = b"end to end stateless";
-    let encrypted = tunnel_a.encrypt(plaintext);
+    let encrypted = tunnel_a.encrypt(plaintext).unwrap();
 
     // C decrypts (relays just forward the routed packet, no tunnel state)
     let decrypted = tunnel_c.decrypt(&encrypted).unwrap();
