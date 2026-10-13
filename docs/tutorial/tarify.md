@@ -26,14 +26,14 @@ TNS has no equivalent of DNS's NXDOMAIN. Because records are encrypted, the DHT 
 
 ## Tarify
 
-`tarnet tarify` wraps a command so its network traffic goes through the SOCKS proxy transparently, without the application needing SOCKS support. It uses `LD_PRELOAD` to intercept socket calls:
+`tarnet tarify` wraps a command so its TCP traffic goes through the SOCKS proxy transparently, without the application needing SOCKS support. It uses `LD_PRELOAD` on Linux and `DYLD_INSERT_LIBRARIES` with dyld interposing on macOS to intercept socket calls:
 
 ```plaintext
 tarnet tarify curl http://alice/
 tarnet tarify ssh alice
 ```
 
-This is the tarnet equivalent of `torify`. The wrapped application sees normal TCP/UDP sockets - the interception is invisible to it.
+This is the tarnet equivalent of `torify`. The wrapped application sees normal TCP sockets - the interception is invisible to it.
 
 Use `--identity` to control which identity you appear as. This selects the TNS zone for name resolution, the circuits used for connections, and the identity the remote side sees you as:
 
@@ -43,6 +43,8 @@ tarnet tarify --identity work curl http://internal-server/
 
 ## Limitations
 
-- `tarify` relies on `LD_PRELOAD`, so it only works with dynamically linked applications on Linux. Statically linked binaries bypass the interception.
+- `tarify` works with dynamically linked applications on Linux and macOS. Statically linked binaries bypass the interception.
+- On macOS, System Integrity Protection strips dyld environment variables from protected system executables (such as `/usr/bin/curl` and `/usr/bin/ssh`). Use a Homebrew-installed executable, for example `tarnet tarify /opt/homebrew/opt/curl/bin/curl http://alice/`, or configure the system application's SOCKS support directly as shown above. Protected shells also strip these variables, so invoke the executable directly. Hardened applications may additionally reject injected libraries. Do not disable SIP to use tarify.
+- The shim intercepts IPv4 TCP and libc hostname resolution. UDP and IPv6 connections pass through; tarify is not a general traffic isolation boundary. Use the SOCKS proxy directly for UDP support.
 - Applications that resolve DNS themselves (bypassing libc) will not go through TNS.
 - Use `socks5h://` (not `socks5://`) when configuring applications manually - the `h` means the proxy handles DNS, which is required for TNS resolution to work.

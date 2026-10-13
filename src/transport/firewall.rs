@@ -172,6 +172,10 @@ impl FirewallDiscovery {
 
 #[async_trait]
 impl Discovery for FirewallDiscovery {
+    fn supports_address(&self, addr: &str) -> bool {
+        self.inner.supports_address(addr)
+    }
+
     async fn accept(&self) -> Result<Box<dyn Transport>> {
         let transport = self.inner.accept().await?;
         let seed = self.next_seed().await;

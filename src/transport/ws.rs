@@ -198,6 +198,10 @@ impl WsConnector {
 
 #[async_trait]
 impl Discovery for WsConnector {
+    fn supports_address(&self, addr: &str) -> bool {
+        addr.starts_with("ws://") || addr.starts_with("wss://")
+    }
+
     async fn accept(&self) -> Result<Box<dyn Transport>> {
         // Never accepts — this is outbound-only.
         futures_util::future::pending().await
@@ -210,6 +214,10 @@ impl Discovery for WsConnector {
 
 #[async_trait]
 impl Discovery for WsDiscovery {
+    fn supports_address(&self, addr: &str) -> bool {
+        addr.starts_with("ws://") || addr.starts_with("wss://")
+    }
+
     async fn accept(&self) -> Result<Box<dyn Transport>> {
         let mut rx = self.accept_rx.lock().await;
         rx.recv()
@@ -228,7 +236,13 @@ async fn ws_connect(addr: &str) -> Result<Box<dyn Transport>> {
     }
     let (ws, _) = tokio_tungstenite::connect_async(addr)
         .await
-        .map_err(|e| Error::Wire(format!("WebSocket connect to {}: {}", addr, e)))?;
+        .map_err(|e| match e {
+            tokio_tungstenite::tungstenite::Error::Http(response) => Error::Protocol(format!(
+                "invalid WebSocket communication from {}: expected HTTP 101 Switching Protocols, received HTTP {}; check the bootstrap URL path and reverse proxy configuration",
+                addr, response.status()
+            )),
+            other => Error::Protocol(format!("WebSocket connect to {}: {}", addr, other)),
+        })?;
     // Enable TCP keepalive on the underlying socket so suspend/resume is detected.
     match ws.get_ref() {
         tokio_tungstenite::MaybeTlsStream::Plain(s) => {

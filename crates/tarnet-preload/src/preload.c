@@ -1,5 +1,5 @@
 /*
- * libtarnet_preload.so — LD_PRELOAD shim for tarify.
+ * Preload shim for tarify (LD_PRELOAD on Linux, dyld interposing on macOS).
  *
  * Intercepts connect() and getaddrinfo() to redirect traffic through
  * a SOCKS5 proxy (tarnet-socks). Uses sentinel IPs (127.44.x.y) to
@@ -58,6 +58,10 @@ typedef int (*getaddrinfo_fn)(const char *, const char *,
 
 static connect_fn real_connect = NULL;
 static getaddrinfo_fn real_getaddrinfo = NULL;
+typedef void (*freeaddrinfo_fn)(struct addrinfo *);
+typedef struct hostent *(*gethostbyname_fn)(const char *);
+static freeaddrinfo_fn real_freeaddrinfo = NULL;
+static gethostbyname_fn real_gethostbyname = NULL;
 
 /* Simple hash of hostname to 16-bit key. */
 static uint16_t hash_hostname(const char *name) {
@@ -88,6 +92,9 @@ static void init_proxy_addr(void) {
     int port = atoi(colon + 1);
 
     memset(&proxy_addr, 0, sizeof(proxy_addr));
+#ifdef __APPLE__
+    proxy_addr.sin_len = sizeof(proxy_addr);
+#endif
     proxy_addr.sin_family = AF_INET;
     proxy_addr.sin_port = htons(port);
     if (inet_pton(AF_INET, buf, &proxy_addr.sin_addr) != 1) {
@@ -107,12 +114,27 @@ static void init_proxy_addr(void) {
 }
 
 static void ensure_init(void) {
+#ifdef __APPLE__
+    /* dyld does not interpose references from the replacement's own image.
+     * dlsym, however, returns the interposed address and would recurse. */
+    real_connect = connect;
+    real_getaddrinfo = getaddrinfo;
+    real_freeaddrinfo = freeaddrinfo;
+    real_gethostbyname = gethostbyname;
+#else
     if (!real_connect) {
         real_connect = (connect_fn)dlsym(RTLD_NEXT, "connect");
     }
     if (!real_getaddrinfo) {
         real_getaddrinfo = (getaddrinfo_fn)dlsym(RTLD_NEXT, "getaddrinfo");
     }
+    if (!real_freeaddrinfo) {
+        real_freeaddrinfo = (freeaddrinfo_fn)dlsym(RTLD_NEXT, "freeaddrinfo");
+    }
+    if (!real_gethostbyname) {
+        real_gethostbyname = (gethostbyname_fn)dlsym(RTLD_NEXT, "gethostbyname");
+    }
+#endif
     pthread_once(&init_once, init_proxy_addr);
 }
 
@@ -351,6 +373,15 @@ static int socks5_connect_ipv4(int fd, struct in_addr addr, uint16_t port) {
 
 /* ── Intercepted functions ── */
 
+#ifdef __APPLE__
+/* Use distinct replacement symbols: Mach-O's two-level namespace needs
+ * explicit interpose tuples rather than ELF-style symbol preemption. */
+#define connect tarnet_connect
+#define getaddrinfo tarnet_getaddrinfo
+#define freeaddrinfo tarnet_freeaddrinfo
+#define gethostbyname tarnet_gethostbyname
+#endif
+
 int connect(int fd, const struct sockaddr *addr, socklen_t len) {
     ensure_init();
 
@@ -431,6 +462,9 @@ int getaddrinfo(const char *node, const char *service,
         return EAI_MEMORY;
     }
 
+#ifdef __APPLE__
+    sin->sin_len = sizeof(*sin);
+#endif
     sin->sin_family = AF_INET;
     uint32_t sentinel_ip = ((uint32_t)SENTINEL_PREFIX_A << 24) |
                            ((uint32_t)SENTINEL_PREFIX_B << 16) |
@@ -465,6 +499,7 @@ int getaddrinfo(const char *node, const char *service,
 }
 
 void freeaddrinfo(struct addrinfo *res) {
+    ensure_init();
     /* Check if this is one of our sentinel results. */
     if (res && res->ai_addr) {
         const struct sockaddr_in *sin = (const struct sockaddr_in *)res->ai_addr;
@@ -476,11 +511,6 @@ void freeaddrinfo(struct addrinfo *res) {
     }
 
     /* Call real freeaddrinfo. */
-    typedef void (*freeaddrinfo_fn)(struct addrinfo *);
-    static freeaddrinfo_fn real_freeaddrinfo = NULL;
-    if (!real_freeaddrinfo) {
-        real_freeaddrinfo = (freeaddrinfo_fn)dlsym(RTLD_NEXT, "freeaddrinfo");
-    }
     if (real_freeaddrinfo) {
         real_freeaddrinfo(res);
     }
@@ -490,11 +520,6 @@ struct hostent *gethostbyname(const char *name) {
     ensure_init();
 
     if (!name || !proxy_addr_valid) {
-        typedef struct hostent *(*gethostbyname_fn)(const char *);
-        static gethostbyname_fn real_gethostbyname = NULL;
-        if (!real_gethostbyname) {
-            real_gethostbyname = (gethostbyname_fn)dlsym(RTLD_NEXT, "gethostbyname");
-        }
         return real_gethostbyname ? real_gethostbyname(name) : NULL;
     }
 
@@ -524,3 +549,22 @@ struct hostent *gethostbyname(const char *name) {
 
     return &he;
 }
+
+#ifdef __APPLE__
+#undef connect
+#undef getaddrinfo
+#undef freeaddrinfo
+#undef gethostbyname
+
+#define INTERPOSE(replacement, original) \
+    __attribute__((used)) static const struct { \
+        const void *replacement_fn; const void *original_fn; \
+    } interpose_##original __attribute__((section("__DATA,__interpose"))) = { \
+        (const void *)&replacement, (const void *)&original \
+    }
+
+INTERPOSE(tarnet_connect, connect);
+INTERPOSE(tarnet_getaddrinfo, getaddrinfo);
+INTERPOSE(tarnet_freeaddrinfo, freeaddrinfo);
+INTERPOSE(tarnet_gethostbyname, gethostbyname);
+#endif

@@ -133,6 +133,10 @@ impl TcpDiscovery {
 
 #[async_trait]
 impl Discovery for TcpDiscovery {
+    fn supports_address(&self, addr: &str) -> bool {
+        !addr.contains("://")
+    }
+
     async fn accept(&self) -> Result<Box<dyn Transport>> {
         let mut rx = self.accept_rx.lock().await;
         let (stream, addr) = rx

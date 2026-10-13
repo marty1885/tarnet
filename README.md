@@ -78,3 +78,11 @@ $ tarnet tarify ssh alice
 ```
 
 See the [tutorial](docs/tutorial/) for the full guide.
+
+## Interactive dashboard
+
+Run `tarnet tui` on a machine with a running `tarnetd`. The interface uses Ratatui with Crossterm for terminal input. It shows the node's identities, local service configuration files, TNS labels, and live name resolution in one terminal. Use `--socket` or `--data-dir` for a nondefault daemon socket and `--services-dir` if the daemon uses a custom exposure directory.
+
+Use `<1>`–`<4>` to switch views, `<j>`/`<k>` or `<up>`/`<down>` to select, `<pgup>`/`<pgdn>` to scroll details, `<i>` to change the active identity zone, `</>` to resolve a name, and `<r>` to refresh. In Services, `<enter>` compares the configured target with the live TNS answer, `<e>` opens the selected TOML file in `$EDITOR`, and `<R>` requests a daemon reload. In TNS, `<a>` sets a record and `<d>` removes the selected record. Use `<q>` to quit.
+
+Service files are read from the local filesystem. The Services view reports the configured target and the daemon's current TNS answer; it cannot show a remote machine's deployment file unless that file is available locally. The selected service directory must match the one passed to `tarnetd --expose-dir` when that override is used.

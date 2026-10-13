@@ -10,6 +10,8 @@ use tarnet_api::types::{PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(
     name = "tarnet",
@@ -31,6 +33,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Interactive dashboard for services, identities, and TNS diagnostics
+    Tui {
+        /// Service configuration directory (default: ~/.config/tarnet/services.d)
+        #[arg(long)]
+        services_dir: Option<PathBuf>,
+    },
     /// DHT operations (put, get, hello)
     #[command(subcommand_required = true, arg_required_else_help = true)]
     Dht {
@@ -379,6 +387,7 @@ async fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
+        Command::Tui { services_dir } => tui::run(&cli, services_dir.as_deref()).await,
         Command::Dht { command } => cmd_dht(&cli, command).await,
         Command::Tns { command } => cmd_tns(&cli, command).await,
         Command::Identity { command } => cmd_identity(&cli, command).await,
@@ -1385,8 +1394,18 @@ async fn cmd_tarify(cli: &Cli, identity: Option<&str>, command: &[String]) {
     let proxy_addr = socks_addrs[0];
 
     let mut cmd = std::process::Command::new(&command[0]);
+    #[cfg(target_os = "macos")]
+    let preload_env = "DYLD_INSERT_LIBRARIES";
+    #[cfg(not(target_os = "macos"))]
+    let preload_env = "LD_PRELOAD";
+    // Keep other injected libraries, with tarify first in the lookup order.
+    let mut libraries = std::ffi::OsString::from(&preload_path);
+    if let Some(existing) = std::env::var_os(preload_env).filter(|s| !s.is_empty()) {
+        libraries.push(":");
+        libraries.push(existing);
+    }
     cmd.args(&command[1..])
-        .env("LD_PRELOAD", &preload_path)
+        .env(preload_env, libraries)
         .env("TARIFY_PROXY_ADDR", format!("{}", proxy_addr));
 
     if let Some(id) = identity {
@@ -1405,6 +1424,7 @@ async fn cmd_tarify(cli: &Cli, identity: Option<&str>, command: &[String]) {
 }
 
 fn find_preload_lib() -> String {
+    let name = env!("TARNET_PRELOAD_NAME");
     let builtin = env!("TARNET_PRELOAD_PATH");
     if std::path::Path::new(builtin).exists() {
         return builtin.to_string();
@@ -1418,25 +1438,25 @@ fn find_preload_lib() -> String {
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("libtarnet_preload.so");
+            let candidate = dir.join(name);
             if candidate.exists() {
                 return candidate.to_string_lossy().into_owned();
             }
         }
     }
 
-    for dir in &["/usr/local/lib", "/usr/lib", "/lib"] {
-        let candidate = format!("{}/libtarnet_preload.so", dir);
+    for dir in &["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib", "/lib"] {
+        let candidate = format!("{}/{}", dir, name);
         if std::path::Path::new(&candidate).exists() {
             return candidate;
         }
     }
 
-    if std::path::Path::new("libtarnet_preload.so").exists() {
-        return "libtarnet_preload.so".to_string();
+    if std::path::Path::new(name).exists() {
+        return name.to_string();
     }
 
-    eprintln!("Cannot find libtarnet_preload.so");
+    eprintln!("Cannot find {}", name);
     eprintln!("Set TARIFY_PRELOAD_PATH or place it next to the tarnet binary.");
     std::process::exit(1);
 }

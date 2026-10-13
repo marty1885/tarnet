@@ -30,6 +30,11 @@ pub trait Transport: Send + Sync {
 /// Accepts and initiates transport connections.
 #[async_trait]
 pub trait Discovery: Send + Sync {
+    /// Whether this discovery understands the address syntax. Custom
+    /// discoveries retain the existing try-in-order behavior by default.
+    fn supports_address(&self, _addr: &str) -> bool {
+        true
+    }
     /// Accept an incoming connection.
     async fn accept(&self) -> Result<Box<dyn Transport>>;
     /// Connect to a peer at the given address.
@@ -37,9 +42,9 @@ pub trait Discovery: Send + Sync {
 }
 
 /// Combines multiple Discovery implementations into one.
-/// Accepts from all listeners, dispatches connect by trying each in order.
-/// Place scheme-specific discoveries (WS) before generic ones (TCP) so that
-/// scheme detection short-circuits without attempting invalid connections.
+/// Accepts from all listeners, dispatches connect by trying compatible
+/// discoveries in order. Unsupported address schemes cannot mask a failure
+/// from the transport that actually understands the address.
 pub struct MultiDiscovery {
     accept_rx: Mutex<mpsc::Receiver<Box<dyn Transport>>>,
     discoveries: Vec<Arc<dyn Discovery>>,
@@ -80,6 +85,10 @@ impl MultiDiscovery {
 
 #[async_trait]
 impl Discovery for MultiDiscovery {
+    fn supports_address(&self, addr: &str) -> bool {
+        self.discoveries.iter().any(|disc| disc.supports_address(addr))
+    }
+
     async fn accept(&self) -> Result<Box<dyn Transport>> {
         let mut rx = self.accept_rx.lock().await;
         rx.recv()
@@ -90,6 +99,9 @@ impl Discovery for MultiDiscovery {
     async fn connect(&self, addr: &str) -> Result<Box<dyn Transport>> {
         let mut last_err = None;
         for disc in &self.discoveries {
+            if !disc.supports_address(addr) {
+                continue;
+            }
             match disc.connect(addr).await {
                 Ok(t) => return Ok(t),
                 Err(e) => last_err = Some(e),
@@ -97,5 +109,59 @@ impl Discovery for MultiDiscovery {
         }
         Err(last_err
             .unwrap_or_else(|| Error::Wire(format!("no discovery can connect to {}", addr))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn discovery() -> MultiDiscovery {
+        MultiDiscovery::new(vec![
+            Box::new(ws::WsConnector::new()),
+            Box::new(tcp::TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap()),
+        ])
+    }
+
+    #[tokio::test]
+    async fn websocket_http_response_is_not_masked_by_tcp() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(stream.read_u8().await.unwrap());
+            }
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        });
+        let error = match discovery().await.connect(&url).await {
+            Err(error) => error,
+            Ok(_) => panic!("ordinary HTTP endpoint should fail WebSocket upgrade"),
+        };
+        let message = error.to_string();
+        assert!(matches!(error, Error::Protocol(_)));
+        assert!(message.contains("invalid WebSocket communication"), "{message}");
+        assert!(message.contains("expected HTTP 101"), "{message}");
+        assert!(message.contains("received HTTP 200"), "{message}");
+        assert!(message.contains(&url), "{message}");
+        assert!(!message.contains("invalid port"), "{message}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_address_skips_websocket_connector() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let transport = discovery().await.connect(&listener.local_addr().unwrap().to_string()).await.unwrap();
+        assert_eq!(transport.name(), "tcp");
+    }
+
+    #[tokio::test]
+    async fn websocket_address_connects() {
+        let listener = ws::WsDiscovery::bind("127.0.0.1:0", "/tarnet".into()).await.unwrap();
+        let url = format!("ws://{}/tarnet", listener.local_addr());
+        let transport = discovery().await.connect(&url).await.unwrap();
+        assert_eq!(transport.name(), "ws");
     }
 }
