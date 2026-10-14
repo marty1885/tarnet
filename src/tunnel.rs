@@ -17,6 +17,8 @@ const TUNNEL_DATA_CONTEXT: &[u8] = b"tarnet tunnel data v4";
 /// Identified by the remote PeerId — one tunnel per peer.
 pub struct Tunnel {
     pub remote_peer: PeerId,
+    /// Forwarding hints toward `remote_peer` when we have no route to it.
+    pub hints: Vec<PeerId>,
     enc_key: [u8; 32],
     dec_key: [u8; 32],
     send_seq: u64,
@@ -37,6 +39,7 @@ impl Tunnel {
 
         Self {
             remote_peer,
+            hints: Vec::new(),
             enc_key: enc,
             dec_key: dec,
             send_seq: 0,

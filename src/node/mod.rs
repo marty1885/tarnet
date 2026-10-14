@@ -13,15 +13,13 @@ use crate::governor::{Governor, GovernorConfig, Verdict};
 use crate::bootstrap;
 use crate::channel::Channel;
 use crate::circuit::{
-    backward_nonce_domain, build_extend_payload, build_extended_payload,
     build_intro_register_payload, build_introduce_cell, build_introduce_payload,
-    build_rendezvous_establish_payload, build_stream_begin_payload, cell_nonce, derive_hop_keys,
-    parse_extend_payload, parse_extended_payload, parse_intro_register_payload,
-    parse_introduce_cell, parse_introduce_payload, parse_rendezvous_establish_payload,
-    parse_rendezvous_join_payload, parse_stream_begin_payload, set_cell_nonce, write_cell_body,
-    CellReplayWindow, CircuitAction, CircuitKey, CircuitState as CircuitPhase, CircuitTable,
-    CryptoOp, ExtendRequest, HopCrypto, HopKey, OutboundCircuit, RelayCell, RelayCellCommand,
-    RelayPiece, CELL_BODY_SIZE, CELL_PAYLOAD_MAX, CELL_SIZE, EXTENDED_FLAG_REACHED,
+    build_rendezvous_establish_payload, build_stream_begin_payload, created_signed_message,
+    verify_intro_register, parse_introduce_cell, parse_introduce_payload,
+    parse_rendezvous_establish_payload, parse_rendezvous_join_payload,
+    parse_stream_begin_payload, seal_outward, write_cell_body, CircuitAction, CircuitKey, CircuitState as CircuitPhase, CircuitTable,
+    CreateRequest, CreatedReply, CryptoOp, HopCrypto, HopKey, LayerKeys, OnionLayers, OutboundCircuit, Peeled,
+    RelayCell, RelayCellCommand, RelayPiece, CELL_BODY_SIZE, CELL_PAYLOAD_MAX, CELL_SIZE,
 };
 use crate::dht::{
     DhtNeighbor, DhtRecord, DhtStore, DhtWatchTable, KBucketTable, RecordSource, WalkStep,
@@ -47,13 +45,18 @@ use tarnet_api::service::{Connection, Listener, ListenerOptions};
 
 mod circuit;
 mod dht;
+mod directory;
 mod hidden_service;
 mod identity_mgmt;
 mod pool;
 mod route;
+mod sample;
+mod search;
 mod stream;
 mod tunnel;
 mod webrtc;
+
+pub use directory::{LandmarkConfig, LandmarkMode};
 
 /// Create an interval that starts after a random jitter of `0..period/2`,
 /// then ticks at `period`.  Desynchronizes periodic timers across nodes.
@@ -213,6 +216,8 @@ const HIDDEN_SERVICE_MAINTAIN_INTERVAL: Duration = Duration::from_secs(240);
 
 /// TTL of a hidden service's TNS intro records.
 const HIDDEN_SERVICE_TTL: u32 = 600;
+/// INTRODUCEs a node's hidden services handle at once.
+const MAX_CONCURRENT_INTRODUCTIONS: usize = 8;
 
 /// How often each Hidden identity's task checks its intro circuits, drawn
 /// uniformly from this range per check so identities stay unsynchronised.
@@ -258,14 +263,22 @@ pub struct CircuitState {
     /// Pending relay extends: outbound_circuit_id → (inbound_from, inbound_circuit_id).
     /// When a relay sends CircuitCreate on behalf of an EXTEND, this maps the outbound
     /// circuit_id to the inbound circuit so the CircuitCreated reply can be routed back.
-    pub relay_extend_pending: Arc<Mutex<HashMap<CircuitKey, (PeerId, u32, bool, Instant)>>>,
+    pub relay_extend_pending: Arc<Mutex<HashMap<CircuitKey, (PeerId, u32, Instant)>>>,
+    /// Routed CREATEs we passed on, keyed by the downstream leg, until the
+    /// destination's CREATED comes back.
+    pub routed_pending: Arc<Mutex<HashMap<CircuitKey, RoutedCreate>>>,
+    /// Ephemeral keys of recent CREATEs (hashed) and the circuit that used
+    /// each, to catch a CREATE that loops back.
+    pub create_keys: Arc<Mutex<HashMap<[u8; 32], (CircuitKey, Instant)>>>,
+    /// Per incoming link: CREATE tokens left and when they were counted.
+    pub create_budget: Arc<Mutex<HashMap<PeerId, (f64, Instant)>>>,
     /// CircuitCreated replies we sent, with a hash of the CREATE they answer,
     /// so a resent CREATE (the first reply was lost) gets the same reply.
     pub created_replies: Arc<Mutex<HashMap<CircuitKey, ([u8; 32], Vec<u8>, Instant)>>>,
-    /// Backward crypto keying material for circuit hops.
-    /// Key: (circuit_id, from_peer) → (backward_key, backward_digest, nonce).
-    /// Stored at CREATE time, used when converting Endpoint → Forward on EXTEND.
-    pub hop_backward_keys: Arc<Mutex<HashMap<(u32, PeerId), ([u8; 32], [u8; 32], [u8; 16], u64)>>>,
+    /// Our backward layer keys for circuits we are a hop of, with the next
+    /// counter for cells we seal ourselves.
+    /// Key: (circuit_id, from_peer). Stored at CREATE time.
+    pub hop_backward_keys: Arc<Mutex<HashMap<(u32, PeerId), HopBackward>>>,
     /// Per-circuit message queues: ensures control and data on the same circuit are
     /// processed in FIFO order rather than racing in spawned tasks.
     /// Key: (circuit_id, from_peer) → sender into that circuit's processing task.
@@ -276,6 +289,26 @@ pub struct CircuitState {
     pub pending_truncates: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>,
 }
 
+/// Our backward layer of a circuit we are a hop of.
+pub struct HopBackward {
+    pub keys: LayerKeys,
+    /// Counter for cells we seal ourselves.
+    pub counter: u64,
+    /// Hash of the CREATE handshake that made this hop.
+    pub transcript: [u8; 32],
+}
+
+/// A routed CREATE a relay passed on.
+pub struct RoutedCreate {
+    /// The leg the CREATE came in on.
+    pub upstream: CircuitKey,
+    /// Hash of its payload, to recognise resends.
+    pub hash: [u8; 32],
+    /// The CREATE as sent downstream, for resending.
+    pub create: Vec<u8>,
+    pub at: Instant,
+}
+
 impl CircuitState {
     fn new() -> Self {
         Self {
@@ -284,6 +317,9 @@ impl CircuitState {
             pending_extends: Arc::new(Mutex::new(HashMap::new())),
             pending_create_peers: Arc::new(Mutex::new(HashMap::new())),
             relay_extend_pending: Arc::new(Mutex::new(HashMap::new())),
+            routed_pending: Arc::new(Mutex::new(HashMap::new())),
+            create_keys: Arc::new(Mutex::new(HashMap::new())),
+            create_budget: Arc::new(Mutex::new(HashMap::new())),
             created_replies: Arc::new(Mutex::new(HashMap::new())),
             hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
             relay_queues: Arc::new(Mutex::new(HashMap::new())),
@@ -340,6 +376,10 @@ pub struct HiddenServiceState {
         Arc<Mutex<HashMap<CircuitKey, (tarnet_api::types::ServiceId, PeerId)>>>,
     /// Rendezvous point state: cookie → RendezvousEntry
     pub(crate) rendezvous: Arc<Mutex<HashMap<[u8; 32], RendezvousEntry>>>,
+    /// Hashes of INTRODUCEs our services answered, to drop replays.
+    pub(super) introduce_seen: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    /// INTRODUCEs handled at once; more are dropped.
+    pub(super) introduce_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl HiddenServiceState {
@@ -350,6 +390,8 @@ impl HiddenServiceState {
             maintained: Arc::new(Mutex::new(HashSet::new())),
             intro_registrations: Arc::new(Mutex::new(HashMap::new())),
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
+            introduce_seen: Arc::new(Mutex::new(HashMap::new())),
+            introduce_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INTRODUCTIONS)),
         }
     }
 }
@@ -480,6 +522,14 @@ pub struct Node {
     listener_next_id: AtomicU32,
     listener_rr: AtomicU64,
     hidden: HiddenServiceState,
+    /// Relay sampling walks and the sampled relay pool.
+    sampling: sample::SampleState,
+    /// Landmark role, our address, the directory store and lookups.
+    directory: directory::DirectoryState,
+    /// Bounded route searches we run and relay.
+    search: search::SearchState,
+    /// This node, for spawning work from `&self` handlers. Set by `run`.
+    weak_self: std::sync::OnceLock<std::sync::Weak<Node>>,
     /// Identity store: named keypairs with privacy levels.
     identity_store: Arc<Mutex<IdentityStore>>,
     /// Pool store: local name → joined virtual-cluster membership.
@@ -748,6 +798,10 @@ impl Node {
             listener_next_id: AtomicU32::new(1),
             listener_rr: AtomicU64::new(0),
             hidden: HiddenServiceState::new(),
+            sampling: sample::SampleState::new(),
+            directory: directory::DirectoryState::new(),
+            search: search::SearchState::new(),
+            weak_self: std::sync::OnceLock::new(),
             identity_store: Arc::new(Mutex::new(identity_store)),
             pool_store: Arc::new(Mutex::new(pool_store)),
             pool_claims: Arc::new(Mutex::new(HashMap::new())),
@@ -884,6 +938,7 @@ impl Node {
         bootstrap: Vec<String>,
         discovery_addrs: Vec<String>,
     ) -> Result<()> {
+        let _ = self.weak_self.set(Arc::downgrade(&self));
         let discovery = Arc::new(discovery);
         *self.discovery.lock().await = Some(discovery.clone());
         *self.bootstrap_addrs.lock().await = bootstrap.clone();
@@ -1233,6 +1288,9 @@ impl Node {
             .ok_or_else(|| Error::Protocol("event loop already running".into()))?;
 
         self.spawn_routing_task();
+        self.spawn_sampling_task(node_arc.clone());
+        self.spawn_directory_task(node_arc.clone());
+        self.spawn_search_gc(node_arc.clone());
 
         // Per-link heartbeat / cover-traffic / liveness task. Every tick:
         //   1. Fire LinkDown for any link that hasn't received in DEAD_TIMEOUT.
@@ -1454,6 +1512,28 @@ impl Node {
             }
         });
 
+        // Tear down routed CREATEs that were never answered.
+        let half_open_ref = node_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = jittered_interval(circuit::ROUTED_CREATE_TIMEOUT / 3);
+            loop {
+                interval.tick().await;
+                half_open_ref.expire_routed_creates().await;
+            }
+        });
+
+        // Tear down relay entries that stopped carrying cells.
+        let idle_ref = node_arc.clone();
+        tokio::spawn(async move {
+            let mut interval = jittered_interval(circuit::RELAY_IDLE_TIMEOUT / 10);
+            loop {
+                interval.tick().await;
+                idle_ref
+                    .expire_idle_relay_entries(circuit::RELAY_IDLE_TIMEOUT)
+                    .await;
+            }
+        });
+
         // Periodic governor tick: decay strikes, update pressure, drain reports.
         let gov_ref = node_arc.clone();
         tokio::spawn(async move {
@@ -1475,6 +1555,7 @@ impl Node {
         let relay_ext_ref = self.circuits.relay_extend_pending.clone();
         let pke_ref = self.pending_key_exchanges.clone();
         let rend_ref = self.hidden.rendezvous.clone();
+        let intro_seen_ref = self.hidden.introduce_seen.clone();
         tokio::spawn(async move {
             let mut interval = jittered_interval(DHT_EXPIRY_INTERVAL);
             loop {
@@ -1508,7 +1589,7 @@ impl Node {
                     .retain(|_, (_, _, at)| now.duration_since(*at) < NONCE_CACHE_TTL);
                 // Expire stale relay extend pending entries (10s — well beyond
                 // the 1.5s circuit extend timeout at the initiator).
-                relay_ext_ref.lock().await.retain(|_, (_, _, _, created)| {
+                relay_ext_ref.lock().await.retain(|_, (_, _, created)| {
                     now.duration_since(*created) < Duration::from_secs(10)
                 });
                 // Expire stale pending key exchanges (30s timeout).
@@ -1526,6 +1607,11 @@ impl Node {
                         // Completed rendezvous — keep longer for circuit lifetime
                         age < Duration::from_secs(300)
                     }
+                });
+                // An INTRODUCE can't be replayed once the records naming its
+                // intro point have expired.
+                intro_seen_ref.lock().await.retain(|_, at| {
+                    now.duration_since(*at) < Duration::from_secs(2 * HIDDEN_SERVICE_TTL as u64)
                 });
             }
         });
@@ -1610,30 +1696,30 @@ impl Node {
 
                 // Resend unconfirmed ChannelOpens ahead of the data behind them.
                 for (remote, inner) in reopens {
-                    let encrypted = {
+                    let (encrypted, hints) = {
                         let mut tt = retransmit_tunnel_table.lock().await;
-                        match tt.get_mut(&remote).map(|t| t.encrypt(&inner)) {
-                            Some(Ok(data)) => data,
-                            _ => continue,
+                        let Some(t) = tt.get_mut(&remote) else { continue };
+                        match t.encrypt(&inner) {
+                            Ok(data) => (data, t.hints.clone()),
+                            Err(_) => continue,
                         }
                     };
                     let msg = EncryptedDataMsg {
                         origin: retransmit_identity.peer_id(),
                         destination: remote,
                         ttl: 64,
-                        hints: Vec::new(),
+                        hints: hints.clone(),
                         data: encrypted,
                     };
                     let encoded = msg.to_wire_encrypted().encode();
-                    let links = retransmit_links.lock().await;
-                    let hop = if links.get(&remote).is_some() {
-                        Some(remote)
-                    } else {
-                        retransmit_routing.lock().await.lookup(&remote).map(|r| r.next_hop)
-                    };
-                    if let Some(link) = hop.and_then(|h| links.get(&h)) {
-                        let _ = link.send_message(&encoded).await;
-                    }
+                    let _ = tunnel::send_overlay(
+                        &retransmit_links,
+                        &retransmit_routing,
+                        &remote,
+                        &hints,
+                        &encoded,
+                    )
+                    .await;
                 }
 
                 // Notify app of dead channels
@@ -1658,6 +1744,7 @@ impl Node {
                         Some(t) => t,
                         None => continue,
                     };
+                    let hints = tunnel.hints.clone();
                     let mut encoded_msgs = Vec::new();
                     for (seq, data) in &packets {
                         let channel_data = ChannelDataMsg {
@@ -1677,7 +1764,7 @@ impl Node {
                             origin: retransmit_identity.peer_id(),
                             destination: remote,
                             ttl: 64,
-                            hints: Vec::new(),
+                            hints: hints.clone(),
                             data: encrypted,
                         };
                         encoded_msgs.push((*seq, msg.to_wire_encrypted().encode()));
@@ -1686,23 +1773,14 @@ impl Node {
 
                     // Route each retransmit
                     for (seq, encoded) in encoded_msgs {
-                        let links = retransmit_links.lock().await;
-                        let result = if let Some(link) = links.get(&remote) {
-                            link.send_message(&encoded).await
-                        } else {
-                            let table = retransmit_routing.lock().await;
-                            let next_hop = table.lookup(&remote).map(|r| r.next_hop);
-                            drop(table);
-                            if let Some(hop) = next_hop {
-                                if let Some(link) = links.get(&hop) {
-                                    link.send_message(&encoded).await
-                                } else {
-                                    continue;
-                                }
-                            } else {
-                                continue;
-                            }
-                        };
+                        let result = tunnel::send_overlay(
+                            &retransmit_links,
+                            &retransmit_routing,
+                            &remote,
+                            &hints,
+                            &encoded,
+                        )
+                        .await;
                         if result.is_ok() {
                             log::trace!(
                                 "Retransmitted ch {} seq {} to {:?}",
@@ -2038,11 +2116,13 @@ impl Node {
         }
     }
 
-    /// A new link can move where walks for our keys end (and on startup it is
-    /// the first chance to place anything): republish our hello and our own
-    /// records and relaunch our watches — at most once per
+    /// A link coming up or going down can move where walks for our keys end
+    /// (and on startup it is the first chance to place anything; after a
+    /// partition, an island re-places its records): republish our hello and
+    /// our own records and relaunch our watches — at most once per
     /// [`LINK_UP_REPUBLISH_MIN_INTERVAL`], after a short delay so it stays off
-    /// the new link's handshake path and the routing table has started to fill.
+    /// a new link's handshake path and the routing table has settled.
+    /// Hidden identities' records are not among them.
     async fn schedule_link_up_republish(&self, node: &Arc<Node>) {
         let due = {
             let mut last = self.dht_link_up_republish.lock().await;
@@ -2143,6 +2223,11 @@ impl Node {
                 .channel_event_tx
                 .send(ChannelEvent::PeerDisconnected { peer_id })
                 .await;
+            if !self.links.lock().await.is_empty() {
+                if let Some(node) = self.weak_self.get().and_then(|w| w.upgrade()) {
+                    self.schedule_link_up_republish(&node).await;
+                }
+            }
         }
 
         // If we have zero links remaining, enter isolation recovery mode.
@@ -2228,7 +2313,13 @@ impl Node {
             .relay_extend_pending
             .lock()
             .await
-            .retain(|id, (from, _, _, _)| *from != peer_id && id.from_peer != peer_id);
+            .retain(|id, (from, _, _)| *from != peer_id && id.from_peer != peer_id);
+        self.circuits
+            .routed_pending
+            .lock()
+            .await
+            .retain(|down, p| down.from_peer != peer_id && p.upstream.from_peer != peer_id);
+        self.circuits.create_budget.lock().await.remove(&peer_id);
         self.hidden
             .rendezvous
             .lock()
@@ -2423,6 +2514,33 @@ impl Node {
             }
             MessageType::RouteRequest => {
                 self.handle_route_request(from, &msg.payload).await?;
+            }
+            MessageType::SampleWalk => {
+                self.handle_sample_walk(from, &msg.payload).await?;
+            }
+            MessageType::SampleResult => {
+                self.handle_sample_result(from, &msg.payload).await?;
+            }
+            MessageType::DirPublish => {
+                self.handle_dir_publish(from, &msg.payload).await?;
+            }
+            MessageType::DirLookup => {
+                self.handle_dir_lookup(from, &msg.payload).await?;
+            }
+            MessageType::DirResult => {
+                self.handle_dir_result(from, &msg.payload).await?;
+            }
+            MessageType::PathTrace => {
+                self.handle_path_trace(from, &msg.payload).await?;
+            }
+            MessageType::PathTraceResult => {
+                self.handle_path_trace_result(from, &msg.payload).await?;
+            }
+            MessageType::RouteSearch => {
+                self.handle_route_search(from, &msg.payload).await?;
+            }
+            MessageType::RouteSearchFound => {
+                self.handle_route_search_found(from, &msg.payload).await?;
             }
             MessageType::DhtPut => {
                 // Charge before parsing further or verifying: the budget bounds
@@ -3011,9 +3129,8 @@ impl Node {
             let kb = self.kbucket.lock().await;
             let kbucket_peers = kb.len();
             drop(kb);
-            // Network size as the DHT sizes its walks: routing-table
-            // destinations plus us.
-            let nse = self.routing_table.lock().await.len() as u64 + 1;
+            // Network size as the DHT sizes its walks.
+            let nse = self.routing_table.lock().await.network_size_estimate() as u64;
             let local_watches = self.local_watches.lock().await.len();
             let remote_watches = self.dht_watches.lock().await.watch_count();
             DhtStatus {

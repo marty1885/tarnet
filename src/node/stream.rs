@@ -162,27 +162,16 @@ async fn send_cell(
         });
         encode_circuit_relay_cell(cid, &cell)
     } else {
-        let (enc, digest, domain, nonce) = {
-            let mut map = circuits.hop_backward_keys.lock().await;
-            let entry = map
-                .get_mut(&(key.circuit_id, key.from_peer))
-                .ok_or_else(|| Error::Protocol("stream backward keys gone".into()))?;
-            let nonce = entry.3;
-            entry.3 = entry
-                .3
-                .checked_add(1)
-                .ok_or_else(|| Error::Crypto("backward nonce exhausted".into()))?;
-            (entry.0, entry.1, entry.2, nonce)
-        };
-        super::circuit::encrypt_backward_cell(
-            enc,
-            digest,
-            domain,
-            nonce,
-            key.circuit_id,
-            command,
-            data,
-        )
+        let body = write_cell_body(command, 0, data);
+        let mut map = circuits.hop_backward_keys.lock().await;
+        let hop = map
+            .get_mut(&(key.circuit_id, key.from_peer))
+            .ok_or_else(|| Error::Protocol("stream backward keys gone".into()))?;
+        let n = hop.counter;
+        hop.counter = n
+            .checked_add(1)
+            .ok_or_else(|| Error::Crypto("backward counter exhausted".into()))?;
+        super::circuit::seal_backward_cell(&hop.keys, n, key.circuit_id, &body)
     };
     let link = links
         .lock()

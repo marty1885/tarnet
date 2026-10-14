@@ -3,11 +3,11 @@
 //! Pure state machine: callers feed it link events and received messages and
 //! send what it hands back. It does no I/O.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crate::types::PeerId;
-use crate::wire::{RouteDigestMsg, RouteEntry, RouteUpdateMsg, ROUTE_INFINITY};
+use crate::wire::{RouteDigestMsg, RouteEntry, RouteUpdateMsg, ROUTE_INFINITY, ROUTE_LANDMARK};
 
 /// Routes kept per destination for failover.
 const MAX_ROUTES_PER_DEST: usize = 3;
@@ -29,6 +29,42 @@ const FD_GC: Duration = Duration::from_secs(180);
 /// Duplicate seqno requests are dropped for this long.
 const REQUEST_DEDUP: Duration = Duration::from_secs(10);
 
+/// Landmark acceptance limits and flag rate limit (sybil defence).
+#[derive(Debug, Clone, Copy)]
+pub struct LandmarkLimits {
+    /// Landmarks always accepted via one next hop (`LM_SHARE_MIN`).
+    pub share_min: usize,
+    /// Fair share factor: `ceil(share_factor · L / d)` per next hop.
+    pub share_factor: usize,
+    /// Most landmarks accepted in total (`LM_MAX`).
+    pub max: usize,
+    /// A destination whose flag changes twice within this is ignored as a
+    /// landmark for this long.
+    pub flag_min_gap: Duration,
+}
+
+impl Default for LandmarkLimits {
+    fn default() -> Self {
+        Self {
+            share_min: 32,
+            share_factor: 2,
+            max: 8192,
+            flag_min_gap: Duration::from_secs(600),
+        }
+    }
+}
+
+/// What we know about a destination's `LANDMARK` flag.
+struct FlagState {
+    flag: bool,
+    /// When the flag last changed.
+    changed: Option<Instant>,
+    /// When we first saw the flag set, this time round.
+    since: Option<Instant>,
+    /// Ignored as a landmark until then: it toggled too fast.
+    ignored_until: Option<Instant>,
+}
+
 /// Link cost of a fast link.
 pub const COST_FAST: u16 = 1;
 /// Link cost of a slow link.
@@ -44,6 +80,8 @@ pub struct Route {
     pub next_hop: PeerId,
     pub cost: u32,
     pub seqno: u16,
+    /// The advertised entry carried the `LANDMARK` flag.
+    pub landmark: bool,
 }
 
 struct Neighbour {
@@ -78,6 +116,18 @@ pub struct RoutingTable {
     /// Feasibility distance `(seqno, metric)` and when it was last used.
     fd: HashMap<PeerId, (u16, u16, Instant)>,
     recent_requests: HashMap<(PeerId, u16), Instant>,
+    /// The last reselection had at least as many destinations as it keeps.
+    evicting: bool,
+    /// We are a landmark: our own route carries the flag.
+    landmark: bool,
+    limits: LandmarkLimits,
+    flags: HashMap<PeerId, FlagState>,
+    /// Accepted landmarks.
+    landmarks: HashSet<PeerId>,
+    /// Cost of the farthest destination in the local area, while evicting.
+    radius: Option<u32>,
+    /// Next hops whose landmark flags toggled too fast, for strikes.
+    flag_strikes: Vec<PeerId>,
 }
 
 impl RoutingTable {
@@ -95,12 +145,108 @@ impl RoutingTable {
             advertised: BTreeMap::new(),
             fd: HashMap::new(),
             recent_requests: HashMap::new(),
+            evicting: false,
+            landmark: false,
+            limits: LandmarkLimits::default(),
+            flags: HashMap::new(),
+            landmarks: HashSet::new(),
+            radius: None,
+            flag_strikes: Vec::new(),
         };
         t.advertise_self();
         t
     }
 
     // ── Lookups ──
+
+    /// Whether the table holds every destination it hears of. Once it is
+    /// at its budget it holds only the local area, which is no fair sample
+    /// of the network.
+    pub fn is_complete(&self) -> bool {
+        !self.evicting
+    }
+
+    /// Change the budget (testing). Returns the seqno requests to send.
+    #[doc(hidden)]
+    pub fn set_budget(&mut self, budget: usize) -> Vec<SeqnoRequest> {
+        self.budget = budget.max(1);
+        self.decide()
+    }
+
+    /// Change the landmark acceptance limits. Returns the seqno requests to
+    /// send.
+    pub fn set_landmark_limits(&mut self, limits: LandmarkLimits) -> Vec<SeqnoRequest> {
+        self.limits = limits;
+        self.decide()
+    }
+
+    /// Our table budget `B_MIN` (before landmarks raise it).
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Whether we are a landmark.
+    pub fn is_landmark(&self) -> bool {
+        self.landmark
+    }
+
+    /// Take or give up the landmark role: our own route carries the flag.
+    pub fn set_landmark(&mut self, on: bool) {
+        if self.landmark != on {
+            self.landmark = on;
+            self.advertise_self();
+        }
+    }
+
+    /// Accepted landmarks other than us, with their best route.
+    pub fn landmarks(&self) -> Vec<(PeerId, Route)> {
+        let mut out: Vec<(PeerId, Route)> = self
+            .landmarks
+            .iter()
+            .filter_map(|l| self.selected.get(l).and_then(|r| r.first()).map(|r| (*l, *r)))
+            .collect();
+        out.sort_by_key(|(l, r)| (r.cost, l.0));
+        out
+    }
+
+    /// When we first saw `dest` carry the landmark flag (incumbency).
+    pub fn landmark_since(&self, dest: &PeerId) -> Option<Instant> {
+        self.flags.get(dest).and_then(|f| f.since)
+    }
+
+    /// Cost of the farthest destination in our local area, while the table
+    /// is evicting; `None` while it holds everything.
+    pub fn local_radius(&self) -> Option<u32> {
+        self.radius
+    }
+
+    /// Some accepted landmark (or we) lies within our local area.
+    pub fn is_covered(&self) -> bool {
+        if self.landmark {
+            return true;
+        }
+        let radius = self.radius.unwrap_or(u32::MAX);
+        self.landmarks()
+            .iter()
+            .any(|(_, r)| r.cost <= radius)
+    }
+
+    /// Next hops that advertised a landmark flag toggling too fast since the
+    /// last call.
+    pub fn take_flag_strikes(&mut self) -> Vec<PeerId> {
+        std::mem::take(&mut self.flag_strikes)
+    }
+
+    /// Network size estimate: the table plus us while it is a complete view,
+    /// else landmarks times budget.
+    pub fn network_size_estimate(&self) -> usize {
+        let complete = self.selected.len() + 1;
+        if self.is_complete() {
+            return complete;
+        }
+        let l = self.landmarks.len() + self.landmark as usize;
+        (l.max(1) * self.budget.max(l)).max(complete)
+    }
 
     /// Number of destinations we have a route to.
     pub fn len(&self) -> usize {
@@ -117,6 +263,7 @@ impl RoutingTable {
                     next_hop: *dest,
                     cost: n.cost as u32,
                     seqno: 0,
+                    landmark: false,
                 })
             })
     }
@@ -130,6 +277,32 @@ impl RoutingTable {
                 .map(|r| vec![r.next_hop])
                 .unwrap_or_default(),
         }
+    }
+
+    /// The forwarding rule: `dest` itself if linked, else the next hop of
+    /// our route to it, else toward the last hint we can reach (the one
+    /// nearest `dest`). `usable` says which neighbours we may send to (linked,
+    /// and not where the packet came from).
+    pub fn next_hop_hinted(
+        &self,
+        dest: &PeerId,
+        hints: &[PeerId],
+        usable: impl Fn(&PeerId) -> bool,
+    ) -> Option<PeerId> {
+        if usable(dest) {
+            return Some(*dest);
+        }
+        let via = |t: &PeerId| {
+            self.lookup_multi(t, MAX_ROUTES_PER_DEST)
+                .into_iter()
+                .find(|n| usable(n))
+        };
+        via(dest).or_else(|| {
+            hints
+                .iter()
+                .rev()
+                .find_map(|h| if usable(h) { Some(*h) } else { via(h) })
+        })
     }
 
     /// Every destination with its best route.
@@ -193,7 +366,12 @@ impl RoutingTable {
 
     /// Apply a `RouteUpdate` from neighbour `from`.
     pub fn apply_update(&mut self, from: &PeerId, msg: &RouteUpdateMsg) -> Vec<SeqnoRequest> {
-        let cap = self.budget.saturating_mul(RIB_SLACK) + 1;
+        // A neighbour keeps its local area plus its accepted landmarks.
+        let cap = self
+            .budget
+            .saturating_mul(RIB_SLACK)
+            .saturating_add(self.limits.max)
+            + 1;
         let Some(nb) = self.neighbours.get_mut(from) else {
             return Vec::new();
         };
@@ -377,7 +555,7 @@ impl RoutingTable {
             dest: self.local,
             seqno: self.seqno,
             metric: 0,
-            eflags: 0,
+            eflags: if self.landmark { ROUTE_LANDMARK } else { 0 },
         };
         self.set_advertised(e);
     }
@@ -419,8 +597,76 @@ impl RoutingTable {
         }
     }
 
-    /// Reselect every route, keep the `budget` best destinations, and queue
-    /// the differences to what we advertised.
+    /// Track each destination's landmark flag (as carried by its best
+    /// route) and mark the ones that toggle too fast.
+    fn observe_flags(&mut self, ranked: &[(u32, PeerId, Vec<Route>)]) {
+        let now = Instant::now();
+        let gap = self.limits.flag_min_gap;
+        for (_, dest, routes) in ranked {
+            let flag = routes[0].landmark;
+            let st = self.flags.entry(*dest).or_insert(FlagState {
+                flag,
+                changed: None,
+                since: flag.then_some(now),
+                ignored_until: None,
+            });
+            if st.flag == flag {
+                continue;
+            }
+            if st.changed.is_some_and(|t| now.duration_since(t) < gap) {
+                st.ignored_until = Some(now + gap);
+                self.flag_strikes.push(routes[0].next_hop);
+            }
+            st.flag = flag;
+            st.changed = Some(now);
+            st.since = flag.then_some(now);
+        }
+        let present: HashSet<PeerId> = ranked.iter().map(|(_, d, _)| *d).collect();
+        // Forget destinations gone for longer than the rate limit.
+        self.flags.retain(|d, st| {
+            present.contains(d) || st.changed.map_or(false, |t| now.duration_since(t) < gap)
+        });
+    }
+
+    /// Landmarks to accept from the ranked candidates: flagged, not toggling,
+    /// at most a fair share per next hop and `max` in total.
+    fn accept_landmarks(&self, ranked: &[(u32, PeerId, Vec<Route>)]) -> HashSet<PeerId> {
+        let now = Instant::now();
+        let candidates: Vec<&(u32, PeerId, Vec<Route>)> = ranked
+            .iter()
+            .filter(|(_, d, routes)| {
+                routes[0].landmark
+                    && !self
+                        .flags
+                        .get(d)
+                        .and_then(|f| f.ignored_until)
+                        .is_some_and(|t| t > now)
+            })
+            .collect();
+        let d = self.neighbours.len().max(1);
+        let share = self
+            .limits
+            .share_min
+            .max((self.limits.share_factor * candidates.len()).div_ceil(d));
+        let mut per_hop: HashMap<PeerId, usize> = HashMap::new();
+        let mut accepted = HashSet::new();
+        for (_, dest, routes) in candidates {
+            if accepted.len() >= self.limits.max {
+                break;
+            }
+            let n = per_hop.entry(routes[0].next_hop).or_default();
+            if *n >= share {
+                continue;
+            }
+            *n += 1;
+            accepted.insert(*dest);
+        }
+        accepted
+    }
+
+    /// Reselect every route, keep the local area (the `max(budget, L)`
+    /// nearest destinations) plus every accepted landmark, and queue the
+    /// differences to what we advertised.
     fn decide(&mut self) -> Vec<SeqnoRequest> {
         let mut candidates: HashMap<PeerId, Vec<Route>> = HashMap::new();
         let mut infeasible: HashMap<PeerId, Vec<PeerId>> = HashMap::new();
@@ -441,6 +687,7 @@ impl RoutingTable {
                     next_hop: *n,
                     cost,
                     seqno: e.seqno,
+                    landmark: e.eflags & ROUTE_LANDMARK != 0,
                 });
             }
         }
@@ -460,7 +707,24 @@ impl RoutingTable {
             })
             .collect();
         ranked.sort_by_key(|(cost, dest, _)| (*cost, dest.0));
-        ranked.truncate(self.budget);
+        self.observe_flags(&ranked);
+        self.landmarks = self.accept_landmarks(&ranked);
+        let area = self.budget.max(self.landmarks.len() + self.landmark as usize);
+        // At exactly the budget we can't tell whether more lie beyond: only
+        // fewer destinations than we could keep proves a complete view.
+        self.evicting = ranked.len() >= area;
+        self.radius = if self.evicting {
+            Some(ranked[area - 1].0)
+        } else {
+            None
+        };
+        let landmarks = &self.landmarks;
+        let ranked: Vec<(u32, PeerId, Vec<Route>)> = ranked
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, dest, _))| *i < area || landmarks.contains(dest))
+            .map(|(_, r)| r)
+            .collect();
 
         let old = std::mem::take(&mut self.selected);
         let mut changes = Vec::with_capacity(ranked.len());
@@ -469,7 +733,8 @@ impl RoutingTable {
                 dest,
                 seqno: routes[0].seqno,
                 metric: cost as u16,
-                eflags: 0,
+                // Relays pass on the flag of the route they selected.
+                eflags: if routes[0].landmark { ROUTE_LANDMARK } else { 0 },
             });
             self.selected.insert(dest, routes);
         }
@@ -678,6 +943,7 @@ mod tests {
         assert!(a.lookup(&pid(9)).is_some());
         assert!(a.lookup(&pid(8)).is_none());
         assert_eq!(a.len(), 2);
+        assert!(!a.is_complete());
         let adv: Vec<PeerId> = a.advertised.keys().copied().collect();
         assert!(!adv.contains(&pid(8)));
     }
@@ -716,6 +982,172 @@ mod tests {
             dump[0].flags,
             ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END
         );
+    }
+
+    fn landmark_entry(dest: u8, seqno: u16, metric: u16) -> RouteEntry {
+        RouteEntry {
+            eflags: ROUTE_LANDMARK,
+            ..entry(dest, seqno, metric)
+        }
+    }
+
+    #[test]
+    fn landmarks_are_kept_beyond_the_budget_and_flagged_on() {
+        let mut a = RoutingTable::with_budget(pid(1), 2);
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(
+            &pid(2),
+            &update(vec![
+                entry(2, 1, 0),
+                entry(7, 1, 1),
+                entry(8, 1, 2),
+                landmark_entry(9, 1, 6),
+            ]),
+        );
+        // Local area: 2 and 7. 9 is far but a landmark.
+        assert!(a.lookup(&pid(8)).is_none());
+        let r = a.lookup(&pid(9)).unwrap();
+        assert!(r.landmark);
+        assert_eq!(a.landmarks().iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec![pid(9)]);
+        assert_eq!(a.local_radius(), Some(2));
+        assert!(!a.is_covered(), "landmark at 7 is outside radius 2");
+        // We pass the flag on.
+        let adv = a.advertised.get(&pid(9)).unwrap();
+        assert_eq!(adv.eflags, ROUTE_LANDMARK);
+
+        // Our own flag rides on our own route.
+        a.set_landmark(true);
+        assert_eq!(a.advertised.get(&pid(1)).unwrap().eflags, ROUTE_LANDMARK);
+        assert!(a.is_covered());
+        a.set_landmark(false);
+        assert_eq!(a.advertised.get(&pid(1)).unwrap().eflags, 0);
+    }
+
+    #[test]
+    fn a_near_landmark_covers_us() {
+        let mut a = RoutingTable::with_budget(pid(1), 2);
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(
+            &pid(2),
+            &update(vec![entry(2, 1, 0), landmark_entry(7, 1, 1), entry(8, 1, 2)]),
+        );
+        assert!(a.is_covered());
+    }
+
+    #[test]
+    fn landmark_budget_grows_with_landmarks() {
+        // Budget 1, three landmarks: B = max(1, 3) keeps three nearest plus
+        // the landmarks.
+        let mut a = RoutingTable::with_budget(pid(1), 1);
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(
+            &pid(2),
+            &update(vec![
+                entry(2, 1, 0),
+                entry(3, 1, 1),
+                entry(4, 1, 2),
+                entry(5, 1, 3),
+                landmark_entry(10, 1, 9),
+                landmark_entry(11, 1, 9),
+                landmark_entry(12, 1, 9),
+            ]),
+        );
+        for d in [2, 3, 4, 10, 11, 12] {
+            assert!(a.lookup(&pid(d)).is_some(), "lost {}", d);
+        }
+        assert!(a.lookup(&pid(5)).is_none());
+        assert_eq!(a.network_size_estimate(), 9);
+    }
+
+    #[test]
+    fn landmarks_per_next_hop_are_capped() {
+        let mut a = RoutingTable::with_budget(pid(1), 1);
+        a.limits = LandmarkLimits {
+            share_min: 2,
+            share_factor: 1,
+            max: 100,
+            ..LandmarkLimits::default()
+        };
+        a.neighbour_up(pid(2), COST_FAST);
+        a.neighbour_up(pid(3), COST_FAST);
+        // A sybil behind 2 claims eight landmarks; 3 has one.
+        let sybils: Vec<RouteEntry> = (10..18).map(|d| landmark_entry(d, 1, 1)).collect();
+        a.apply_update(&pid(2), &update(sybils));
+        a.apply_update(&pid(3), &update(vec![landmark_entry(30, 1, 1)]));
+        let ls: Vec<PeerId> = a.landmarks().into_iter().map(|(l, _)| l).collect();
+        // Share: max(2, ceil(1 * 9 / 2)) = 5 via one next hop.
+        assert_eq!(ls.iter().filter(|l| l.0[0] < 20).count(), 5);
+        assert!(ls.contains(&pid(30)));
+
+        a.limits.max = 3;
+        a.decide();
+        assert_eq!(a.landmarks().len(), 3);
+    }
+
+    #[test]
+    fn a_toggling_landmark_flag_is_ignored_and_struck() {
+        let mut a = RoutingTable::with_budget(pid(1), 1);
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![landmark_entry(9, 1, 1)]));
+        assert_eq!(a.landmarks().len(), 1);
+        // One change is fine.
+        a.apply_update(&pid(2), &update(vec![entry(9, 1, 1)]));
+        assert!(a.landmarks().is_empty());
+        assert!(a.take_flag_strikes().is_empty());
+        // A second within the rate limit is not.
+        a.apply_update(&pid(2), &update(vec![landmark_entry(9, 1, 1)]));
+        assert!(a.landmarks().is_empty(), "toggling landmark accepted");
+        assert_eq!(a.take_flag_strikes(), vec![pid(2)]);
+    }
+
+    #[test]
+    fn landmark_flag_propagates_along_a_chain() {
+        let (mut a, mut b, mut c) = (
+            RoutingTable::new(pid(1)),
+            RoutingTable::new(pid(2)),
+            RoutingTable::new(pid(3)),
+        );
+        link(&mut a, &mut b);
+        link(&mut b, &mut c);
+        exchange(&mut [&mut a, &mut b, &mut c]);
+        c.set_landmark(true);
+        exchange(&mut [&mut a, &mut b, &mut c]);
+        assert!(a.lookup(&pid(3)).unwrap().landmark);
+        assert!(a.landmark_since(&pid(3)).is_some());
+        c.set_landmark(false);
+        exchange(&mut [&mut a, &mut b, &mut c]);
+        assert!(!a.lookup(&pid(3)).unwrap().landmark);
+        assert!(a.landmark_since(&pid(3)).is_none());
+    }
+
+    #[test]
+    fn forwarding_rule_prefers_dest_then_route_then_last_reachable_hint() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.neighbour_up(pid(3), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![entry(20, 1, 1)]));
+        a.apply_update(&pid(3), &update(vec![entry(30, 1, 1)]));
+        let linked = |p: &PeerId| *p == pid(2) || *p == pid(3);
+        // 1. Linked destination.
+        assert_eq!(a.next_hop_hinted(&pid(3), &[], linked), Some(pid(3)));
+        // 2. Routed destination, hints ignored.
+        assert_eq!(a.next_hop_hinted(&pid(20), &[pid(30)], linked), Some(pid(2)));
+        // 3. Unknown: the last hint we reach, not the first.
+        assert_eq!(
+            a.next_hop_hinted(&pid(99), &[pid(20), pid(30), pid(98)], linked),
+            Some(pid(3))
+        );
+        assert_eq!(
+            a.next_hop_hinted(&pid(99), &[pid(30), pid(20)], linked),
+            Some(pid(2))
+        );
+        // A linked hint is used directly.
+        assert_eq!(a.next_hop_hinted(&pid(99), &[pid(2)], linked), Some(pid(2)));
+        // 4. Nothing reachable.
+        assert_eq!(a.next_hop_hinted(&pid(99), &[pid(98)], linked), None);
+        // Never back where it came from: the alternative route is used.
+        let not_2 = |p: &PeerId| *p == pid(3);
+        assert_eq!(a.next_hop_hinted(&pid(20), &[pid(30)], not_2), Some(pid(3)));
     }
 
     #[test]

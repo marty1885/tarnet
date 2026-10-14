@@ -243,6 +243,10 @@ impl Fragments {
         self.count
     }
 
+    pub(crate) fn has(&self, index: u16) -> bool {
+        self.parts.contains_key(&index)
+    }
+
     /// Bytes held.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes
@@ -283,7 +287,15 @@ struct Partial {
     gap_nacked_below: u16,
     started: Instant,
     last_rx: Instant,
+    /// NACKs sent since a new fragment last arrived. Only NACKs that bring
+    /// nothing count against the budget: on a link that delays rather than
+    /// loses, a NACK followed by the late fragment costs nothing.
     nacks: u8,
+    /// Stall NACK backoff exponent: up per stall NACK, down per new fragment.
+    backoff: u8,
+    /// Silence after which the next stall NACK goes out: the stall time
+    /// doubled per backoff step, jittered.
+    nack_after: Duration,
 }
 
 /// Receiver-side reassembly of fragmented messages for one link.
@@ -301,8 +313,11 @@ pub(crate) struct Reassembler {
 /// Largest message reassembled: a full wire message.
 const MAX_MESSAGE: usize = crate::wire::HEADER_SIZE + crate::wire::MAX_PAYLOAD;
 
-/// Most NACKs sent for one message. Stall NACKs back off (stall, 2×, 4×…),
-/// so the later ones cover repairs that were themselves lost or delayed.
+/// Most NACKs sent for one message without a new fragment arriving in
+/// between. Stall NACKs back off (stall, 2×, 4×…), so the later ones cover
+/// repairs that were themselves lost or delayed. Each refill needs a
+/// fragment not seen before, so a message gets at most this plus its
+/// fragment count in all.
 const MAX_NACKS_PER_MESSAGE: u8 = 5;
 const DONE_MEMORY: usize = 64;
 
@@ -367,6 +382,8 @@ impl Reassembler {
                     started: now,
                     last_rx: now,
                     nacks: 0,
+                    backoff: 0,
+                    nack_after: crate::types::jittered(self.stall),
                 },
             );
         }
@@ -381,7 +398,14 @@ impl Reassembler {
             self.remember_done(msg_id);
             return (None, nacks);
         }
+        let new = !p.frags.has(index);
         p.frags.insert(index, bytes);
+        if new {
+            // Progress: the NACKs so far were not wasted.
+            p.nacks = 0;
+            p.backoff = p.backoff.saturating_sub(1);
+            p.nack_after = crate::types::jittered(self.stall * (1u32 << p.backoff.min(8)));
+        }
         if p.frags.is_complete() {
             let p = self.partials.remove(&msg_id).unwrap();
             self.remember_done(msg_id);
@@ -421,11 +445,12 @@ impl Reassembler {
         }
         let mut nacks = Vec::new();
         for (&id, p) in self.partials.iter_mut() {
-            let wait = self.stall * (1u32 << p.nacks.min(8));
-            if p.nacks < MAX_NACKS_PER_MESSAGE && now.duration_since(p.last_rx) > wait {
+            if p.nacks < MAX_NACKS_PER_MESSAGE && now.duration_since(p.last_rx) > p.nack_after {
                 let missing = p.frags.missing(p.frags.count());
                 if !missing.is_empty() {
                     p.nacks += 1;
+                    p.backoff = p.backoff.saturating_add(1);
+                    p.nack_after = crate::types::jittered(self.stall * (1u32 << p.backoff.min(8)));
                     p.last_rx = now;
                     nacks.extend(encode_nack(id, &missing));
                 }
@@ -695,10 +720,43 @@ mod tests {
             }
         }
         assert_eq!(at.len(), MAX_NACKS_PER_MESSAGE as usize);
-        // Each NACK waits twice as long as the one before.
-        for w in at.windows(3) {
-            assert!(w[2] - w[1] > (w[1] - w[0]) * 3 / 2, "{:?}", at);
+        // Each NACK waits about twice as long as the one before, within the
+        // ±25% jitter (and the 50 ms poll step).
+        let poll = Duration::from_millis(50);
+        let mut prev = Duration::ZERO;
+        for (k, t) in at.iter().enumerate() {
+            let nominal = stall * (1u32 << k);
+            let gap = *t - prev;
+            assert!(gap >= nominal * 3 / 4 && gap <= nominal * 5 / 4 + poll, "{:?}", at);
+            prev = *t;
         }
+    }
+
+    #[test]
+    fn late_fragments_refill_the_nack_budget() {
+        // A link that delays every fragment past the stall time: each NACK
+        // is followed by the late fragment, so none is wasted.
+        let data = vec![3u8; 2000];
+        let frags = fragments(&data, 128, 0);
+        assert!(frags.len() > MAX_NACKS_PER_MESSAGE as usize + 2);
+        let stall = Duration::from_millis(200);
+        let mut r = Reassembler::new(8, Duration::from_secs(600), stall);
+        let mut now = Instant::now();
+        r.insert(frags[0].0, frags[0].1, frags[0].2, &frags[0].3, now);
+        let mut nacks = 0;
+        let mut done = None;
+        for f in &frags[1..] {
+            let mut waited = 0;
+            while r.poll(now).is_empty() {
+                now += Duration::from_millis(50);
+                waited += 1;
+                assert!(waited < 2000, "no NACK after {} NACKs", nacks);
+            }
+            nacks += 1;
+            done = r.insert(f.0, f.1, f.2, &f.3, now).0.or(done);
+        }
+        assert_eq!(nacks, frags.len() - 1);
+        assert_eq!(done.unwrap(), data);
     }
 
     #[test]

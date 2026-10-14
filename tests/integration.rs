@@ -1075,7 +1075,8 @@ async fn circuit_extend_recovers_by_truncate() {
     assert!(node_a.connected_peers().await.contains(&pid_b));
     assert!(node_b.connected_peers().await.contains(&pid_c));
 
-    // C ignores CREATE for the first second: B's CREATE for A's EXTEND is lost.
+    // C ignores CREATE for the first second: B's CREATE for A's EXTEND is
+    // lost. B is a waypoint, so reaching C takes an EXTEND step.
     let mut fw = Firewall::default();
     fw.add_rule(Match::MsgType(MessageType::CircuitCreate), Action::Drop);
     node_c.set_firewall(fw).await;
@@ -1088,7 +1089,7 @@ async fn circuit_extend_recovers_by_truncate() {
     let started = std::time::Instant::now();
     let circuit_id = tokio::time::timeout(
         Duration::from_secs(15),
-        node_a.build_circuit(pid_b, vec![pid_c]),
+        node_a.build_circuit(pid_b, vec![pid_b, pid_c]),
     )
     .await
     .expect("circuit build timed out")
@@ -1389,10 +1390,16 @@ async fn hidden_service_rendezvous() {
     // bypassing circuit_connect's direct-route attempts.
     let kem_algo = default_kp_c.identity.kem_algo() as u8;
     let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
-    let intro_points = vec![(node_b.peer_id(), kem_algo, kem_pubkey)];
+    // The intro points C actually registered at.
+    let intro_points: Vec<_> = node_c
+        .hidden_intro_peers(&service_id_c)
+        .await
+        .into_iter()
+        .map(|p| (p, kem_algo, kem_pubkey.clone()))
+        .collect();
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
-        node_a.connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points),
+        node_a.connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points, 1),
     )
     .await
     .expect("connect timed out")
@@ -1556,14 +1563,21 @@ async fn hidden_service_multi_non_default_reachable() {
 
     // A connects to the NON-default service via rendezvous, encrypting INTRODUCE
     // to sid2's KEM key.
-    let intro_points = vec![(
-        node_b.peer_id(),
-        kp2.identity.kem_algo() as u8,
-        kp2.identity.kem.kem_pubkey_bytes(),
-    )];
+    let intro_points: Vec<_> = node_c
+        .hidden_intro_peers(&sid2)
+        .await
+        .into_iter()
+        .map(|p| {
+            (
+                p,
+                kp2.identity.kem_algo() as u8,
+                kp2.identity.kem.kem_pubkey_bytes(),
+            )
+        })
+        .collect();
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
-        node_a.connect_via_rendezvous(sid2, TEST_MODE, "80", &intro_points),
+        node_a.connect_via_rendezvous(sid2, TEST_MODE, "80", &intro_points, 1),
     )
     .await
     .expect("connect to sid2 timed out")

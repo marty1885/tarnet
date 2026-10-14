@@ -24,136 +24,260 @@ fn listeners_overlap(a: &Listener, b: &Listener) -> bool {
     a.mode == b.mode && port_overlap && service_overlap
 }
 
+/// Rendezvous points a client tries before giving up.
+const RENDEZVOUS_ATTEMPTS: usize = 3;
+/// How long a client waits for the service to join at the rendezvous
+/// point: the service builds a multi-hop circuit first.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Rounds of relays tried when registering intro points.
+const INTRO_ROUNDS: usize = 3;
+
 impl Node {
+    /// The neighbour to send a CREATE for `dest` to, using `hints` when we
+    /// have no route.
+    async fn first_hop_toward(&self, dest: &PeerId, hints: &[PeerId]) -> Option<PeerId> {
+        self.next_hop_toward(dest, hints, &self.peer_id()).await
+    }
+
+    /// Build a circuit to `target` through `hops - 1` random waypoints first,
+    /// reaching `target` with `target_hints` if given. Fails rather than
+    /// using fewer waypoints.
+    pub(super) async fn build_private_circuit(
+        &self,
+        target: PeerId,
+        target_hints: &[PeerId],
+        hops: usize,
+        exclude: &[PeerId],
+    ) -> Result<u32> {
+        // Intro records carry no hints: reach the target by its address.
+        let target_hints = if target_hints.is_empty() {
+            self.relay_hints(&target).await
+        } else {
+            target_hints.to_vec()
+        };
+        let target_hints = target_hints.as_slice();
+        let mut avoid = exclude.to_vec();
+        avoid.push(target);
+        let want = hops.saturating_sub(1);
+        let mut waypoints = self.pick_relays(want, &avoid).await;
+        if waypoints.len() < want {
+            return Err(Error::Protocol(format!(
+                "{} relays needed for {} hops, {} known",
+                want,
+                hops,
+                waypoints.len()
+            )));
+        }
+        let first_hints = if waypoints.is_empty() {
+            target_hints.to_vec()
+        } else {
+            self.relay_hints(&waypoints[0]).await
+        };
+        waypoints.push(target);
+        let first_hop = self
+            .first_hop_toward(&waypoints[0], &first_hints)
+            .await
+            .ok_or_else(|| Error::Protocol(format!("no route to {:?}", waypoints[0])))?;
+        self.build_circuit_hinted(first_hop, waypoints, target_hints)
+            .await
+    }
+
+    /// An identity's hop count (1 for unknown identities).
+    pub(super) async fn identity_hops(&self, sid: &tarnet_api::types::ServiceId) -> usize {
+        self.identity_store
+            .lock()
+            .await
+            .get_by_service_id(sid)
+            .map_or(1, |id| id.outbound_hops.max(1) as usize)
+    }
+
+    /// Seal a relay message to a circuit's last hop and send it.
+    async fn send_on_circuit(&self, circuit_id: u32, message: &RelayCell) -> Result<()> {
+        let (first_hop, cid, cells) = {
+            let mut circuits = self.circuits.outbound.lock().await;
+            let circuit = circuits
+                .get_mut(&circuit_id)
+                .ok_or_else(|| Error::Protocol("circuit disappeared".into()))?;
+            circuit.send_relay_message(message)?
+        };
+        for cell in &cells {
+            self.send_to_peer_critical(&first_hop, &encode_circuit_relay_cell(cid, cell))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Connect to a hidden service through one of its intro points. `hops` is
+    /// the client's hop count to the intro and rendezvous points. A
+    /// rendezvous point that doesn't work out (for instance the service's own
+    /// host) is replaced by another.
     pub async fn connect_via_rendezvous(
         &self,
         service_id: tarnet_api::types::ServiceId,
         mode: tarnet_api::service::PortMode,
         port: &str,
         intro_points: &[(PeerId, u8, Vec<u8>)],
+        hops: usize,
     ) -> Result<tarnet_api::service::Connection> {
         if intro_points.is_empty() {
             return Err(Error::Protocol(
                 "no introduction points for rendezvous".into(),
             ));
         }
-        let connected = self.connected_peers().await;
-        if connected.is_empty() {
-            return Err(Error::Protocol("no connected peers for rendezvous".into()));
+        let mut tried = Vec::new();
+        let mut last_err = Error::Protocol("no rendezvous point available".into());
+        for _ in 0..RENDEZVOUS_ATTEMPTS {
+            match self
+                .try_rendezvous(service_id, mode, port, intro_points, hops, &mut tried)
+                .await
+            {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    log::debug!("Rendezvous attempt for {:?} failed: {}", service_id, e);
+                    last_err = e;
+                }
+            }
         }
+        Err(last_err)
+    }
 
-        // Pick a rendezvous point (any connected peer)
-        let rendezvous_peer = connected[0];
+    async fn try_rendezvous(
+        &self,
+        service_id: tarnet_api::types::ServiceId,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
+        intro_points: &[(PeerId, u8, Vec<u8>)],
+        hops: usize,
+        tried: &mut Vec<PeerId>,
+    ) -> Result<tarnet_api::service::Connection> {
+        use rand::seq::SliceRandom;
+        let (intro_peer, kem_algo_byte, kem_pubkey) = intro_points
+            .choose(&mut rand::thread_rng())
+            .expect("intro points checked non-empty")
+            .clone();
 
-        // Generate a random cookie
+        // Rendezvous point: a random relay, preferably not the intro point.
+        let mut avoid = tried.clone();
+        avoid.push(intro_peer);
+        let mut rp = self.pick_relays(1, &avoid).await;
+        if rp.is_empty() {
+            rp = self.pick_relays(1, tried).await;
+        }
+        let rendezvous_peer = *rp
+            .first()
+            .ok_or_else(|| Error::Protocol("no relay for a rendezvous point".into()))?;
+        tried.push(rendezvous_peer);
+        // How to reach it: only nodes near the rendezvous point, so the
+        // service learns nothing about where we are.
+        let rendezvous_hints = self.relay_hints(&rendezvous_peer).await;
+
         let mut cookie = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut cookie);
 
-        // Build circuit to rendezvous point
         let rend_circuit_id = self
-            .build_circuit(rendezvous_peer, vec![rendezvous_peer])
+            .build_private_circuit(rendezvous_peer, &rendezvous_hints, hops, &[intro_peer])
             .await?;
         let mut rend_attempt = self.circuit_attempt_guard(rend_circuit_id);
+        self.send_on_circuit(
+            rend_circuit_id,
+            &RelayCell {
+                command: RelayCellCommand::RendezvousEstablish,
+                stream_id: 0,
+                data: build_rendezvous_establish_payload(&cookie),
+            },
+        )
+        .await?;
 
-        // Send RendezvousEstablish(cookie)
-        let establish_cell = RelayCell {
-            command: RelayCellCommand::RendezvousEstablish,
-            stream_id: 0,
-            data: build_rendezvous_establish_payload(&cookie),
+        // We may be one of the service's intro points ourselves; then the
+        // INTRODUCE needs no circuit.
+        let intro_circuit_id = if intro_peer == self.peer_id() {
+            None
+        } else {
+            Some(
+                self.build_private_circuit(intro_peer, &[], hops, &[rendezvous_peer])
+                    .await?,
+            )
         };
-        {
-            let mut circuits = self.circuits.outbound.lock().await;
-            let circuit = circuits
-                .get_mut(&rend_circuit_id)
-                .ok_or_else(|| Error::Protocol("rendezvous circuit disappeared".into()))?;
-            let (fh, cid, cell) = circuit.send_relay_cell(&establish_cell);
-            drop(circuits);
+        let _intro_attempt = intro_circuit_id.map(|id| self.circuit_attempt_guard(id));
 
-            let encoded = encode_circuit_relay_cell(cid, &cell);
-            self.send_to_peer_critical(&fh, &encoded).await?;
-        }
-
-        // Build circuit to an intro point
-        let (intro_peer, kem_algo_byte, ref kem_pubkey) = intro_points[0];
-        let intro_circuit_id = self.build_circuit(intro_peer, vec![intro_peer]).await?;
-        let _intro_attempt = self.circuit_attempt_guard(intro_circuit_id);
-
-        // KEM encapsulate to the service's KEM public key.
-        // Only the real service can decapsulate to recover the shared secret.
+        // Seal the introduction to the service's KEM key; only the service
+        // can read it. A fresh client key lets the service's answer give the
+        // end-to-end key forward secrecy.
         let kem_algo = tarnet_api::types::KemAlgo::from_u8(kem_algo_byte)
             .map_err(|e| Error::Protocol(format!("intro point unknown KEM algo: {}", e)))?;
-        let (shared_secret, kem_ciphertext) =
-            crate::identity::KemKeypair::encapsulate_to(kem_pubkey, kem_algo)
+        let (static_secret, kem_ciphertext) =
+            crate::identity::KemKeypair::encapsulate_to(&kem_pubkey, kem_algo)
                 .map_err(|e| Error::Crypto(format!("INTRODUCE KEM encapsulate failed: {}", e)))?;
-
-        // Register oneshot receivers BEFORE sending, to avoid the race where
-        // the response arrives on localhost before the sender is inserted.
-        let (ack_tx, ack_rx) = oneshot::channel();
-        let (joined_tx, joined_rx) = oneshot::channel();
-        {
-            let mut pending = self.circuits.pending_extends.lock().await;
-            pending.insert(intro_circuit_id, ack_tx);
-            pending.insert(rend_circuit_id, joined_tx);
-        }
-
-        // Send encrypted INTRODUCE through intro circuit.
-        // The payload is encrypted to the service's KEM public key so the intro
-        // point cannot learn the rendezvous peer or cookie.
-        let sealed = build_introduce_payload(
-            &rendezvous_peer,
-            &cookie,
+        let client_kex = KexOffer::new(self.identity.identity.kem_algo());
+        let introduction = crate::circuit::Introduction {
+            rendezvous: rendezvous_peer,
+            rendezvous_hints: rendezvous_hints.clone(),
+            cookie,
             mode,
-            port,
-            &kem_ciphertext,
-            &shared_secret,
-        );
-        let introduce_cell = RelayCell {
-            command: RelayCellCommand::Introduce,
-            stream_id: 0,
-            // Prefix the target ServiceId so the intro point forwards to the
-            // right service circuit when it hosts more than one service.
-            data: build_introduce_cell(&service_id, &sealed),
+            port: port.to_string(),
+            client_kem_algo: client_kex.algo_byte(),
+            client_eph_pk: client_kex.pubkey_bytes(),
         };
-        {
-            let mut circuits = self.circuits.outbound.lock().await;
-            let circuit = circuits
-                .get_mut(&intro_circuit_id)
-                .ok_or_else(|| Error::Protocol("introduction circuit disappeared".into()))?;
-            // Sealed to a post-quantum KEM, INTRODUCE spans several cells.
-            let (fh, cid, cells) = circuit.send_relay_message(&introduce_cell)?;
-            drop(circuits);
+        let sealed = build_introduce_payload(&introduction, &kem_ciphertext, &static_secret);
 
-            for cell in &cells {
-                let encoded = encode_circuit_relay_cell(cid, cell);
-                self.send_to_peer_critical(&fh, &encoded).await?;
+        // Register receivers before sending: replies may be immediate.
+        let (joined_tx, joined_rx) = oneshot::channel();
+        self.circuits
+            .pending_extends
+            .lock()
+            .await
+            .insert(rend_circuit_id, joined_tx);
+        match intro_circuit_id {
+            Some(intro_circuit_id) => {
+                let (ack_tx, ack_rx) = oneshot::channel();
+                self.circuits
+                    .pending_extends
+                    .lock()
+                    .await
+                    .insert(intro_circuit_id, ack_tx);
+                self.send_on_circuit(
+                    intro_circuit_id,
+                    &RelayCell {
+                        command: RelayCellCommand::Introduce,
+                        stream_id: 0,
+                        data: build_introduce_cell(&service_id, &[], &sealed),
+                    },
+                )
+                .await?;
+                tokio::time::timeout(Duration::from_secs(10), ack_rx)
+                    .await
+                    .map_err(|_| Error::Protocol("IntroduceAck timeout".into()))?
+                    .map_err(|_| Error::Protocol("IntroduceAck channel dropped".into()))?;
+            }
+            None => {
+                if !self.forward_introduce(&service_id, &sealed).await {
+                    return Err(Error::Protocol("service not registered at our intro point".into()));
+                }
             }
         }
-        // Wait for IntroduceAck
-        let _ack = tokio::time::timeout(Duration::from_secs(10), ack_rx)
-            .await
-            .map_err(|_| Error::Protocol("IntroduceAck timeout".into()))?
-            .map_err(|_| Error::Protocol("IntroduceAck channel dropped".into()))?;
-        let _joined = tokio::time::timeout(Duration::from_secs(10), joined_rx)
+        let join = tokio::time::timeout(JOIN_TIMEOUT, joined_rx)
             .await
             .map_err(|_| Error::Protocol("RendezvousJoined timeout".into()))?
             .map_err(|_| Error::Protocol("RendezvousJoined channel dropped".into()))?;
 
-        // Derive e2e hop key from the same KEM shared secret used for INTRODUCE encryption.
-        let e2e_hop = crate::circuit::HopKey::from_shared_secret(&shared_secret);
+        // The service proves it read the introduction and answered our key.
+        let (join_ct, confirm) = crate::circuit::parse_join(&join)?;
+        let eph_secret = client_kex.complete(join_ct)?;
+        let (e2e, expected) =
+            crate::circuit::rendezvous_keys(&static_secret, &eph_secret, &sealed, join_ct);
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(&confirm[..], &expected[..])) {
+            return Err(Error::Crypto("rendezvous confirmation failed".into()));
+        }
         {
             let mut circuits = self.circuits.outbound.lock().await;
             let circuit = circuits
                 .get_mut(&rend_circuit_id)
                 .ok_or_else(|| Error::Protocol("rendezvous circuit disappeared".into()))?;
-            // Replace all hop keys with only the e2e key. The rendezvous point
-            // bridges the two circuits at the cell level (Forward with no crypto),
-            // so circuit-level encryption must be removed.
-            circuit.hop_keys = vec![e2e_hop];
-            circuit.nonce_domain = rand::random();
+            // The end-to-end layer rides inside every hop's layer.
+            circuit.layers.push(e2e);
         }
-
         log::info!(
-            "Rendezvous established for {:?} on circuit_id={} (e2e encrypted)",
+            "Rendezvous established for {:?} on circuit_id={}",
             service_id,
             rend_circuit_id,
         );
@@ -168,7 +292,9 @@ impl Node {
         )
         .await?;
         // The introduction circuit is only needed for the handshake.
-        self.destroy_circuit(intro_circuit_id).await?;
+        if let Some(intro_circuit_id) = intro_circuit_id {
+            self.destroy_circuit(intro_circuit_id).await?;
+        }
         rend_attempt.armed = false;
         Ok(conn)
     }
@@ -304,109 +430,75 @@ impl Node {
         }
     }
 
-    /// Publish a hidden service with introduction points.
+    /// Publish a hidden service with introduction points: random relays,
+    /// each reached by a circuit with the service identity's hop count and
+    /// registered with a signature bound to that circuit.
     pub async fn publish_hidden_service(
         &self,
         service_id: tarnet_api::types::ServiceId,
         num_intro_points: usize,
     ) -> Result<()> {
-        let connected = self.connected_peers().await;
-        if connected.is_empty() {
-            return Err(Error::Protocol(
-                "no connected peers for intro points".into(),
-            ));
-        }
-
-        let count = num_intro_points.min(connected.len());
+        let zone_keypair = {
+            let is = self.identity_store.lock().await;
+            let kp = is
+                .keypair_for(&service_id)
+                .ok_or_else(|| Error::Protocol("no keypair for hidden service".into()))?;
+            crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap()
+        };
+        let hops = self.identity_hops(&service_id).await;
         let mut intro_records = Vec::new();
-        let mut intro_circuits = Vec::new();
-
-        for i in 0..count {
-            let intro_peer = connected[i % connected.len()];
-
-            // Build a circuit to the intro point
-            let circuit_id = self.build_circuit(intro_peer, vec![intro_peer]).await?;
-
-            // Send IntroRegister relay cell
-            let register_cell = RelayCell {
-                command: RelayCellCommand::IntroRegister,
-                stream_id: 0,
-                data: build_intro_register_payload(&service_id),
-            };
-            {
-                let mut circuits = self.circuits.outbound.lock().await;
-                let circuit = circuits
-                    .get_mut(&circuit_id)
-                    .ok_or_else(|| Error::Protocol("circuit disappeared".into()))?;
-                let (fh, cid, cell) = circuit.send_relay_cell(&register_cell);
-                drop(circuits);
-
-                let encoded = encode_circuit_relay_cell(cid, &cell);
-                self.send_to_peer_critical(&fh, &encoded).await?;
+        let mut intro_circuits: Vec<(PeerId, u32)> = Vec::new();
+        let mut tried: Vec<PeerId> = Vec::new();
+        // A build to a sampled relay can fail (a lost CREATE, stale hints):
+        // try others rather than publish fewer intro points, a few rounds.
+        for _ in 0..INTRO_ROUNDS {
+            let want = num_intro_points.saturating_sub(intro_circuits.len());
+            if want == 0 {
+                break;
             }
-
-            // Wait for IntroRegistered
-            let (tx, rx) = oneshot::channel();
-            self.circuits
-                .pending_extends
-                .lock()
-                .await
-                .insert(circuit_id, tx);
-
-            let _reply = tokio::time::timeout(Duration::from_secs(5), rx)
-                .await
-                .map_err(|_| Error::Protocol("IntroRegister timeout".into()))?
-                .map_err(|_| Error::Protocol("IntroRegister channel dropped".into()))?;
-
-            log::info!(
-                "Intro point registered: {:?} on circuit_id={}",
-                intro_peer,
-                circuit_id,
-            );
-
-            intro_records.push(crate::tns::TnsRecord::IntroductionPoint {
-                relay_peer_id: intro_peer,
-                kem_algo: 0, // filled in below after we have the service keypair
-                kem_pubkey: Vec::new(),
-            });
-            intro_circuits.push((intro_peer, circuit_id));
+            let candidates = self.pick_relays(want, &tried).await;
+            if candidates.is_empty() {
+                break;
+            }
+            for intro_peer in candidates {
+                tried.push(intro_peer);
+                match self
+                    .register_intro_point(&zone_keypair, service_id, intro_peer, hops)
+                    .await
+                {
+                    Ok(circuit_id) => {
+                        log::info!(
+                            "Intro point registered: {:?} on circuit_id={}",
+                            intro_peer,
+                            circuit_id,
+                        );
+                        intro_records.push(crate::tns::TnsRecord::IntroductionPoint {
+                            relay_peer_id: intro_peer,
+                            kem_algo: zone_keypair.identity.kem_algo() as u8,
+                            kem_pubkey: zone_keypair.identity.kem.kem_pubkey_bytes(),
+                        });
+                        intro_circuits.push((intro_peer, circuit_id));
+                    }
+                    Err(e) => log::info!("Intro point {:?} failed: {}", intro_peer, e),
+                }
+            }
         }
-
-        // Store intro circuits for later use
+        if tried.is_empty() {
+            return Err(Error::Protocol("no relays for intro points".into()));
+        }
+        if intro_circuits.is_empty() {
+            return Err(Error::Protocol("no intro point could be registered".into()));
+        }
+        let count = intro_circuits.len();
         self.hidden
             .intros
             .lock()
             .await
             .insert(service_id, intro_circuits);
 
-        // Publish intro records via TNS using the service keypair
-        let zone_keypair = {
-            let is = self.identity_store.lock().await;
-            match is.keypair_for(&service_id) {
-                Some(kp) => crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap(),
-                None => {
-                    // Fallback to node identity if service keypair not found
-                    crate::identity::Keypair::from_full_bytes(&self.identity.to_full_bytes())
-                        .unwrap()
-                }
-            }
-        };
-
-        // Fill in the service's KEM pubkey in all intro records
-        let service_kem_algo = zone_keypair.identity.kem_algo() as u8;
-        let service_kem_pubkey = zone_keypair.identity.kem.kem_pubkey_bytes();
-        for record in &mut intro_records {
-            if let crate::tns::TnsRecord::IntroductionPoint {
-                kem_algo,
-                kem_pubkey,
-                ..
-            } = record
-            {
-                *kem_algo = service_kem_algo;
-                *kem_pubkey = service_kem_pubkey.clone();
-            }
-        }
-
+        // A Hidden identity has no peer record: drop it from the zone in case
+        // the identity was Public before. The new root replaces the old one.
+        self.zone_published_update(&service_id, "peer", None).await;
         crate::tns::publish(self, &zone_keypair, "intro", &intro_records, HIDDEN_SERVICE_TTL)
             .await?;
 
@@ -415,8 +507,62 @@ impl Node {
             service_id,
             count,
         );
-
         Ok(())
+    }
+
+    /// The intro points a hidden service of ours is registered at (testing).
+    #[doc(hidden)]
+    pub async fn hidden_intro_peers(&self, service_id: &tarnet_api::types::ServiceId) -> Vec<PeerId> {
+        self.hidden
+            .intros
+            .lock()
+            .await
+            .get(service_id)
+            .map(|v| v.iter().map(|(peer, _)| *peer).collect())
+            .unwrap_or_default()
+    }
+
+    /// Build a circuit to `intro_peer` and register the service there.
+    async fn register_intro_point(
+        &self,
+        zone_keypair: &crate::identity::Keypair,
+        service_id: tarnet_api::types::ServiceId,
+        intro_peer: PeerId,
+        hops: usize,
+    ) -> Result<u32> {
+        let circuit_id = self.build_private_circuit(intro_peer, &[], hops, &[]).await?;
+        let mut attempt = self.circuit_attempt_guard(circuit_id);
+        let transcript = self
+            .circuits
+            .outbound
+            .lock()
+            .await
+            .get(&circuit_id)
+            .and_then(|c| c.transcripts.last().copied())
+            .ok_or_else(|| Error::Protocol("circuit disappeared".into()))?;
+        let sig = zone_keypair.sign(&crate::circuit::intro_register_message(&intro_peer, &transcript));
+        let register = RelayCell {
+            command: RelayCellCommand::IntroRegister,
+            stream_id: 0,
+            data: build_intro_register_payload(
+                &service_id,
+                &zone_keypair.identity.signing.signing_pubkey_bytes(),
+                &sig,
+            ),
+        };
+        let (tx, rx) = oneshot::channel();
+        self.circuits
+            .pending_extends
+            .lock()
+            .await
+            .insert(circuit_id, tx);
+        self.send_on_circuit(circuit_id, &register).await?;
+        tokio::time::timeout(Duration::from_secs(10), rx)
+            .await
+            .map_err(|_| Error::Protocol("IntroRegister timeout".into()))?
+            .map_err(|_| Error::Protocol("IntroRegister channel dropped".into()))?;
+        attempt.armed = false;
+        Ok(circuit_id)
     }
 
     /// Tear down all intro circuits for a hidden service and remove tracking state.
@@ -749,7 +895,19 @@ impl Node {
             }
         };
 
-        let (rendezvous_peer, cookie, mode, port, shared_secret) =
+        let digest = *blake3::hash(payload).as_bytes();
+        if self
+            .hidden
+            .introduce_seen
+            .lock()
+            .await
+            .insert(digest, Instant::now())
+            .is_some()
+        {
+            log::debug!("Replayed INTRODUCE for {:?}, dropping", service_sid);
+            return;
+        }
+        let (intro, static_secret) =
             match parse_introduce_payload(payload, &service_keypair.identity.kem) {
                 Ok(v) => v,
                 Err(e) => {
@@ -757,17 +915,29 @@ impl Node {
                     return;
                 }
             };
+        log::info!("Service received INTRODUCE: rendezvous={:?}", intro.rendezvous);
 
-        log::info!(
-            "Service received INTRODUCE: rendezvous={:?}",
-            rendezvous_peer,
-        );
+        // Answer the client's ephemeral key: the end-to-end key then needs
+        // both it and the service key, which gives forward secrecy.
+        let Ok(client_algo) = tarnet_api::types::KemAlgo::from_u8(intro.client_kem_algo) else {
+            return;
+        };
+        let Ok((eph_secret, join_ct)) = kex_accept(client_algo, &intro.client_eph_pk) else {
+            return;
+        };
+        let (e2e, confirm) =
+            crate::circuit::rendezvous_keys(&static_secret, &eph_secret, payload, &join_ct);
 
-        // Build a circuit to the rendezvous peer
+        // The client may have picked our host as rendezvous point without
+        // knowing it. Our circuit then goes out through a waypoint and back,
+        // so nothing looks different from outside.
+        let mut hops = self.identity_hops(&service_sid).await;
+        if intro.rendezvous == self.peer_id() {
+            hops = hops.max(2);
+        }
         let circuit_id = match self
-            .build_circuit(rendezvous_peer, vec![rendezvous_peer])
-            .await
-        {
+            .build_private_circuit(intro.rendezvous, &intro.rendezvous_hints, hops, &[])
+            .await {
             Ok(id) => id,
             Err(e) => {
                 log::debug!("Failed to build circuit to rendezvous: {}", e);
@@ -783,32 +953,40 @@ impl Node {
             .await
             .insert(circuit_id, ready_tx);
 
-        // Encode JOIN with the rendezvous keys, but install the e2e receiver
-        // before sending it: the client may answer immediately.
+        // Seal JOIN to the rendezvous point, then add the end-to-end layer
+        // before sending: the client may answer immediately.
         let join_cell = RelayCell {
             command: RelayCellCommand::RendezvousJoin,
             stream_id: 0,
-            data: cookie.to_vec(),
+            data: crate::circuit::build_rendezvous_join_payload(
+                &intro.cookie,
+                &crate::circuit::build_join(&join_ct, &confirm),
+            ),
         };
-        let (fh, cid, cell) = {
+        let sealed_join = {
             let mut circuits = self.circuits.outbound.lock().await;
             let Some(circuit) = circuits.get_mut(&circuit_id) else {
                 return;
             };
-            let encoded = circuit.send_relay_cell(&join_cell);
-            circuit.hop_keys = vec![crate::circuit::HopKey::from_shared_secret_responder(
-                &shared_secret,
-            )];
-            circuit.nonce_domain = rand::random();
-            encoded
+            let Ok(sealed) = circuit.send_relay_message(&join_cell) else {
+                return;
+            };
+            circuit.layers.push(e2e.responder());
+            sealed
         };
+        let (mode, port) = (intro.mode, intro.port);
         let conn = self
             .circuit_connection(service_sid, mode, &port, circuit_id)
             .await;
-        let encoded = encode_circuit_relay_cell(cid, &cell);
-        if let Err(e) = self.send_to_peer_critical(&fh, &encoded).await {
-            log::debug!("Failed to send RendezvousJoin: {}", e);
-            return;
+        let (fh, cid, cells) = sealed_join;
+        for cell in &cells {
+            if let Err(e) = self
+                .send_to_peer_critical(&fh, &encode_circuit_relay_cell(cid, cell))
+                .await
+            {
+                log::debug!("Failed to send RendezvousJoin: {}", e);
+                return;
+            }
         }
 
         // Do not expose the backend until the client has installed e2e keys

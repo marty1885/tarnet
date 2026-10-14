@@ -954,7 +954,14 @@ pub struct DhtWatch {
     /// Direct neighbor that forwarded this watch (for sending notifications).
     pub via_peer: PeerId,
     pub expires_at: Instant,
+    /// Newest sequence notified per signer, so a re-PUT of a record the
+    /// watcher already has (a republish) notifies nothing.
+    pub notified: HashMap<[u8; 32], u64>,
 }
+
+/// Signers whose last notified sequence a watch remembers. Past this the
+/// oldest-looking entry is forgotten (it may then be notified once more).
+const MAX_NOTIFIED_SIGNERS: usize = 64;
 
 /// Cap on a watch's lifetime, regardless of the (wire-supplied) request. Watch
 /// re-sends are short-lived: callers refresh at 300s (see node::mod re-send and
@@ -1063,6 +1070,7 @@ impl DhtWatchTable {
             query_token,
             via_peer,
             expires_at,
+            notified: HashMap::new(),
         });
         *self.per_peer_count.entry(via_peer).or_insert(0) += 1;
         self.total_count += 1;
@@ -1105,6 +1113,35 @@ impl DhtWatchTable {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Watchers of `key` to notify about a PUT of `(signer, sequence)`: those
+    /// not yet notified of that sequence or a newer one from that signer.
+    /// Marks them notified.
+    pub fn watchers_for_news(
+        &mut self,
+        key: &[u8; 64],
+        signer: &[u8; 32],
+        sequence: u64,
+    ) -> Vec<([u8; 32], PeerId)> {
+        let now = Instant::now();
+        let Some(entries) = self.watches.get_mut(key) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for w in entries.iter_mut().filter(|w| w.expires_at > now) {
+            if w.notified.get(signer).is_some_and(|s| *s >= sequence) {
+                continue;
+            }
+            if !w.notified.contains_key(signer) && w.notified.len() >= MAX_NOTIFIED_SIGNERS {
+                if let Some(k) = w.notified.iter().min_by_key(|(_, s)| **s).map(|(k, _)| *k) {
+                    w.notified.remove(&k);
+                }
+            }
+            w.notified.insert(*signer, sequence);
+            out.push((w.query_token, w.via_peer));
+        }
+        out
     }
 
     /// Remove expired watches.
@@ -2307,6 +2344,27 @@ mod tests {
     }
 
     #[test]
+    fn watchers_are_notified_only_of_news() {
+        let mut table = DhtWatchTable::new();
+        let key = [0xAB; 64];
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        assert!(table.set_watch(key, a, PeerId([3; 32]), 60));
+        let (signer, other) = ([7u8; 32], [8u8; 32]);
+        assert_eq!(table.watchers_for_news(&key, &signer, 5).len(), 1);
+        // A republish of the same record, or an older one: nothing.
+        assert!(table.watchers_for_news(&key, &signer, 5).is_empty());
+        assert!(table.watchers_for_news(&key, &signer, 4).is_empty());
+        // Newer, or another signer: news.
+        assert_eq!(table.watchers_for_news(&key, &signer, 6).len(), 1);
+        assert_eq!(table.watchers_for_news(&key, &other, 1).len(), 1);
+        // A refreshed watch keeps what it was told; a new watcher hears it.
+        assert!(table.set_watch(key, a, PeerId([3; 32]), 60));
+        assert!(table.set_watch(key, b, PeerId([4; 32]), 60));
+        let news = table.watchers_for_news(&key, &signer, 6);
+        assert_eq!(news, vec![(b, PeerId([4; 32]))]);
+    }
+
+    #[test]
     fn watch_table_expiry() {
         let mut table = DhtWatchTable::new();
         let key = [0xCC; 64];
@@ -2318,6 +2376,7 @@ mod tests {
             query_token: [0x33; 32],
             via_peer: peer,
             expires_at: Instant::now() - Duration::from_secs(1),
+            notified: HashMap::new(),
         });
 
         // Should not return expired watcher

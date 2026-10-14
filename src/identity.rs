@@ -745,10 +745,25 @@ pub fn ed25519_pubkey_to_x25519(ed_pubkey: &[u8; 32]) -> X25519Public {
 /// Verify a signature given the signing algorithm, public key, message, and signature.
 ///
 /// FalconEd25519: BOTH Ed25519 and Falcon signatures must pass.
+/// The signing algorithm a public key belongs to, from its exact length.
+pub fn signing_algo_of(pubkey: &[u8]) -> Option<SigningAlgo> {
+    match pubkey.len() {
+        32 => Some(SigningAlgo::Ed25519),
+        n if n == 32 + falcon512::public_key_bytes() => Some(SigningAlgo::FalconEd25519),
+        _ => None,
+    }
+}
+
+/// Verify a signature. The key must have exactly the length of `algo`'s keys:
+/// a peer id hashes the whole key, so checking a hybrid key as Ed25519 alone
+/// would let a broken Ed25519 impersonate a hybrid identity.
 pub fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    if signing_algo_of(pubkey) != Some(algo) {
+        return false;
+    }
     match algo {
         SigningAlgo::Ed25519 => {
-            if pubkey.len() < 32 || sig.len() < 64 {
+            if sig.len() != 64 {
                 return false;
             }
             let mut pk = [0u8; 32];
@@ -761,7 +776,7 @@ pub fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool 
             vk.verify(msg, &Signature::from_bytes(&sig_bytes)).is_ok()
         }
         SigningAlgo::FalconEd25519 => {
-            if pubkey.len() < 32 || sig.len() < 64 {
+            if sig.len() <= 64 {
                 return false;
             }
             // Ed25519 verification
@@ -855,6 +870,18 @@ mod tests {
         let pubkey = kp.signing.signing_pubkey_bytes();
         assert!(verify(SigningAlgo::FalconEd25519, &pubkey, msg, &sig));
         assert!(!verify(SigningAlgo::FalconEd25519, &pubkey, b"wrong", &sig));
+    }
+
+    #[test]
+    fn hybrid_key_cannot_be_verified_as_ed25519_alone() {
+        let kp = IdentityKeypair::generate_default();
+        let msg = b"downgrade";
+        let sig = kp.sign(msg);
+        let pubkey = kp.signing.signing_pubkey_bytes();
+        // The Ed25519 half alone is a valid signature for the key's first 32
+        // bytes, but the whole key (which the peer id hashes) is a hybrid key.
+        assert!(!verify(SigningAlgo::Ed25519, &pubkey, msg, &sig[..64]));
+        assert_eq!(signing_algo_of(&pubkey), Some(SigningAlgo::FalconEd25519));
     }
 
     #[test]

@@ -32,10 +32,9 @@ impl DhtWalker {
             .collect()
     }
 
-    /// ρ for the current network size (routing-table destinations + us) and
-    /// degree.
+    /// ρ for the estimated network size and our degree.
     pub(super) async fn walk_count(&self) -> usize {
-        let n = self.routing_table.lock().await.len() + 1;
+        let n = self.routing_table.lock().await.network_size_estimate();
         let d = self.links.lock().await.iter().count();
         crate::dht::walk_count(n, d)
     }
@@ -156,7 +155,13 @@ impl Node {
 
     /// Tell every watcher registered here (except via `exclude`) about `put`.
     pub(super) async fn notify_dht_watchers(&self, put: &DhtPutMsg, exclude: Option<&PeerId>) {
-        let watchers = self.dht_watches.lock().await.get_watchers(&put.key);
+        // Only news: a republish of what a watcher already has tells it
+        // nothing, and would show the watcher when the owner republishes.
+        let watchers = self
+            .dht_watches
+            .lock()
+            .await
+            .watchers_for_news(&put.key, &put.signer, put.sequence);
         if watchers.is_empty() {
             return;
         }

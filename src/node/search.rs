@@ -1,0 +1,289 @@
+//! Bounded route search: the fallback when the directory has no record for
+//! a node, or every address it has fails. An expanding-ring flood, with no
+//! originator, answered by any node with a route to the target. See
+//! "Fallback: bounded route search" in `docs/spec/routing.md`.
+
+use super::*;
+use crate::wire::{RouteSearchFoundMsg, RouteSearchMsg, MAX_HINTS, ROUTE_SEARCH_MAX_TTL, ROUTE_SEARCH_PATH_MAX};
+
+/// Ring sizes, tried in turn.
+const RINGS: [u8; 3] = [4, 8, 16];
+/// How long a ring of `ttl` hops is waited for.
+fn ring_wait(ttl: u8) -> Duration {
+    Duration::from_millis(500 * ttl as u64)
+}
+/// How long relays remember a search.
+const NONCE_LIFETIME: Duration = Duration::from_secs(30);
+/// Searches a relay remembers at once.
+const MAX_SEEN: usize = 8192;
+/// Searches accepted per second per neighbour, and the burst.
+const SEARCH_RATE: f64 = 5.0;
+const SEARCH_BURST: f64 = 20.0;
+/// At most one search per target this often.
+const SEARCH_PER_TARGET: Duration = Duration::from_secs(30);
+/// How long a search's answer is used.
+const FOUND_LIFETIME: Duration = Duration::from_secs(300);
+
+/// A search that passed us.
+struct Seen {
+    prev: PeerId,
+    /// An answer already went back through us.
+    answered: bool,
+    at: Instant,
+}
+
+pub(super) struct SearchState {
+    seen: Mutex<HashMap<[u8; 16], Seen>>,
+    waiters: Mutex<HashMap<[u8; 16], oneshot::Sender<Vec<PeerId>>>>,
+    /// Hints a search found, by target.
+    found: Mutex<HashMap<PeerId, (Vec<PeerId>, Instant)>>,
+    last_search: Mutex<HashMap<PeerId, Instant>>,
+    budget: Mutex<HashMap<PeerId, (f64, Instant)>>,
+}
+
+impl SearchState {
+    pub(super) fn new() -> Self {
+        Self {
+            seen: Mutex::new(HashMap::new()),
+            waiters: Mutex::new(HashMap::new()),
+            found: Mutex::new(HashMap::new()),
+            last_search: Mutex::new(HashMap::new()),
+            budget: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Hints from an answer's hop list (answering node first, our neighbour
+/// last): reversed to run toward the target, starting from the last node we
+/// can reach ourselves. `None` if that is still longer than a message may
+/// carry.
+fn hints_from_hops(hops: &[PeerId], reach: impl Fn(&PeerId) -> bool) -> Option<Vec<PeerId>> {
+    let toward: Vec<PeerId> = hops.iter().rev().copied().collect();
+    let start = toward.iter().rposition(|p| reach(p)).unwrap_or(0);
+    let hints = toward[start..].to_vec();
+    (hints.len() <= MAX_HINTS).then_some(hints)
+}
+
+impl Node {
+    async fn search_allowed(&self, from: &PeerId) -> bool {
+        let mut budget = self.search.budget.lock().await;
+        let now = Instant::now();
+        let (tokens, at) = budget.entry(*from).or_insert((SEARCH_BURST, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * SEARCH_RATE).min(SEARCH_BURST);
+        *at = now;
+        if *tokens < 1.0 {
+            return false;
+        }
+        *tokens -= 1.0;
+        true
+    }
+
+    /// Remember a search. False if we have seen it already.
+    async fn remember_search(&self, nonce: [u8; 16], prev: PeerId, answered: bool) -> bool {
+        let mut seen = self.search.seen.lock().await;
+        let now = Instant::now();
+        if seen.contains_key(&nonce) {
+            return false;
+        }
+        if seen.len() >= MAX_SEEN {
+            seen.retain(|_, s| now.duration_since(s.at) < NONCE_LIFETIME);
+            if seen.len() >= MAX_SEEN {
+                return false;
+            }
+        }
+        seen.insert(nonce, Seen { prev, answered, at: now });
+        true
+    }
+
+    pub(super) async fn handle_route_search(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let msg = RouteSearchMsg::from_bytes(payload)?;
+        if !self.search_allowed(&from).await || !self.remember_search(msg.nonce, from, false).await {
+            return Ok(());
+        }
+        let me = self.peer_id();
+        let links: Vec<PeerId> = self.links.lock().await.keys().copied().collect();
+        let knows = msg.target == me
+            || links.contains(&msg.target)
+            || self.routing_table.lock().await.lookup(&msg.target).is_some();
+        if knows {
+            if let Some(s) = self.search.seen.lock().await.get_mut(&msg.nonce) {
+                s.answered = true;
+            }
+            let found = RouteSearchFoundMsg {
+                nonce: msg.nonce,
+                target: msg.target,
+                hops: vec![me],
+            };
+            return self
+                .send_to_peer_deferred(&from, &found.to_wire().encode())
+                .await;
+        }
+        let ttl = msg.ttl.min(ROUTE_SEARCH_MAX_TTL);
+        if ttl <= 1 {
+            return Ok(());
+        }
+        let next = RouteSearchMsg { ttl: ttl - 1, ..msg }.to_wire().encode();
+        for peer in links.iter().filter(|p| **p != from) {
+            let _ = self.send_to_peer_deferred(peer, &next).await;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn handle_route_search_found(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let mut msg = RouteSearchFoundMsg::from_bytes(payload)?;
+        if msg.hops.last() != Some(&from) {
+            return Ok(());
+        }
+        if let Some(tx) = self.search.waiters.lock().await.remove(&msg.nonce) {
+            let _ = tx.send(msg.hops);
+            return Ok(());
+        }
+        let prev = {
+            let mut seen = self.search.seen.lock().await;
+            match seen.get_mut(&msg.nonce) {
+                // The first answer goes back; the rest add nothing.
+                Some(s) if !s.answered => {
+                    s.answered = true;
+                    s.prev
+                }
+                _ => return Ok(()),
+            }
+        };
+        let me = self.peer_id();
+        if msg.hops.contains(&me) || msg.hops.len() >= ROUTE_SEARCH_PATH_MAX {
+            return Ok(());
+        }
+        msg.hops.push(me);
+        self.send_to_peer_deferred(&prev, &msg.to_wire().encode())
+            .await
+    }
+
+    /// Hints toward `target` from a recent search, if any.
+    pub(super) async fn searched_hints(&self, target: &PeerId) -> Vec<PeerId> {
+        let mut found = self.search.found.lock().await;
+        match found.get(target) {
+            Some((hints, at)) if at.elapsed() < FOUND_LIFETIME => hints.clone(),
+            Some(_) => {
+                found.remove(target);
+                Vec::new()
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// A build using the searched hints failed: search again next time.
+    pub(super) async fn forget_search(&self, target: &PeerId) {
+        self.search.found.lock().await.remove(target);
+    }
+
+    /// Search for a route to `target` in rings of 4, 8 and 16 hops. Returns
+    /// hints toward it, or `None` if no ring found it (or a search for it
+    /// ran less than `SEARCH_PER_TARGET` ago).
+    pub async fn route_search(&self, target: &PeerId) -> Option<Vec<PeerId>> {
+        {
+            let mut last = self.search.last_search.lock().await;
+            let now = Instant::now();
+            last.retain(|_, t| now.duration_since(*t) < SEARCH_PER_TARGET);
+            if last.contains_key(target) {
+                return None;
+            }
+            last.insert(*target, now);
+        }
+        let me = self.peer_id();
+        for ttl in RINGS {
+            let links: Vec<PeerId> = self.links.lock().await.keys().copied().collect();
+            if links.is_empty() {
+                return None;
+            }
+            let nonce: [u8; 16] = rand::random();
+            // Our own flood coming back is not forwarded again.
+            self.remember_search(nonce, me, true).await;
+            let (tx, rx) = oneshot::channel();
+            self.search.waiters.lock().await.insert(nonce, tx);
+            let msg = RouteSearchMsg {
+                nonce,
+                target: *target,
+                ttl,
+            }
+            .to_wire()
+            .encode();
+            for peer in &links {
+                let _ = self.send_to_peer_deferred(peer, &msg).await;
+            }
+            let answer = tokio::time::timeout(ring_wait(ttl), rx).await;
+            self.search.waiters.lock().await.remove(&nonce);
+            let Ok(Ok(hops)) = answer else { continue };
+            let linked: HashSet<PeerId> = self.links.lock().await.keys().copied().collect();
+            let hints = {
+                let rt = self.routing_table.lock().await;
+                hints_from_hops(&hops, |p| linked.contains(p) || rt.lookup(p).is_some())
+            };
+            match hints {
+                Some(hints) => {
+                    log::info!("Route search found {:?} within {} hops", target, ttl);
+                    self.search
+                        .found
+                        .lock()
+                        .await
+                        .insert(*target, (hints.clone(), Instant::now()));
+                    return Some(hints);
+                }
+                None => {
+                    log::debug!("Route search found {:?}, but too far for hints", target);
+                    return None;
+                }
+            }
+        }
+        log::info!("Route search found no route to {:?}", target);
+        None
+    }
+
+    pub(super) fn spawn_search_gc(&self, node: Arc<Node>) {
+        tokio::spawn(async move {
+            let mut interval = jittered_interval(NONCE_LIFETIME);
+            loop {
+                interval.tick().await;
+                let now = Instant::now();
+                node.search
+                    .seen
+                    .lock()
+                    .await
+                    .retain(|_, s| now.duration_since(s.at) < NONCE_LIFETIME);
+                node.search
+                    .found
+                    .lock()
+                    .await
+                    .retain(|_, (_, at)| now.duration_since(*at) < FOUND_LIFETIME);
+                node.search
+                    .budget
+                    .lock()
+                    .await
+                    .retain(|_, (_, at)| now.duration_since(*at) < NONCE_LIFETIME);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pid(b: u8) -> PeerId {
+        PeerId([b; 32])
+    }
+
+    #[test]
+    fn hints_start_at_the_last_node_we_reach() {
+        // Answer from 5, back through 4, 3, 2 to our neighbour 1.
+        let hops = vec![pid(5), pid(4), pid(3), pid(2), pid(1)];
+        // We reach 1 and 2 (our local area).
+        let reach = |p: &PeerId| *p == pid(1) || *p == pid(2);
+        assert_eq!(hints_from_hops(&hops, reach), Some(vec![pid(2), pid(3), pid(4), pid(5)]));
+        // We reach the answering node itself.
+        assert_eq!(hints_from_hops(&hops, |p| *p == pid(5)), Some(vec![pid(5)]));
+        // Too long to carry.
+        let long: Vec<PeerId> = (1..=12).rev().map(pid).collect();
+        assert_eq!(hints_from_hops(&long, |p| *p == pid(1)), None);
+        assert!(hints_from_hops(&long, |p| *p == pid(4)).is_some());
+    }
+}

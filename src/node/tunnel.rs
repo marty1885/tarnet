@@ -6,6 +6,26 @@ const KEX_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const KEX_RETRY_MAX: Duration = Duration::from_secs(1);
 const KEX_RETRY_WINDOW: Duration = Duration::from_secs(30);
 
+/// Send an overlay message toward `dest`: over the link if we have one,
+/// else by the forwarding rule with `hints`. For spawned tasks that hold the
+/// tables but not the node.
+pub(super) async fn send_overlay(
+    links: &Mutex<LinkTable>,
+    routing: &Mutex<RoutingTable>,
+    dest: &PeerId,
+    hints: &[PeerId],
+    data: &[u8],
+) -> Result<()> {
+    let links = links.lock().await;
+    let next = routing
+        .lock()
+        .await
+        .next_hop_hinted(dest, hints, |p| links.contains_key(p))
+        .ok_or(Error::NotFound)?;
+    let link = links.get(&next).ok_or(Error::NotFound)?;
+    link.send_message(data).await
+}
+
 impl Node {
     /// Handle incoming TunnelKeyExchange — routed to us as destination.
     pub(super) async fn handle_tunnel_key_exchange(
@@ -73,7 +93,8 @@ impl Node {
             .map(|(_, msg, _)| msg.clone());
         if let Some(msg) = cached {
             log::debug!("TunnelKeyExchange from {:?} retried, resending response", ke.initiator_peer_id);
-            return self.route_message(&ke.initiator_peer_id, &msg).await;
+            let hints = self.known_hints(&ke.initiator_peer_id).await;
+            return self.route_message(&ke.initiator_peer_id, &hints, &msg).await;
         }
         {
             let nonces = self.seen_nonces.lock().await;
@@ -97,7 +118,10 @@ impl Node {
             .map_err(|e| Error::Wire(format!("TunnelKeyExchange unknown KEM algo: {}", e)))?;
         let (shared_bytes, reply_ciphertext) = kex_accept(offer_algo, &ke.ephemeral_pubkey)?;
 
-        let tunnel = Tunnel::new(ke.initiator_peer_id, &shared_bytes, false);
+        // The initiator may be beyond our local area: reach it by its address.
+        let hints = self.address_hints(&ke.initiator_peer_id).await;
+        let mut tunnel = Tunnel::new(ke.initiator_peer_id, &shared_bytes, false);
+        tunnel.hints = hints.clone();
         self.tunnel_table.lock().await.add(tunnel);
 
         // Generate our own nonce for the response
@@ -129,7 +153,7 @@ impl Node {
             origin: self.peer_id(),
             destination: ke.initiator_peer_id,
             ttl: 64,
-            hints: Vec::new(),
+            hints: hints.clone(),
             data: response.to_wire().encode(),
         };
         let encoded = msg.to_wire().encode();
@@ -137,7 +161,7 @@ impl Node {
             .lock()
             .await
             .insert(ke.nonce, (ke.initiator_peer_id, encoded.clone(), Instant::now()));
-        self.route_message(&ke.initiator_peer_id, &encoded).await?;
+        self.route_message(&ke.initiator_peer_id, &hints, &encoded).await?;
 
         log::info!(
             "Tunnel established (responder) with {:?}",
@@ -208,7 +232,8 @@ impl Node {
                 .expect("pending tunnel exchange disappeared while locked");
             drop(pending);
 
-            let tunnel = Tunnel::new(dest, &shared_bytes, true);
+            let mut tunnel = Tunnel::new(dest, &shared_bytes, true);
+            tunnel.hints = self.known_hints(&dest).await;
             self.tunnel_table.lock().await.add(tunnel);
 
             log::info!("Tunnel established (initiator) with {:?}", dest);
@@ -261,13 +286,10 @@ impl Node {
         }
         msg.ttl -= 1;
 
-        let next_hop = {
-            let table = self.routing_table.lock().await;
-            table
-                .lookup(&msg.destination)
-                .map(|r| r.next_hop)
-                .ok_or(Error::NotFound)?
-        };
+        let next_hop = self
+            .next_hop_toward(&msg.destination, &msg.hints, &from)
+            .await
+            .ok_or(Error::NotFound)?;
         self.send_to_peer(&next_hop, &msg.to_wire_encrypted().encode())
             .await
     }
@@ -445,13 +467,10 @@ impl Node {
         }
         data.ttl -= 1;
 
-        let next_hop = {
-            let table = self.routing_table.lock().await;
-            table
-                .lookup(&data.destination)
-                .map(|r| r.next_hop)
-                .ok_or(Error::NotFound)?
-        };
+        let next_hop = self
+            .next_hop_toward(&data.destination, &data.hints, &from)
+            .await
+            .ok_or(Error::NotFound)?;
         log::debug!(
             "Forwarding data for {:?} via {:?} (ttl={})",
             data.destination,
@@ -464,41 +483,27 @@ impl Node {
     /// Send application data to a remote peer, routed through the overlay.
     /// Per-hop encrypted by the link layer. TTL limits forwarding hops.
     pub async fn send_data(&self, dest: &PeerId, payload: &[u8]) -> Result<()> {
+        let hints = self.address_hints(dest).await;
         let msg = DataMsg {
             origin: self.peer_id(),
             destination: *dest,
             ttl: 64,
-            hints: Vec::new(),
+            hints: hints.clone(),
             data: payload.to_vec(),
         };
-        let encoded = msg.to_wire().encode();
-
-        // Direct link?
-        {
-            let links = self.links.lock().await;
-            if let Some(link) = links.get(dest) {
-                return link.send_message(&encoded).await;
-            }
-        }
-
-        // Route through overlay
-        let next_hop = {
-            let table = self.routing_table.lock().await;
-            table
-                .lookup(dest)
-                .map(|r| r.next_hop)
-                .ok_or(Error::NotFound)?
-        };
-        self.send_to_peer(&next_hop, &encoded).await
+        self.route_message(dest, &hints, &msg.to_wire().encode())
+            .await
     }
 
     /// Send data to a peer through routing (finds next hop).
     pub async fn send_routed(&self, dest: &PeerId, data: &[u8]) -> Result<()> {
-        self.route_message(dest, data).await
+        let hints = self.known_hints(dest).await;
+        self.route_message(dest, &hints, data).await
     }
 
-    /// Route a message to a destination peer, either directly or via next hop.
-    pub(super) async fn route_message(&self, dest: &PeerId, data: &[u8]) -> Result<()> {
+    /// Route a message to a destination peer: directly, via our route, or
+    /// toward the last of `hints` we can reach.
+    pub(super) async fn route_message(&self, dest: &PeerId, hints: &[PeerId], data: &[u8]) -> Result<()> {
         // Check if we have a direct link
         {
             let links = self.links.lock().await;
@@ -506,15 +511,10 @@ impl Node {
                 return link.send_message(data).await;
             }
         }
-
-        // Find next hop via routing table
-        let next_hop = {
-            let table = self.routing_table.lock().await;
-            table
-                .lookup(dest)
-                .map(|r| r.next_hop)
-                .ok_or(Error::NotFound)?
-        };
+        let next_hop = self
+            .next_hop_toward(dest, hints, &self.peer_id())
+            .await
+            .ok_or(Error::NotFound)?;
         self.send_to_peer(&next_hop, data).await
     }
 
@@ -526,22 +526,27 @@ impl Node {
             return Ok(rx);
         }
 
-        // Wait for a route to the destination (up to 30s).
+        // Wait for a route to the destination, or (beyond our local area)
+        // its address (up to 30s).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
+        let hints = loop {
             let connected = self.connected_peers().await;
             if connected.contains(&dest) {
-                break;
+                break Vec::new();
             }
             let has_route = self.routing_table.lock().await.lookup(&dest).is_some();
             if has_route {
-                break;
+                break Vec::new();
+            }
+            let hints = self.address_hints(&dest).await;
+            if !hints.is_empty() {
+                break hints;
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(Error::Protocol(format!("no route to {:?}", dest)));
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        };
 
         let kem_algo = self.identity.identity.kem_algo();
         let kex = KexOffer::new(kem_algo);
@@ -576,7 +581,7 @@ impl Node {
             origin: self.peer_id(),
             destination: dest,
             ttl: 64,
-            hints: Vec::new(),
+            hints: hints.clone(),
             data: inner,
         };
 
@@ -588,7 +593,7 @@ impl Node {
             .insert(nonce, (kex, tx, dest, Instant::now()));
 
         let encoded = msg.to_wire().encode();
-        self.route_message(&dest, &encoded).await?;
+        self.route_message(&dest, &hints, &encoded).await?;
 
         // The offer or its response may be lost: resend the identical offer
         // (same nonce, same ephemeral key) until the response arrives. The
@@ -600,18 +605,14 @@ impl Node {
             let mut wait = KEX_RETRY_INITIAL;
             let give_up = Instant::now() + KEX_RETRY_WINDOW;
             loop {
-                tokio::time::sleep(wait).await;
+                tokio::time::sleep(crate::types::jittered(wait)).await;
                 if Instant::now() >= give_up || !pending.lock().await.contains_key(&nonce) {
                     return;
                 }
-                let links = links.lock().await;
-                let hop = if links.get(&dest).is_some() {
-                    Some(dest)
-                } else {
-                    routing.lock().await.lookup(&dest).map(|r| r.next_hop)
-                };
-                if let Some(link) = hop.and_then(|h| links.get(&h)) {
-                    let _ = link.send_message(&encoded).await;
+                if send_overlay(&links, &routing, &dest, &hints, &encoded)
+                    .await
+                    .is_ok()
+                {
                     log::debug!("Tunnel key exchange to {:?} resent", dest);
                 }
                 wait = (wait * 2).min(KEX_RETRY_MAX);
@@ -639,16 +640,17 @@ impl Node {
             .get_mut(dest)
             .ok_or_else(|| Error::Protocol(format!("no tunnel to {:?}", dest)))?;
         let encrypted = tunnel.encrypt(data)?;
+        let hints = tunnel.hints.clone();
         drop(tt);
 
         let msg = EncryptedDataMsg {
             origin: self.peer_id(),
             destination: *dest,
             ttl: 64,
-            hints: Vec::new(),
+            hints: hints.clone(),
             data: encrypted,
         };
-        self.route_message(dest, &msg.to_wire_encrypted().encode())
+        self.route_message(dest, &hints, &msg.to_wire_encrypted().encode())
             .await
     }
 

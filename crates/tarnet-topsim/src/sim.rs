@@ -29,7 +29,17 @@ pub struct LocalRuntime {
     pub exported_nodes: Vec<ExportedNode>,
     sim_nodes: Vec<Option<SimNode>>,
     started_nodes: usize,
+    /// Force every routing table down to this many destinations, so
+    /// landmarks and the address directory run at simulation scale.
+    pub route_budget: Option<usize>,
+    /// Probe by building a circuit and opening a stream, not by waiting for
+    /// a route (scoped tables have no route to most destinations).
+    pub circuit_probes: bool,
 }
+
+/// Port every node listens on for circuit probes.
+const PROBE_PORT: &str = "topsim-probe";
+const PROBE_MODE: tarnet_api::service::PortMode = tarnet_api::service::PortMode::ReliableOrdered;
 
 pub struct ProbeOutcome {
     pub pair: ProbePair,
@@ -97,6 +107,8 @@ impl LocalRuntime {
             exported_nodes,
             sim_nodes,
             started_nodes: 0,
+            route_budget: None,
+            circuit_probes: false,
         })
     }
 
@@ -129,6 +141,37 @@ impl LocalRuntime {
                 .collect::<Vec<_>>();
 
             let node = Arc::new(Node::new(Keypair::generate_ed25519()));
+            if let Some(budget) = self.route_budget {
+                node.set_route_budget(budget).await;
+                node.set_landmark_config(tarnet::node::LandmarkConfig {
+                    promote_delay_max: Duration::from_secs(10),
+                    publish_gap: Duration::from_secs(5),
+                    ..Default::default()
+                })
+                .await;
+            }
+            if self.circuit_probes {
+                let listener = node
+                    .circuit_listen(
+                        tarnet_api::types::ServiceId::ALL,
+                        PROBE_MODE,
+                        PROBE_PORT,
+                        tarnet_api::service::ListenerOptions::default(),
+                    )
+                    .await?;
+                let acceptor = node.clone();
+                tokio::spawn(async move {
+                    while let Ok(conn) = acceptor.circuit_accept(listener.id).await {
+                        tokio::spawn(async move {
+                            while let Ok(data) = conn.recv().await {
+                                if conn.send(&data).await.is_err() {
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
             let peer_id = node.peer_id();
             let runner = node.clone();
             let discovery = self.discoveries[*idx]
@@ -279,7 +322,15 @@ impl LocalRuntime {
         let total = tasks.len();
         let mut handles = Vec::with_capacity(tasks.len());
 
+        let mut services = HashMap::new();
+        if self.circuit_probes {
+            for sim in self.sim_nodes.iter().flatten() {
+                services.insert(sim.peer_id, sim.node.default_service_id().await);
+            }
+        }
+        let circuit_probes = self.circuit_probes;
         for (src_local_idx, src_global_idx, dst_global_idx, label, dst_peer) in tasks {
+            let dst_service = services.get(&dst_peer).copied();
             let permit = if let Some(semaphore) = &semaphore {
                 Some(
                     semaphore
@@ -299,8 +350,29 @@ impl LocalRuntime {
             let completed = completed.clone();
             handles.push(tokio::spawn(async move {
                 let started = Instant::now();
+                let cost = if circuit_probes {
+                    // Build a circuit and echo one message over it.
+                    let probe = async {
+                        let service = dst_service?;
+                        let conn = src
+                            .circuit_connect(service, PROBE_MODE, PROBE_PORT, Some(dst_peer), None)
+                            .await
+                            .ok()?;
+                        conn.send(b"probe").await.ok()?;
+                        let back = conn.recv().await.ok()?;
+                        (back == b"probe").then_some(())
+                    };
+                    match tokio::time::timeout(Duration::from_secs(90), probe).await {
+                        Ok(Some(())) => Some(
+                            src.route_cost(&dst_peer)
+                                .await
+                                .map_or(0, |c| c.min(u16::MAX as u32) as u16),
+                        ),
+                        _ => None,
+                    }
+                } else {
                 // Wait for distance-vector routing to learn the destination.
-                let cost = tokio::time::timeout(Duration::from_secs(12), async {
+                tokio::time::timeout(Duration::from_secs(12), async {
                     loop {
                         if let Some(c) = src.route_cost(&dst_peer).await {
                             break c.min(u16::MAX as u32) as u16;
@@ -309,7 +381,8 @@ impl LocalRuntime {
                     }
                 })
                 .await
-                .ok();
+                .ok()
+                };
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 println!(
                     "  probe {done}/{total}: {src_global_idx} -> {dst_global_idx} {} in {:.0}ms",

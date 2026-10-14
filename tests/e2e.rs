@@ -1252,6 +1252,234 @@ async fn circuit_build_through_relay() {
     a.destroy_circuit(circuit_id).await.unwrap();
 }
 
+/// Onion layers sit only at waypoints: relays between them pass the routed
+/// CREATE on and keep keyless entries.
+#[tokio::test]
+async fn circuit_layers_only_at_waypoints() {
+    init_log();
+    let nodes = spawn_chain(4).await;
+    let (a, b, c, d) = (
+        &nodes[0].node,
+        &nodes[1].node,
+        &nodes[2].node,
+        &nodes[3].node,
+    );
+    assert!(
+        wait_route(a, d.peer_id(), Duration::from_secs(5)).await,
+        "A should have a route to D"
+    );
+
+    let one = tokio::time::timeout(
+        Duration::from_secs(10),
+        a.build_circuit(b.peer_id(), vec![d.peer_id()]),
+    )
+    .await
+    .expect("circuit build timed out")
+    .expect("circuit build failed");
+    assert_eq!(a.circuit_layer_count(one).await, Some(1));
+    for relay in [b, c] {
+        let status = relay.node_status().await.circuits;
+        assert_eq!(status.relay_endpoints, 0, "a relay between waypoints has no layer");
+        assert_eq!(status.relay_forwards, 2);
+    }
+    assert_eq!(d.node_status().await.circuits.relay_endpoints, 1);
+    a.destroy_circuit(one).await.unwrap();
+
+    let two = tokio::time::timeout(
+        Duration::from_secs(10),
+        a.build_circuit(b.peer_id(), vec![c.peer_id(), d.peer_id()]),
+    )
+    .await
+    .expect("circuit build timed out")
+    .expect("circuit build failed");
+    assert_eq!(a.circuit_layer_count(two).await, Some(2));
+    a.destroy_circuit(two).await.unwrap();
+}
+
+/// A hidden service and its client both use two-hop circuits: intro and
+/// rendezvous circuits cross waypoints, the rendezvous point swaps its layers,
+/// and the end-to-end layer rides inside them.
+#[tokio::test]
+async fn hidden_service_multi_hop_rendezvous() {
+    init_log();
+    let nodes = spawn_chain(5).await;
+    let (client, host) = (&nodes[0].node, &nodes[4].node);
+    for n in &nodes[..4] {
+        assert!(wait_route(host, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+    for n in &nodes[1..] {
+        assert!(wait_route(client, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+
+    let sid = host
+        .create_identity(
+            "hidden",
+            PrivacyLevel::Hidden { intro_points: 1 },
+            2,
+            IdentityScheme::DEFAULT,
+        )
+        .await
+        .unwrap();
+    let listener = host
+        .circuit_listen(sid, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    if host.hidden_intro_peers(&sid).await.is_empty() {
+        host.publish_hidden_service(sid, 1)
+            .await
+            .expect("publish_hidden_service failed");
+    }
+    let kp = host.keypair_for_service(&sid).await.unwrap();
+    let intro_points: Vec<_> = host
+        .hidden_intro_peers(&sid)
+        .await
+        .into_iter()
+        .map(|p| (p, kp.identity.kem_algo() as u8, kp.identity.kem.kem_pubkey_bytes()))
+        .collect();
+    assert!(!intro_points.is_empty());
+
+    let accepting = host.clone();
+    let accept = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(30), accepting.circuit_accept(listener.id))
+            .await
+            .expect("accept timed out")
+            .expect("accept failed")
+    });
+    let conn = tokio::time::timeout(
+        Duration::from_secs(30),
+        client.connect_via_rendezvous(sid, TEST_MODE, "80", &intro_points, 2),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let served = accept.await.unwrap();
+
+    conn.send(b"to the service").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), served.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"to the service");
+    served.send(b"to the client").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), conn.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"to the client");
+}
+
+/// Relay sampling on a chain: every sample is another node, its hints are
+/// a stretch of the chain ending next to it, and never our own neighbour.
+#[tokio::test]
+async fn relay_sampling_walk_finds_far_relays() {
+    init_log();
+    let nodes = spawn_chain(6).await;
+    let walker = &nodes[0].node;
+    for n in &nodes[1..] {
+        assert!(wait_route(walker, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+    let index = |p: &tarnet::types::PeerId| nodes.iter().position(|n| n.node.peer_id() == *p).unwrap();
+    let mut seen = std::collections::HashSet::new();
+    let walks: Vec<_> = (0..30)
+        .map(|_| {
+            let walker = walker.clone();
+            tokio::spawn(async move { walker.sample_relay_for_test().await })
+        })
+        .collect();
+    for walk in walks {
+        let Some((peer, hints)) = walk.await.unwrap() else {
+            continue;
+        };
+        let at = index(&peer);
+        assert_ne!(at, 0, "sampled ourselves");
+        seen.insert(at);
+        let idx: Vec<usize> = hints.iter().map(index).collect();
+        assert!(!idx.contains(&0) && !idx.contains(&1), "hints {:?} name us or our neighbour", idx);
+        // Loop-erased on a chain: consecutive nodes leading up to the sample.
+        let mut expect = at;
+        for i in idx.iter().rev() {
+            expect -= 1;
+            assert_eq!(*i, expect, "hints {:?} for sample {}", idx, at);
+        }
+    }
+    assert!(seen.len() >= 3, "samples not spread: {:?}", seen);
+    assert!(seen.iter().any(|&i| i >= 3), "no sample beyond the local area: {:?}", seen);
+}
+
+/// Both ends see only their local area: intro point, rendezvous point and
+/// waypoints all come from sampled relays, reached through their hints.
+#[tokio::test]
+async fn hidden_service_with_sampled_relays() {
+    init_log();
+    let nodes = spawn_chain(6).await;
+    let (client, host) = (&nodes[0].node, &nodes[5].node);
+    for n in &nodes[..5] {
+        assert!(wait_route(host, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+    for n in &nodes[1..] {
+        assert!(wait_route(client, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+    client.set_route_budget(2).await;
+    host.set_route_budget(2).await;
+    assert!(client.route_cost(&nodes[4].node.peer_id()).await.is_none());
+
+    let sid = host
+        .create_identity(
+            "hidden",
+            PrivacyLevel::Hidden { intro_points: 1 },
+            2,
+            IdentityScheme::DEFAULT,
+        )
+        .await
+        .unwrap();
+    let listener = host
+        .circuit_listen(sid, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    if host.hidden_intro_peers(&sid).await.is_empty() {
+        host.publish_hidden_service(sid, 1)
+            .await
+            .expect("publish_hidden_service failed");
+    }
+    let kp = host.keypair_for_service(&sid).await.unwrap();
+    let intro_points: Vec<_> = host
+        .hidden_intro_peers(&sid)
+        .await
+        .into_iter()
+        .map(|p| (p, kp.identity.kem_algo() as u8, kp.identity.kem.kem_pubkey_bytes()))
+        .collect();
+    assert!(!intro_points.is_empty());
+
+    let accepting = host.clone();
+    let accept = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(60), accepting.circuit_accept(listener.id))
+            .await
+            .expect("accept timed out")
+            .expect("accept failed")
+    });
+    let conn = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.connect_via_rendezvous(sid, TEST_MODE, "80", &intro_points, 2),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let served = accept.await.unwrap();
+
+    conn.send(b"to the service").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), served.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"to the service");
+    served.send(b"to the client").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(10), conn.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, b"to the client");
+}
+
 // ── Cross-algorithm interop tests ──
 //
 // The network MUST work with mixed algorithms. A falcon_ed25519 identity
@@ -1412,11 +1640,18 @@ async fn cross_algo_connect_pq_to_classic() {
     // A (PQ) connects to C (classic) via rendezvous
     let kem_algo = default_kp_c.identity.kem_algo() as u8;
     let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
-    let intro_points = vec![(b.node.peer_id(), kem_algo, kem_pubkey)];
+    // The intro points C actually registered at.
+    let intro_points: Vec<_> = c
+        .node
+        .hidden_intro_peers(&service_id_c)
+        .await
+        .into_iter()
+        .map(|p| (p, kem_algo, kem_pubkey.clone()))
+        .collect();
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
         a.node
-            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points),
+            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points, 1),
     )
     .await
     .expect("connect timed out")
@@ -1498,11 +1733,18 @@ async fn cross_algo_connect_classic_to_pq() {
     // A (classic) connects to C (PQ) via rendezvous
     let kem_algo = default_kp_c.identity.kem_algo() as u8;
     let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
-    let intro_points = vec![(b.node.peer_id(), kem_algo, kem_pubkey)];
+    // The intro points C actually registered at.
+    let intro_points: Vec<_> = c
+        .node
+        .hidden_intro_peers(&service_id_c)
+        .await
+        .into_iter()
+        .map(|p| (p, kem_algo, kem_pubkey.clone()))
+        .collect();
     let client_conn = tokio::time::timeout(
         Duration::from_secs(10),
         a.node
-            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points),
+            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points, 1),
     )
     .await
     .expect("connect timed out")

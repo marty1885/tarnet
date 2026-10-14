@@ -92,6 +92,23 @@ async fn main() {
     node.set_link_limits(opts.max_inbound, opts.max_outbound);
     node.set_bandwidth_limits(opts.upload_limit, opts.download_limit);
     node.set_dht_store(opts.dht_store);
+    node.set_client_only(opts.client_only);
+    node.set_landmark_config(tarnet::node::LandmarkConfig {
+        mode: opts.landmark,
+        ..Default::default()
+    })
+    .await;
+    if opts.route_budget != tarnet::routing::B_MIN {
+        log::warn!(
+            "Routing table budget {} differs from the network-wide {}",
+            opts.route_budget,
+            tarnet::routing::B_MIN
+        );
+    }
+    node.set_route_budget(opts.route_budget).await;
+    if opts.landmark == tarnet::node::LandmarkMode::Always && (!opts.dht_store || opts.client_only) {
+        log::warn!("landmark = \"always\" on a node that doesn't qualify by default");
+    }
 
     let tcp_discovery = TcpDiscovery::bind(&opts.listen_addrs)
         .await

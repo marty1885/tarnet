@@ -9,32 +9,25 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use chacha20poly1305::aead::{Aead, AeadInPlace, KeyInit, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 
 use rand::RngCore;
-use subtle::ConstantTimeEq;
 
 use crate::crypto::{kdf, mac_16};
 use crate::types::{Error, PeerId, Result};
 
-/// Per-hop Poly1305 tag size.
-const HOP_MAC_SIZE: usize = 16;
-/// Explicit nonce size in the cell trailer.
-pub const CELL_NONCE_SIZE: usize = 24;
-/// Size of the encrypted body within a cell (before nonce + hop MAC). Cells
-/// are 512 bytes on every circuit: small enough that an interactive cell
-/// isn't stuck behind seconds of airtime on a slow radio hop, the same
-/// everywhere so a relay can't tell interactive circuits from bulk ones.
-pub const CELL_BODY_SIZE: usize = 512 - CELL_NONCE_SIZE - HOP_MAC_SIZE;
-/// Full cell size on the wire: encrypted body + nonce + per-hop MAC.
-pub const CELL_SIZE: usize = CELL_BODY_SIZE + CELL_NONCE_SIZE + HOP_MAC_SIZE;
+pub use crate::onion::{
+    cell_trailer, seal_outward, CryptoOp, HopCrypto, HopKey, LayerKeys, OnionLayers, Peeled,
+    ReplayWindow, CELL_BODY_SIZE, CELL_CRYPTO_VERSION, CELL_SIZE,
+};
+
 /// Header: command(1) + stream_id(2) + length(2).
 const CELL_HEADER_SIZE: usize = 5;
-/// BLAKE2b-128 digest for integrity at the endpoint.
+/// SENDME digest size.
 const DIGEST_SIZE: usize = 16;
 /// Maximum payload bytes in a single relay cell.
-pub const CELL_PAYLOAD_MAX: usize = CELL_BODY_SIZE - CELL_HEADER_SIZE - DIGEST_SIZE;
+pub const CELL_PAYLOAD_MAX: usize = CELL_BODY_SIZE - CELL_HEADER_SIZE;
 /// Set in a relay cell's length field when more cells of the same relay
 /// message follow.
 const LENGTH_MORE: u16 = 0x8000;
@@ -74,106 +67,6 @@ pub struct CircuitKey {
     pub from_peer: PeerId,
 }
 
-/// Crypto operation applied by a relay when processing a cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CryptoOp {
-    /// Decrypt one onion layer (forward direction: initiator → endpoint).
-    Decrypt,
-    /// Encrypt one onion layer (backward direction: endpoint → initiator).
-    Encrypt,
-}
-
-/// Per-hop crypto state stored in a circuit forwarding entry.
-/// Relays use this to peel/add one onion layer as cells pass through.
-///
-/// The nonce is carried explicitly in the cell trailer (24 bytes) rather than
-/// tracked as an implicit counter. This allows the scheme to survive
-/// unreliable (UDP-like) transports where cells may be dropped or reordered.
-/// A sliding-window bitmap rejects replayed cells.
-#[derive(Debug, Clone)]
-pub struct HopCrypto {
-    pub key: [u8; 32],
-    /// Digest key for relay cell integrity at endpoints.
-    pub digest_key: [u8; 32],
-    /// Per-circuit nonce prefix derived from shared secret.
-    /// Ensures nonce uniqueness even if keys are accidentally reused.
-    pub nonce_prefix: [u8; 16],
-    pub op: CryptoOp,
-    /// Replay window for this hop (only meaningful for Decrypt).
-    pub replay: CellReplayWindow,
-}
-
-impl HopCrypto {
-    /// Process a cell through this hop's crypto layer.
-    ///
-    /// The 24-byte nonce is read from the cell trailer.
-    ///
-    /// **Decrypt** (relay peeling a forward layer / initiator peeling backward):
-    ///   - Reads the nonce from the cell trailer.
-    ///   - Checks the replay window; returns `false` if replayed/too old.
-    ///   - Verifies the hop MAC; returns `false` if it doesn't match.
-    ///   - Decrypts the body, zeros the MAC, and peels the nonce-domain mask.
-    ///   - Returns `true` on success.
-    ///   - Inner tags are overwritten by onion wrapping. A zero tag marks a
-    ///     peeled layer; endpoint integrity is checked with the relay digest.
-    ///     Callers must respect rejection, including replay rejection.
-    ///
-    /// **Encrypt** (relay adding a backward layer):
-    ///   - Reads the nonce from the cell trailer (set by the sender/previous hop).
-    ///   - Blinds the nonce domain, encrypts the body, then writes the hop MAC.
-    ///   - Rejects repeated nonces before encryption.
-    pub fn process_cell(&mut self, cell: &mut [u8; CELL_SIZE]) -> bool {
-        let nonce_val = cell_nonce(cell);
-        let aead = XChaCha20Poly1305::new((&self.key).into());
-        match self.op {
-            CryptoOp::Decrypt => {
-                let nonce = build_nonce(&self.nonce_prefix, &nonce_val);
-                let mac_start = CELL_BODY_SIZE + CELL_NONCE_SIZE;
-                let tag: [u8; 16] = cell[mac_start..].try_into().unwrap();
-                let ok = if tag == [0; 16] {
-                    // Inner tags are explicitly cleared by the previous hop.
-                    let _ = aead.encrypt_in_place_detached(
-                        (&nonce).into(),
-                        b"",
-                        &mut cell[..CELL_BODY_SIZE],
-                    );
-                    true
-                } else {
-                    aead.decrypt_in_place_detached(
-                        (&nonce).into(),
-                        b"",
-                        &mut cell[..CELL_BODY_SIZE],
-                        (&tag).into(),
-                    )
-                    .is_ok()
-                };
-                if !ok || !self.replay.accept(nonce_val) {
-                    return false;
-                }
-                // Zero the tag but preserve the nonce — relays forward
-                // the counter, peeling this hop's blinding from the domain.
-                cell[mac_start..].fill(0);
-                blind_cell_domain(cell, &self.nonce_prefix);
-                ok
-            }
-            CryptoOp::Encrypt => {
-                if !self.replay.accept(nonce_val) {
-                    return false;
-                }
-                blind_cell_domain(cell, &self.nonce_prefix);
-                let nonce = build_nonce(&self.nonce_prefix, &cell_nonce(cell));
-                let tag = aead
-                    .encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE])
-                    .expect("AEAD encryption should not fail");
-                // Preserve the nonce, overwrite the tag.
-                let mac_start = CELL_BODY_SIZE + CELL_NONCE_SIZE;
-                cell[mac_start..].copy_from_slice(&tag);
-                true
-            }
-        }
-    }
-}
-
 /// What a relay does with a circuit cell.
 #[derive(Debug, Clone)]
 pub enum CircuitAction {
@@ -203,12 +96,15 @@ pub enum CircuitAction {
 pub struct CircuitTable {
     /// Forwarding entries: key → action.
     entries: HashMap<CircuitKey, CircuitAction>,
+    /// When each entry last carried a cell (or was installed).
+    last_used: HashMap<CircuitKey, Instant>,
 }
 
 impl CircuitTable {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            last_used: HashMap::new(),
         }
     }
 
@@ -240,6 +136,7 @@ impl CircuitTable {
     /// Install a forwarding entry.
     pub fn insert(&mut self, key: CircuitKey, action: CircuitAction) {
         self.entries.insert(key, action);
+        self.last_used.insert(key, Instant::now());
     }
 
     /// Look up what to do with an incoming circuit cell.
@@ -248,13 +145,46 @@ impl CircuitTable {
     }
 
     /// Mutable lookup — needed for updating nonce counters during onion processing.
+    /// Counts as use of the entry for idle expiry.
     pub fn lookup_mut(&mut self, key: &CircuitKey) -> Option<&mut CircuitAction> {
-        self.entries.get_mut(key)
+        let action = self.entries.get_mut(key)?;
+        self.last_used.insert(*key, Instant::now());
+        Some(action)
     }
 
     /// Remove a circuit entry (teardown).
     pub fn remove(&mut self, key: &CircuitKey) -> Option<CircuitAction> {
+        self.last_used.remove(key);
         self.entries.remove(key)
+    }
+
+    /// Entries that carried no cell for `max_idle`, counting a forwarding
+    /// entry as used while its reverse entry is.
+    pub fn idle_entries(&self, max_idle: Duration) -> Vec<CircuitKey> {
+        let now = Instant::now();
+        let idle = |k: &CircuitKey| {
+            self.last_used
+                .get(k)
+                .map_or(true, |t| now.duration_since(*t) >= max_idle)
+        };
+        self.entries
+            .iter()
+            .filter(|(k, action)| {
+                idle(k)
+                    && match action {
+                        CircuitAction::Forward {
+                            next_hop,
+                            next_circuit_id,
+                            ..
+                        } => idle(&CircuitKey {
+                            circuit_id: *next_circuit_id,
+                            from_peer: *next_hop,
+                        }),
+                        CircuitAction::Endpoint { .. } => true,
+                    }
+            })
+            .map(|(k, _)| *k)
+            .collect()
     }
 
     /// Remove all entries involving a given peer (link went down).
@@ -270,6 +200,12 @@ impl CircuitTable {
             }
             keep
         });
+        for (circuit_id, from_peer) in &removed {
+            self.last_used.remove(&CircuitKey {
+                circuit_id: *circuit_id,
+                from_peer: *from_peer,
+            });
+        }
         removed
     }
 
@@ -331,163 +267,6 @@ impl CircuitTable {
             }
         }
         count
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Nonce construction
-// ---------------------------------------------------------------------------
-
-/// Build an XChaCha20 nonce from the hop-blinded domain and counter.
-fn build_nonce(prefix: &[u8; 16], transmitted: &[u8; 24]) -> [u8; 24] {
-    let mut nonce = *transmitted;
-    for (byte, mask) in nonce[..16].iter_mut().zip(prefix) {
-        *byte ^= mask;
-    }
-    nonce
-}
-
-/// Each onion layer changes the visible domain using a hop-private mask.
-/// Non-adjacent relays must not see an identical circuit-wide origin marker.
-/// XOR is reversible, and domains remain stable within a hop's replay window.
-fn blind_cell_domain(cell: &mut [u8; CELL_SIZE], mask: &[u8; 16]) {
-    for (byte, mask) in cell[CELL_BODY_SIZE..CELL_BODY_SIZE + 16]
-        .iter_mut()
-        .zip(mask)
-    {
-        *byte ^= mask;
-    }
-}
-
-/// Domain separation: an origin's domain must not equal its hop blinding mask.
-/// Otherwise a locally originated cell would expose a constant zero domain.
-pub(crate) fn backward_nonce_domain(prefix: &[u8; 16]) -> [u8; 16] {
-    let material = blake3::derive_key("tarnet backward cell origin v3", prefix);
-    material[..16].try_into().unwrap()
-}
-
-/// Read the explicit origin domain and counter from a cell's trailer.
-pub fn cell_nonce(cell: &[u8; CELL_SIZE]) -> [u8; 24] {
-    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + CELL_NONCE_SIZE]
-        .try_into()
-        .unwrap()
-}
-
-/// Write the origin domain and counter into a cell's trailer.
-pub fn set_cell_nonce(cell: &mut [u8; CELL_SIZE], origin: &[u8; 16], counter: u64) {
-    cell[CELL_BODY_SIZE..CELL_BODY_SIZE + 16].copy_from_slice(origin);
-    cell[CELL_BODY_SIZE + 16..CELL_BODY_SIZE + CELL_NONCE_SIZE]
-        .copy_from_slice(&counter.to_le_bytes());
-}
-
-/// Each backward origin has its own 128-bit nonce domain. Keep old domains
-/// instead of resetting replay protection when the circuit gains another hop.
-#[derive(Debug, Clone, Default)]
-pub struct CellReplayWindow {
-    domains: HashMap<[u8; 16], ReplayWindow>,
-}
-
-impl CellReplayWindow {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn accept(&mut self, nonce: [u8; 24]) -> bool {
-        let domain = nonce[..16].try_into().unwrap();
-        if !self.domains.contains_key(&domain) && self.domains.len() >= 128 {
-            return false;
-        }
-        self.domains
-            .entry(domain)
-            .or_insert_with(ReplayWindow::new)
-            .accept(u64::from_le_bytes(nonce[16..].try_into().unwrap()))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Replay window (sliding bitmap)
-// ---------------------------------------------------------------------------
-
-const REPLAY_WINDOW_SIZE: u64 = 2048;
-/// Number of u64 words in the bitmap.
-const REPLAY_BITMAP_WORDS: usize = (REPLAY_WINDOW_SIZE / 64) as usize;
-
-/// Sliding-window replay protection.
-///
-/// Tracks the highest accepted nonce and a bitmap of the last
-/// `REPLAY_WINDOW_SIZE` nonces. Rejects duplicates and nonces
-/// older than the window.
-#[derive(Debug, Clone)]
-pub struct ReplayWindow {
-    /// Highest nonce accepted so far. Starts at 0 (no cells seen).
-    max_seen: u64,
-    /// Bitmap: bit `(nonce % REPLAY_WINDOW_SIZE)` is set if that nonce
-    /// has already been accepted.
-    bitmap: [u64; REPLAY_BITMAP_WORDS],
-    /// Whether any nonce has been seen yet.
-    initialized: bool,
-}
-
-impl ReplayWindow {
-    pub fn new() -> Self {
-        Self {
-            max_seen: 0,
-            bitmap: [0u64; REPLAY_BITMAP_WORDS],
-            initialized: false,
-        }
-    }
-
-    /// Check and accept a nonce. Returns `true` if the nonce is fresh
-    /// (not replayed and not too old). Returns `false` to reject.
-    pub fn accept(&mut self, nonce: u64) -> bool {
-        if !self.initialized {
-            // First cell ever — accept and initialize.
-            self.initialized = true;
-            self.max_seen = nonce;
-            self.set_bit(nonce);
-            return true;
-        }
-
-        if nonce > self.max_seen {
-            // Ahead of window — advance.
-            let advance = nonce - self.max_seen;
-            if advance >= REPLAY_WINDOW_SIZE {
-                // Jumped far ahead — clear entire bitmap.
-                self.bitmap = [0u64; REPLAY_BITMAP_WORDS];
-            } else {
-                // Clear bits for the positions we're skipping over.
-                for i in (self.max_seen + 1)..=nonce {
-                    self.clear_bit(i);
-                }
-            }
-            self.max_seen = nonce;
-            self.set_bit(nonce);
-            true
-        } else if self.max_seen - nonce >= REPLAY_WINDOW_SIZE {
-            // Too old — outside the window.
-            false
-        } else if self.get_bit(nonce) {
-            // Already seen — replay.
-            false
-        } else {
-            // Within window and fresh.
-            self.set_bit(nonce);
-            true
-        }
-    }
-
-    fn set_bit(&mut self, nonce: u64) {
-        let idx = (nonce % REPLAY_WINDOW_SIZE) as usize;
-        self.bitmap[idx / 64] |= 1u64 << (idx % 64);
-    }
-
-    fn clear_bit(&mut self, nonce: u64) {
-        let idx = (nonce % REPLAY_WINDOW_SIZE) as usize;
-        self.bitmap[idx / 64] &= !(1u64 << (idx % 64));
-    }
-
-    fn get_bit(&self, nonce: u64) -> bool {
-        let idx = (nonce % REPLAY_WINDOW_SIZE) as usize;
-        self.bitmap[idx / 64] & (1u64 << (idx % 64)) != 0
     }
 }
 
@@ -567,15 +346,14 @@ pub struct RelayCell {
     pub data: Vec<u8>,
 }
 
-/// Serialize relay cell fields directly into a fixed-size cell body with digest.
-/// Avoids constructing a RelayCell struct and the Vec<u8> allocation for data.
+/// Serialize relay cell fields into a fixed-size cell body. Integrity comes
+/// from the cell's end-to-end tag, added when the body is sealed.
 pub fn write_cell_body(
     command: RelayCellCommand,
     stream_id: u16,
     data: &[u8],
-    digest_key: &[u8; 32],
 ) -> [u8; CELL_BODY_SIZE] {
-    write_piece_body(command, stream_id, false, data, digest_key)
+    write_piece_body(command, stream_id, false, data)
 }
 
 fn write_piece_body(
@@ -583,7 +361,6 @@ fn write_piece_body(
     stream_id: u16,
     more: bool,
     data: &[u8],
-    digest_key: &[u8; 32],
 ) -> [u8; CELL_BODY_SIZE] {
     assert!(
         data.len() <= CELL_PAYLOAD_MAX,
@@ -597,11 +374,7 @@ fn write_piece_body(
     cell[0] = command as u8;
     cell[1..3].copy_from_slice(&stream_id.to_be_bytes());
     cell[3..5].copy_from_slice(&length_field.to_be_bytes());
-
-    let digest = relay_cell_digest(digest_key, &cell[..5], &data[..len]);
-    cell[5..5 + DIGEST_SIZE].copy_from_slice(&digest);
-
-    cell[5 + DIGEST_SIZE..5 + DIGEST_SIZE + len].copy_from_slice(&data[..len]);
+    cell[CELL_HEADER_SIZE..CELL_HEADER_SIZE + len].copy_from_slice(data);
     cell
 }
 
@@ -611,7 +384,7 @@ fn write_piece_body(
 /// larger one is split: the first piece carries the real command, `more`,
 /// and `total_len(u16) || bytes`; each following piece is a `Continue` with
 /// `index(u8) || bytes`, `more` set on all but the last. Every piece has its
-/// own end-to-end digest, so pieces can be lost but not forged.
+/// own end-to-end tag, so pieces can be lost but not forged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPiece {
     pub command: RelayCellCommand,
@@ -621,12 +394,12 @@ pub struct RelayPiece {
 }
 
 impl RelayPiece {
-    pub fn to_cell(&self, digest_key: &[u8; 32]) -> [u8; CELL_BODY_SIZE] {
-        write_piece_body(self.command, self.stream_id, self.more, &self.data, digest_key)
+    pub fn to_cell(&self) -> [u8; CELL_BODY_SIZE] {
+        write_piece_body(self.command, self.stream_id, self.more, &self.data)
     }
 
-    /// Parse a fully-decrypted cell body and verify its digest.
-    pub fn from_cell(cell: &[u8; CELL_BODY_SIZE], digest_key: &[u8; 32]) -> Result<Self> {
+    /// Parse an opened cell body (its tag already checked).
+    pub fn from_cell(cell: &[u8; CELL_BODY_SIZE]) -> Result<Self> {
         let command = RelayCellCommand::from_u8(cell[0])?;
         let stream_id = u16::from_be_bytes([cell[1], cell[2]]);
         let length_field = u16::from_be_bytes([cell[3], cell[4]]);
@@ -637,13 +410,7 @@ impl RelayPiece {
             return Err(Error::Wire("relay cell length exceeds max".into()));
         }
 
-        let stored_digest = &cell[5..5 + DIGEST_SIZE];
-        let payload = &cell[5 + DIGEST_SIZE..5 + DIGEST_SIZE + length];
-
-        let expected = relay_cell_digest(digest_key, &cell[..5], payload);
-        if stored_digest.ct_eq(&expected).unwrap_u8() == 0 {
-            return Err(Error::Crypto("relay cell digest mismatch".into()));
-        }
+        let payload = &cell[CELL_HEADER_SIZE..CELL_HEADER_SIZE + length];
 
         Ok(Self {
             command,
@@ -655,18 +422,18 @@ impl RelayPiece {
 }
 
 impl RelayCell {
-    /// Serialize into a fixed-size cell body with digest, ready for onion wrapping.
-    /// `digest_key` is the endpoint's forward digest key. Panics if the data
-    /// doesn't fit one cell; use [`RelayCell::pieces`] for messages that may not.
-    pub fn to_cell(&self, digest_key: &[u8; 32]) -> [u8; CELL_BODY_SIZE] {
-        write_cell_body(self.command, self.stream_id, &self.data, digest_key)
+    /// Serialize into a fixed-size cell body, ready for sealing. Panics if the
+    /// data doesn't fit one cell; use [`RelayCell::pieces`] for messages that
+    /// may not.
+    pub fn to_cell(&self) -> [u8; CELL_BODY_SIZE] {
+        write_cell_body(self.command, self.stream_id, &self.data)
     }
 
-    /// Parse a fully-decrypted single-cell message and verify its digest.
+    /// Parse an opened single-cell message.
     /// A piece of a multi-cell message is an error here; receivers that may
     /// get one feed [`RelayPiece`]s to a [`RelayAssembler`].
-    pub fn from_cell(cell: &[u8; CELL_BODY_SIZE], digest_key: &[u8; 32]) -> Result<Self> {
-        let piece = RelayPiece::from_cell(cell, digest_key)?;
+    pub fn from_cell(cell: &[u8; CELL_BODY_SIZE]) -> Result<Self> {
+        let piece = RelayPiece::from_cell(cell)?;
         if piece.more || piece.command == RelayCellCommand::Continue {
             return Err(Error::Wire("relay cell is part of a multi-cell message".into()));
         }
@@ -832,137 +599,6 @@ pub fn relay_cell_digest_for_sendme(payload: &[u8]) -> [u8; DIGEST_SIZE] {
     mac_16(key, &[payload])
 }
 
-/// 16-byte digest for relay cell integrity.
-fn relay_cell_digest(digest_key: &[u8; 32], header: &[u8], payload: &[u8]) -> [u8; DIGEST_SIZE] {
-    mac_16(digest_key, &[header, payload])
-}
-
-// ---------------------------------------------------------------------------
-// Key derivation
-// ---------------------------------------------------------------------------
-
-/// The symmetric keys derived for a circuit hop.
-pub struct HopKeys {
-    pub forward_key: [u8; 32],
-    pub forward_digest: [u8; 32],
-    pub backward_key: [u8; 32],
-    pub backward_digest: [u8; 32],
-    /// Per-circuit nonce prefix derived from shared secret.
-    pub nonce_prefix: [u8; 16],
-}
-
-/// Derive the symmetric keys for a circuit hop from a DH shared secret.
-pub fn derive_hop_keys(shared_secret: &[u8; 32]) -> HopKeys {
-    let nonce_material = kdf(shared_secret, "tarnet circuit nonce");
-    let mut nonce_prefix = [0u8; 16];
-    nonce_prefix.copy_from_slice(&nonce_material[..16]);
-    HopKeys {
-        forward_key: kdf(shared_secret, "tarnet circuit hop enc"),
-        forward_digest: kdf(shared_secret, "tarnet circuit hop enc digest"),
-        backward_key: kdf(shared_secret, "tarnet circuit hop dec"),
-        backward_digest: kdf(shared_secret, "tarnet circuit hop dec digest"),
-        nonce_prefix,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Initiator-side circuit state
-// ---------------------------------------------------------------------------
-
-/// Per-hop symmetric keys held by the circuit initiator.
-///
-/// The nonce is NOT stored per-hop. Instead, a single per-cell nonce is
-/// chosen by the sender (OutboundCircuit) and written into the cell trailer.
-/// All hops read it from there.
-#[derive(Debug, Clone)]
-pub struct HopKey {
-    /// Key for encrypting cells toward the endpoint (forward direction).
-    pub forward_key: [u8; 32],
-    /// Digest key for forward relay cell integrity.
-    pub forward_digest: [u8; 32],
-    /// Key for decrypting cells from the endpoint (backward direction).
-    pub backward_key: [u8; 32],
-    /// Digest key for backward relay cell integrity.
-    pub backward_digest: [u8; 32],
-    /// Per-circuit nonce prefix derived from shared secret.
-    pub nonce_prefix: [u8; 16],
-}
-
-impl HopKey {
-    pub fn from_shared_secret(shared_secret: &[u8; 32]) -> Self {
-        let keys = derive_hop_keys(shared_secret);
-        Self {
-            forward_key: keys.forward_key,
-            forward_digest: keys.forward_digest,
-            backward_key: keys.backward_key,
-            backward_digest: keys.backward_digest,
-            nonce_prefix: keys.nonce_prefix,
-        }
-    }
-
-    /// Like `from_shared_secret` but with forward/backward swapped.
-    /// Used by the responder side of an end-to-end key exchange so that
-    /// the responder's "forward" decrypts the initiator's "forward" and
-    /// vice versa.
-    pub fn from_shared_secret_responder(shared_secret: &[u8; 32]) -> Self {
-        let keys = derive_hop_keys(shared_secret);
-        Self {
-            forward_key: keys.backward_key,
-            forward_digest: keys.backward_digest,
-            backward_key: keys.forward_key,
-            backward_digest: keys.forward_digest,
-            nonce_prefix: keys.nonce_prefix,
-        }
-    }
-
-    /// Encrypt one onion layer (forward direction).
-    /// Reads the nonce from the cell trailer, encrypts the body,
-    /// then writes the hop tag. The domain is blinded; the counter is preserved.
-    pub fn encrypt_forward(&self, cell: &mut [u8; CELL_SIZE]) {
-        blind_cell_domain(cell, &self.nonce_prefix);
-        let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(&self.nonce_prefix, &nonce_val);
-        let aead = XChaCha20Poly1305::new((&self.forward_key).into());
-        let tag = aead
-            .encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE])
-            .expect("AEAD encryption should not fail");
-        let mac_start = CELL_BODY_SIZE + CELL_NONCE_SIZE;
-        cell[mac_start..].copy_from_slice(&tag);
-    }
-
-    /// Decrypt one onion layer (backward direction).
-    /// Reads the nonce from the cell trailer, decrypts the body.
-    /// Only the outermost layer's tag survives; inner tags are overwritten.
-    pub fn decrypt_backward(&self, cell: &mut [u8; CELL_SIZE]) -> bool {
-        let nonce_val = cell_nonce(cell);
-        let nonce = build_nonce(&self.nonce_prefix, &nonce_val);
-        let aead = XChaCha20Poly1305::new((&self.backward_key).into());
-        // Use encrypt_in_place_detached for decryption: ChaCha20 is a
-        // symmetric stream cipher (encrypt == decrypt). This avoids
-        // AEAD tag verification, which would fail for inner onion layers
-        // whose tags are overwritten by outer layers.
-        let tag: [u8; 16] = cell[CELL_BODY_SIZE + CELL_NONCE_SIZE..].try_into().unwrap();
-        if tag == [0; 16] {
-            let _ =
-                aead.encrypt_in_place_detached((&nonce).into(), b"", &mut cell[..CELL_BODY_SIZE]);
-        } else if aead
-            .decrypt_in_place_detached(
-                (&nonce).into(),
-                b"",
-                &mut cell[..CELL_BODY_SIZE],
-                (&tag).into(),
-            )
-            .is_err()
-        {
-            return false;
-        }
-        // Zero the tag but preserve the nonce for multi-hop decryption.
-        cell[CELL_BODY_SIZE + CELL_NONCE_SIZE..].fill(0);
-        blind_cell_domain(cell, &self.nonce_prefix);
-        true
-    }
-}
-
 /// State of a circuit being built or in use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircuitState {
@@ -981,55 +617,42 @@ pub struct OutboundCircuit {
     pub first_hop_circuit_id: CircuitId,
     /// First hop PeerId (our direct neighbor).
     pub first_hop: PeerId,
-    /// Per-hop symmetric keys, in order from first to last hop.
-    pub hop_keys: Vec<HopKey>,
+    /// Onion layers, outermost first.
+    pub layers: OnionLayers,
+    /// Hash of each waypoint's CREATE handshake, in layer order.
+    pub transcripts: Vec<[u8; 32]>,
     /// Current state of the circuit.
     pub state: CircuitState,
     /// Waypoints this circuit routes through (the originator's view, not actual hops).
     pub waypoints: Vec<PeerId>,
     /// Last time we received any relay cell on this circuit.
     pub last_activity: Instant,
-    /// Forward nonce counter — one counter shared by all hops for a given cell.
-    pub forward_nonce: u64,
-    pub nonce_domain: [u8; 16],
-    pub backward_replay: CellReplayWindow,
     /// Multi-cell messages arriving from the circuit's hops.
     pub assembler: RelayAssembler,
 }
 
 impl OutboundCircuit {
-    fn next_forward_nonce(&mut self) -> ([u8; 16], u64) {
-        // Rotate the domain before the counter can wrap and reuse a nonce.
-        if self.forward_nonce == u64::MAX {
-            self.nonce_domain = rand::random();
-            self.forward_nonce = 0;
-        }
-        let nonce = self.forward_nonce;
-        self.forward_nonce += 1;
-        (self.nonce_domain, nonce)
-    }
-    /// Wrap a relay cell in all onion layers for sending through the circuit.
-    /// Sets the explicit nonce in the cell trailer before encrypting.
-    pub fn wrap_forward(&mut self, cell: &mut [u8; CELL_SIZE]) {
-        let (domain, nonce) = self.next_forward_nonce();
-        set_cell_nonce(cell, &domain, nonce);
-        // Encrypt in reverse hop order: innermost (endpoint) first, outermost (hop 1) last.
-        for hop in self.hop_keys.iter().rev() {
-            hop.encrypt_forward(cell);
+    pub fn new(
+        first_hop: PeerId,
+        first_hop_circuit_id: CircuitId,
+        layers: OnionLayers,
+        waypoints: Vec<PeerId>,
+        state: CircuitState,
+    ) -> Self {
+        Self {
+            first_hop_circuit_id,
+            first_hop,
+            layers,
+            transcripts: Vec::new(),
+            state,
+            waypoints,
+            last_activity: Instant::now(),
+            assembler: Default::default(),
         }
     }
 
-    /// Unwrap all onion layers from a cell received through the circuit (backward direction).
-    /// The nonce is read from the cell trailer (set by the endpoint).
-    /// Returns the plaintext cell bytes — caller should parse with `RelayCell::from_cell()`.
-    pub fn unwrap_backward(&self, cell: &mut [u8; CELL_SIZE]) -> bool {
-        // Decrypt in forward hop order: outermost (hop 1) first, innermost (endpoint) last.
-        for hop in self.hop_keys.iter() {
-            if !hop.decrypt_backward(cell) {
-                return false;
-            }
-        }
-        true
+    fn last(&self) -> usize {
+        self.layers.len() - 1
     }
 
     /// Send a relay cell through this circuit. Returns (first_hop, circuit_id, encrypted_cell).
@@ -1037,32 +660,21 @@ impl OutboundCircuit {
         &mut self,
         relay_cell: &RelayCell,
     ) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
-        let last = self.hop_keys.len() - 1;
+        let last = self.last();
         self.send_to_hop(relay_cell, last)
     }
 
     /// Send a DATA cell through this circuit without constructing a RelayCell.
-    /// Avoids a Vec<u8> allocation for the data payload on the hot path.
-    pub fn send_data_cell(
-        &mut self,
-        data: &[u8],
-    ) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
-        let last = self.hop_keys.len() - 1;
-        let digest_key = self.hop_keys[last].forward_digest;
-        let body = write_cell_body(RelayCellCommand::Data, 0, data, &digest_key);
-        let mut cell = [0u8; CELL_SIZE];
-        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-        let (domain, nonce) = self.next_forward_nonce();
-        set_cell_nonce(&mut cell, &domain, nonce);
-        for hop in self.hop_keys[..=last].iter().rev() {
-            hop.encrypt_forward(&mut cell);
-        }
+    pub fn send_data_cell(&mut self, data: &[u8]) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
+        let body = write_cell_body(RelayCellCommand::Data, 0, data);
+        let last = self.last();
+        let cell = self.layers.seal_to(last, &body);
         (self.first_hop, self.first_hop_circuit_id, cell)
     }
 
-    /// Receive and decrypt a relay cell from this circuit.
-    pub fn recv_relay_cell(&mut self, cell: &mut [u8; CELL_SIZE]) -> Result<RelayCell> {
-        let last = self.hop_keys.len() - 1;
+    /// Receive and decrypt a relay cell from this circuit's last hop.
+    pub fn recv_relay_cell(&mut self, cell: &[u8; CELL_SIZE]) -> Result<RelayCell> {
+        let last = self.last();
         self.recv_from_hop(cell, last)
     }
 
@@ -1076,7 +688,7 @@ impl OutboundCircuit {
         let cells = relay_cell
             .pieces()?
             .iter()
-            .map(|piece| self.wrap_piece_to_hop(piece, hop_index))
+            .map(|piece| self.layers.seal_to(hop_index, &piece.to_cell()))
             .collect();
         Ok((self.first_hop, self.first_hop_circuit_id, cells))
     }
@@ -1086,58 +698,30 @@ impl OutboundCircuit {
         &mut self,
         relay_cell: &RelayCell,
     ) -> Result<(PeerId, CircuitId, Vec<[u8; CELL_SIZE]>)> {
-        let last = self.hop_keys.len() - 1;
+        let last = self.last();
         self.send_message_to_hop(relay_cell, last)
-    }
-
-    fn wrap_piece_to_hop(&mut self, piece: &RelayPiece, hop_index: usize) -> [u8; CELL_SIZE] {
-        let digest_key = self.hop_keys[hop_index].forward_digest;
-        let body = piece.to_cell(&digest_key);
-        let mut cell = [0u8; CELL_SIZE];
-        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-        let (domain, nonce) = self.next_forward_nonce();
-        set_cell_nonce(&mut cell, &domain, nonce);
-        for hop in self.hop_keys[..=hop_index].iter().rev() {
-            hop.encrypt_forward(&mut cell);
-        }
-        cell
     }
 
     /// Receive a cell from the circuit's last hop, returning a relay message
     /// once one is complete.
-    pub fn recv_relay_message(&mut self, cell: &mut [u8; CELL_SIZE]) -> Result<Option<RelayCell>> {
-        let last = self.hop_keys.len() - 1;
+    pub fn recv_relay_message(&mut self, cell: &[u8; CELL_SIZE]) -> Result<Option<RelayCell>> {
+        let last = self.last();
         let piece = self.recv_piece_from_hop(cell, last)?;
         Ok(self.assembler.push(piece))
     }
 
-    /// Send a single-cell relay message to a specific intermediate hop.
-    /// `hop_index` is 0-based (0 = first hop, which is the current endpoint during extension).
+    /// Send a single-cell relay message to a specific hop (0 = first hop).
     pub fn send_to_hop(
         &mut self,
         relay_cell: &RelayCell,
         hop_index: usize,
     ) -> (PeerId, CircuitId, [u8; CELL_SIZE]) {
-        let digest_key = self.hop_keys[hop_index].forward_digest;
-        let body = relay_cell.to_cell(&digest_key);
-        let mut cell = [0u8; CELL_SIZE];
-        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-        // Set the explicit nonce and encrypt layers from hop_index down to 0.
-        let (domain, nonce) = self.next_forward_nonce();
-        set_cell_nonce(&mut cell, &domain, nonce);
-        for hop in self.hop_keys[..=hop_index].iter().rev() {
-            hop.encrypt_forward(&mut cell);
-        }
+        let cell = self.layers.seal_to(hop_index, &relay_cell.to_cell());
         (self.first_hop, self.first_hop_circuit_id, cell)
     }
 
-    /// Receive and decrypt a relay cell from a specific intermediate hop.
-    /// The nonce is read from the cell trailer.
-    pub fn recv_from_hop(
-        &mut self,
-        cell: &mut [u8; CELL_SIZE],
-        hop_index: usize,
-    ) -> Result<RelayCell> {
+    /// Receive a single-cell relay message sealed by a specific hop.
+    pub fn recv_from_hop(&mut self, cell: &[u8; CELL_SIZE], hop_index: usize) -> Result<RelayCell> {
         let piece = self.recv_piece_from_hop(cell, hop_index)?;
         if piece.more || piece.command == RelayCellCommand::Continue {
             return Err(Error::Wire("relay cell is part of a multi-cell message".into()));
@@ -1149,24 +733,18 @@ impl OutboundCircuit {
         })
     }
 
-    fn recv_piece_from_hop(
-        &mut self,
-        cell: &mut [u8; CELL_SIZE],
-        hop_index: usize,
-    ) -> Result<RelayPiece> {
-        let nonce = cell_nonce(cell);
-        for hop in self.hop_keys[..=hop_index].iter() {
-            if !hop.decrypt_backward(cell) {
-                return Err(Error::Crypto("backward cell MAC mismatch".into()));
-            }
+    fn recv_piece_from_hop(&mut self, cell: &[u8; CELL_SIZE], hop_index: usize) -> Result<RelayPiece> {
+        let (origin, body) = self
+            .layers
+            .open(cell)
+            .ok_or_else(|| Error::Crypto("backward cell failed to open or was replayed".into()))?;
+        if origin != hop_index {
+            return Err(Error::Protocol(format!(
+                "cell from hop {} where hop {} was expected",
+                origin, hop_index
+            )));
         }
-        let digest_key = self.hop_keys[hop_index].backward_digest;
-        let body: &[u8; CELL_BODY_SIZE] = cell[..CELL_BODY_SIZE].try_into().unwrap();
-        let piece = RelayPiece::from_cell(body, &digest_key)?;
-        if !self.backward_replay.accept(nonce) {
-            return Err(Error::Crypto("backward cell replay".into()));
-        }
-        Ok(piece)
+        RelayPiece::from_cell(&body)
     }
 }
 
@@ -1300,103 +878,146 @@ impl CongestionWindow {
 // EXTEND / EXTENDED payload helpers
 // ---------------------------------------------------------------------------
 
-/// Build an EXTEND relay cell payload.
-/// Format: kem_algo(1) || eph_pk_len(2 BE) || eph_pk(variable) || destination(32)
-///         || hint_count(u8) || hint_count × hint(32)
+/// A request to create a circuit hop at `destination`: the payload of a
+/// routed CREATE, and of EXTEND.
 ///
-/// The destination is the waypoint target — the relay routes toward it via DV,
-/// extending to its own best next_hop rather than requiring a direct link.
-/// Hints are peers known to be on the way to the destination, for relays that
-/// don't know it themselves.
-pub fn build_extend_payload(
-    kem_algo: u8,
-    eph_pk: &[u8],
-    destination: &PeerId,
-    hints: &[PeerId],
-) -> Vec<u8> {
-    let len = eph_pk.len() as u16;
-    let mut payload = Vec::with_capacity(3 + eph_pk.len() + 32 + 1 + 32 * hints.len());
-    payload.push(kem_algo);
-    payload.extend_from_slice(&len.to_be_bytes());
-    payload.extend_from_slice(eph_pk);
-    payload.extend_from_slice(destination.as_bytes());
-    payload.push(hints.len() as u8);
-    for hint in hints {
-        payload.extend_from_slice(hint.as_bytes());
-    }
-    payload
-}
-
-/// A parsed EXTEND payload.
+/// `version(u8) || flags(u8) || kem_algo(u8) || pk_len(u16) || eph_pk ||
+/// destination(32) || hint_count(u8) || hint_count × peer(32)`
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtendRequest {
+pub struct CreateRequest {
     pub kem_algo: u8,
     pub eph_pk: Vec<u8>,
     pub destination: PeerId,
     pub hints: Vec<PeerId>,
 }
 
-/// Parse an EXTEND relay cell payload.
-pub fn parse_extend_payload(data: &[u8]) -> Result<ExtendRequest> {
-    let short = || Error::Wire("EXTEND payload too short".into());
-    if data.len() < 3 {
-        return Err(short());
+impl CreateRequest {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(5 + self.eph_pk.len() + 33 + 32 * self.hints.len());
+        buf.push(CELL_CRYPTO_VERSION);
+        buf.push(0); // flags, none defined
+        buf.push(self.kem_algo);
+        buf.extend_from_slice(&(self.eph_pk.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.eph_pk);
+        buf.extend_from_slice(self.destination.as_bytes());
+        buf.push(self.hints.len() as u8);
+        for hint in &self.hints {
+            buf.extend_from_slice(hint.as_bytes());
+        }
+        buf
     }
-    let kem_algo = data[0];
-    let eph_pk_len = u16::from_be_bytes([data[1], data[2]]) as usize;
-    let offset = 3 + eph_pk_len;
-    if data.len() < offset + 32 + 1 {
-        return Err(short());
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let short = || Error::Wire("CREATE payload too short".into());
+        if data.len() < 5 {
+            return Err(short());
+        }
+        if data[0] != CELL_CRYPTO_VERSION {
+            return Err(Error::Wire(format!("unsupported cell crypto version {}", data[0])));
+        }
+        let kem_algo = data[2];
+        let pk_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+        let eph_pk = data.get(5..5 + pk_len).ok_or_else(short)?.to_vec();
+        let at = 5 + pk_len;
+        let destination = PeerId(data.get(at..at + 32).ok_or_else(short)?.try_into().unwrap());
+        let hint_count = *data.get(at + 32).ok_or_else(short)? as usize;
+        if hint_count > crate::wire::MAX_HINTS {
+            return Err(Error::Wire(format!("CREATE carries {} hints", hint_count)));
+        }
+        let hints_at = at + 33;
+        let hints = data
+            .get(hints_at..hints_at + 32 * hint_count)
+            .ok_or_else(short)?
+            .chunks_exact(32)
+            .map(|h| PeerId(h.try_into().unwrap()))
+            .collect();
+        Ok(Self {
+            kem_algo,
+            eph_pk,
+            destination,
+            hints,
+        })
     }
-    let eph_pk = data[3..offset].to_vec();
-    let destination = PeerId(data[offset..offset + 32].try_into().unwrap());
-    let hint_count = data[offset + 32] as usize;
-    if hint_count > crate::wire::MAX_HINTS {
-        return Err(Error::Wire(format!("EXTEND carries {} hints", hint_count)));
+
+    /// Hash of the handshake, mixed into the hop's keys and signed by the
+    /// destination.
+    pub fn transcript(&self, kem_ct: &[u8]) -> [u8; 32] {
+        let mut h = blake3::Hasher::new_derive_key("tarnet circuit create transcript v1");
+        h.update(&[CELL_CRYPTO_VERSION, self.kem_algo]);
+        h.update(self.destination.as_bytes());
+        h.update(&(self.eph_pk.len() as u32).to_be_bytes());
+        h.update(&self.eph_pk);
+        h.update(&(kem_ct.len() as u32).to_be_bytes());
+        h.update(kem_ct);
+        *h.finalize().as_bytes()
     }
-    let hints_at = offset + 33;
-    let hint_bytes = data.get(hints_at..hints_at + 32 * hint_count).ok_or_else(short)?;
-    let hints = hint_bytes
-        .chunks_exact(32)
-        .map(|h| PeerId(h.try_into().unwrap()))
-        .collect();
-    Ok(ExtendRequest {
-        kem_algo,
-        eph_pk,
-        destination,
-        hints,
-    })
 }
 
-/// Build an EXTENDED relay cell payload.
-/// Format: kem_algo(1) || reply_len(2 BE) || reply(variable)
-/// Flag in EXTENDED payload: the extend reached the requested destination.
-pub const EXTENDED_FLAG_REACHED: u8 = 0x01;
-
-pub fn build_extended_payload(kem_algo: u8, reply: &[u8]) -> Vec<u8> {
-    let len = reply.len() as u16;
-    let mut payload = Vec::with_capacity(4 + reply.len());
-    payload.push(0u8); // flags — relay sets EXTENDED_FLAG_REACHED when waypoint reached
-    payload.push(kem_algo);
-    payload.extend_from_slice(&len.to_be_bytes());
-    payload.extend_from_slice(reply);
-    payload
+/// What the destination signs in CREATED.
+pub fn created_signed_message(transcript: &[u8; 32]) -> Vec<u8> {
+    let mut msg = b"tarnet circuit created v1".to_vec();
+    msg.extend_from_slice(transcript);
+    msg
 }
 
-/// Parse an EXTENDED relay cell payload.
-/// Returns (reached, kem_algo, reply).
-pub fn parse_extended_payload(data: &[u8]) -> Result<(bool, u8, Vec<u8>)> {
-    if data.len() < 4 {
-        return Err(Error::Wire("EXTENDED payload too short".into()));
+/// The destination's answer to a CREATE: the payload of CREATED, and of
+/// EXTENDED (an empty EXTENDED means the step failed).
+///
+/// `kem_ct_len(u16) || kem_ct || signing_pk_len(u16) || signing_pk ||
+/// sig_len(u16) || sig`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedReply {
+    pub kem_ct: Vec<u8>,
+    pub signing_pk: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+impl CreatedReply {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for field in [&self.kem_ct, &self.signing_pk, &self.sig] {
+            buf.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            buf.extend_from_slice(field);
+        }
+        buf
     }
-    let reached = (data[0] & EXTENDED_FLAG_REACHED) != 0;
-    let kem_algo = data[1];
-    let reply_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-    if data.len() < 4 + reply_len {
-        return Err(Error::Wire("EXTENDED payload too short".into()));
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut at = 0;
+        let mut field = || -> Result<Vec<u8>> {
+            let len = data
+                .get(at..at + 2)
+                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+                .ok_or_else(|| Error::Wire("CREATED payload too short".into()))?;
+            let bytes = data
+                .get(at + 2..at + 2 + len)
+                .ok_or_else(|| Error::Wire("CREATED payload too short".into()))?
+                .to_vec();
+            at += 2 + len;
+            Ok(bytes)
+        };
+        Ok(Self {
+            kem_ct: field()?,
+            signing_pk: field()?,
+            sig: field()?,
+        })
     }
-    let reply = data[4..4 + reply_len].to_vec();
-    Ok((reached, kem_algo, reply))
+
+    /// Check that `request.destination` itself answered: its signing key
+    /// hashes to the destination and signed this handshake. Returns the
+    /// transcript hash for key derivation.
+    pub fn verify(&self, request: &CreateRequest) -> Result<[u8; 32]> {
+        if crate::identity::peer_id_from_signing_pubkey(&self.signing_pk) != request.destination {
+            return Err(Error::Crypto("CREATED key is not the destination's".into()));
+        }
+        let algo = crate::identity::signing_algo_of(&self.signing_pk)
+            .ok_or_else(|| Error::Crypto("CREATED key has an unknown length".into()))?;
+        let transcript = request.transcript(&self.kem_ct);
+        if !crate::identity::verify(algo, &self.signing_pk, &created_signed_message(&transcript), &self.sig) {
+            return Err(Error::Crypto("CREATED signature invalid".into()));
+        }
+        Ok(transcript)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,156 +1074,216 @@ pub fn parse_stream_begin_payload(
 // Rendezvous payload helpers
 // ---------------------------------------------------------------------------
 
-/// Encrypted INTRODUCE payload.
+/// What a client tells a hidden service in INTRODUCE, sealed to the
+/// service's KEM key so the intro point can't read it.
 ///
-/// The inner plaintext is `rendezvous_peer_id(32) || cookie(32)` (64 bytes).
-/// It is encrypted to the service's public key so that the introduction point
-/// cannot learn which rendezvous peer / cookie belongs to which service.
-///
-/// Wire format: `eph_pubkey(32) || nonce(24) || ciphertext(64) || tag(16)` = 136 bytes.
-///
-/// Encryption uses KEM → KDF → XChaCha20-Poly1305 AEAD,
-/// matching the patterns used elsewhere in tarnet.
-/// Build an INTRODUCE payload encrypted to the service's KEM public key.
-///
-/// The client encapsulates to the service's KEM pubkey, producing a shared
-/// secret and ciphertext. The shared secret encrypts the INTRODUCE body
-/// and is also used later as the e2e session key.
-///
-/// Wire format: `ct_len(2 BE) || kem_ciphertext(variable) || nonce(24) || encrypted(64+16)`
+/// Plaintext: `rendezvous(32) || cookie(32) || mode(u8) || port_len(u16) ||
+/// port || hint_count(u8) || hints || kem_algo(u8) || pk_len(u16) ||
+/// client_eph_pk`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Introduction {
+    pub rendezvous: PeerId,
+    /// Hints toward the rendezvous point.
+    pub rendezvous_hints: Vec<PeerId>,
+    pub cookie: [u8; 32],
+    pub mode: tarnet_api::service::PortMode,
+    pub port: String,
+    /// The client's ephemeral KEM key: the service answers it, which gives
+    /// the end-to-end key forward secrecy.
+    pub client_kem_algo: u8,
+    pub client_eph_pk: Vec<u8>,
+}
+
+impl Introduction {
+    fn to_plaintext(&self) -> Vec<u8> {
+        let port = self.port.as_bytes();
+        let mut out = Vec::with_capacity(72 + port.len() + 32 * self.rendezvous_hints.len() + 3 + self.client_eph_pk.len());
+        out.extend_from_slice(self.rendezvous.as_bytes());
+        out.extend_from_slice(&self.cookie);
+        out.push(self.mode as u8);
+        out.extend_from_slice(&(u16::try_from(port.len()).expect("port name too long")).to_be_bytes());
+        out.extend_from_slice(port);
+        out.push(self.rendezvous_hints.len() as u8);
+        for hint in &self.rendezvous_hints {
+            out.extend_from_slice(hint.as_bytes());
+        }
+        out.push(self.client_kem_algo);
+        out.extend_from_slice(&(self.client_eph_pk.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.client_eph_pk);
+        out
+    }
+
+    fn from_plaintext(p: &[u8]) -> Result<Self> {
+        let short = || Error::Wire("INTRODUCE plaintext truncated".into());
+        let take = |at: usize, n: usize| p.get(at..at + n).ok_or_else(short);
+        let rendezvous = PeerId(take(0, 32)?.try_into().unwrap());
+        let cookie: [u8; 32] = take(32, 32)?.try_into().unwrap();
+        let mode = match take(64, 1)?[0] {
+            0 => tarnet_api::service::PortMode::ReliableOrdered,
+            1 => tarnet_api::service::PortMode::ReliableUnordered,
+            2 => tarnet_api::service::PortMode::UnreliableUnordered,
+            other => return Err(Error::Wire(format!("unknown port mode {}", other))),
+        };
+        let port_len = u16::from_be_bytes(take(65, 2)?.try_into().unwrap()) as usize;
+        let port = String::from_utf8(take(67, port_len)?.to_vec())
+            .map_err(|_| Error::Wire("INTRODUCE port is not valid UTF-8".into()))?;
+        let mut at = 67 + port_len;
+        let hint_count = take(at, 1)?[0] as usize;
+        if hint_count > crate::wire::MAX_HINTS {
+            return Err(Error::Wire(format!("INTRODUCE carries {} hints", hint_count)));
+        }
+        let rendezvous_hints = take(at + 1, 32 * hint_count)?
+            .chunks_exact(32)
+            .map(|h| PeerId(h.try_into().unwrap()))
+            .collect();
+        at += 1 + 32 * hint_count;
+        let client_kem_algo = take(at, 1)?[0];
+        let pk_len = u16::from_be_bytes(take(at + 1, 2)?.try_into().unwrap()) as usize;
+        let client_eph_pk = take(at + 3, pk_len)?.to_vec();
+        Ok(Self {
+            rendezvous,
+            rendezvous_hints,
+            cookie,
+            mode,
+            port,
+            client_kem_algo,
+            client_eph_pk,
+        })
+    }
+}
+
+/// Seal an [`Introduction`] to the service.
+/// Wire: `ct_len(u16) || kem_ciphertext || nonce(24) || AEAD(plaintext)`.
 pub fn build_introduce_payload(
-    rendezvous_peer: &PeerId,
-    cookie: &[u8; 32],
-    mode: tarnet_api::service::PortMode,
-    port: &str,
+    intro: &Introduction,
     kem_ciphertext: &[u8],
     shared_secret: &[u8; 32],
 ) -> Vec<u8> {
     let enc_key = kdf(shared_secret, "tarnet introduce enc");
-    let port_bytes = port.as_bytes();
-    let port_len = u16::try_from(port_bytes.len()).expect("port name too long");
-
-    // Plaintext: rendezvous_peer(32) || cookie(32) || mode(1) || port_len(2) || port(bytes)
-    let mut plaintext = Vec::with_capacity(67 + port_bytes.len());
-    plaintext.extend_from_slice(rendezvous_peer.as_bytes());
-    plaintext.extend_from_slice(cookie);
-    plaintext.push(mode as u8);
-    plaintext.extend_from_slice(&port_len.to_be_bytes());
-    plaintext.extend_from_slice(port_bytes);
-
     let mut nonce = [0u8; 24];
     RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-
-    let aead = XChaCha20Poly1305::new((&enc_key).into());
-    let ciphertext = aead
+    let ciphertext = XChaCha20Poly1305::new((&enc_key).into())
         .encrypt(
             (&nonce).into(),
             Payload {
-                msg: &plaintext,
+                msg: &intro.to_plaintext(),
                 aad: b"",
             },
         )
         .expect("AEAD encryption should not fail");
-
-    // Wire: ct_len(2) || kem_ciphertext(variable) || nonce(24) || encrypted(plaintext+16)
-    let ct_len = kem_ciphertext.len() as u16;
     let mut payload = Vec::with_capacity(2 + kem_ciphertext.len() + 24 + ciphertext.len());
-    payload.extend_from_slice(&ct_len.to_be_bytes());
+    payload.extend_from_slice(&(kem_ciphertext.len() as u16).to_be_bytes());
     payload.extend_from_slice(kem_ciphertext);
     payload.extend_from_slice(&nonce);
     payload.extend_from_slice(&ciphertext);
     payload
 }
 
-/// Parse and decrypt an INTRODUCE payload using the service's KEM keypair.
-///
-/// Returns `(rendezvous_peer_id, cookie, mode, port, shared_secret)`.
+/// Open a sealed INTRODUCE with the service's KEM keypair. Returns the
+/// introduction and the KEM secret it was sealed with.
 pub fn parse_introduce_payload(
     data: &[u8],
     service_kem: &crate::identity::KemKeypair,
-) -> Result<(
-    PeerId,
-    [u8; 32],
-    tarnet_api::service::PortMode,
-    String,
-    [u8; 32],
-)> {
-    if data.len() < 2 {
-        return Err(Error::Wire("INTRODUCE payload too short".into()));
-    }
-
-    let ct_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-    let min_len = 2 + ct_len + 24 + 32 + 32 + 1 + 2 + 16;
-    if data.len() < min_len {
+) -> Result<(Introduction, [u8; 32])> {
+    let ct_len = data
+        .get(..2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+        .ok_or_else(|| Error::Wire("INTRODUCE payload too short".into()))?;
+    if data.len() < 2 + ct_len + 24 + 16 {
         return Err(Error::Wire("INTRODUCE payload truncated".into()));
     }
-
     let kem_ct = &data[2..2 + ct_len];
     let nonce = &data[2 + ct_len..2 + ct_len + 24];
-    let ciphertext_with_tag = &data[2 + ct_len + 24..];
-
-    // Recover shared secret via KEM decapsulation
-    let shared_bytes = service_kem
+    let sealed = &data[2 + ct_len + 24..];
+    let shared = service_kem
         .decapsulate(kem_ct)
         .map_err(|e| Error::Crypto(format!("INTRODUCE KEM decapsulate failed: {}", e)))?;
-
-    let enc_key = kdf(&shared_bytes, "tarnet introduce enc");
-
-    // Decrypt and verify via AEAD
-    let aead = XChaCha20Poly1305::new((&enc_key).into());
-    let plaintext = aead
+    let enc_key = kdf(&shared, "tarnet introduce enc");
+    let plaintext = XChaCha20Poly1305::new((&enc_key).into())
         .decrypt(
             nonce.into(),
             Payload {
-                msg: ciphertext_with_tag,
+                msg: sealed,
                 aad: b"",
             },
         )
         .map_err(|_| Error::Crypto("INTRODUCE AEAD decryption failed".into()))?;
-
-    let mut peer = [0u8; 32];
-    peer.copy_from_slice(&plaintext[..32]);
-    let mut cookie = [0u8; 32];
-    cookie.copy_from_slice(&plaintext[32..64]);
-    let mode = match plaintext[64] {
-        0 => tarnet_api::service::PortMode::ReliableOrdered,
-        1 => tarnet_api::service::PortMode::ReliableUnordered,
-        2 => tarnet_api::service::PortMode::UnreliableUnordered,
-        other => return Err(Error::Wire(format!("unknown port mode {}", other))),
-    };
-    let port_len = u16::from_be_bytes([plaintext[65], plaintext[66]]) as usize;
-    if plaintext.len() < 67 + port_len {
-        return Err(Error::Wire("INTRODUCE port truncated".into()));
-    }
-    let port = String::from_utf8(plaintext[67..67 + port_len].to_vec())
-        .map_err(|_| Error::Wire("INTRODUCE port is not valid UTF-8".into()))?;
-
-    Ok((PeerId(peer), cookie, mode, port, shared_bytes))
+    Ok((Introduction::from_plaintext(&plaintext)?, shared))
 }
 
-/// Build the INTRODUCE *relay-cell* payload: `target_service_id(32) || sealed`.
-///
-/// The leading ServiceId is a plaintext selector the intro point uses to route
-/// the INTRODUCE to the circuit of the service the client actually wants. The
-/// intro point already learned this ServiceId via `IntroRegister`, so it leaks
-/// nothing new. `sealed` is the [`build_introduce_payload`] blob, encrypted to
-/// the service's KEM key — the intro point cannot read it.
-pub fn build_introduce_cell(service_id: &tarnet_api::types::ServiceId, sealed: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + sealed.len());
+/// The INTRODUCE relay-cell payload: `service_id(32) || ext_len(u16) || ext
+/// || sealed`. The intro point reads the service id to pick the service's
+/// circuit; `ext` carries typed extensions (none defined yet; unknown ones
+/// are ignored), so proof-of-work can be added without a break.
+pub fn build_introduce_cell(
+    service_id: &tarnet_api::types::ServiceId,
+    ext: &[u8],
+    sealed: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(34 + ext.len() + sealed.len());
     out.extend_from_slice(service_id.as_bytes());
+    out.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+    out.extend_from_slice(ext);
     out.extend_from_slice(sealed);
     out
 }
 
-/// Parse the INTRODUCE relay-cell payload built by [`build_introduce_cell`].
-/// Returns `(target_service_id, sealed_introduce_payload)`.
-pub fn parse_introduce_cell(data: &[u8]) -> Result<(tarnet_api::types::ServiceId, &[u8])> {
-    if data.len() < 32 {
-        return Err(Error::Wire("INTRODUCE cell too short".into()));
-    }
-    let mut sid = [0u8; 32];
-    sid.copy_from_slice(&data[..32]);
-    Ok((tarnet_api::types::ServiceId(sid), &data[32..]))
+/// Parse an INTRODUCE relay-cell payload: `(service_id, ext, sealed)`.
+pub fn parse_introduce_cell(data: &[u8]) -> Result<(tarnet_api::types::ServiceId, &[u8], &[u8])> {
+    let short = || Error::Wire("INTRODUCE cell too short".into());
+    let sid: [u8; 32] = data.get(..32).ok_or_else(short)?.try_into().unwrap();
+    let ext_len = data
+        .get(32..34)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+        .ok_or_else(short)?;
+    let ext = data.get(34..34 + ext_len).ok_or_else(short)?;
+    Ok((tarnet_api::types::ServiceId(sid), ext, &data[34 + ext_len..]))
+}
+
+/// End-to-end keys of a rendezvous, in the client's orientation, and the
+/// tag the service sends to prove it derived them. Mixes the INTRODUCE
+/// secret (authenticates the service) with the service's answer to the
+/// client's ephemeral key (forward secrecy).
+pub fn rendezvous_keys(
+    static_secret: &[u8; 32],
+    eph_secret: &[u8; 32],
+    sealed: &[u8],
+    kem_ct: &[u8],
+) -> (HopKey, [u8; 16]) {
+    let mut h = blake3::Hasher::new_derive_key("tarnet rendezvous transcript v1");
+    h.update(&(sealed.len() as u32).to_be_bytes());
+    h.update(sealed);
+    h.update(&(kem_ct.len() as u32).to_be_bytes());
+    h.update(kem_ct);
+    let transcript = *h.finalize().as_bytes();
+    let mut material = Vec::with_capacity(96);
+    material.extend_from_slice(static_secret);
+    material.extend_from_slice(eph_secret);
+    material.extend_from_slice(&transcript);
+    let secret = blake3::derive_key("tarnet rendezvous secret v1", &material);
+    let confirm_key = blake3::derive_key("tarnet rendezvous confirm v1", &secret);
+    (HopKey::derive(&secret, &transcript), mac_16(&confirm_key, &[&transcript]))
+}
+
+/// The service's answer carried by JOIN and JOINED:
+/// `kem_ct_len(u16) || kem_ct || confirm(16)`.
+pub fn build_join(kem_ct: &[u8], confirm: &[u8; 16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + kem_ct.len() + 16);
+    out.extend_from_slice(&(kem_ct.len() as u16).to_be_bytes());
+    out.extend_from_slice(kem_ct);
+    out.extend_from_slice(confirm);
+    out
+}
+
+pub fn parse_join(data: &[u8]) -> Result<(&[u8], [u8; 16])> {
+    let short = || Error::Wire("JOIN answer too short".into());
+    let len = data
+        .get(..2)
+        .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+        .ok_or_else(short)?;
+    let kem_ct = data.get(2..2 + len).ok_or_else(short)?;
+    let confirm = data.get(2 + len..2 + len + 16).ok_or_else(short)?;
+    Ok((kem_ct, confirm.try_into().unwrap()))
 }
 
 /// Build a rendezvous cookie payload (used by both ESTABLISH and JOIN).
@@ -1632,28 +1313,75 @@ pub fn parse_rendezvous_establish_payload(data: &[u8]) -> Result<[u8; 32]> {
 }
 
 /// RENDEZVOUS_JOIN payload: cookie(32)
-pub fn build_rendezvous_join_payload(cookie: &[u8; 32]) -> Vec<u8> {
-    build_rendezvous_cookie_payload(cookie)
+pub fn build_rendezvous_join_payload(cookie: &[u8; 32], join: &[u8]) -> Vec<u8> {
+    let mut out = cookie.to_vec();
+    out.extend_from_slice(join);
+    out
 }
 
-/// Parse a RENDEZVOUS_JOIN payload.
-pub fn parse_rendezvous_join_payload(data: &[u8]) -> Result<[u8; 32]> {
-    parse_rendezvous_cookie_payload(data, "RENDEZVOUS_JOIN")
+/// Parse a RENDEZVOUS_JOIN payload: `(cookie, join)`.
+pub fn parse_rendezvous_join_payload(data: &[u8]) -> Result<([u8; 32], &[u8])> {
+    let cookie = parse_rendezvous_cookie_payload(data, "RENDEZVOUS_JOIN")?;
+    Ok((cookie, &data[32..]))
 }
 
-/// INTRO_REGISTER payload: service_id(52)
-pub fn build_intro_register_payload(service_id: &tarnet_api::types::ServiceId) -> Vec<u8> {
-    service_id.as_bytes().to_vec()
+/// What a service signs to register at an intro point: bound to the intro
+/// point and to the circuit's handshake with it, so the signature can't be
+/// replayed elsewhere.
+pub fn intro_register_message(intro_point: &PeerId, transcript: &[u8; 32]) -> Vec<u8> {
+    let mut msg = b"tarnet intro register v1".to_vec();
+    msg.extend_from_slice(intro_point.as_bytes());
+    msg.extend_from_slice(transcript);
+    msg
 }
 
-/// Parse an INTRO_REGISTER payload.
-pub fn parse_intro_register_payload(data: &[u8]) -> Result<tarnet_api::types::ServiceId> {
-    if data.len() < 32 {
-        return Err(Error::Wire("INTRO_REGISTER payload too short".into()));
+/// INTRO_REGISTER payload:
+/// `service_id(32) || pk_len(u16) || signing_pk || sig_len(u16) || sig`.
+pub fn build_intro_register_payload(
+    service_id: &tarnet_api::types::ServiceId,
+    signing_pk: &[u8],
+    sig: &[u8],
+) -> Vec<u8> {
+    let mut out = service_id.as_bytes().to_vec();
+    for field in [signing_pk, sig] {
+        out.extend_from_slice(&(field.len() as u16).to_be_bytes());
+        out.extend_from_slice(field);
     }
-    let mut sid = [0u8; 32];
-    sid.copy_from_slice(&data[..32]);
-    Ok(tarnet_api::types::ServiceId(sid))
+    out
+}
+
+/// Parse and check an INTRO_REGISTER at the intro point: the key must be the
+/// service's and the signature must cover our id and our handshake with the
+/// registering circuit.
+pub fn verify_intro_register(
+    data: &[u8],
+    intro_point: &PeerId,
+    transcript: &[u8; 32],
+) -> Result<tarnet_api::types::ServiceId> {
+    let short = || Error::Wire("INTRO_REGISTER payload too short".into());
+    let sid: [u8; 32] = data.get(..32).ok_or_else(short)?.try_into().unwrap();
+    let mut at = 32;
+    let mut field = || -> Result<&[u8]> {
+        let len = data
+            .get(at..at + 2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+            .ok_or_else(short)?;
+        let bytes = data.get(at + 2..at + 2 + len).ok_or_else(short)?;
+        at += 2 + len;
+        Ok(bytes)
+    };
+    let pk = field()?;
+    let sig = field()?;
+    let service_id = tarnet_api::types::ServiceId(sid);
+    if tarnet_api::types::ServiceId::from_signing_pubkey(pk) != service_id {
+        return Err(Error::Crypto("INTRO_REGISTER key is not the service's".into()));
+    }
+    let algo = crate::identity::signing_algo_of(pk)
+        .ok_or_else(|| Error::Crypto("INTRO_REGISTER key has an unknown length".into()))?;
+    if !crate::identity::verify(algo, pk, &intro_register_message(intro_point, transcript), sig) {
+        return Err(Error::Crypto("INTRO_REGISTER signature invalid".into()));
+    }
+    Ok(service_id)
 }
 
 #[cfg(test)]
@@ -1833,194 +1561,70 @@ mod tests {
 
     #[test]
     fn relay_cell_roundtrip() {
-        let digest_key = [42u8; 32];
         let cell = RelayCell {
             command: RelayCellCommand::Data,
             stream_id: 0,
             data: b"hello onion".to_vec(),
         };
-        let serialized = cell.to_cell(&digest_key);
+        let serialized = cell.to_cell();
         assert_eq!(serialized.len(), CELL_BODY_SIZE);
 
-        let parsed = RelayCell::from_cell(&serialized, &digest_key).unwrap();
+        let parsed = RelayCell::from_cell(&serialized).unwrap();
         assert_eq!(parsed.command, RelayCellCommand::Data);
         assert_eq!(parsed.stream_id, 0);
         assert_eq!(parsed.data, b"hello onion");
     }
 
-    #[test]
-    fn relay_cell_bad_digest() {
-        let digest_key = [42u8; 32];
-        let cell = RelayCell {
-            command: RelayCellCommand::Data,
-            stream_id: 0,
-            data: b"data".to_vec(),
-        };
-        let mut serialized = cell.to_cell(&digest_key);
-        // Corrupt the digest
-        serialized[5] ^= 0xff;
-        assert!(RelayCell::from_cell(&serialized, &digest_key).is_err());
+    fn request(dest: PeerId, hints: Vec<PeerId>) -> CreateRequest {
+        CreateRequest {
+            kem_algo: 0x02,
+            eph_pk: vec![0xBB; 1216],
+            destination: dest,
+            hints,
+        }
     }
 
     #[test]
-    fn onion_encrypt_decrypt_three_hops() {
-        let shared1 = [1u8; 32];
-        let shared2 = [2u8; 32];
-        let shared3 = [3u8; 32];
+    fn create_request_roundtrip() {
+        let req = request(pid(7), vec![pid(1), pid(2), pid(3)]);
+        let bytes = req.to_bytes();
+        assert_eq!(CreateRequest::from_bytes(&bytes).unwrap(), req);
+        assert!(CreateRequest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut other_version = bytes;
+        other_version[0] = 2;
+        assert!(CreateRequest::from_bytes(&other_version).is_err());
+    }
 
-        // Initiator has 3 hop keys
-        let hop1 = HopKey::from_shared_secret(&shared1);
-        let hop2 = HopKey::from_shared_secret(&shared2);
-        let hop3 = HopKey::from_shared_secret(&shared3);
-
-        // Relays each have their own HopCrypto for decryption (forward direction)
-        let keys1 = derive_hop_keys(&shared1);
-        let keys2 = derive_hop_keys(&shared2);
-        let keys3 = derive_hop_keys(&shared3);
-
-        let mut relay1_fwd = HopCrypto {
-            key: keys1.forward_key,
-            digest_key: keys1.forward_digest,
-            nonce_prefix: keys1.nonce_prefix,
-            op: CryptoOp::Decrypt,
-            replay: CellReplayWindow::new(),
-        };
-        let mut relay2_fwd = HopCrypto {
-            key: keys2.forward_key,
-            digest_key: keys2.forward_digest,
-            nonce_prefix: keys2.nonce_prefix,
-            op: CryptoOp::Decrypt,
-            replay: CellReplayWindow::new(),
-        };
-        let mut relay3_fwd = HopCrypto {
-            key: keys3.forward_key,
-            digest_key: keys3.forward_digest,
-            nonce_prefix: keys3.nonce_prefix,
-            op: CryptoOp::Decrypt,
-            replay: CellReplayWindow::new(),
-        };
-
-        // Initiator builds and wraps a cell
-        let msg = b"secret message through 3 hops";
-        let relay_cell = RelayCell {
-            command: RelayCellCommand::Data,
-            stream_id: 0,
-            data: msg.to_vec(),
-        };
-
-        // Serialize with endpoint's (hop3) forward MAC key, embed in full cell
-        let body = relay_cell.to_cell(&hop3.forward_digest);
-        let mut cell = [0u8; CELL_SIZE];
-        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-
-        // Set the explicit nonce (initiator picks nonce 0 for this cell)
-        set_cell_nonce(&mut cell, &[1; 16], 0);
-
-        // Wrap: encrypt with each hop in reverse (3, 2, 1)
-        // All hops read the same nonce from the cell trailer.
-        hop3.encrypt_forward(&mut cell);
-        hop2.encrypt_forward(&mut cell);
-        hop1.encrypt_forward(&mut cell);
-
-        // Relay 1 (outermost) peels layer — MAC verification succeeds here
-        assert!(relay1_fwd.process_cell(&mut cell), "relay1 MAC failed");
-        // Relay 2 peels layer — inner hop MAC was overwritten, skip verification
-        relay2_fwd.process_cell(&mut cell);
-        // Relay 3 (endpoint) peels layer — inner hop MAC was overwritten, skip verification
-        relay3_fwd.process_cell(&mut cell);
-
-        // Endpoint verifies and parses
-        let body: &[u8; CELL_BODY_SIZE] = cell[..CELL_BODY_SIZE].try_into().unwrap();
-        let parsed = RelayCell::from_cell(body, &keys3.forward_digest).unwrap();
-        assert_eq!(parsed.data, msg);
-
-        // --- Backward direction ---
-        let reply = RelayCell {
-            command: RelayCellCommand::Data,
-            stream_id: 0,
-            data: b"reply from endpoint".to_vec(),
-        };
-
-        // Endpoint serializes with backward MAC
-        let bkeys3 = derive_hop_keys(&shared3);
-        let bkeys2 = derive_hop_keys(&shared2);
-        let bkeys1 = derive_hop_keys(&shared1);
-
-        let body = reply.to_cell(&bkeys3.backward_digest);
-        let mut cell = [0u8; CELL_SIZE];
-        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-        // Set the explicit backward nonce (endpoint picks nonce 0)
-        set_cell_nonce(&mut cell, &[1; 16], 0);
-
-        // Endpoint (hop3) encrypts backward, then each relay adds a layer.
-        // All read the same nonce from the cell trailer.
-        let mut r3_bwd = HopCrypto {
-            key: bkeys3.backward_key,
-            digest_key: bkeys3.backward_digest,
-            nonce_prefix: bkeys3.nonce_prefix,
-            op: CryptoOp::Encrypt,
-            replay: CellReplayWindow::new(),
-        };
-        let mut r2_bwd = HopCrypto {
-            key: bkeys2.backward_key,
-            digest_key: bkeys2.backward_digest,
-            nonce_prefix: bkeys2.nonce_prefix,
-            op: CryptoOp::Encrypt,
-            replay: CellReplayWindow::new(),
-        };
-        let mut r1_bwd = HopCrypto {
-            key: bkeys1.backward_key,
-            digest_key: bkeys1.backward_digest,
-            nonce_prefix: bkeys1.nonce_prefix,
-            op: CryptoOp::Encrypt,
-            replay: CellReplayWindow::new(),
-        };
-
-        r3_bwd.process_cell(&mut cell);
-        r2_bwd.process_cell(&mut cell);
-        r1_bwd.process_cell(&mut cell);
-
-        // Initiator unwraps all layers
-        hop1.decrypt_backward(&mut cell);
-        hop2.decrypt_backward(&mut cell);
-        hop3.decrypt_backward(&mut cell);
-
-        let body: &[u8; CELL_BODY_SIZE] = cell[..CELL_BODY_SIZE].try_into().unwrap();
-        let parsed = RelayCell::from_cell(body, &hop3.backward_digest).unwrap();
-        assert_eq!(parsed.data, b"reply from endpoint");
+    fn answer(kp: &crate::identity::Keypair, req: &CreateRequest) -> CreatedReply {
+        let kem_ct = vec![0xDD; 1120];
+        let sig = kp.sign(&created_signed_message(&req.transcript(&kem_ct)));
+        CreatedReply {
+            kem_ct,
+            signing_pk: kp.identity.signing.signing_pubkey_bytes(),
+            sig,
+        }
     }
 
     #[test]
-    fn extend_payload_roundtrip_x25519() {
-        let pubkey = [0xAA; 32];
-        let dest = pid(5);
-        let payload = build_extend_payload(0x00, &pubkey, &dest, &[]);
-        let req = parse_extend_payload(&payload).unwrap();
-        assert_eq!(req.kem_algo, 0x00);
-        assert_eq!(req.eph_pk, pubkey);
-        assert_eq!(req.destination, dest);
-        assert!(req.hints.is_empty());
-    }
+    fn created_reply_proves_the_destination() {
+        let dest = crate::identity::Keypair::generate();
+        let req = request(dest.peer_id(), vec![]);
+        let reply = answer(&dest, &req);
+        let parsed = CreatedReply::from_bytes(&reply.to_bytes()).unwrap();
+        assert_eq!(parsed, reply);
+        assert_eq!(parsed.verify(&req).unwrap(), req.transcript(&reply.kem_ct));
 
-    #[test]
-    fn extend_payload_carries_hints() {
-        let hints = [pid(1), pid(2), pid(3)];
-        let payload = build_extend_payload(0x01, &[0xCC; 64], &pid(9), &hints);
-        let req = parse_extend_payload(&payload).unwrap();
-        assert_eq!(req.hints, hints);
-        assert!(parse_extend_payload(&payload[..payload.len() - 1]).is_err());
-    }
-
-    #[test]
-    fn extend_payload_roundtrip_mlkem() {
-        // Simulate a 1216-byte MlkemX25519 public key
-        let pubkey = vec![0xBB; 1216];
-        let dest = pid(7);
-        let payload = build_extend_payload(0x01, &pubkey, &dest, &[]);
-        let req = parse_extend_payload(&payload).unwrap();
-        assert_eq!(req.kem_algo, 0x01);
-        assert_eq!(req.eph_pk, pubkey);
-        assert_eq!(req.destination, dest);
+        // A relay on the way answering for the destination.
+        let relay = crate::identity::Keypair::generate();
+        assert!(answer(&relay, &req).verify(&req).is_err());
+        // A relay swapping the ciphertext.
+        let mut swapped = reply.clone();
+        swapped.kem_ct[0] ^= 1;
+        assert!(swapped.verify(&req).is_err());
+        // A relay swapping the initiator's ephemeral key.
+        let mut other = req.clone();
+        other.eph_pk[0] ^= 1;
+        assert!(reply.verify(&other).is_err());
     }
 
     fn pieces_of(len: usize, stream_id: u16) -> (RelayCell, Vec<RelayPiece>) {
@@ -2049,7 +1653,6 @@ mod tests {
 
     #[test]
     fn post_quantum_extend_spans_cells_and_reassembles() {
-        let key = [7u8; 32];
         let (cell, pieces) = pieces_of(1216 + 32 + 1, 0);
         assert!(pieces.len() >= 3);
         assert!(pieces[..pieces.len() - 1].iter().all(|p| p.more));
@@ -2057,10 +1660,10 @@ mod tests {
         let mut a = RelayAssembler::default();
         let mut out = None;
         for p in &pieces {
-            // Through the wire format, digest included.
-            let parsed = RelayPiece::from_cell(&p.to_cell(&key), &key).unwrap();
+            // Through the cell body format.
+            let parsed = RelayPiece::from_cell(&p.to_cell()).unwrap();
             assert_eq!(&parsed, p);
-            assert!(RelayCell::from_cell(&p.to_cell(&key), &key).is_err());
+            assert!(RelayCell::from_cell(&p.to_cell()).is_err());
             out = a.push(parsed);
         }
         let out = out.unwrap();
@@ -2090,7 +1693,7 @@ mod tests {
 
     #[test]
     fn lost_piece_drops_the_message() {
-        let (_, pieces) = pieces_of(1400, 3);
+        let (_, pieces) = pieces_of(1900, 3);
         assert!(pieces.len() >= 4);
         let mut a = RelayAssembler::default();
         for (i, p) in pieces.iter().enumerate() {
@@ -2112,39 +1715,6 @@ mod tests {
             data: vec![0; RELAY_MESSAGE_MAX + 1],
         };
         assert!(cell.pieces().is_err());
-    }
-
-    #[test]
-    fn extended_payload_roundtrip_x25519() {
-        let reply = [0xCC; 32];
-        let payload = build_extended_payload(0x00, &reply);
-        let (reached, algo, parsed_reply) = parse_extended_payload(&payload).unwrap();
-        assert_eq!(algo, 0x00);
-        assert_eq!(parsed_reply, reply);
-        assert!(!reached); // default is not reached
-    }
-
-    #[test]
-    fn extended_payload_roundtrip_mlkem() {
-        // Simulate a 1120-byte MlkemX25519 ciphertext
-        let reply = vec![0xDD; 1120];
-        let payload = build_extended_payload(0x01, &reply);
-        let (reached, algo, parsed_reply) = parse_extended_payload(&payload).unwrap();
-        assert_eq!(algo, 0x01);
-        assert_eq!(parsed_reply, reply);
-        assert!(!reached);
-    }
-
-    #[test]
-    fn extended_payload_reached_flag() {
-        let reply = [0xEE; 32];
-        let mut payload = build_extended_payload(0x00, &reply);
-        // Simulate relay setting the reached flag
-        payload[0] |= EXTENDED_FLAG_REACHED;
-        let (reached, algo, parsed_reply) = parse_extended_payload(&payload).unwrap();
-        assert!(reached);
-        assert_eq!(algo, 0x00);
-        assert_eq!(parsed_reply, reply);
     }
 
     #[test]
@@ -2238,11 +1808,11 @@ mod tests {
         let mut rw = ReplayWindow::new();
         assert!(rw.accept(0));
         // Advance far ahead
-        assert!(rw.accept(REPLAY_WINDOW_SIZE + 100));
+        assert!(rw.accept(2048 + 100));
         // Nonce 0 is now outside the window
         assert!(!rw.accept(0), "too old should be rejected");
         // But something within the window should work
-        assert!(rw.accept(REPLAY_WINDOW_SIZE + 50));
+        assert!(rw.accept(2048 + 50));
     }
 
     #[test]

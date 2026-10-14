@@ -122,6 +122,15 @@ enum_with_u16! {
         RouteUpdate = 0x0110,
         RouteDigest = 0x0111,
         RouteRequest = 0x0112,
+        DirPublish = 0x0130,
+        DirLookup = 0x0131,
+        DirResult = 0x0132,
+        PathTrace = 0x0133,
+        PathTraceResult = 0x0134,
+        RouteSearch = 0x0140,
+        RouteSearchFound = 0x0141,
+        SampleWalk = 0x0150,
+        SampleResult = 0x0151,
         // DHT (0x02xx)
         DhtPut = 0x0200,
         DhtGet = 0x0201,
@@ -682,6 +691,509 @@ impl RouteRequestMsg {
 
     pub fn to_wire(&self) -> WireMessage {
         WireMessage::new(MessageType::RouteRequest, self.to_bytes())
+    }
+}
+
+/// Most path entries a `SampleResult` carries (`PATH_MAX`).
+pub const SAMPLE_PATH_MAX: usize = 8;
+
+/// SampleWalk: token(32) || steps(u8). A Metropolis–Hastings walk for a
+/// uniformly random relay. The token is replaced at every hop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleWalkMsg {
+    pub token: [u8; 32],
+    pub steps: u8,
+}
+
+impl SampleWalkMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.token.to_vec();
+        buf.push(self.steps);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        Ok(Self {
+            token: r.read_array::<32>()?,
+            steps: r.read_u8()?,
+        })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::SampleWalk, self.to_bytes())
+    }
+}
+
+/// One sampled relay: who, the walk's last stretch before it (nearest it
+/// first), and its address record if it publishes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sample {
+    pub peer: PeerId,
+    pub path: Vec<PeerId>,
+    pub address: Option<AddressRecord>,
+}
+
+/// SampleResult: token(32) || status(u8) ||
+/// [peer(32) || count(u8) || count × path(32) || addr_len(u16) ||
+/// address_record(addr_len)] iff status 0.
+/// `path` holds the walk's last nodes before `peer`, nearest it first: hints
+/// that reach `peer` without saying where the walk began. `addr_len` 0 means
+/// the sample has no address record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleResultMsg {
+    pub token: [u8; 32],
+    /// `None` for no sample.
+    pub sample: Option<Sample>,
+}
+
+impl SampleResultMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.token.to_vec();
+        match &self.sample {
+            None => buf.push(1),
+            Some(s) => {
+                buf.push(0);
+                buf.extend_from_slice(s.peer.as_bytes());
+                buf.push(s.path.len() as u8);
+                for p in &s.path {
+                    buf.extend_from_slice(p.as_bytes());
+                }
+                let addr = s.address.as_ref().map(|a| a.to_bytes()).unwrap_or_default();
+                buf.extend_from_slice(&(addr.len() as u16).to_be_bytes());
+                buf.extend_from_slice(&addr);
+            }
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let token = r.read_array::<32>()?;
+        let sample = match r.read_u8()? {
+            0 => {
+                let peer = PeerId(r.read_array::<32>()?);
+                let count = r.read_u8()? as usize;
+                if count > SAMPLE_PATH_MAX {
+                    return Err(Error::Wire(format!("SampleResult carries {} path entries", count)));
+                }
+                let path = (0..count)
+                    .map(|_| r.read_array::<32>().map(PeerId))
+                    .collect::<Result<Vec<_>>>()?;
+                let addr_len = r.read_u16()? as usize;
+                let address = if addr_len == 0 {
+                    None
+                } else {
+                    Some(AddressRecord::from_bytes(&r.read_bytes(addr_len)?)?)
+                };
+                Some(Sample { peer, path, address })
+            }
+            _ => None,
+        };
+        Ok(Self { token, sample })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::SampleResult, self.to_bytes())
+    }
+}
+
+// ── Addresses and the directory ──
+
+/// Most entries (nearest landmarks) in an address record.
+pub const ADDRESS_ENTRIES_MAX: usize = 3;
+/// Most nodes in an address path (`PATH_MAX`).
+pub const PATH_MAX: usize = 8;
+/// Most nodes a `PathTrace` may list: its origin, `PATH_MAX` relays and the
+/// target.
+pub const PATH_TRACE_MAX: usize = PATH_MAX + 2;
+
+fn read_peers(r: &mut Reader, count: usize, max: usize, what: &str) -> Result<Vec<PeerId>> {
+    if count > max {
+        return Err(Error::Wire(format!("{} lists {} peers", what, count)));
+    }
+    (0..count).map(|_| r.read_array::<32>().map(PeerId)).collect()
+}
+
+fn write_peers(buf: &mut Vec<u8>, peers: &[PeerId]) {
+    buf.push(peers.len() as u8);
+    for p in peers {
+        buf.extend_from_slice(p.as_bytes());
+    }
+}
+
+/// One way to reach a node: a landmark, and the nodes after it up to, but
+/// excluding, the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressEntry {
+    pub landmark: PeerId,
+    pub path: Vec<PeerId>,
+}
+
+/// A node's signed address:
+/// `peer(32) || seq(u32) || ttl_secs(u32) || count(u8) ||
+/// count × (landmark(32) || path_len(u8) || path(32 × path_len)) ||
+/// signer_algo(u8) || pk_len(u16) || signer_pubkey || sig_len(u16) || signature`,
+/// signed over `"tarnet address v1"` and every field before `signer_algo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressRecord {
+    pub peer: PeerId,
+    pub seq: u32,
+    pub ttl_secs: u32,
+    pub entries: Vec<AddressEntry>,
+    pub signer_algo: u8,
+    pub signer_pubkey: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+impl AddressRecord {
+    fn body(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(41 + self.entries.len() * (33 + 32 * PATH_MAX));
+        buf.extend_from_slice(self.peer.as_bytes());
+        buf.extend_from_slice(&self.seq.to_be_bytes());
+        buf.extend_from_slice(&self.ttl_secs.to_be_bytes());
+        buf.push(self.entries.len() as u8);
+        for e in &self.entries {
+            buf.extend_from_slice(e.landmark.as_bytes());
+            write_peers(&mut buf, &e.path);
+        }
+        buf
+    }
+
+    /// A record for `keypair`'s node, signed.
+    pub fn sign(
+        keypair: &crate::identity::Keypair,
+        seq: u32,
+        ttl_secs: u32,
+        entries: Vec<AddressEntry>,
+    ) -> Self {
+        let mut rec = Self {
+            peer: keypair.peer_id(),
+            seq,
+            ttl_secs,
+            entries,
+            signer_algo: keypair.identity.signing_algo() as u8,
+            signer_pubkey: keypair.identity.signing.signing_pubkey_bytes(),
+            signature: Vec::new(),
+        };
+        rec.signature = keypair.sign(&rec.signed_bytes());
+        rec
+    }
+
+    /// The bytes the signature covers.
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        let mut msg = b"tarnet address v1".to_vec();
+        msg.extend_from_slice(&self.body());
+        msg
+    }
+
+    /// The signer key hashes to `peer` and signs the record.
+    pub fn verify(&self) -> bool {
+        let Ok(algo) = tarnet_api::types::SigningAlgo::from_u8(self.signer_algo) else {
+            return false;
+        };
+        crate::identity::verify_with_pubkey(
+            algo,
+            &self.signer_pubkey,
+            &self.peer,
+            &self.signed_bytes(),
+            &self.signature,
+        )
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.body();
+        buf.push(self.signer_algo);
+        buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signer_pubkey);
+        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.signature);
+        buf
+    }
+
+    fn read(r: &mut Reader) -> Result<Self> {
+        let peer = PeerId(r.read_array::<32>()?);
+        let seq = r.read_u32()?;
+        let ttl_secs = r.read_u32()?;
+        let count = r.read_u8()? as usize;
+        if count > ADDRESS_ENTRIES_MAX {
+            return Err(Error::Wire(format!("address record has {} entries", count)));
+        }
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let landmark = PeerId(r.read_array::<32>()?);
+            let n = r.read_u8()? as usize;
+            let path = read_peers(r, n, PATH_MAX, "address path")?;
+            entries.push(AddressEntry { landmark, path });
+        }
+        let signer_algo = r.read_u8()?;
+        let pk_len = r.read_u16()? as usize;
+        let signer_pubkey = r.read_bytes(pk_len)?;
+        let sig_len = r.read_u16()? as usize;
+        let signature = r.read_bytes(sig_len)?;
+        Ok(Self {
+            peer,
+            seq,
+            ttl_secs,
+            entries,
+            signer_algo,
+            signer_pubkey,
+            signature,
+        })
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let rec = Self::read(&mut r)?;
+        if r.remaining() != 0 {
+            return Err(Error::Wire("trailing bytes after address record".into()));
+        }
+        Ok(rec)
+    }
+}
+
+/// Most hops a route search may flood, and so the longest hop list an
+/// answer carries (the answering node plus the relays back to the searcher).
+pub const ROUTE_SEARCH_MAX_TTL: u8 = 16;
+pub const ROUTE_SEARCH_PATH_MAX: usize = ROUTE_SEARCH_MAX_TTL as usize + 1;
+
+/// RouteSearch: nonce(16) || target(32) || ttl(u8). A deduplicated flood for
+/// a node the directory can't place. No originator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteSearchMsg {
+    pub nonce: [u8; 16],
+    pub target: PeerId,
+    pub ttl: u8,
+}
+
+impl RouteSearchMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.nonce.to_vec();
+        buf.extend_from_slice(self.target.as_bytes());
+        buf.push(self.ttl);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        Ok(Self {
+            nonce: r.read_array::<16>()?,
+            target: PeerId(r.read_array::<32>()?),
+            ttl: r.read_u8()?,
+        })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::RouteSearch, self.to_bytes())
+    }
+}
+
+/// RouteSearchFound: nonce(16) || target(32) || count(u8) || count × peer(32).
+/// `hops` starts with the node that answered (it has a route to `target`, or
+/// is it); each node on the way back appends itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteSearchFoundMsg {
+    pub nonce: [u8; 16],
+    pub target: PeerId,
+    pub hops: Vec<PeerId>,
+}
+
+impl RouteSearchFoundMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.nonce.to_vec();
+        buf.extend_from_slice(self.target.as_bytes());
+        write_peers(&mut buf, &self.hops);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let nonce = r.read_array::<16>()?;
+        let target = PeerId(r.read_array::<32>()?);
+        let n = r.read_u8()? as usize;
+        let hops = read_peers(&mut r, n, ROUTE_SEARCH_PATH_MAX, "RouteSearchFound")?;
+        Ok(Self { nonce, target, hops })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::RouteSearchFound, self.to_bytes())
+    }
+}
+
+/// DirPublish: landmark(32) || replica(u8) || address_record. Routed toward
+/// the landmark, which stores the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirPublishMsg {
+    pub landmark: PeerId,
+    pub replica: u8,
+    pub record: AddressRecord,
+}
+
+impl DirPublishMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.landmark.as_bytes().to_vec();
+        buf.push(self.replica);
+        buf.extend_from_slice(&self.record.to_bytes());
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let landmark = PeerId(r.read_array::<32>()?);
+        let replica = r.read_u8()?;
+        let record = AddressRecord::from_bytes(&r.read_rest())?;
+        Ok(Self {
+            landmark,
+            replica,
+            record,
+        })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::DirPublish, self.to_bytes())
+    }
+}
+
+/// `DirLookup` flag: still in the random-walk phase.
+pub const DIR_LOOKUP_WALKING: u8 = 0x01;
+
+/// DirLookup: flags(u8) || lookup_token(32) || target(32) || replica(u8) ||
+/// landmark(32). No originator; `landmark` is all zero while walking and set
+/// by the node that ends the walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirLookupMsg {
+    pub walking: bool,
+    pub token: [u8; 32],
+    pub target: PeerId,
+    pub replica: u8,
+    pub landmark: PeerId,
+}
+
+impl DirLookupMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(98);
+        buf.push(if self.walking { DIR_LOOKUP_WALKING } else { 0 });
+        buf.extend_from_slice(&self.token);
+        buf.extend_from_slice(self.target.as_bytes());
+        buf.push(self.replica);
+        buf.extend_from_slice(self.landmark.as_bytes());
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let flags = r.read_u8()?;
+        Ok(Self {
+            walking: flags & DIR_LOOKUP_WALKING != 0,
+            token: r.read_array::<32>()?,
+            target: PeerId(r.read_array::<32>()?),
+            replica: r.read_u8()?,
+            landmark: PeerId(r.read_array::<32>()?),
+        })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::DirLookup, self.to_bytes())
+    }
+}
+
+/// DirResult: lookup_token(32) || status(u8) || [address_record] iff found
+/// (status 0; 1 is not found). Returns along the lookup's reverse path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirResultMsg {
+    pub token: [u8; 32],
+    pub record: Option<AddressRecord>,
+}
+
+impl DirResultMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.token.to_vec();
+        match &self.record {
+            Some(rec) => {
+                buf.push(0);
+                buf.extend_from_slice(&rec.to_bytes());
+            }
+            None => buf.push(1),
+        }
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let token = r.read_array::<32>()?;
+        let record = match r.read_u8()? {
+            0 => Some(AddressRecord::from_bytes(&r.read_rest())?),
+            _ => None,
+        };
+        Ok(Self { token, record })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::DirResult, self.to_bytes())
+    }
+}
+
+/// PathTrace: token(32) || target(32) || count(u8) || count × peer(32).
+/// Routed toward `target`; every node appends itself, starting with the
+/// origin. The target answers `PathTraceResult` with the whole list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathTraceMsg {
+    pub token: [u8; 32],
+    pub target: PeerId,
+    pub path: Vec<PeerId>,
+}
+
+impl PathTraceMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.token.to_vec();
+        buf.extend_from_slice(self.target.as_bytes());
+        write_peers(&mut buf, &self.path);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let token = r.read_array::<32>()?;
+        let target = PeerId(r.read_array::<32>()?);
+        let n = r.read_u8()? as usize;
+        let path = read_peers(&mut r, n, PATH_TRACE_MAX, "PathTrace")?;
+        Ok(Self {
+            token,
+            target,
+            path,
+        })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::PathTrace, self.to_bytes())
+    }
+}
+
+/// PathTraceResult: token(32) || count(u8) || count × peer(32). Returns
+/// along the listed path: each node passes it to the entry before its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathTraceResultMsg {
+    pub token: [u8; 32],
+    pub path: Vec<PeerId>,
+}
+
+impl PathTraceResultMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.token.to_vec();
+        write_peers(&mut buf, &self.path);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let token = r.read_array::<32>()?;
+        let n = r.read_u8()? as usize;
+        let path = read_peers(&mut r, n, PATH_TRACE_MAX, "PathTraceResult")?;
+        Ok(Self { token, path })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::PathTraceResult, self.to_bytes())
     }
 }
 
@@ -1563,6 +2075,10 @@ pub mod capabilities {
     pub const RELAY: u32 = 1 << 0;
     /// This node supports encrypted tunnels.
     pub const TUNNEL: u32 = 1 << 1;
+    /// This node may become a landmark.
+    pub const LANDMARK_ELIGIBLE: u32 = 1 << 2;
+    /// This node is a landmark now.
+    pub const LANDMARK: u32 = 1 << 3;
 
     /// Format capability bitflags as a human-readable string.
     pub fn format(caps: u32) -> String {
@@ -1572,6 +2088,12 @@ pub mod capabilities {
         }
         if caps & TUNNEL != 0 {
             names.push("tunnel");
+        }
+        if caps & LANDMARK_ELIGIBLE != 0 {
+            names.push("landmark-eligible");
+        }
+        if caps & LANDMARK != 0 {
+            names.push("landmark");
         }
         if names.is_empty() {
             "none".to_string()
@@ -1914,6 +2436,157 @@ pub fn hash_port_name(name: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sample_messages_round_trip() {
+        let walk = SampleWalkMsg { token: [3; 32], steps: 24 };
+        assert_eq!(SampleWalkMsg::from_bytes(&walk.to_bytes()).unwrap(), walk);
+        let kp = crate::identity::Keypair::generate();
+        let address = AddressRecord::sign(&kp, 1, 3600, Vec::new());
+        for address in [None, Some(address)] {
+            let found = SampleResultMsg {
+                token: [4; 32],
+                sample: Some(Sample {
+                    peer: PeerId([5; 32]),
+                    path: vec![PeerId([6; 32]), PeerId([7; 32])],
+                    address,
+                }),
+            };
+            assert_eq!(SampleResultMsg::from_bytes(&found.to_bytes()).unwrap(), found);
+        }
+        let none = SampleResultMsg { token: [4; 32], sample: None };
+        assert_eq!(SampleResultMsg::from_bytes(&none.to_bytes()).unwrap(), none);
+        let long = SampleResultMsg {
+            token: [4; 32],
+            sample: Some(Sample {
+                peer: PeerId([5; 32]),
+                path: vec![PeerId([6; 32]); SAMPLE_PATH_MAX + 1],
+                address: None,
+            }),
+        };
+        assert!(SampleResultMsg::from_bytes(&long.to_bytes()).is_err());
+    }
+
+    fn address_entries() -> Vec<AddressEntry> {
+        vec![
+            AddressEntry {
+                landmark: PeerId([1; 32]),
+                path: vec![PeerId([2; 32]), PeerId([3; 32])],
+            },
+            AddressEntry {
+                landmark: PeerId([4; 32]),
+                path: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn address_record_signs_round_trips_and_rejects_tampering() {
+        for kp in [
+            crate::identity::Keypair::generate(),
+            crate::identity::Keypair::generate_ed25519(),
+        ] {
+            let rec = AddressRecord::sign(&kp, 7, 3 * 3600, address_entries());
+            assert!(rec.verify());
+            let back = AddressRecord::from_bytes(&rec.to_bytes()).unwrap();
+            assert_eq!(back, rec);
+            assert!(back.verify());
+
+            let mut moved = rec.clone();
+            moved.entries[0].path.pop();
+            assert!(!moved.verify(), "changed path still verifies");
+            let mut newer = rec.clone();
+            newer.seq += 1;
+            assert!(!newer.verify(), "changed seq still verifies");
+            // Another node can't sign for this peer.
+            let other = crate::identity::Keypair::generate();
+            let mut forged = AddressRecord::sign(&other, 7, 3600, address_entries());
+            forged.peer = rec.peer;
+            assert!(!forged.verify(), "signer key does not hash to peer");
+        }
+    }
+
+    #[test]
+    fn address_record_bounds() {
+        let kp = crate::identity::Keypair::generate_ed25519();
+        let mut entries = address_entries();
+        entries[0].path = vec![PeerId([9; 32]); PATH_MAX + 1];
+        let rec = AddressRecord::sign(&kp, 1, 60, entries);
+        assert!(AddressRecord::from_bytes(&rec.to_bytes()).is_err());
+        let rec = AddressRecord::sign(
+            &kp,
+            1,
+            60,
+            vec![address_entries()[1].clone(); ADDRESS_ENTRIES_MAX + 1],
+        );
+        assert!(AddressRecord::from_bytes(&rec.to_bytes()).is_err());
+        let mut bytes = AddressRecord::sign(&kp, 1, 60, Vec::new()).to_bytes();
+        bytes.push(0);
+        assert!(AddressRecord::from_bytes(&bytes).is_err(), "trailing bytes");
+    }
+
+    #[test]
+    fn route_search_messages_round_trip() {
+        let search = RouteSearchMsg {
+            nonce: [1; 16],
+            target: PeerId([2; 32]),
+            ttl: 8,
+        };
+        assert_eq!(RouteSearchMsg::from_bytes(&search.to_bytes()).unwrap(), search);
+        let found = RouteSearchFoundMsg {
+            nonce: [1; 16],
+            target: PeerId([2; 32]),
+            hops: vec![PeerId([3; 32]), PeerId([4; 32])],
+        };
+        assert_eq!(RouteSearchFoundMsg::from_bytes(&found.to_bytes()).unwrap(), found);
+        let long = RouteSearchFoundMsg {
+            hops: vec![PeerId([3; 32]); ROUTE_SEARCH_PATH_MAX + 1],
+            ..found
+        };
+        assert!(RouteSearchFoundMsg::from_bytes(&long.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn directory_messages_round_trip() {
+        let kp = crate::identity::Keypair::generate_ed25519();
+        let record = AddressRecord::sign(&kp, 3, 600, address_entries());
+        let publish = DirPublishMsg {
+            landmark: PeerId([8; 32]),
+            replica: 2,
+            record: record.clone(),
+        };
+        assert_eq!(DirPublishMsg::from_bytes(&publish.to_bytes()).unwrap(), publish);
+        for walking in [true, false] {
+            let lookup = DirLookupMsg {
+                walking,
+                token: [5; 32],
+                target: kp.peer_id(),
+                replica: 1,
+                landmark: PeerId([if walking { 0 } else { 8 }; 32]),
+            };
+            assert_eq!(DirLookupMsg::from_bytes(&lookup.to_bytes()).unwrap(), lookup);
+        }
+        for record in [Some(record), None] {
+            let result = DirResultMsg { token: [6; 32], record };
+            assert_eq!(DirResultMsg::from_bytes(&result.to_bytes()).unwrap(), result);
+        }
+        let trace = PathTraceMsg {
+            token: [7; 32],
+            target: PeerId([8; 32]),
+            path: vec![PeerId([1; 32]), PeerId([2; 32])],
+        };
+        assert_eq!(PathTraceMsg::from_bytes(&trace.to_bytes()).unwrap(), trace);
+        let back = PathTraceResultMsg {
+            token: [7; 32],
+            path: trace.path.clone(),
+        };
+        assert_eq!(PathTraceResultMsg::from_bytes(&back.to_bytes()).unwrap(), back);
+        let long = PathTraceMsg {
+            path: vec![PeerId([1; 32]); PATH_TRACE_MAX + 1],
+            ..trace
+        };
+        assert!(PathTraceMsg::from_bytes(&long.to_bytes()).is_err());
+    }
 
     #[test]
     fn wire_message_roundtrip() {

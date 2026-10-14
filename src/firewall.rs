@@ -126,7 +126,16 @@ fn proto_category(mt: MessageType) -> ProtoCategory {
 
         MessageType::RouteUpdate
         | MessageType::RouteDigest
-        | MessageType::RouteRequest => ProtoCategory::Routing,
+        | MessageType::RouteRequest
+        | MessageType::SampleWalk
+        | MessageType::SampleResult
+        | MessageType::DirPublish
+        | MessageType::DirLookup
+        | MessageType::DirResult
+        | MessageType::PathTrace
+        | MessageType::PathTraceResult
+        | MessageType::RouteSearch
+        | MessageType::RouteSearchFound => ProtoCategory::Routing,
 
         MessageType::DhtPut
         | MessageType::DhtGet

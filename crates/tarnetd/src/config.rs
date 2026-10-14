@@ -159,6 +159,14 @@ pub struct CoreConfig {
     pub download_limit: String,
     /// Store DHT records for other nodes. `false` makes this node relay-only.
     pub dht_store: bool,
+    /// Publish no address and never become a landmark: replies reach this
+    /// node only over circuits it builds (roaming laptops).
+    pub client_only: bool,
+    /// Landmark role: "auto", "never" or "always".
+    pub landmark: String,
+    /// Destinations the routing table keeps (`B_MIN`). A network-wide
+    /// assumption: don't lower it outside tests.
+    pub route_budget: usize,
 }
 
 impl Default for CoreConfig {
@@ -169,6 +177,9 @@ impl Default for CoreConfig {
             upload_limit: String::new(),
             download_limit: String::new(),
             dht_store: true,
+            client_only: false,
+            landmark: "auto".into(),
+            route_budget: tarnet::routing::B_MIN,
         }
     }
 }
@@ -246,6 +257,9 @@ pub struct ResolvedConfig {
     pub download_limit: u64,
     /// Store DHT records for other nodes (false = relay-only).
     pub dht_store: bool,
+    pub client_only: bool,
+    pub landmark: tarnet::node::LandmarkMode,
+    pub route_budget: usize,
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub identity_path: PathBuf,
@@ -331,6 +345,17 @@ pub fn resolve(
         upload_limit,
         download_limit,
         dht_store: config.core.dht_store,
+        client_only: config.core.client_only,
+        landmark: match config.core.landmark.as_str() {
+            "auto" | "" => tarnet::node::LandmarkMode::Auto,
+            "never" => tarnet::node::LandmarkMode::Never,
+            "always" => tarnet::node::LandmarkMode::Always,
+            other => {
+                eprintln!("core.landmark: unknown mode {:?} (auto, never, always)", other);
+                std::process::exit(1);
+            }
+        },
+        route_budget: config.core.route_budget.max(1),
         config_dir: config_dir.to_path_buf(),
         data_dir: data_dir.to_path_buf(),
         identity_path: cli

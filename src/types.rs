@@ -1,5 +1,13 @@
 use std::fmt;
 
+/// `d` scaled by a random factor in [0.75, 1.25). Retries, backoffs and
+/// thresholds use it so the two ends of a link don't fall into lockstep, and
+/// so their timing isn't a fixed fingerprint on the wire.
+pub fn jittered(d: std::time::Duration) -> std::time::Duration {
+    use rand::Rng;
+    d.mul_f64(rand::thread_rng().gen_range(0.75..1.25))
+}
+
 // Re-export from tarnet-api — these are the canonical definitions.
 // Everything in this crate and downstream uses the same types.
 pub use tarnet_api::types::{DhtId, PeerId, PrivacyLevel};

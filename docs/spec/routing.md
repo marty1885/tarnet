@@ -1,8 +1,7 @@
 # Routing protocol (v2, draft)
 
-Status: **draft, partly implemented** (link framing, scheduler, distance
-vector; landmarks, directory, hints, route search, sampling and the onion
-changes are not). Replaces the routing part of wire
+Status: **draft, mostly implemented**. Not yet: per-transport link-death
+timing and Hidden-identity lookups over circuits. Replaces the routing part of wire
 v4 (`RouteAdvertisement`, `RouteProbe`, `RouteProbeFound`) and changes link
 framing, `Data` and circuit `EXTEND`. Ships as wire version 5, a hard break
 (`WIRE_VERSION_MIN = WIRE_VERSION_MAX = 5`); after it the wire is frozen or
@@ -111,7 +110,12 @@ record:
     later `msg_id` arrives past a gap, or when no fragment of it has arrived for
     the stall time `max(200 ms, 2 · tx_time(frame))`. Repeated stall NACKs back
     off: each waits twice as long as the one before, so later NACKs cover
-    repairs that were themselves lost or reordered. At most 5 NACKs per message.
+    repairs that were themselves lost or reordered. At most 5 NACKs per message
+    in a row without a new fragment arriving. A new fragment resets that count
+    and steps the backoff down once, so on a path that delays rather than
+    loses, NACKs answered by late fragments don't use up the budget. Each reset
+    needs a fragment not seen before, so a message gets at most 5 plus its
+    fragment count.
   * The sender keeps the fragments of recently sent messages in a small
     per-link buffer and resends the listed ones at the message's original
     priority. It ignores a NACK for a `msg_id` it no longer holds.
@@ -302,6 +306,9 @@ Landmarks exist only once the network outgrows `B_MIN`. A landmark is an
 ordinary node that everyone keeps a route to. About √N of them give every node
 a route toward any destination's neighbourhood with a √N-size table.
 
+Status: **implemented**, with the election, flag propagation, acceptance
+limits and lazy hello verification below.
+
 ### Eligibility
 
 Local configuration.
@@ -330,14 +337,38 @@ No global size estimate is needed.
   if still uncovered it becomes a landmark: it sets `LANDMARK` on its own route
   and in its hello.
 * **Demote.** A landmark that has held the role for at least the minimum tenure
-  steps down when another landmark lies within half its local-area radius.
-  The incumbent (the one that has held the role longer, as observed locally)
-  stays; ties go to the lower `BLAKE3("tarnet landmark tie" || peer)`. Tenure
-  and hysteresis prevent flapping.
+  is *crowded* when another landmark lies within half its local-area radius.
+  One of the two must step down, and both must agree which without asking:
+  * If the other was already flagged when this node promoted (it first saw the
+    flag before its own promotion), this node is the younger, and the other
+    knows it is the older; this node steps down.
+  * Otherwise neither may know who came first: after a merge each side finds
+    the other already flagged. Both fall back to the same order: the higher
+    `BLAKE3("tarnet landmark tie" || peer)` steps down.
+
+  Landmark age is not carried on the wire: a claimed age can't be checked,
+  and a node claiming to be oldest would make honest neighbours hand it the
+  directory role.
+* **Hysteresis.** A landmark steps down only once its reason has held for the
+  hysteresis time, twice that when only hash order decided. A brief merge
+  (a link that comes back for a minute) therefore moves no landmarks or
+  records, and where one side knows it is younger and the other decides by
+  hash, the younger goes first and the other is no longer crowded, so both
+  never step down at once. After stepping down, a node doesn't promote again
+  for the hysteresis time.
+* A landmark also steps down, after its tenure and the hysteresis time, when
+  its table holds every destination again (the network shrank below its
+  budget), and at once when it is no longer eligible (it opted out, or lost
+  its last link that isn't slow).
 * **Balance.** Since `B = max(B_MIN, L)` and there is about one landmark per
   local area, `L · B ≈ N` settles at `L ≈ B ≈ √N`.
 * **Partitions.** An island bigger than `B_MIN` that loses its landmarks becomes
   uncovered and elects its own. A smaller island needs none.
+* **Merges.** When islands join, every node's local area shrinks to the
+  denser merged graph, so only landmarks that now sit close together are
+  crowded; each such pair resolves as above, about twice the hysteresis time
+  after the join, and `L` settles back toward `√N`. Records follow: a
+  placement change triggers a republish.
 
 ### How everyone learns them
 
@@ -345,12 +376,17 @@ The `LANDMARK` flag rides on the landmark's own route in `RouteUpdate`
 (`eflags` bit 0). A relay propagates the flag of the route it selected.
 
 There is no separate signed claim flood. The flag's authority is the landmark's
-own hello record in the DHT (signed, republished every 5 minutes). A node
-verifies a landmark's hello lazily, the first time it uses that landmark for
-directory placement, and caches the result. A flag that fails verification
-earns the advertising neighbour a governor strike. Routing via an unverified
-flag is allowed; the damage a lying neighbour can do is bounded by the fair
-share below, and it could lie about any route anyway.
+own hello record in the DHT (signed, republished every 5 minutes, and at
+once when the role changes). A node verifies a landmark's hello lazily, the
+first time it uses that landmark for directory placement, and caches the
+result. Verification searches the DHT for the newest hello rather than
+trusting a stored copy, which may predate the promotion. A hello without
+`LANDMARK` is checked again 60 s later; if it still says no, the landmark is
+left out of placement for 10 minutes and the neighbour advertising the flag
+earns a governor strike. If no hello is found, the landmark is used and
+checked again after 5 minutes. Routing via an unverified flag is allowed;
+the damage a lying neighbour can do is bounded by the fair share below, and
+it could lie about any route anyway.
 
 ### Acceptance limits (sybil defence)
 
@@ -390,7 +426,31 @@ signature over "tarnet address v1" || every field before signer_algo
   `path_len ≤ PATH_MAX`. A node farther than that from every landmark is
   reachable only by route search.
 * The signer key must hash to `peer`. Directory nodes and resolvers verify.
-  Newest `seq` wins.
+  Newest `seq` wins. Publishers use the current Unix time (or the last seq
+  plus one, if larger), so a restarted node's record is never older than the
+  one it left behind.
+* A landmark's own record lists itself first, with an empty path.
+
+Status: **implemented**.
+
+### Tracing the path
+
+A node knows only its next hop toward a landmark, so it learns the path by
+tracing it:
+
+* `PathTrace` is routed toward the landmark through the routing table, and
+  every node appends itself, starting with the publisher. A node already on
+  the list, or a list already `PATH_MAX + 2` long, drops it.
+* The landmark appends itself and answers `PathTraceResult` with the whole
+  list. The result returns along the list: each node passes it to the entry
+  before its own, if that is a neighbour and the result came from the entry
+  after. Relays keep no state.
+* The address path is the list between publisher and landmark, reversed.
+  Links are bidirectional, so the reverse of a route is a path. A trace longer
+  than `PATH_MAX` relays leaves that landmark out of the address.
+* The publisher traces again when its nearest landmarks or its next hop to
+  any of them change, and otherwise every 10 minutes, since a change beyond
+  its next hop is invisible to it.
 
 ### Placement
 
@@ -411,8 +471,16 @@ signature over "tarnet address v1" || every field before signer_algo
 * It publishes when its address changes (nearest landmarks or paths), after a
   short delay and rate-limited, and otherwise every `DIR_REPUBLISH`.
 * A landmark stores bounded, verified records with TTL, newest seq per peer.
-  When the landmark set changes, owners republish. There is no handoff between
-  landmarks.
+  A repeat of the stored record refreshes it; a different record with the
+  same seq is refused. When full, the record expiring soonest makes room.
+  A node that is not a landmark stores nothing. When the landmark set
+  changes, owners republish. There is no handoff between landmarks.
+* `DirPublish` is not acknowledged and lossy links lose it, so the publisher
+  checks: 5 s after publishing it looks its own record up at each landmark it
+  sent it to (a `DirLookup` routed straight there, no walk; it names only the
+  publisher), and sends it again where it is missing or older. Checks back
+  off, 4 at most, and stop once a newer record is published.
+* A path trace that gets no answer is retried after 15 s.
 
 ### Lookup (no origin)
 
@@ -420,9 +488,16 @@ signature over "tarnet address v1" || every field before signer_algo
 * It starts with a random-walk phase (same rule as DHT walks: end with
   probability q). The node ending the walk computes the responsible landmark and
   routes the lookup toward it.
+* The walk-ending node picks one of the responsible landmarks (spread and
+  direction diversity included) at random, so a second attempt may reach
+  another. With no landmark it answers "not found".
 * Every hop keeps `lookup_token → previous hop` for a short time; `DirResult`
   returns along that reverse path. The landmark learns that x was looked up, not
-  by whom.
+  by whom. A walk that passes a node twice keeps the first entry, which erases
+  the loop; a lookup that passes a node twice after the walk is dropped.
+* A lookup that passes through x itself on its way is answered by x.
+* The resolver looks up every replica at once, each up to twice, and takes
+  the first verified answer.
 * Relays do not cache results.
 * For Hidden identities, lookups go over a circuit (DHT-over-circuits, phase 3).
   Until then a Hidden identity's lookups use the walk prefix, and the residual
@@ -430,9 +505,14 @@ signature over "tarnet address v1" || every field before signer_algo
 
 ### Endpoint caching
 
-The resolver keeps an address record until its expiry and drops it the first
-time a circuit build from it fails, then looks it up again. Cached addresses are
-never advertised and never installed as routes.
+The resolver keeps an address record until its expiry (at most an hour).
+When a circuit build using it fails, it stops using the entry it used, so the
+next attempt goes by another landmark; when every entry has failed, it drops
+the record and looks it up again. Address records that arrive with relay samples are kept the same way.
+Cached addresses are never advertised and never installed as routes.
+
+A node looks an address up only when it has no route to the destination and
+its table is not a complete view; in a small network nothing changes.
 
 ## Forwarding
 
@@ -451,6 +531,23 @@ toward the destination. A node forwarding toward destination x:
 Rule 3 makes shortcuts automatic: the packet heads toward x's landmark until it
 meets a node that knows x or a later point on x's path. The landmark is on the
 path only when nobody earlier knows x.
+
+A node never sends a packet back where it came from; if its best route
+leads there, it uses another of its routes to that node.
+
+Status: **implemented** for `Data`, `EncryptedData`, CREATE and EXTEND. The
+sender takes the hints from the destination's address. A tunnel keeps the
+hints toward its far end for its lifetime; the responder looks up the
+initiator's address when it has no route to it.
+
+**Connection attempts persist.** A connection to a destination the node
+knew how to reach when it started (a link, a route or an address), or to
+any destination while its table is not a complete view, keeps
+building for up to 60 s while builds fail, re-planning each round with a
+fresh address lookup, 1 s apart doubling to 8 s. After a link dies, routes
+reconverge and addresses are republished inside that, so a connection made
+then succeeds well inside a TCP connect timeout. A built circuit whose
+stream is refused ends the attempt.
 
 ### Circuits
 
@@ -496,7 +593,7 @@ path only when nobody earlier knows x.
 
 ### Onion circuits
 
-Status: **design, not implemented.** Fixes from the 2026-10 audit: hop
+Status: **implemented**. Fixes from the 2026-10 audit: hop
 authentication (A1), cell integrity (C2, C3), the visible cell counter (C4),
 relay state limits (C5), the signature downgrade (C7) and one-hop hidden
 services (A2–A4, B4, B5).
@@ -535,8 +632,8 @@ signing public key, so CREATED carries the key and the initiator checks it
 against the waypoint's id.
 
 * CREATED: `kem_ct`, the destination's signing public key, and a signature
-  over `"tarnet circuit created v1" || version || destination ||
-  eph_pk || kem_ct`.
+  over a hash of the handshake (version, KEM algorithm, destination,
+  ephemeral key, `kem_ct`; see the wire format).
 * The initiator verifies `peer_id(signing_pk) == waypoint` and the signature.
   A relay on the segment can't answer for the waypoint, and can't swap the
   ephemeral key, which the signature covers. The `reached` flag is gone.
@@ -575,8 +672,12 @@ tag    = MAC(digest_key, counter || body)      16 B keyed BLAKE3
   the same tag value.
 * **Replay.** The end of a direction keeps an ordered window on the counter.
   Relays keep a set of the last 2048 trailers they peeled and drop repeats,
-  so a replayed cell dies at the first honest relay. Replays older than that
-  still die at the end of the direction.
+  so a recent replay dies at the first honest relay. Older replays pass the
+  relays and die only at the end of the direction (see Privacy).
+* **Separate nonce spaces.** The layer that seals or opens a cell uses a
+  different keystream nonce from layers it passes through. Otherwise an inner
+  hop could choose trailers equal to a waypoint's own future counters and
+  force keystream reuse.
 * Payload per cell: 475 B (v4: 451 B).
 * CREATE carries a cell-crypto version (1). A wide-block construction such as
   Tor's CGO, which would make a tampered cell undecryptable at the next hop,
@@ -584,19 +685,37 @@ tag    = MAC(digest_key, counter || body)      16 B keyed BLAKE3
 
 #### Relay limits (local policy, fixes C5)
 
-* Half-open entries (CREATE seen, no CREATED) expire after the routed-CREATE
-  timeout; established entries idle for 10 min expire.
-* CREATE is rate-limited per incoming link.
-* The ephemeral-key cache that detects loops is bounded.
+* Half-open entries (CREATE passed on, no CREATED) are torn down after 30 s,
+  with DESTROY both ways. Established relay and endpoint entries that carry
+  no cell for 10 min are torn down the same way; a forwarding entry counts as
+  used while its reverse entry is. Live circuits send keepalive padding after
+  30 s of idleness, so this only catches circuits whose ends vanished without
+  a DESTROY.
+* CREATE is rate-limited per incoming link: 50 per second, bursts of 200.
+  Refused CREATEs get DESTROY.
+* The ephemeral-key cache that detects loops holds 16 K keys for 30 s.
 
 #### Hidden services
 
 Every circuit used by a hidden service, on either side, is a normal
-multi-waypoint circuit. Intro and rendezvous points are sampled relays (see
-Relay sampling), never just a direct neighbour, and never the service host or
-the client.
+multi-waypoint circuit. Its hop count is the identity's `outbound_hops`: the
+service's for intro and rendezvous circuits it builds, the client's for its
+own. With `outbound_hops = n`, a circuit has `n - 1` random waypoints before
+the intro or rendezvous point. Hidden identities should use at least 3.
 
-* **Service to intro point:** at least 2 waypoints before the intro point.
+* **Choosing points.** Intro points (by the service), rendezvous points (by
+  the client, preferring one that isn't the intro point) and every waypoint
+  are picked at random as in Relay sampling: from the routing table while it
+  is a complete view, else from the sampled relay pool. Neither side knows
+  the other's host, so either may pick it:
+  * The rendezvous point is the service's host: the service builds its
+    rendezvous circuit out through at least one waypoint and back to itself,
+    so it looks like any other. A waypoint answering EXTEND may route the new
+    segment back the way the circuit came (only relays passing a routed
+    CREATE on are kept from sending it back).
+  * The intro point is the client: the client hands its INTRODUCE to the
+    registered service locally, without an intro circuit.
+  * A client that gets no join tries up to 3 rendezvous points.
 * **IntroRegister is signed (fixes B4):** `service signing_pk || sig` over
   `"tarnet intro register v1" || intro point id || H(transcript of the
   service's handshake with the intro point)`. The intro point checks that the
@@ -604,18 +723,28 @@ the client.
   can't be replayed on another one.
 * **INTRODUCE:** `service_id || ext_len(u16) || ext || sealed`. `sealed` is
   encrypted to the service's KEM key and contains the rendezvous point, its
-  hints, the cookie, mode, port and a fresh client KEM public key. `ext` holds
-  typed extensions the intro point and service ignore when unknown, so
+  hints, the cookie, mode, port and a fresh client KEM public key. The hints
+  are the rendezvous point's address, or failing that its sample hints
+  (nodes next to it on the walk that found it, never the client's
+  neighbours), so the service's circuit can reach a rendezvous point outside
+  its own local area without learning anything about the client's.
+* **Reaching the intro point.** Intro records carry no hints: hints from the
+  service's walk would describe where the service sampled from. A client
+  outside the intro point's local area looks up its address in the directory,
+  like any other destination (a Hidden client's lookup leaks only that
+  someone looked up this intro point, see "Privacy"). `ext` holds typed
+  extensions the intro point and service ignore when unknown, so
   proof-of-work can be added later without a break.
 * **At the service (fixes B5):** INTRODUCE is handled off the circuit's message
-  queue and rate-limited. A replay cache, keyed by the hash of `sealed` and
-  kept for the descriptor lifetime, drops repeats.
-* **Service to rendezvous point:** at least 2 waypoints before the
-  rendezvous point. `RendezvousJoin` carries the cookie plus `join =
+  queue, at most 8 at a time per node; more are dropped. A replay cache, keyed
+  by the hash of `sealed` and kept for twice the descriptor lifetime, drops
+  repeats.
+* **Service to rendezvous point:** `RendezvousJoin` carries the cookie plus `join =
   kem_ct_to_client_eph || confirm_tag`, which the rendezvous point passes to
   the client in `RendezvousJoined`.
-* **End-to-end key, with forward secrecy:** `KDF(static_secret ||
-  eph_secret, H(INTRODUCE transcript || join))`. v4 used the static KEM
+* **End-to-end key, with forward secrecy:** derived from `static_secret ||
+  eph_secret` and a hash of `sealed` and the service's ciphertext; the
+  client checks the confirm tag before using it. v4 used the static KEM
   secret alone, so a later compromise of the service key exposed past
   sessions.
 * **The rendezvous point splices with crypto.** A cell from the client loses
@@ -624,14 +753,14 @@ the client.
   hop key and add the end-to-end key as an extra innermost layer. v4 replaced
   all hop keys with the end-to-end key, which is why its hidden-service
   circuits could only be one hop.
-* **Client side:** the client's own identity sets its hop count to the
-  rendezvous and intro points.
-* **Direct streams refused (fixes A3).** A Hidden identity refuses
-  `StreamBegin` arriving other than through its rendezvous circuits.
+* **Direct streams refused (fixes A3).** A Hidden identity answers a direct
+  `StreamBegin` exactly as a node that doesn't host it would (StreamRefused).
 * **No peer record (fixes A4).** A Hidden identity never publishes the `"peer"`
   record, and switching an identity to Hidden deletes it.
-* **No silent downgrade.** A Hidden identity's connection fails if it can't
-  get enough distinct relays, instead of using fewer hops.
+* **No silent downgrade.** Any identity's connection fails if there aren't
+  enough distinct relays for its hop count, instead of using fewer hops.
+* An intro point without the service's key: v4 fell back to the node key,
+  which linked the service to its host. Publishing now fails instead.
 
 ### Fallback: bounded route search
 
@@ -647,6 +776,25 @@ runs a deduplicated, expanding-ring flood:
 * Relays install no routes. Searches are rate-limited per target and per
   neighbour. There is no originator field.
 
+Status: **implemented**.
+
+* Each ring is a new nonce, waited for `ttl / 2` seconds (2, 4 and 8 s). The
+  searcher remembers its own nonces, so its flood coming back is dropped.
+* Only the first answer for a nonce is passed back at each relay. An answer
+  with more than `ROUTE_SEARCH_MAX_TTL + 1` hops is dropped.
+* The searcher reverses the hop list and starts it at the last node it can
+  reach itself, so the hints skip its own local area. If that is still longer
+  than a message may carry (`PATH_MAX + 1`), the answer is unusable.
+* A node searches when it has no route to x and no usable address: the
+  directory has no record, it knows no landmark, or every entry of x's
+  address failed in the last 60 s and the directory has nothing newer. It searches even when its table looks
+  complete: a node at the edge of a scoped network holds no more than its
+  budget and can't tell its view is partial. In a small network, a connection
+  to a node that doesn't exist therefore fails after the rings (about 14 s),
+  not at once.
+* A search's answer is used for 5 minutes, and dropped when a build from it
+  fails.
+
 This replaces v4's `RouteProbe`, which was a set of random walks whose found
 routes never expired.
 
@@ -657,20 +805,43 @@ the visible population is the local area plus landmarks: nearby nodes (an
 adversary near you supplies all hops) or a small self-elected set (a sybil
 target). Waypoints must instead be sampled from the whole network.
 
-* **Complete view** (table not evicting): sample uniformly from the routing
+* **Complete view** (fewer destinations than the budget; at exactly the
+  budget a node can't tell, so it counts as scoped): sample uniformly from the routing
   table, as in v4.
+Status: **implemented**.
+
 * **Otherwise: Metropolis–Hastings walks.**
   * The node keeps a pool of sampled relays, refreshed in the background. Each
-    sample is a `SampleWalk`.
+    sample is a `SampleWalk`. If the pool has too few for a request (just
+    started, or many excluded), the node walks on demand. It never falls back
+    to its local area.
   * At node i with d_i links, pick a neighbour j uniformly and move with
     probability `min(1, d_i / d_j)`, else stay. Either way one step is consumed.
     Degrees come from the `degree` field of `RouteUpdate`.
-  * After `steps` steps the end node answers `SampleResult` with its own address
-    record along the reverse path.
+  * After `steps` steps the end node answers `SampleResult` along the reverse
+    path. Each node replaces the token before passing the walk on and keeps
+    `new token → (previous hop, old token, next hop)` for 20 s, at most 4096
+    walks. Only the next hop may answer. A walk that passes a node twice
+    holds two entries there, with different tokens.
   * The walk converges to a uniform node rather than one weighted by degree.
     Sybils behind few attack links are reached with probability bounded by those
     links.
-  * The walk carries no originator.
+  * The walk carries no originator. Walks are rate-limited per neighbour
+    (10/s, bursts of 100).
+* **The sample's address.** The end node puts its own address record in the
+  result, if it publishes one. The walker verifies and keeps it, and reaches
+  the sample by its address like any other destination.
+* **Hints in the result.** The walk's path is kept too, for a sample without
+  an address (no landmarks yet, or farther than `PATH_MAX` from every one).
+  On the way back each node
+  adds itself to the result's path, until it holds `PATH_MAX` nodes, and
+  erases loops: a node already in the path cuts it back to itself. The path
+  is then the walk's last stretch before the sample, which says nothing about
+  where the walk began. The walker also drops its own neighbours and anything
+  past them. The hints go into CREATE and EXTEND for that waypoint and into
+  INTRODUCE for a rendezvous point, when no usable address is known. Relays
+  use them as for any hints: they route toward the hint nearest the
+  destination they can reach.
 * A node that publishes no address (client-only) answers with an empty result
   and is not used as a relay.
 * Samples are used only as waypoints, with their address hints. They are never
@@ -698,13 +869,15 @@ These change `dht.md`'s "Local policy" table only; no DHT wire change.
    * Fixed in v4 already (no wire change).
 2. **Republish on link-down** as well as link-up, with the same rate limit
    (60 s) and random delay. An island then re-places its records within seconds
-   of link-death detection instead of up to 30 minutes.
+   of link-death detection instead of up to 30 minutes. *Implemented.*
 3. **Watch notifications only for news.** A node relaying a PUT notifies a
    watch token only when `(signer, sequence)` is newer than the last it notified
-   for that token.
+   for that token. *Implemented*: each watch remembers up to 64 signers; a
+   refreshed watch keeps what it was told.
 4. **Network-size estimate.** ρ uses `N_est = table size + 1` while the view is
-   complete, else `L · B`. v4's `routing_table.len() + 1` would silently shrink
-   ρ once tables are scoped.
+   complete, else `L · B` (never less than the table size + 1). v4's
+   `routing_table.len() + 1` would silently shrink ρ once tables are scoped.
+   *Implemented*, for DHT walks and sample walk length.
 
 ## Privacy
 
@@ -739,8 +912,16 @@ Accepted residuals:
   yet specified.
 * **Interim Hidden-identity lookups** (before phase 3) reveal "someone looked up
   this intro or rendezvous point" to the directory landmark, without the origin.
+* **A path trace names its origin.** It is the publisher tracing to its own
+  landmark, and the resulting path is published in its address anyway.
 * `Data` still carries origin and destination in clear to every relay, as in v4.
   Hints add the destination's address, which is public anyway.
+* **Old replays reach the end of a direction.** A relay can't keep an ordered
+  replay window without seeing a counter shared with other relays, so it only
+  remembers its last 2048 trailers. An attacker who records a cell and
+  replays it later makes the honest relays after it forward a duplicate, which
+  a colluding relay further on can see. This is an active watermark, like
+  delaying cells, which low-latency onion routing doesn't prevent either.
 * **Relays between two waypoints see identical cells.** Without a layer of
   their own, colluding relays on one segment can match a circuit by its bytes
   instead of by timing, which already matches them. These relays are chosen
@@ -788,19 +969,32 @@ DirResult          (0x0132)
   lookup_token(32) || status(u8)       0 found, 1 not found
   [address_record]                     present iff found
 
+PathTrace          (0x0133)
+  token(32) || target(32) || count(u8) || count × peer(32)
+                     count ≤ PATH_MAX + 2; the origin first, each node
+                     appends itself
+
+PathTraceResult    (0x0134)
+  token(32) || count(u8) || count × peer(32)
+                     the trace's list, target last; returns along it
+
 RouteSearch        (0x0140)
   nonce(16) || target(32) || ttl(u8)
 
 RouteSearchFound   (0x0141)
   nonce(16) || target(32) || count(u8) || count × peer(32)
-                     hop list from the answering node back toward the searcher
+                     hop list from the answering node back toward the searcher:
+                     the answering node first, each relay appends itself;
+                     count ≤ 17
 
 SampleWalk         (0x0150)
   token(32) || steps(u8)
 
 SampleResult       (0x0151)
   token(32) || status(u8)              0 sample, 1 no sample
-  [address_record]                     present iff sample
+  [peer(32) || count(u8) ||            present iff sample; count ≤ PATH_MAX
+   count × path(32) ||                 path nearest the sample first
+   addr_len(u16) || address_record]    addr_len 0: the sample has no address
 ```
 
 Changed messages:
@@ -813,14 +1007,17 @@ Data / EncryptedData (0x0500 / 0x0501)
 CircuitCreate (0x0700)
   circuit_id(u32) || version(u8) || flags(u8) ||
   kem_algo(u8) || pk_len(u16) || eph_pk ||
-  [destination(32) || hint_count(u8) || hint_count × peer(32)]   iff flags bit0 ROUTED
-                     version: cell crypto, 1
+  destination(32) || hint_count(u8) || hint_count × peer(32)
+                     version: cell crypto, 1 (others are refused with DESTROY);
+                     flags: none defined, sent 0, ignored
 
 CircuitCreated (0x0701)
   circuit_id(u32) || kem_ct_len(u16) || kem_ct ||
   signing_pk_len(u16) || signing_pk || sig_len(u16) || sig
-                     sig over "tarnet circuit created v1" || version ||
-                     destination || eph_pk || kem_ct
+                     sig over "tarnet circuit created v1" || transcript, where
+                     transcript = BLAKE3 derive_key("tarnet circuit create
+                     transcript v1", version || kem_algo || destination ||
+                     len(eph_pk)(u32) || eph_pk || len(kem_ct)(u32) || kem_ct)
 
 EXTEND payload (relay cell 0x05)
   the routed CREATE's fields after circuit_id (destination always present)
@@ -842,13 +1039,13 @@ TRUNCATE  (relay cell 0x14)   empty payload
 TRUNCATED (relay cell 0x15)   empty payload
 ```
 
-`hint_count ≤ PATH_MAX + 1`; a message with more is rejected. Until forwarding
-with hints is implemented, senders send `hint_count = 0` and forwarders carry
+`hint_count ≤ PATH_MAX + 1`; a message with more is rejected. Forwarders carry
 hints unchanged. Unknown flag bits are sent as 0 and ignored.
 Unknown message types are dropped, so new message types can be added later
 without a break. A future hierarchy layer above landmarks would go there.
 
-Hello record: `capabilities` gains bit `LANDMARK_ELIGIBLE` and bit `LANDMARK`.
+Hello record: `capabilities` gains bit 2 `LANDMARK_ELIGIBLE` and bit 3
+`LANDMARK`.
 
 ## Local policy (not part of the wire contract)
 
@@ -859,7 +1056,7 @@ Hello record: `capabilities` gains bit `LANDMARK_ELIGIBLE` and bit `LANDMARK`.
 | Coalescing wait, fast links | 30 ms + jitter for deferred messages; held outside the scheduler, so the wait is not queueing delay |
 | Coalescing, slow links | until the frame is full or the link is free |
 | Fragment reassembly | timeout `max(5 s, 4 · tx_time(message))`, 8 partial messages per link |
-| Fragment repair buffer | sent fragments kept max(5 s, 16 · tx_time(frame)), at most 16 KB per link; NACK at most 5 per message, backing off |
+| Fragment repair buffer | sent fragments kept max(5 s, 16 · tx_time(frame)), at most 16 KB per link; NACK at most 5 per message in a row without progress, backing off |
 | Link handshake deadline | `max(30 s, 3 · tx_time(12 KB))`, extended while bytes arrive |
 | Reconnect backoff | 1 s doubling to 5 min, jittered |
 | Scheduler minimum share, bulk + background | 10% |
@@ -867,6 +1064,7 @@ Hello record: `capabilities` gains bit `LANDMARK_ELIGIBLE` and bit `LANDMARK`.
 | Link queue byte cap | 2 s at link rate, at least 16 KB |
 | Channel window | AIMD: initial 4, min 2, max 32 |
 | Retransmit timers | `max(floor, SRTT + 4·RTTVAR + 2 · tx_time(msg))`; floors are today's constants |
+| Jitter | Every retry, resend and backoff timer (fragment NACKs, CREATE and tunnel key-exchange resends) is scaled by a random factor in [0.75, 1.25), so the ends of a link don't fall into lockstep and timing isn't a fixed fingerprint |
 | Link death, TCP/WS | transport error immediately; probe after 15 s idle; dead after 45 s silent |
 | Link death, slow links | probe after 30 s idle; dead after 120 s silent |
 | Triggered update batching | 250 ms, so at most 4 updates/s per link (slow: 1 per 2 s) |
@@ -877,16 +1075,28 @@ Hello record: `capabilities` gains bit `LANDMARK_ELIGIBLE` and bit `LANDMARK`.
 | Routes kept per destination | 3 |
 | `B_MIN` | 1024 (tests: as low as 4) |
 | Landmark promotion delay | uniform 0–60 s |
-| Landmark minimum tenure | 30 min; demotion hysteresis 10 min |
+| Landmark minimum tenure | 30 min; demotion hysteresis 10 min (20 min when hash order decides) |
 | `LM_SHARE_MIN`, `LM_SHARE_FACTOR`, `LM_MAX` | 32, 2, 8192 |
 | Landmark flag rate limit | 1 change per 10 min per destination |
 | Directory replicas R, spread | 3, 2 |
 | Address record TTL, republish | 3 h, 1 h; on change after 1–5 s, at most once per 30 s |
+| Election and address upkeep | every 2 s |
+| Path trace timeout, retrace | 20 s; every 10 min, or when the nearest landmarks or the next hop to one change |
+| Directory store | 65,536 records per landmark; records kept at most 6 h whatever their TTL |
+| Directory messages per neighbour | 20/s, bursts of 200 |
+| Lookup attempt timeout | 10 s |
+| Resolved address cache | until expiry, at most 1 h; dropped when a build from it fails |
+| Landmark hello check | recheck a denial after 60 s, then ignore 10 min; no hello found: retry after 5 min |
+| Connection persistence | 60 s, rounds 1 s apart doubling to 8 s; in a complete view only for destinations reachable at the start |
+| Publish check | lookup at each landmark 5 s after publishing, backing off, 4 checks; resend where missing |
+| Path trace retry | 15 s after one got no answer |
+| Configuration | `core.client_only` (default off), `core.landmark` (`auto`, `never`, `always`), `core.route_budget` (`B_MIN`) |
 | `PATH_MAX` | 8 |
 | Addresses per node | 3 (nearest landmarks) |
 | Lookup token lifetime | 30 s; 2 attempts per replica |
-| Route search | ttl 4 → 8 → 16; at most 1 search per target per 30 s |
-| Relay sample pool | 32 relays, refreshed every 10 min |
+| Route search | ttl 4 → 8 → 16, each ring waited `ttl / 2` s; at most 1 search per target per 30 s; relays: 5/s per neighbour, bursts of 20, nonces kept 30 s (8,192 at most); answers used 5 min |
+| Relay sample pool | 32 relays, each replaced after 10 min (jittered); topped up every 20 s, 8 walks at once; only while the table is not a complete view |
+| Sample walks | 20 s timeout and relay memory; 4096 remembered per relay; 10/s per neighbour, bursts of 100 |
 | Sample walk steps | `min(64, 2 · ceil(log2 N_est) + 4)` |
 | EXTEND step timeout | sum of link-aware RTOs over built hops, floor 1.5 s |
 
@@ -901,10 +1111,29 @@ link.
 * **Barbell e2e.** Two clusters joined by a 5-hop chain, with the chain on a
   bandwidth-limited, lossy firewall policy. `B_MIN` is forced to 4 so landmarks,
   the directory, hints and sampling all run at small N.
+  *Implemented* in `tests/directory.rs`: two clusters of 5, the chain at
+  16 KB/s with 2% loss, plus a fast path through one gateway. A circuit and a
+  tunnel reach a node of the far cluster that the near node has no route to.
 * **School down.** Cut the fast path in the barbell. A new circuit to a node on
-  the far side succeeds within the recovery budget.
+  the far side succeeds within the recovery budget. *Implemented* (same
+  test). The cut resets the gateway's connections, so link death is detected
+  at once; per-transport link-death timing is not implemented yet.
 * **Island.** Partition the network; resolution (DHT republish on link-down) and
-  connections inside the island recover.
+  connections inside the island recover. *Implemented* as
+  `island_keeps_resolving_inside`: the island elects its own landmark and
+  connects beyond a local area.
+* **Split and merge.** Two chains joined through a bridge node that can be cut,
+  one landmark-eligible node on each side of the bridge, close enough to crowd
+  each other while joined. Joined, they settle on one landmark; split, the
+  half without it elects its own; a merge shorter than the hysteresis moves
+  nothing; a lasting merge leaves one landmark again (neither saw the other
+  promote, so hash order decides) and the far ends connect. *Implemented* as
+  `split_halves_elect_and_merged_halves_thin_out`.
+* **Scoped chain, client-only, hidden service.** On an 8-node chain with a
+  table budget of 3: landmarks get elected and the far end is resolved and
+  reached by circuit and tunnel; a client-only node publishes nothing and
+  still connects; a hidden service is reached by a one-hop client through
+  intro and rendezvous points beyond its local area.
 * **Hidden republish.** A watcher sees no re-PUT of a Hidden identity's records
   when a link to the host comes up or goes down.
 * **Truncate and resume.** Drop an EXTEND mid-path; the circuit completes from
@@ -921,7 +1150,10 @@ link.
 * **Slow-link handshake.** A link over an HC-12-speed firewall policy with 10%
   loss completes its handshake and is never closed while traffic flows or
   while idle.
-* **Unit tests:** feasibility and seqno requests, digest mismatch recovery,
+* **Unit tests:** placement (determinism, spread, direction diversity), the
+  directory store, address record signing and bounds, landmark acceptance
+  caps and flag rate limit, and hints from an address. Also:
+  feasibility and seqno requests, digest mismatch recovery,
   fragment reassembly and NACK repair (including NACK for an evicted message),
   frame seq/nonce across rekey (no `(key, seq)` reuse, old-key stragglers
   still decrypt), landmark promote/demote, fair-share caps, the forwarding

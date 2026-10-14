@@ -62,13 +62,16 @@ pub(crate) fn classify(msg: &[u8]) -> (Class, Option<u64>) {
         | RouteUpdate | RouteDigest | RouteRequest => (Class::Control, None),
         CircuitCreate | CircuitCreated | CircuitDestroy | TunnelKeyExchange
         | TunnelKeyResponse | ChannelOpen | ChannelClose => (Class::CircuitControl, None),
+        // Someone is waiting on a first contact.
+        DirLookup | DirResult | RouteSearch | RouteSearchFound => (Class::CircuitControl, None),
         // Keyed by circuit id.
         CircuitRelay => (Class::Data, flow_of(4)),
         // Keyed by channel id.
         ChannelData | ChannelAck => (Class::Data, flow_of(4)),
         // Keyed by the origin's first bytes.
         Data | EncryptedData => (Class::Data, flow_of(6)),
-        DhtPut | DhtGet | DhtGetResponse | DhtWatch | DhtWatchNotify | DhtNeighbor => {
+        DhtPut | DhtGet | DhtGetResponse | DhtWatch | DhtWatchNotify | DhtNeighbor
+        | SampleWalk | SampleResult | DirPublish | PathTrace | PathTraceResult => {
             (Class::Background, None)
         }
     }

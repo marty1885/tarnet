@@ -68,6 +68,14 @@ struct LocalCli {
     /// Example: --svg-layers errors,links
     #[arg(long, default_value = "all")]
     svg_layers: String,
+    /// Force every routing table down to this many destinations, so
+    /// landmarks and the address directory run (default: the real `B_MIN`).
+    #[arg(long)]
+    route_budget: Option<usize>,
+    /// Probe by building a circuit and echoing a message, instead of
+    /// waiting for a route.
+    #[arg(long)]
+    circuit_probes: bool,
 }
 
 #[derive(Args, Debug)]
@@ -138,6 +146,8 @@ async fn run_local(cli: LocalCli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut runtime =
         LocalRuntime::prepare("local", plan.clone(), "127.0.0.1:0", false, None).await?;
+    runtime.route_budget = cli.route_budget;
+    runtime.circuit_probes = cli.circuit_probes;
     let phase_pause = phase_pause(cli.settle_secs);
 
     println!(

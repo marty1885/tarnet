@@ -436,42 +436,24 @@ async fn send_on_channel(
         let inner = msg.to_wire().encode();
 
         // Encrypt via tunnel
-        let encrypted = {
+        let (encrypted, hints) = {
             let mut tt = tunnel_table.lock().await;
             let tunnel = tt
                 .get_mut(&dest)
                 .ok_or_else(|| Error::Protocol(format!("no tunnel to {:?}", dest)))?;
-            tunnel.encrypt(&inner)?
+            (tunnel.encrypt(&inner)?, tunnel.hints.clone())
         };
 
         let enc_msg = EncryptedDataMsg {
             origin: our_peer_id,
             destination: dest,
             ttl: 64,
-            hints: Vec::new(),
+            hints: hints.clone(),
             data: encrypted,
         };
         let encoded = enc_msg.to_wire_encrypted().encode();
 
-        // Route
-        {
-            let lks = links.lock().await;
-            if let Some(link) = lks.get(&dest) {
-                link.send_message(&encoded).await?;
-                continue;
-            }
-        }
-        let next_hop = {
-            let table = routing_table.lock().await;
-            table
-                .lookup(&dest)
-                .map(|r| r.next_hop)
-                .ok_or(Error::NotFound)?
-        };
-        let lks = links.lock().await;
-        if let Some(link) = lks.get(&next_hop) {
-            link.send_message(&encoded).await?;
-        }
+        super::tunnel::send_overlay(links, routing_table, &dest, &hints, &encoded).await?;
     }
     Ok(())
 }

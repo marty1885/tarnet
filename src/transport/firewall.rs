@@ -19,6 +19,41 @@ use tokio::sync::{mpsc, Mutex};
 use super::{Discovery, Transport};
 use crate::types::{Error, Result};
 
+/// A switch that cuts every link of a `FirewallDiscovery`, as if its cable
+/// were pulled with connection resets: open transports fail, and new ones
+/// can't be made until it is restored.
+#[derive(Default)]
+pub struct LinkCut {
+    cut: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl LinkCut {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn cut(&self) {
+        self.cut.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    pub fn restore(&self) {
+        self.cut.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cut(&self) -> bool {
+        self.cut.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.is_cut() {
+            return Err(Error::Wire("link cut".into()));
+        }
+        Ok(())
+    }
+}
+
 /// What the firewall does to each packet.
 #[derive(Clone, Debug)]
 pub enum FirewallPolicy {
@@ -43,6 +78,7 @@ pub enum FirewallPolicy {
 pub struct FirewallTransport {
     inner: Arc<dyn Transport>,
     shared: Arc<Shared>,
+    cut: Option<Arc<LinkCut>>,
     /// Packets received from `inner` that survived the policy, in the order
     /// their delays expired.
     inbound: Mutex<mpsc::Receiver<Result<Vec<u8>>>>,
@@ -86,6 +122,15 @@ impl Shared {
 
 impl FirewallTransport {
     pub fn new(inner: Box<dyn Transport>, policy: FirewallPolicy, seed: u64) -> Self {
+        Self::with_cut(inner, policy, seed, None)
+    }
+
+    pub fn with_cut(
+        inner: Box<dyn Transport>,
+        policy: FirewallPolicy,
+        seed: u64,
+        cut: Option<Arc<LinkCut>>,
+    ) -> Self {
         let inner: Arc<dyn Transport> = Arc::from(inner);
         let shared = Arc::new(Shared {
             policy,
@@ -93,10 +138,11 @@ impl FirewallTransport {
             line: Mutex::new(()),
         });
         let (tx, rx) = mpsc::channel(1024);
-        let pump = tokio::spawn(Self::pump(inner.clone(), shared.clone(), tx));
+        let pump = tokio::spawn(Self::pump(inner.clone(), shared.clone(), tx, cut.clone()));
         Self {
             inner,
             shared,
+            cut,
             inbound: Mutex::new(rx),
             pump,
         }
@@ -108,10 +154,25 @@ impl FirewallTransport {
         inner: Arc<dyn Transport>,
         shared: Arc<Shared>,
         tx: mpsc::Sender<Result<Vec<u8>>>,
+        cut: Option<Arc<LinkCut>>,
     ) {
         let mut buf = vec![0u8; PUMP_BUFFER];
         loop {
-            let n = match inner.recv(&mut buf).await {
+            let received = match &cut {
+                Some(cut) => {
+                    let cut_now = cut.notify.notified();
+                    if let Err(e) = cut.check() {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                    tokio::select! {
+                        r = inner.recv(&mut buf) => r,
+                        _ = cut_now => Err(Error::Wire("link cut".into())),
+                    }
+                }
+                None => inner.recv(&mut buf).await,
+            };
+            let n = match received {
                 Ok(n) => n,
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
@@ -151,6 +212,9 @@ impl Drop for FirewallTransport {
 #[async_trait]
 impl Transport for FirewallTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
+        if let Some(cut) = &self.cut {
+            cut.check()?;
+        }
         if let FirewallPolicy::RateLimit { bytes_per_sec, .. } = self.shared.policy {
             let _line = self.shared.line.lock().await;
             let airtime = Duration::from_secs_f64(data.len() as f64 / bytes_per_sec.max(1) as f64);
@@ -223,6 +287,7 @@ pub struct FirewallDiscovery {
     inner: Box<dyn Discovery>,
     policy: FirewallPolicy,
     seed_counter: Mutex<u64>,
+    cut: Option<Arc<LinkCut>>,
 }
 
 impl FirewallDiscovery {
@@ -231,7 +296,14 @@ impl FirewallDiscovery {
             inner,
             policy,
             seed_counter: Mutex::new(0),
+            cut: None,
         }
+    }
+
+    /// Every link this discovery makes can be cut with `cut`.
+    pub fn with_cut(mut self, cut: Arc<LinkCut>) -> Self {
+        self.cut = Some(cut);
+        self
     }
 
     async fn next_seed(&self) -> u64 {
@@ -249,22 +321,33 @@ impl Discovery for FirewallDiscovery {
     }
 
     async fn accept(&self) -> Result<Box<dyn Transport>> {
-        let transport = self.inner.accept().await?;
-        let seed = self.next_seed().await;
-        Ok(Box::new(FirewallTransport::new(
-            transport,
-            self.policy.clone(),
-            seed,
-        )))
+        loop {
+            let transport = self.inner.accept().await?;
+            // While cut, connections are reset as they arrive.
+            if self.cut.as_ref().is_some_and(|c| c.is_cut()) {
+                continue;
+            }
+            let seed = self.next_seed().await;
+            return Ok(Box::new(FirewallTransport::with_cut(
+                transport,
+                self.policy.clone(),
+                seed,
+                self.cut.clone(),
+            )));
+        }
     }
 
     async fn connect(&self, addr: &str) -> Result<Box<dyn Transport>> {
+        if let Some(cut) = &self.cut {
+            cut.check()?;
+        }
         let transport = self.inner.connect(addr).await?;
         let seed = self.next_seed().await;
-        Ok(Box::new(FirewallTransport::new(
+        Ok(Box::new(FirewallTransport::with_cut(
             transport,
             self.policy.clone(),
             seed,
+            self.cut.clone(),
         )))
     }
 }

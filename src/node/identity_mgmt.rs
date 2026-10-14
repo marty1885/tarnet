@@ -248,7 +248,9 @@ impl Node {
         }
         HelloRecord {
             peer_id: self.peer_id(),
-            capabilities: capabilities::RELAY | capabilities::TUNNEL,
+            capabilities: capabilities::RELAY
+                | capabilities::TUNNEL
+                | self.landmark_capabilities().await,
             signaling_secret: self.signaling_secret,
             transports,
             introducers,

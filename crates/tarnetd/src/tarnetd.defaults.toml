@@ -56,6 +56,15 @@ download_limit = ""
 # still forward DHT lookups but never store or verify other nodes' records.
 dht_store = true
 
+# Publish no address and never become a landmark. For roaming machines that
+# only make outgoing connections: replies come back over their circuits.
+client_only = false
+
+# Landmark role once the network outgrows the routing table: "auto" (when
+# this node relays, stores DHT records and has a link that isn't slow),
+# "never", or "always".
+landmark = "auto"
+
 [bootstrap]
 # Bootstrap peer transport URIs (repeatable)
 # Supports: tcp://host:port, ws://host/path, wss://host/path
