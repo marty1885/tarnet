@@ -191,6 +191,8 @@ pub enum CircuitAction {
         origin_hop: PeerId,
         /// Onion layer crypto for inbound cells.
         crypto: Option<HopCrypto>,
+        /// Multi-cell relay messages from the originator being reassembled.
+        assembler: RelayAssembler,
     },
 }
 
@@ -719,6 +721,7 @@ impl RelayCell {
     }
 }
 
+#[derive(Clone)]
 struct PartialRelayMessage {
     command: RelayCellCommand,
     total: usize,
@@ -732,7 +735,7 @@ struct PartialRelayMessage {
 /// messages may arrive between the pieces of a larger one. One message is
 /// assembled per stream id; a piece that doesn't continue it exactly drops
 /// the partial message.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct RelayAssembler {
     partials: HashMap<u16, PartialRelayMessage>,
 }
@@ -1713,6 +1716,7 @@ mod tests {
         table.insert(
             key,
             CircuitAction::Endpoint {
+                assembler: Default::default(),
                 origin_hop: pid(3),
                 crypto: None,
             },
@@ -1773,6 +1777,7 @@ mod tests {
         table.insert(
             key,
             CircuitAction::Endpoint {
+                assembler: Default::default(),
                 origin_hop: pid(1),
                 crypto: None,
             },

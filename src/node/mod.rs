@@ -276,9 +276,6 @@ pub struct CircuitState {
     pub relay_queues: Arc<Mutex<HashMap<(u32, PeerId), mpsc::Sender<WireMessage>>>>,
     /// Multipath circuit groups: destination → CircuitGroup.
     pub groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
-    /// Multi-cell relay messages being reassembled at this hop, per inbound
-    /// circuit, with when the last piece arrived.
-    pub relay_assembly: Arc<Mutex<HashMap<CircuitKey, (Instant, crate::circuit::RelayAssembler)>>>,
     /// Initiator: circuits waiting for TRUNCATED from their last built hop.
     pub pending_truncates: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>,
 }
@@ -295,7 +292,6 @@ impl CircuitState {
             hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
             relay_queues: Arc::new(Mutex::new(HashMap::new())),
             groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
-            relay_assembly: Arc::new(Mutex::new(HashMap::new())),
             pending_truncates: Arc::new(Mutex::new(HashMap::new())),
         }
     }

@@ -16,7 +16,7 @@
 //! resends them from a small buffer, so one lost frame doesn't cost the whole
 //! message.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 const REC_END: u8 = 0x00;
@@ -221,26 +221,69 @@ pub(crate) fn pack_frame(ready: &mut VecDeque<Vec<u8>>, frame_plain: usize) -> O
     Some(frame)
 }
 
-struct Partial {
+/// The fragments of one message received so far, shared by link and stream
+/// reassembly. Memory grows with what arrives, not with the count the
+/// sender claims.
+pub(crate) struct Fragments {
     count: u16,
-    parts: Vec<Option<Vec<u8>>>,
-    received: u16,
-    /// Highest index seen so far.
-    highest: u16,
+    parts: BTreeMap<u16, Vec<u8>>,
+    bytes: usize,
+}
+
+impl Fragments {
+    pub(crate) fn new(count: u16) -> Self {
+        Self {
+            count,
+            parts: BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(crate) fn count(&self) -> u16 {
+        self.count
+    }
+
+    /// Bytes held.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Add fragment `index` (below `count`). Returns the bytes it added: 0
+    /// for a duplicate.
+    pub(crate) fn insert(&mut self, index: u16, bytes: &[u8]) -> usize {
+        debug_assert!(index < self.count);
+        if self.parts.contains_key(&index) {
+            return 0;
+        }
+        self.parts.insert(index, bytes.to_vec());
+        self.bytes += bytes.len();
+        bytes.len()
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.parts.len() == self.count as usize
+    }
+
+    /// Indices below `below` not yet received.
+    pub(crate) fn missing(&self, below: u16) -> Vec<u16> {
+        (0..below.min(self.count))
+            .filter(|i| !self.parts.contains_key(i))
+            .collect()
+    }
+
+    pub(crate) fn into_message(self) -> Vec<u8> {
+        self.parts.into_values().flatten().collect()
+    }
+}
+
+struct Partial {
+    frags: Fragments,
     /// Indices already asked for by a gap NACK, so a later fragment doesn't
     /// ask again for the same gap.
     gap_nacked_below: u16,
     started: Instant,
     last_rx: Instant,
     nacks: u8,
-}
-
-impl Partial {
-    fn missing(&self, below: u16) -> Vec<u16> {
-        (0..below.min(self.count))
-            .filter(|&i| self.parts[i as usize].is_none())
-            .collect()
-    }
 }
 
 /// Receiver-side reassembly of fragmented messages for one link.
@@ -254,6 +297,9 @@ pub(crate) struct Reassembler {
     /// Silence on a partial message before the receiver NACKs it.
     stall: Duration,
 }
+
+/// Largest message reassembled: a full wire message.
+const MAX_MESSAGE: usize = crate::wire::HEADER_SIZE + crate::wire::MAX_PAYLOAD;
 
 /// Most NACKs sent for one message. Stall NACKs back off (stall, 2×, 4×…),
 /// so the later ones cover repairs that were themselves lost or delayed.
@@ -295,10 +341,11 @@ impl Reassembler {
         // A fragment of a newer message means earlier partials have seen
         // their last fragment go by: whatever they still miss is lost.
         for (&id, p) in self.partials.iter_mut() {
-            if id != msg_id && p.nacks < MAX_NACKS_PER_MESSAGE && p.gap_nacked_below < p.count {
-                let missing = p.missing(p.count);
+            let count = p.frags.count();
+            if id != msg_id && p.nacks < MAX_NACKS_PER_MESSAGE && p.gap_nacked_below < count {
+                let missing = p.frags.missing(count);
                 if !missing.is_empty() && msg_id.wrapping_sub(id) < 0x8000 {
-                    p.gap_nacked_below = p.count;
+                    p.gap_nacked_below = count;
                     p.nacks += 1;
                     nacks.extend(encode_nack(id, &missing));
                 }
@@ -315,10 +362,7 @@ impl Reassembler {
             self.partials.insert(
                 msg_id,
                 Partial {
-                    count,
-                    parts: vec![None; count as usize],
-                    received: 0,
-                    highest: 0,
+                    frags: Fragments::new(count),
                     gap_nacked_below: 0,
                     started: now,
                     last_rx: now,
@@ -327,25 +371,28 @@ impl Reassembler {
             );
         }
         let p = self.partials.get_mut(&msg_id).unwrap();
-        if p.count != count || index >= count {
+        if p.frags.count() != count || index >= count {
             return (None, nacks);
         }
         p.last_rx = now;
-        if p.parts[index as usize].is_none() {
-            p.parts[index as usize] = Some(bytes.to_vec());
-            p.received += 1;
+        if p.frags.bytes() + bytes.len() > MAX_MESSAGE {
+            // More than any wire message: the sender is lying about count.
+            self.partials.remove(&msg_id);
+            self.remember_done(msg_id);
+            return (None, nacks);
         }
-        p.highest = p.highest.max(index);
-        if p.received == p.count {
+        p.frags.insert(index, bytes);
+        if p.frags.is_complete() {
             let p = self.partials.remove(&msg_id).unwrap();
             self.remember_done(msg_id);
-            let msg = p.parts.into_iter().flatten().flatten().collect();
+            let msg = p.frags.into_message();
             return (Some(msg), nacks);
         }
         // Fragments of one message are sent in order, so a gap below the
         // newest index means loss (or reordering; resends are idempotent).
         if p.nacks < MAX_NACKS_PER_MESSAGE && index > p.gap_nacked_below {
             let missing: Vec<u16> = p
+                .frags
                 .missing(index)
                 .into_iter()
                 .filter(|&i| i >= p.gap_nacked_below)
@@ -376,7 +423,7 @@ impl Reassembler {
         for (&id, p) in self.partials.iter_mut() {
             let wait = self.stall * (1u32 << p.nacks.min(8));
             if p.nacks < MAX_NACKS_PER_MESSAGE && now.duration_since(p.last_rx) > wait {
-                let missing = p.missing(p.count);
+                let missing = p.frags.missing(p.frags.count());
                 if !missing.is_empty() {
                     p.nacks += 1;
                     p.last_rx = now;
@@ -652,6 +699,17 @@ mod tests {
         for w in at.windows(3) {
             assert!(w[2] - w[1] > (w[1] - w[0]) * 3 / 2, "{:?}", at);
         }
+    }
+
+    #[test]
+    fn partial_larger_than_any_message_is_dropped() {
+        let t0 = Instant::now();
+        let mut r = Reassembler::new(8, Duration::from_secs(60), Duration::from_secs(60));
+        let chunk = [7u8; 1000];
+        for index in 0..=(MAX_MESSAGE / chunk.len()) as u16 {
+            assert!(r.insert(9, index, u16::MAX, &chunk, t0).0.is_none());
+        }
+        assert!(r.is_empty(), "oversized partial kept");
     }
 
     #[test]

@@ -200,6 +200,9 @@ the measured rate if there is no hint. Messages are classified by wire type:
 * CoDel, per data flow and for background: when the time a message has spent
   queued stays above the target for a whole interval, the scheduler drops from
   the head of that queue, more often the longer it persists.
+  A queue holding no more than one frame after a message leaves it is not
+  standing and is never dropped from (RFC 8289); otherwise one delayed
+  message on an idle link arms the timer and a later, lone message is lost.
 * Target and interval scale with the link: fast links 5 ms / 100 ms; slow links
   target 2 cell airtimes, interval 5 targets.
 * A hard byte cap per link backs this up (fast links 8 MB; slow links 2 s of
@@ -667,7 +670,7 @@ Hello record: `capabilities` gains bit `LANDMARK_ELIGIBLE` and bit `LANDMARK`.
 |---|---|
 | Frame size, fast links | 1449 B (today's `LINK_PAD_SIZE`; fits two 512 B cells) |
 | Frame size, slow links (< 100 KB/s hint) | 256 B on the wire (232 B plaintext) |
-| Coalescing wait, fast links | 30 ms (today's deferred flush) |
+| Coalescing wait, fast links | 30 ms + jitter for deferred messages; held outside the scheduler, so the wait is not queueing delay |
 | Coalescing, slow links | until the frame is full or the link is free |
 | Fragment reassembly | timeout `max(5 s, 4 · tx_time(message))`, 8 partial messages per link |
 | Fragment repair buffer | sent fragments kept max(5 s, 16 · tx_time(frame)), at most 16 KB per link; NACK at most 5 per message, backing off |

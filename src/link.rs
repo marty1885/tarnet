@@ -58,8 +58,6 @@ const MAX_LINK_FRAME: usize = SEQ_SIZE + MAX_FRAME_PLAIN + TAG_SIZE;
 const MAX_PARTIAL_MESSAGES: usize = 8;
 /// Sender buffer of recently sent fragments, for NACK repair.
 const FRAGMENT_REPAIR_BYTES: usize = 16 * 1024;
-/// Record batches (NACKs, repaired fragments) waiting for the drain task.
-const REPAIR_QUEUE_SIZE: usize = 256;
 /// Sliding window size for replay detection.
 const REPLAY_WINDOW: u64 = 128;
 /// Re-key after this many messages sent.
@@ -347,12 +345,21 @@ impl LinkCrypto {
     }
 }
 
-/// The drain task's channels and the state it shares with the receive path.
+/// What the drain task sends.
+enum Outgoing {
+    /// A wire message, dropped by the scheduler under queueing delay.
+    Message(Vec<u8>),
+    /// A wire message the scheduler never drops (circuit control).
+    Critical(Vec<u8>),
+    /// A wire message that waits briefly to share a frame with another.
+    Deferred(Vec<u8>),
+    /// An encoded record (NACK or resent fragment), sent ahead of messages.
+    Repair(Vec<u8>),
+}
+
+/// The drain task's channel and the state it shares with the receive path.
 struct LinkPipes {
-    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    critical_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    deferred_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    repair_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    outbound_tx: tokio::sync::mpsc::Sender<Outgoing>,
     reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
     sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
     task: tokio::task::JoinHandle<()>,
@@ -443,6 +450,7 @@ fn sched_config(transport: &dyn Transport, frame_plain: usize) -> crate::link_sc
                 interval: target * 5,
                 byte_cap: (16 * 1024).max(2 * bps as usize),
                 msg_cap: OUTBOUND_QUEUE_SIZE,
+                quantum: frame_plain,
             }
         }
         _ => SchedConfig {
@@ -450,6 +458,7 @@ fn sched_config(transport: &dyn Transport, frame_plain: usize) -> crate::link_sc
             interval: Duration::from_millis(100),
             byte_cap: 8 * 1024 * 1024,
             msg_cap: OUTBOUND_QUEUE_SIZE,
+            quantum: frame_plain,
         },
     }
 }
@@ -609,24 +618,19 @@ fn is_handshake_type(t: MessageType) -> bool {
 
 /// Authenticated encrypted link to a direct neighbor.
 ///
-/// Outbound wire messages are placed into bounded channels. A background
-/// drain task packs them into fixed-size frames (see [`crate::link_frame`]),
-/// encrypts each frame and writes it to the transport. When the peer is
-/// slower than the sender, the channels fill and new messages are silently
-/// dropped — TCP/WS backpressure propagates naturally from the slow peer
-/// through the drain task into the bounded channels.
+/// Outbound wire messages go through one bounded channel to a background
+/// drain task, which queues them in the link scheduler
+/// ([`crate::link_sched`]), packs them into fixed-size frames (see
+/// [`crate::link_frame`]), encrypts each frame and writes it to the
+/// transport. The scheduler drops what waits too long; if the channel itself
+/// fills, new messages are dropped, except critical ones, which wait.
 pub struct PeerLink {
     transport: Arc<dyn Transport>,
     /// Shared with the drain task, which encrypts frames as it sends them so
     /// frame seqs go out in order.
     crypto: Arc<tokio::sync::Mutex<LinkCrypto>>,
-    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// Sends that must not be dropped for queueing delay (circuit control).
-    critical_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// Non-critical messages, sent in the next frame that has room.
-    deferred_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// Encoded records (NACKs, repaired fragments) sent ahead of messages.
-    repair_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Everything sent on the link, to the drain task.
+    outbound_tx: tokio::sync::mpsc::Sender<Outgoing>,
     reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
     /// Fragments recently sent, for NACK repair.
     sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
@@ -880,9 +884,6 @@ impl PeerLink {
             transport,
             crypto,
             outbound_tx: pipes.outbound_tx,
-            critical_tx: pipes.critical_tx,
-            deferred_tx: pipes.deferred_tx,
-            repair_tx: pipes.repair_tx,
             reassembler: pipes.reassembler,
             sent_fragments: pipes.sent_fragments,
             remote_peer,
@@ -1096,9 +1097,6 @@ impl PeerLink {
             transport,
             crypto,
             outbound_tx: pipes.outbound_tx,
-            critical_tx: pipes.critical_tx,
-            deferred_tx: pipes.deferred_tx,
-            repair_tx: pipes.repair_tx,
             reassembler: pipes.reassembler,
             sent_fragments: pipes.sent_fragments,
             remote_peer,
@@ -1164,11 +1162,11 @@ impl PeerLink {
     /// Spawn the background drain task that packs queued messages into
     /// frames, encrypts them and writes them to the transport.
     ///
-    /// High-priority messages go out at once, sharing their frame with
-    /// whatever else is queued. Deferred messages wait up to
-    /// [`DEFERRED_FLUSH_MS`] (jittered) for a high-priority message to ride
-    /// with, so fewer distinctly-timed frames appear on the wire. Repair
-    /// records (NACKs, resent fragments) go ahead of both.
+    /// Messages go out at once in scheduler order, sharing their frame with
+    /// whatever else is queued. A deferred message arriving at an idle link
+    /// waits up to [`DEFERRED_FLUSH_MS`] (jittered) for another message to
+    /// ride with, so fewer distinctly-timed frames appear on the wire. Repair
+    /// records (NACKs, resent fragments) go ahead of everything.
     fn spawn_drain(
         transport: Arc<dyn Transport>,
         crypto: Arc<tokio::sync::Mutex<LinkCrypto>>,
@@ -1196,10 +1194,7 @@ impl PeerLink {
             Duration::from_secs(5).max(frame_time * 16),
         )));
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
-        let (crit_tx, mut crit_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
-        let (def_tx, mut def_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
-        let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(REPAIR_QUEUE_SIZE);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Outgoing>(OUTBOUND_QUEUE_SIZE);
         let sched_cfg = sched_config(transport.as_ref(), frame_plain);
 
         let task_reassembler = reassembler.clone();
@@ -1211,8 +1206,6 @@ impl PeerLink {
             // one frame's worth plus the rest of a fragmented message.
             let mut ready: VecDeque<Vec<u8>> = VecDeque::new();
             let mut next_msg_id: u16 = 0;
-            let mut nack_tick = tokio::time::interval(stall / 2);
-            nack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut reported_drops = 0;
             let mut next_nack_poll = std::time::Instant::now();
 
@@ -1228,77 +1221,22 @@ impl PeerLink {
                 }
                 ready.extend(records);
             };
+            // Messages go to the scheduler; repair records skip it.
+            let take = |sched: &mut Scheduler, ready: &mut VecDeque<Vec<u8>>, out: Outgoing| {
+                let now = std::time::Instant::now();
+                match out {
+                    Outgoing::Message(data) | Outgoing::Deferred(data) => sched.push(data, false, now),
+                    Outgoing::Critical(data) => sched.push(data, true, now),
+                    Outgoing::Repair(rec) => ready.push_front(rec),
+                }
+            };
 
             'drain: loop {
                 // Take in everything already waiting.
-                let now = std::time::Instant::now();
-                let mut repairs = Vec::new();
-                while let Ok(rec) = repair_rx.try_recv() {
-                    repairs.push(rec);
+                while let Ok(out) = rx.try_recv() {
+                    take(&mut sched, &mut ready, out);
                 }
-                for rec in repairs.into_iter().rev() {
-                    ready.push_front(rec);
-                }
-                while let Ok(data) = crit_rx.try_recv() {
-                    sched.push(data, true, now);
-                }
-                while let Ok(data) = rx.try_recv() {
-                    sched.push(data, false, now);
-                }
-                while let Ok(data) = def_rx.try_recv() {
-                    sched.push(data, false, now);
-                }
-
-                if ready.is_empty() && sched.is_empty() {
-                    tokio::select! {
-                        biased;
-                        rec = repair_rx.recv() => {
-                            let Some(rec) = rec else { break };
-                            ready.push_back(rec);
-                        }
-                        msg = crit_rx.recv() => {
-                            let Some(data) = msg else { break };
-                            sched.push(data, true, std::time::Instant::now());
-                        }
-                        msg = rx.recv() => {
-                            let Some(data) = msg else { break };
-                            sched.push(data, false, std::time::Instant::now());
-                        }
-                        msg = def_rx.recv() => {
-                            let Some(data) = msg else { break };
-                            sched.push(data, false, std::time::Instant::now());
-                            // Wait briefly for a high-priority message to share
-                            // the frame with; it ends the wait early.
-                            let jitter = {
-                                use rand::Rng;
-                                rand::thread_rng().gen_range(0..DEFERRED_FLUSH_MS)
-                            };
-                            let wait = Duration::from_millis(DEFERRED_FLUSH_MS + jitter);
-                            tokio::select! {
-                                biased;
-                                msg = crit_rx.recv() => {
-                                    let Some(data) = msg else { break 'drain };
-                                    sched.push(data, true, std::time::Instant::now());
-                                }
-                                msg = rx.recv() => {
-                                    let Some(data) = msg else { break 'drain };
-                                    sched.push(data, false, std::time::Instant::now());
-                                }
-                                _ = tokio::time::sleep(wait) => {}
-                            }
-                        }
-                        _ = nack_tick.tick() => {
-                            let nacks = {
-                                let mut r = task_reassembler.lock().unwrap();
-                                if r.is_empty() { Vec::new() } else { r.poll(std::time::Instant::now()) }
-                            };
-                            ready.extend(nacks);
-                        }
-                    }
-                    continue;
-                }
-
-                // Stalled partials still get NACKed while the link is busy.
+                // NACK stalled partial messages, idle or busy.
                 let now = std::time::Instant::now();
                 if now >= next_nack_poll {
                     next_nack_poll = now + stall / 2;
@@ -1306,6 +1244,48 @@ impl PeerLink {
                     if !r.is_empty() {
                         ready.extend(r.poll(now));
                     }
+                }
+
+                if ready.is_empty() && sched.is_empty() {
+                    tokio::select! {
+                        out = rx.recv() => {
+                            let Some(out) = out else { break };
+                            let Outgoing::Deferred(first) = out else {
+                                take(&mut sched, &mut ready, out);
+                                continue;
+                            };
+                            // Wait briefly for a message that isn't deferred
+                            // to share the frame; it ends the wait early.
+                            // Held messages reach the scheduler only after
+                            // the wait, which is not queueing delay.
+                            let mut held = vec![first];
+                            let jitter = {
+                                use rand::Rng;
+                                rand::thread_rng().gen_range(0..DEFERRED_FLUSH_MS)
+                            };
+                            let flush = tokio::time::sleep(Duration::from_millis(DEFERRED_FLUSH_MS + jitter));
+                            tokio::pin!(flush);
+                            loop {
+                                tokio::select! {
+                                    out = rx.recv() => match out {
+                                        None => break 'drain,
+                                        Some(Outgoing::Deferred(data)) => held.push(data),
+                                        Some(out) => {
+                                            take(&mut sched, &mut ready, out);
+                                            break;
+                                        }
+                                    },
+                                    _ = &mut flush => break,
+                                }
+                            }
+                            let now = std::time::Instant::now();
+                            for data in held {
+                                sched.push(data, false, now);
+                            }
+                        }
+                        _ = tokio::time::sleep_until(next_nack_poll.into()) => {}
+                    }
+                    continue;
                 }
 
                 // Fill the frame from the scheduler, highest class first.
@@ -1335,9 +1315,6 @@ impl PeerLink {
         });
         LinkPipes {
             outbound_tx: tx,
-            critical_tx: crit_tx,
-            deferred_tx: def_tx,
-            repair_tx,
             reassembler,
             sent_fragments,
             task,
@@ -1363,9 +1340,8 @@ impl PeerLink {
     }
 
     /// Enqueue a message, dropping it if the queue is full.
-    fn enqueue(&self, tx: &tokio::sync::mpsc::Sender<Vec<u8>>, data: &[u8]) -> Result<()> {
-        Self::check_size(data, self.remote_peer)?;
-        match tx.try_send(data.to_vec()) {
+    fn enqueue(&self, out: Outgoing) -> Result<()> {
+        match self.outbound_tx.try_send(out) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 log::trace!("outbound queue full to {:?}, dropping", self.remote_peer);
@@ -1382,7 +1358,8 @@ impl PeerLink {
     /// If the queue is full (peer is congested), the message is silently
     /// dropped — reliable end-to-end Channels handle recovery.
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
-        self.enqueue(&self.outbound_tx, data)
+        Self::check_size(data, self.remote_peer)?;
+        self.enqueue(Outgoing::Message(data.to_vec()))
     }
 
     /// Send over the high-priority queue, awaiting capacity instead of
@@ -1395,8 +1372,8 @@ impl PeerLink {
     /// [`send_message`], where reliable Channels recover dropped packets.
     pub async fn send_message_critical(&self, data: &[u8]) -> Result<()> {
         Self::check_size(data, self.remote_peer)?;
-        self.critical_tx
-            .send(data.to_vec())
+        self.outbound_tx
+            .send(Outgoing::Critical(data.to_vec()))
             .await
             .map_err(|_| Error::Wire("link closed".into()))
     }
@@ -1404,10 +1381,12 @@ impl PeerLink {
     /// Send a non-critical message via the deferred queue.
     ///
     /// The drain task holds deferred messages for up to [`DEFERRED_FLUSH_MS`]
-    /// and sends them in the frame of the next high-priority message, reducing
-    /// the number of distinctly-timed link-layer frames an observer can see.
+    /// and sends them in the frame of the next message that isn't deferred,
+    /// reducing the number of distinctly-timed link-layer frames an observer
+    /// can see.
     pub async fn send_deferred(&self, data: &[u8]) -> Result<()> {
-        self.enqueue(&self.deferred_tx, data)
+        Self::check_size(data, self.remote_peer)?;
+        self.enqueue(Outgoing::Deferred(data.to_vec()))
     }
 
     /// Unpack a decrypted frame: queue its messages, reassemble fragments,
@@ -1442,7 +1421,7 @@ impl PeerLink {
         drop(inbox);
         for rec in repairs {
             // Best effort: a full repair queue costs only the repair.
-            let _ = self.repair_tx.try_send(rec);
+            let _ = self.outbound_tx.try_send(Outgoing::Repair(rec));
         }
     }
 

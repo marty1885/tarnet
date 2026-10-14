@@ -85,6 +85,9 @@ pub(crate) struct SchedConfig {
     pub byte_cap: usize,
     /// Most messages queued across all classes.
     pub msg_cap: usize,
+    /// A queue holding no more than this after a message leaves it is not a
+    /// standing queue and is never dropped from (one frame).
+    pub quantum: usize,
 }
 
 struct Queued {
@@ -120,8 +123,17 @@ impl CoDel {
         now + cfg.interval.div_f64((self.count.max(1) as f64).sqrt())
     }
 
-    /// Whether to drop a message that waited `sojourn`, CoDel's control law.
-    fn should_drop(&mut self, sojourn: Duration, now: Instant, cfg: &SchedConfig) -> bool {
+    /// Whether to drop a message that waited `sojourn`, leaving `backlog`
+    /// bytes queued behind it: CoDel's control law.
+    fn should_drop(&mut self, sojourn: Duration, backlog: usize, now: Instant, cfg: &SchedConfig) -> bool {
+        // A nearly empty queue isn't standing, however long its last message
+        // waited (RFC 8289). Without this, one delayed message on an idle
+        // link arms the timer and a later, lone message is dropped.
+        if backlog <= cfg.quantum {
+            self.first_above = None;
+            self.dropping = false;
+            return false;
+        }
         let above = self.above_for_interval(sojourn, now, cfg);
         if self.dropping {
             if !above {
@@ -166,6 +178,7 @@ enum FlowList {
 pub(crate) struct Scheduler {
     /// Control, circuit control and background queues (FIFO).
     fifo: [VecDeque<Queued>; 4],
+    fifo_bytes: [usize; 4],
     fifo_codel: CoDel,
     /// Data flows, fair-queued.
     flows: HashMap<u64, (Flow, FlowList)>,
@@ -187,6 +200,7 @@ impl Scheduler {
     pub(crate) fn new(cfg: SchedConfig) -> Self {
         Self {
             fifo: Default::default(),
+            fifo_bytes: [0; 4],
             fifo_codel: CoDel::default(),
             flows: HashMap::new(),
             new_flows: VecDeque::new(),
@@ -230,6 +244,7 @@ impl Scheduler {
         self.total_msgs += 1;
         let queued = Queued { data, at: now };
         if class != Class::Data {
+            self.fifo_bytes[class as usize] += len;
             self.fifo[class as usize].push_back(queued);
             return;
         }
@@ -246,6 +261,7 @@ impl Scheduler {
     /// false if nothing at or below that priority can go.
     fn shed(&mut self, incoming: Class) -> bool {
         if let Some(q) = self.fifo[Class::Background as usize].pop_back() {
+            self.fifo_bytes[Class::Background as usize] -= q.data.len();
             self.total_bytes -= q.data.len();
             self.total_msgs -= 1;
             self.dropped += 1;
@@ -310,11 +326,13 @@ impl Scheduler {
     fn pop_fifo(&mut self, class: Class, now: Instant) -> Option<Vec<u8>> {
         loop {
             let q = self.fifo[class as usize].pop_front()?;
+            self.fifo_bytes[class as usize] -= q.data.len();
             self.total_bytes -= q.data.len();
             self.total_msgs -= 1;
             if class == Class::Background {
                 let sojourn = now.saturating_duration_since(q.at);
-                if self.fifo_codel.should_drop(sojourn, now, &self.cfg) {
+                let backlog = self.fifo_bytes[class as usize];
+                if self.fifo_codel.should_drop(sojourn, backlog, now, &self.cfg) {
                     self.dropped += 1;
                     continue;
                 }
@@ -339,7 +357,7 @@ impl Scheduler {
                 self.total_bytes -= q.data.len();
                 self.total_msgs -= 1;
                 let sojourn = now.saturating_duration_since(q.at);
-                if flow.codel.should_drop(sojourn, now, &cfg) {
+                if flow.codel.should_drop(sojourn, flow.bytes, now, &cfg) {
                     self.dropped += 1;
                     continue;
                 }
@@ -372,6 +390,7 @@ mod tests {
             interval: Duration::from_millis(500),
             byte_cap: 64 * 1024,
             msg_cap: 4096,
+            quantum: 0,
         }
     }
 
@@ -394,6 +413,21 @@ mod tests {
 
     fn create() -> Vec<u8> {
         WireMessage::new(MessageType::CircuitCreate, vec![0; 50]).encode()
+    }
+
+    #[test]
+    fn lone_late_message_on_idle_queue_is_not_dropped() {
+        let mut s = Scheduler::new(cfg());
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        // Each message waits past the target, but the queue never holds more
+        // than the one: nothing is standing, nothing is dropped.
+        for k in 0..5u32 {
+            let at = t0 + ms(1000) * k;
+            s.push(dht(), false, at);
+            assert!(s.pop(at + ms(200)).is_some(), "message {k} dropped");
+        }
+        assert_eq!(s.dropped(), 0);
     }
 
     #[test]

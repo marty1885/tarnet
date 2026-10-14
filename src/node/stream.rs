@@ -1,6 +1,5 @@
 //! End-to-end sequencing, acknowledgements, retransmission, and ordered EOF.
 use super::*;
-use std::collections::BTreeMap;
 
 pub(super) struct StreamState {
     pub app_tx: mpsc::WeakSender<Vec<u8>>,
@@ -76,9 +75,7 @@ struct FragmentAssembler {
 
 struct PartialMessage {
     first_arrival: u64,
-    count: u16,
-    parts: BTreeMap<u16, Vec<u8>>,
-    bytes: usize,
+    frags: crate::link_frame::Fragments,
 }
 
 impl FragmentAssembler {
@@ -89,7 +86,7 @@ impl FragmentAssembler {
             .min_by_key(|(_, p)| p.first_arrival)
             .map(|(id, _)| *id);
         if let Some(p) = oldest.and_then(|id| self.partials.remove(&id)) {
-            self.bytes -= p.bytes;
+            self.bytes -= p.frags.bytes();
         }
     }
 
@@ -115,26 +112,20 @@ impl FragmentAssembler {
         let arrivals = self.arrivals;
         let partial = self.partials.entry(msg_id).or_insert_with(|| PartialMessage {
             first_arrival: arrivals,
-            count,
-            parts: BTreeMap::new(),
-            bytes: 0,
+            frags: crate::link_frame::Fragments::new(count),
         });
-        if partial.count != count {
+        if partial.frags.count() != count {
             let p = self.partials.remove(&msg_id)?;
-            self.bytes -= p.bytes;
+            self.bytes -= p.frags.bytes();
             return None;
         }
-        if !partial.parts.contains_key(&index) {
-            partial.parts.insert(index, bytes.to_vec());
-            partial.bytes += bytes.len();
-            self.bytes += bytes.len();
-        }
-        if partial.parts.len() < count as usize {
+        self.bytes += partial.frags.insert(index, bytes);
+        if !partial.frags.is_complete() {
             return None;
         }
         let p = self.partials.remove(&msg_id)?;
-        self.bytes -= p.bytes;
-        Some(p.parts.into_values().flatten().collect())
+        self.bytes -= p.frags.bytes();
+        Some(p.frags.into_message())
     }
 }
 

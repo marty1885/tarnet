@@ -13,11 +13,6 @@ const EXTEND_PER_HOP: Duration = Duration::from_millis(500);
 const EXTEND_ATTEMPTS: usize = 3;
 /// Tries at getting TRUNCATED back from the last built hop.
 const TRUNCATE_ATTEMPTS: usize = 3;
-/// A multi-cell relay message whose next piece doesn't arrive within this
-/// is abandoned.
-const RELAY_ASSEMBLY_TTL: Duration = Duration::from_secs(60);
-/// Inbound circuits with a multi-cell message in reassembly at once.
-const MAX_RELAY_ASSEMBLIES: usize = 1024;
 /// How long a hop keeps its CircuitCreated reply for answering resent CREATEs.
 const CREATED_REPLY_TTL: Duration = Duration::from_secs(30);
 
@@ -182,6 +177,7 @@ mod audit_tests {
         node.circuits.table.lock().await.insert(
             remote_key,
             CircuitAction::Endpoint {
+                assembler: Default::default(),
                 crypto: None,
                 origin_hop: remote_peer,
             },
@@ -801,55 +797,36 @@ impl Node {
             return Ok(());
         }
 
-        // We need the MAC key to parse. Get it from the endpoint crypto entry.
-        let table = self.circuits.table.lock().await;
         let key = CircuitKey {
             circuit_id,
             from_peer: from,
         };
-        let digest_key = match table.lookup(&key) {
-            Some(CircuitAction::Endpoint {
-                crypto: Some(c), ..
-            }) => c.digest_key,
-            _ => {
+        let body: &[u8; CELL_BODY_SIZE] = cell_data[..CELL_BODY_SIZE].try_into().unwrap();
+        // Pieces of a larger message are held on the circuit entry, so they
+        // go away with the circuit.
+        let relay_cell = {
+            let mut table = self.circuits.table.lock().await;
+            let Some(CircuitAction::Endpoint {
+                crypto: Some(crypto),
+                assembler,
+                ..
+            }) = table.lookup_mut(&key)
+            else {
                 log::debug!("No endpoint crypto for circuit_id={}", circuit_id);
                 return Ok(());
-            }
-        };
-        drop(table);
-
-        let body: &[u8; CELL_BODY_SIZE] = cell_data[..CELL_BODY_SIZE].try_into().unwrap();
-        let piece = match RelayPiece::from_cell(body, &digest_key) {
-            Ok(piece) => piece,
-            Err(e) => {
-                log::warn!(
-                    "Relay cell parse failed at endpoint circuit_id={}: {}",
-                    circuit_id,
-                    e
-                );
-                return Ok(());
-            }
-        };
-        let relay_cell = if !piece.more && piece.command != RelayCellCommand::Continue {
-            RelayCell {
-                command: piece.command,
-                stream_id: piece.stream_id,
-                data: piece.data,
-            }
-        } else {
-            let mut assembly = self.circuits.relay_assembly.lock().await;
-            let now = Instant::now();
-            assembly.retain(|_, (at, _)| now.duration_since(*at) < RELAY_ASSEMBLY_TTL);
-            if assembly.len() >= MAX_RELAY_ASSEMBLIES && !assembly.contains_key(&key) {
-                return Ok(());
-            }
-            let entry = assembly.entry(key).or_insert_with(|| (now, Default::default()));
-            entry.0 = now;
-            let done = entry.1.push(piece);
-            if entry.1.is_empty() {
-                assembly.remove(&key);
-            }
-            match done {
+            };
+            let piece = match RelayPiece::from_cell(body, &crypto.digest_key) {
+                Ok(piece) => piece,
+                Err(e) => {
+                    log::warn!(
+                        "Relay cell parse failed at endpoint circuit_id={}: {}",
+                        circuit_id,
+                        e
+                    );
+                    return Ok(());
+                }
+            };
+            match assembler.push(piece) {
                 Some(relay_cell) => relay_cell,
                 None => return Ok(()),
             }
@@ -957,6 +934,7 @@ impl Node {
                     table.insert(
                         key,
                         CircuitAction::Endpoint {
+                            assembler: Default::default(),
                             origin_hop: from,
                             crypto: Some(crypto),
                         },
@@ -1356,6 +1334,7 @@ impl Node {
                 from_peer: from,
             },
             CircuitAction::Endpoint {
+                assembler: Default::default(),
                 origin_hop: from,
                 crypto: Some(HopCrypto {
                     key: hop_keys.forward_key,
