@@ -2440,3 +2440,99 @@ async fn firewall_channel_drop_and_delay() {
     )
     .await;
 }
+
+/// A bulk transfer and an interactive session share an HC-12-class line
+/// (B sends at 2 KB/s). Keystroke round trips must stay short while the bulk
+/// transfer still makes progress: the link schedules interactive cells ahead
+/// of bulk ones and drops bulk cells that queue too long, instead of letting
+/// them pile up seconds deep.
+#[tokio::test]
+async fn firewall_slow_link_keeps_interactive_latency_under_bulk() {
+    init_log();
+    let policy = FirewallPolicy::RateLimit {
+        bytes_per_sec: 2_000,
+        drop_rate: 0.0,
+    };
+    let (node_a, node_b) = lossy_pair(0, 0, Some(policy)).await;
+    let pid_b = node_b.peer_id();
+    let service_id = node_b.default_service_id().await;
+
+    let bulk_listener = node_b
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "bulk", ListenerOptions::default())
+        .await
+        .unwrap();
+    let echo_listener = node_b
+        .circuit_listen(ServiceId::ALL, TEST_MODE, "echo", ListenerOptions::default())
+        .await
+        .unwrap();
+
+    // B: push bulk data at A as fast as the stream accepts it.
+    let nb = node_b.clone();
+    let bulk_sender = tokio::spawn(async move {
+        let conn = nb.circuit_accept(bulk_listener.id).await.unwrap();
+        let chunk = vec![0x5Au8; 400];
+        while conn.send(&chunk).await.is_ok() {}
+    });
+    // B: echo whatever arrives on the interactive stream.
+    let nb = node_b.clone();
+    let echo = tokio::spawn(async move {
+        let conn = nb.circuit_accept(echo_listener.id).await.unwrap();
+        while let Ok(data) = conn.recv().await {
+            if conn.send(&data).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let connect = |port: &'static str| {
+        let na = node_a.clone();
+        async move {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                na.circuit_connect(service_id, TEST_MODE, port, Some(pid_b), None),
+            )
+            .await
+            .expect("connect timed out")
+            .expect("connect failed")
+        }
+    };
+    let bulk = connect("bulk").await;
+    let echo_conn = connect("echo").await;
+
+    let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = received.clone();
+    let bulk_reader = tokio::spawn(async move {
+        while let Ok(data) = bulk.recv().await {
+            counter.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+
+    // Let the bulk transfer fill the line.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let mut worst = Duration::ZERO;
+    for i in 0..6u8 {
+        let started = std::time::Instant::now();
+        echo_conn.send(&[i; 8]).await.unwrap();
+        let back = tokio::time::timeout(Duration::from_secs(30), echo_conn.recv())
+            .await
+            .expect("keystroke echo lost")
+            .unwrap();
+        assert_eq!(back, vec![i; 8]);
+        worst = worst.max(started.elapsed());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let goodput = received.load(std::sync::atomic::Ordering::Relaxed);
+    log::info!("slow link: worst keystroke RTT {:?}, bulk received {} B", worst, goodput);
+
+    assert!(goodput > 4_000, "bulk transfer starved: {} B", goodput);
+    assert!(
+        worst < Duration::from_secs(3),
+        "keystroke RTT {:?} behind bulk traffic on a 2 KB/s line",
+        worst
+    );
+
+    bulk_sender.abort();
+    echo.abort();
+    bulk_reader.abort();
+}

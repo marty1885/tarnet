@@ -1,5 +1,6 @@
 //! End-to-end sequencing, acknowledgements, retransmission, and ordered EOF.
 use super::*;
+use std::collections::BTreeMap;
 
 pub(super) struct StreamState {
     pub app_tx: mpsc::WeakSender<Vec<u8>>,
@@ -8,6 +9,133 @@ pub(super) struct StreamState {
     pub outbound: bool,
     remote_fin: std::sync::Mutex<Option<u32>>,
     remote_closed: std::sync::atomic::AtomicBool,
+    /// Application messages arriving in several channel packets.
+    fragments: std::sync::Mutex<FragmentAssembler>,
+}
+
+// Channel packet kinds. A packet is `kind(u8) || body`.
+/// One whole application message.
+const KIND_DATA: u8 = 0;
+/// End of the sending direction (body empty).
+const KIND_FIN: u8 = 1;
+/// Part of an application message too large for one cell:
+/// `msg_id(u16) || index(u16) || count(u16) || bytes`.
+const KIND_FRAGMENT: u8 = 2;
+const FRAGMENT_HEADER: usize = 1 + 6;
+/// Channel packet bytes that fit one DATA cell after the channel sequence.
+const PACKET_MAX: usize = CELL_PAYLOAD_MAX - 4;
+/// Bounds on partially received application messages per stream. On a
+/// reliable stream every missing fragment is still on its way (it holds a
+/// channel window slot until acknowledged), so these only trip for a
+/// misbehaving peer; on an unreliable stream they also shed messages whose
+/// fragments were lost. The oldest partial message is dropped first.
+const MAX_PARTIAL_MESSAGES: usize = 256;
+const MAX_PARTIAL_BYTES: usize = 4 * 1024 * 1024;
+
+/// Split an application message into channel packets.
+fn packetize(data: &[u8], next_msg_id: &mut u16) -> Vec<Vec<u8>> {
+    if 1 + data.len() <= PACKET_MAX {
+        let mut packet = Vec::with_capacity(1 + data.len());
+        packet.push(KIND_DATA);
+        packet.extend_from_slice(data);
+        return vec![packet];
+    }
+    let chunk = PACKET_MAX - FRAGMENT_HEADER;
+    let count = data.len().div_ceil(chunk);
+    // A message too large to number in 16 bits is sent as several messages.
+    if count > u16::MAX as usize {
+        let (head, tail) = data.split_at(chunk * u16::MAX as usize);
+        let mut packets = packetize(head, next_msg_id);
+        packets.extend(packetize(tail, next_msg_id));
+        return packets;
+    }
+    let msg_id = *next_msg_id;
+    *next_msg_id = next_msg_id.wrapping_add(1);
+    data.chunks(chunk)
+        .enumerate()
+        .map(|(index, bytes)| {
+            let mut packet = Vec::with_capacity(FRAGMENT_HEADER + bytes.len());
+            packet.push(KIND_FRAGMENT);
+            packet.extend_from_slice(&msg_id.to_be_bytes());
+            packet.extend_from_slice(&(index as u16).to_be_bytes());
+            packet.extend_from_slice(&(count as u16).to_be_bytes());
+            packet.extend_from_slice(bytes);
+            packet
+        })
+        .collect()
+}
+
+/// Reassembles fragmented application messages. Fragments may arrive in any
+/// order (unordered streams) or never (unreliable streams).
+#[derive(Default)]
+struct FragmentAssembler {
+    partials: HashMap<u16, PartialMessage>,
+    bytes: usize,
+    arrivals: u64,
+}
+
+struct PartialMessage {
+    first_arrival: u64,
+    count: u16,
+    parts: BTreeMap<u16, Vec<u8>>,
+    bytes: usize,
+}
+
+impl FragmentAssembler {
+    fn drop_oldest(&mut self) {
+        let oldest = self
+            .partials
+            .iter()
+            .min_by_key(|(_, p)| p.first_arrival)
+            .map(|(id, _)| *id);
+        if let Some(p) = oldest.and_then(|id| self.partials.remove(&id)) {
+            self.bytes -= p.bytes;
+        }
+    }
+
+    /// Add a fragment packet body; returns the message it completes.
+    fn push(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+        if body.len() < 6 {
+            return None;
+        }
+        let msg_id = u16::from_be_bytes([body[0], body[1]]);
+        let index = u16::from_be_bytes([body[2], body[3]]);
+        let count = u16::from_be_bytes([body[4], body[5]]);
+        let bytes = &body[6..];
+        if count < 2 || index >= count {
+            return None;
+        }
+        self.arrivals += 1;
+        if !self.partials.contains_key(&msg_id) && self.partials.len() >= MAX_PARTIAL_MESSAGES {
+            self.drop_oldest();
+        }
+        while self.bytes + bytes.len() > MAX_PARTIAL_BYTES && !self.partials.is_empty() {
+            self.drop_oldest();
+        }
+        let arrivals = self.arrivals;
+        let partial = self.partials.entry(msg_id).or_insert_with(|| PartialMessage {
+            first_arrival: arrivals,
+            count,
+            parts: BTreeMap::new(),
+            bytes: 0,
+        });
+        if partial.count != count {
+            let p = self.partials.remove(&msg_id)?;
+            self.bytes -= p.bytes;
+            return None;
+        }
+        if !partial.parts.contains_key(&index) {
+            partial.parts.insert(index, bytes.to_vec());
+            partial.bytes += bytes.len();
+            self.bytes += bytes.len();
+        }
+        if partial.parts.len() < count as usize {
+            return None;
+        }
+        let p = self.partials.remove(&msg_id)?;
+        self.bytes -= p.bytes;
+        Some(p.parts.into_values().flatten().collect())
+    }
 }
 
 impl EndpointState {
@@ -100,7 +228,18 @@ impl Node {
             outbound,
             remote_fin: std::sync::Mutex::new(None),
             remote_closed: std::sync::atomic::AtomicBool::new(false),
+            fragments: Default::default(),
         });
+        // Our link on this circuit is the slowest hop we know of: size
+        // retransmission timeouts so packets queued on it aren't resent early.
+        let airtime = self
+            .links
+            .lock()
+            .await
+            .get(&key.from_peer)
+            .map(|l| l.message_airtime(HEADER_SIZE + 4 + CELL_SIZE))
+            .unwrap_or_default();
+        stream.channel.lock().await.set_path_airtime(airtime);
         let (incoming_tx, app_rx) = mpsc::channel::<Vec<u8>>(256);
         self.endpoints
             .data_txs
@@ -117,6 +256,7 @@ impl Node {
         let links = self.links.clone();
         tokio::spawn(async move {
             let mut pending = VecDeque::<Vec<u8>>::new();
+            let mut next_msg_id: u16 = 0;
             let mut closing = false;
             let mut fin_sent = false;
             let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -165,7 +305,7 @@ impl Node {
                     }
                     if channel.can_send() {
                         pending.pop_front().map(|payload| {
-                            fin_sent |= payload[0] == 1;
+                            fin_sent |= payload[0] == KIND_FIN;
                             channel.prepare_send(payload).remove(0)
                         })
                     } else {
@@ -173,6 +313,7 @@ impl Node {
                     }
                 };
                 if let Some((sequence, payload)) = packet {
+                    log::trace!("stream {:?}: send seq {}", key.circuit_id, sequence);
                     let mut data = sequence.to_be_bytes().to_vec();
                     data.extend_from_slice(&payload);
                     if send_cell(
@@ -194,16 +335,11 @@ impl Node {
                     data = outgoing.recv(), if pending.is_empty() && !closing => {
                         match data {
                             Some(data) => {
-                                for chunk in data.chunks(CELL_PAYLOAD_MAX - 5) {
-                                    let mut payload = Vec::with_capacity(chunk.len() + 1);
-                                    payload.push(0);
-                                    payload.extend_from_slice(chunk);
-                                    pending.push_back(payload);
-                                }
+                                pending.extend(packetize(&data, &mut next_msg_id));
                             }
                             None => {
                                 closing = true;
-                                if reliable { pending.push_back(vec![1]); }
+                                if reliable { pending.push_back(vec![KIND_FIN]); }
                                 else { break; }
                             }
                         }
@@ -212,6 +348,7 @@ impl Node {
                     _ = tick.tick() => {
                         let due = stream.channel.lock().await.retransmit_due();
                         for (sequence, payload) in due {
+                            log::trace!("stream {:?}: retransmit seq {}", key.circuit_id, sequence);
                             let mut data = sequence.to_be_bytes().to_vec();
                             data.extend_from_slice(&payload);
                             if send_cell(&circuits, &links, key, outbound, RelayCellCommand::Data, &data).await.is_err() { break 'send; }
@@ -243,7 +380,11 @@ impl Node {
     }
 
     pub(super) async fn handle_stream_data(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
-        if data.len() < 5 || data[4] > 1 || (data[4] == 1 && data.len() != 5) {
+        if data.len() < 5
+            || data[4] > KIND_FRAGMENT
+            || (data[4] == KIND_FIN && data.len() != 5)
+            || (data[4] == KIND_FRAGMENT && data.len() < 4 + FRAGMENT_HEADER)
+        {
             return Err(Error::Wire("invalid stream DATA".into()));
         }
         let stream = self.endpoints.streams.lock().await.get(&key).cloned();
@@ -256,16 +397,22 @@ impl Node {
             let ready = channel.receive_data(sequence, data[4..].to_vec());
             (ready, channel.generate_ack())
         };
-        if data[4] == 1 {
+        if data[4] == KIND_FIN {
             *stream.remote_fin.lock().unwrap() = Some(sequence);
         }
+        let messages: Vec<Vec<u8>> = ready
+            .into_iter()
+            .filter_map(|payload| match payload[0] {
+                KIND_DATA => Some(payload[1..].to_vec()),
+                KIND_FRAGMENT => stream.fragments.lock().unwrap().push(&payload[1..]),
+                _ => None,
+            })
+            .collect();
         // Application backpressure must not hold a node-wide map lock.
-        for payload in ready {
-            if payload[0] == 0 {
-                let tx = self.endpoints.data_txs.lock().await.get(&key).cloned();
-                if let Some(tx) = tx {
-                    let _ = tx.send(payload[1..].to_vec()).await;
-                }
+        for message in messages {
+            let tx = self.endpoints.data_txs.lock().await.get(&key).cloned();
+            if let Some(tx) = tx {
+                let _ = tx.send(message).await;
             }
         }
         if let Some((ack_seq, selective_acks)) = ack {
@@ -303,6 +450,12 @@ impl Node {
         }
         let stream = self.endpoints.streams.lock().await.get(&key).cloned();
         if let Some(stream) = stream {
+            log::trace!(
+                "stream {:?}: ack {} sack {:?}",
+                key.circuit_id,
+                ack.ack_seq,
+                ack.selective_acks
+            );
             stream
                 .channel
                 .lock()
@@ -311,5 +464,79 @@ impl Node {
             stream.notify.notify_one();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(len: usize, shuffle: bool) {
+        let data: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+        let mut id = 0;
+        let mut packets = packetize(&data, &mut id);
+        assert!(packets.iter().all(|p| p.len() <= PACKET_MAX));
+        if shuffle {
+            packets.reverse();
+        }
+        let mut asm = FragmentAssembler::default();
+        let mut out = None;
+        for p in packets {
+            out = match p[0] {
+                KIND_DATA => Some(p[1..].to_vec()),
+                KIND_FRAGMENT => asm.push(&p[1..]).or(out),
+                _ => panic!(),
+            };
+        }
+        assert_eq!(out.unwrap(), data);
+    }
+
+    #[test]
+    fn message_boundaries_survive_small_cells() {
+        roundtrip(10, false);
+        roundtrip(PACKET_MAX - 1, false);
+        roundtrip(PACKET_MAX, false);
+        roundtrip(1000, false);
+        roundtrip(64 * 1024, false);
+    }
+
+    #[test]
+    fn fragments_reassemble_in_any_order() {
+        roundtrip(5000, true);
+    }
+
+    #[test]
+    fn lost_fragment_drops_only_its_message() {
+        let mut id = 0;
+        let a = packetize(&[1u8; 1000], &mut id);
+        let b = packetize(&[2u8; 1000], &mut id);
+        let mut asm = FragmentAssembler::default();
+        for p in &a[1..] {
+            assert!(asm.push(&p[1..]).is_none());
+        }
+        let mut out = None;
+        for p in &b {
+            out = asm.push(&p[1..]).or(out);
+        }
+        assert_eq!(out.unwrap(), vec![2u8; 1000]);
+    }
+
+    #[test]
+    fn many_messages_waiting_on_lost_fragments_all_complete() {
+        // Unordered reliable delivery under loss: dozens of messages each
+        // missing one fragment until retransmission fills the holes.
+        let mut id = 0;
+        let messages: Vec<Vec<Vec<u8>>> =
+            (0..64u8).map(|i| packetize(&[i; 1000], &mut id)).collect();
+        let mut asm = FragmentAssembler::default();
+        for m in &messages {
+            for p in &m[1..] {
+                assert!(asm.push(&p[1..]).is_none());
+            }
+        }
+        for (i, m) in messages.iter().enumerate() {
+            assert_eq!(asm.push(&m[0][1..]).unwrap(), vec![i as u8; 1000]);
+        }
+        assert_eq!(asm.bytes, 0);
     }
 }

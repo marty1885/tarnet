@@ -1067,6 +1067,63 @@ async fn circuit_build_two_hop() {
         .expect("destroy_circuit failed");
 }
 
+/// A lost CREATE on the far side of a relay makes the EXTEND time out. The
+/// initiator truncates back to the built hop and retries the step instead of
+/// failing the whole circuit.
+#[tokio::test]
+async fn circuit_extend_recovers_by_truncate() {
+    use tarnet::firewall::{Action, Firewall, Match};
+    use tarnet::wire::MessageType;
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let node_a = Arc::new(Node::new(Keypair::generate()));
+    let node_b = Arc::new(Node::new(Keypair::generate()));
+    let node_c = Arc::new(Node::new(Keypair::generate()));
+    let pid_b = node_b.peer_id();
+    let pid_c = node_c.peer_id();
+
+    let disc_c = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let addr_c = disc_c.local_addrs()[0].to_string();
+    let nc = node_c.clone();
+    tokio::spawn(async move { nc.run(Box::new(disc_c), vec![], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let disc_b = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let addr_b = disc_b.local_addrs()[0].to_string();
+    let nb = node_b.clone();
+    tokio::spawn(async move { nb.run(Box::new(disc_b), vec![addr_c], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+    let na = node_a.clone();
+    tokio::spawn(async move { na.run(Box::new(disc_a), vec![addr_b], vec![]).await.ok() });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(node_a.connected_peers().await.contains(&pid_b));
+    assert!(node_b.connected_peers().await.contains(&pid_c));
+
+    // C ignores CREATE for the first second: B's CREATE for A's EXTEND is lost.
+    let mut fw = Firewall::default();
+    fw.add_rule(Match::MsgType(MessageType::CircuitCreate), Action::Drop);
+    node_c.set_firewall(fw).await;
+    let heal = node_c.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        heal.set_firewall(Firewall::default()).await;
+    });
+
+    let started = std::time::Instant::now();
+    let circuit_id = tokio::time::timeout(
+        Duration::from_secs(15),
+        node_a.build_circuit(pid_b, vec![pid_c]),
+    )
+    .await
+    .expect("circuit build timed out")
+    .expect("circuit build failed instead of truncating and retrying");
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "the first EXTEND cannot have succeeded"
+    );
+    node_a.destroy_circuit(circuit_id).await.unwrap();
+}
+
 /// Test building a 1-hop circuit (direct endpoint).
 #[tokio::test]
 async fn circuit_build_one_hop() {

@@ -119,11 +119,14 @@ impl Node {
             let circuit = circuits
                 .get_mut(&intro_circuit_id)
                 .ok_or_else(|| Error::Protocol("introduction circuit disappeared".into()))?;
-            let (fh, cid, cell) = circuit.send_relay_cell(&introduce_cell);
+            // Sealed to a post-quantum KEM, INTRODUCE spans several cells.
+            let (fh, cid, cells) = circuit.send_relay_message(&introduce_cell)?;
             drop(circuits);
 
-            let encoded = encode_circuit_relay_cell(cid, &cell);
-            self.send_to_peer_critical(&fh, &encoded).await?;
+            for cell in &cells {
+                let encoded = encode_circuit_relay_cell(cid, cell);
+                self.send_to_peer_critical(&fh, &encoded).await?;
+            }
         }
         // Wait for IntroduceAck
         let _ack = tokio::time::timeout(Duration::from_secs(10), ack_rx)
@@ -404,7 +407,8 @@ impl Node {
             }
         }
 
-        crate::tns::publish(self, &zone_keypair, "intro", &intro_records, 600).await?;
+        crate::tns::publish(self, &zone_keypair, "intro", &intro_records, HIDDEN_SERVICE_TTL)
+            .await?;
 
         log::info!(
             "Hidden service published: {:?} with {} intro points",
@@ -515,11 +519,19 @@ impl Node {
         // identity_store lock only briefly — not across the DB reads / async
         // publishes below. The label DB is keyed by the identity's label, which
         // is exactly what `identity_store.list()` yields.
+        //
+        // Hidden identities are skipped: republishing their zone in the same
+        // burst as a Public identity's (whose PeerId is published) links the
+        // two. `maintain_hidden_services` republishes a hidden zone root, with
+        // every label, on its own timer.
         let identities: Vec<(String, crate::identity::Keypair)> = {
             let is = self.identity_store.lock().await;
             is.list()
                 .into_iter()
-                .filter_map(|(label, sid, ..)| {
+                .filter_map(|(label, sid, privacy, ..)| {
+                    if matches!(privacy, tarnet_api::types::PrivacyLevel::Hidden { .. }) {
+                        return None;
+                    }
                     is.keypair_for(&sid).map(|kp| {
                         (
                             label,
@@ -567,36 +579,84 @@ impl Node {
         }
     }
 
-    /// Scan identity_store for all Hidden identities and ensure each has
-    /// active intro points. Re-publishes if approaching TTL expiry or if
-    /// intro circuits have failed.
-    pub(super) async fn maintain_hidden_services(&self) {
-        let hidden_identities: Vec<(tarnet_api::types::ServiceId, u8)> = {
+    /// DHT record signers (`Keypair::peer_id`) of every local Hidden identity.
+    pub(super) async fn hidden_identity_signers(&self) -> HashSet<[u8; 32]> {
+        let is = self.identity_store.lock().await;
+        is.list()
+            .into_iter()
+            .filter(|(_, _, privacy, ..)| {
+                matches!(privacy, tarnet_api::types::PrivacyLevel::Hidden { .. })
+            })
+            .filter_map(|(_, sid, ..)| is.keypair_for(&sid).map(|kp| *kp.peer_id().as_bytes()))
+            .collect()
+    }
+
+    /// Start a maintenance task for every Hidden identity that lacks one.
+    ///
+    /// Each identity gets its own task with its own random timing. A single
+    /// loop republishing all of them back to back would link the identities:
+    /// an observer seeing their intro records refreshed together learns they
+    /// share a host.
+    pub(super) async fn maintain_hidden_services(self: &Arc<Self>) {
+        let hidden_identities: Vec<tarnet_api::types::ServiceId> = {
             let store = self.identity_store.lock().await;
             store
                 .list()
                 .into_iter()
                 .filter_map(|(_, sid, privacy, _, _, _, _)| match privacy {
-                    tarnet_api::types::PrivacyLevel::Hidden { intro_points } => {
-                        Some((sid, intro_points))
-                    }
+                    tarnet_api::types::PrivacyLevel::Hidden { .. } => Some(sid),
                     _ => None,
                 })
                 .collect()
         };
 
-        if hidden_identities.is_empty() {
-            return;
+        let mut maintained = self.hidden.maintained.lock().await;
+        for sid in hidden_identities {
+            if maintained.insert(sid) {
+                let node = self.clone();
+                tokio::spawn(async move { node.maintain_hidden_service(sid).await });
+            }
         }
+    }
 
-        let connected = self.connected_peers().await;
-        if connected.is_empty() {
-            log::debug!("maintain_hidden_services: no peers, skipping");
-            return;
-        }
+    /// Desired intro point count if `sid` is still a Hidden identity.
+    async fn hidden_intro_points(&self, sid: &tarnet_api::types::ServiceId) -> Option<u8> {
+        let store = self.identity_store.lock().await;
+        store
+            .list()
+            .into_iter()
+            .find_map(|(_, s, privacy, _, _, _, _)| match privacy {
+                tarnet_api::types::PrivacyLevel::Hidden { intro_points } if s == *sid => {
+                    Some(intro_points)
+                }
+                _ => None,
+            })
+    }
 
-        for (sid, desired_intros) in hidden_identities {
-            // Check if we need to (re)publish
+    /// Keep one Hidden identity's intro points alive until it stops being
+    /// Hidden. Republishes when intro circuits have failed, or once the
+    /// records are past a random point between a third and half of their TTL,
+    /// drawn afresh after every publish.
+    async fn maintain_hidden_service(&self, sid: tarnet_api::types::ServiceId) {
+        use rand::Rng;
+        let ttl = Duration::from_secs(HIDDEN_SERVICE_TTL as u64);
+        let draw_republish_after = || rand::thread_rng().gen_range(ttl / 3..ttl / 2);
+        let mut republish_after = draw_republish_after();
+
+        loop {
+            let wait = rand::thread_rng().gen_range(HIDDEN_SERVICE_CHECK_INTERVAL);
+            tokio::time::sleep(wait).await;
+
+            let Some(desired_intros) = self.hidden_intro_points(&sid).await else {
+                self.hidden.maintained.lock().await.remove(&sid);
+                return;
+            };
+
+            if self.connected_peers().await.is_empty() {
+                log::debug!("maintain_hidden_service: no peers, skipping");
+                continue;
+            }
+
             let needs_publish = {
                 let intros = self.hidden.intros.lock().await;
                 let last_pub = self.hidden.last_publish.lock().await;
@@ -604,11 +664,11 @@ impl Node {
                     .get(&sid)
                     .map(|v| v.len() >= desired_intros as usize)
                     .unwrap_or(false);
-                let expired = last_pub
+                let stale = last_pub
                     .get(&sid)
-                    .map(|t| t.elapsed() > HIDDEN_SERVICE_REPUBLISH_AFTER)
+                    .map(|t| t.elapsed() > republish_after)
                     .unwrap_or(true); // never published
-                !has_enough || expired
+                !has_enough || stale
             };
 
             if !needs_publish {
@@ -636,6 +696,7 @@ impl Node {
                         .lock()
                         .await
                         .insert(sid, Instant::now());
+                    republish_after = draw_republish_after();
                     log::info!("Hidden service {:?} maintained successfully", sid);
                 }
                 Err(e) => {
@@ -848,5 +909,38 @@ mod tests {
                 false,
             )
         ));
+    }
+
+    /// Link-up republish must not carry a Hidden identity's records: a watcher
+    /// could trigger it by opening a link to a suspected host.
+    #[tokio::test]
+    async fn hidden_identity_records_are_not_event_republished() {
+        use tarnet_api::types::{IdentityScheme, PrivacyLevel};
+
+        let node = Node::new(Keypair::generate());
+        let hidden = node
+            .create_identity("h", PrivacyLevel::Hidden { intro_points: 1 }, 1, IdentityScheme::Ed25519)
+            .await
+            .unwrap();
+        let public = node
+            .create_identity("p", PrivacyLevel::Public, 1, IdentityScheme::Ed25519)
+            .await
+            .unwrap();
+        let hidden_kp = node.keypair_for_service(&hidden).await.unwrap();
+        let public_kp = node.keypair_for_service(&public).await.unwrap();
+        for kp in [&hidden_kp, &public_kp] {
+            let record =
+                crate::dht::VerifiedRecord::new_zone_root(kp, b"zone", 1, Duration::from_secs(600));
+            node.dht_publish(record).await;
+        }
+
+        let signers: Vec<[u8; 32]> = node
+            .own_records_to_republish()
+            .await
+            .iter()
+            .map(|r| r.signer)
+            .collect();
+        assert!(!signers.contains(hidden_kp.peer_id().as_bytes()));
+        assert!(signers.contains(public_kp.peer_id().as_bytes()));
     }
 }

@@ -9,6 +9,10 @@ use crate::wire;
 const MAX_SELECTIVE_ACKS: usize = 32;
 
 const DEFAULT_WINDOW_SIZE: u32 = 32;
+/// Congestion window at the start, in packets. The send window above is its cap.
+const INITIAL_CWND: f64 = 4.0;
+/// Congestion window floor, in packets.
+const MIN_CWND: f64 = 2.0;
 
 /// Maximum out-of-order packets buffered on the receive side.
 /// Caps memory usage from peers sending wildly out-of-order sequences.
@@ -107,6 +111,21 @@ struct ReliableState {
     // Sender
     send_seq: u32,
     send_window: u32,
+    /// AIMD congestion window in packets: grows per ACKed packet (doubling
+    /// per RTT below `ssthresh`, one packet per RTT above it), halves on a
+    /// loss. With a slow link dropping what queues too long in front of it,
+    /// this keeps each channel near its share of the link rate instead of a
+    /// fixed 32 packets queued.
+    cwnd: f64,
+    ssthresh: f64,
+    /// Losses of packets sent before this sequence belong to the loss event
+    /// that already halved the window.
+    recovery_until: Option<u32>,
+    /// Time one packet occupies the slowest known link on the path (zero if
+    /// unknown or fast). Packets queued ahead of a packet delay it by their
+    /// airtime, so its timeout must cover them or it is resent before the
+    /// first copy has even gone out.
+    path_airtime: Duration,
     send_buf: BTreeMap<u32, Vec<u8>>,
     /// Per-packet first-send timestamp for RTO calculation.
     send_times: BTreeMap<u32, Instant>,
@@ -141,6 +160,10 @@ impl ReliableState {
         Self {
             send_seq: 0,
             send_window: window,
+            cwnd: INITIAL_CWND.min(window as f64),
+            ssthresh: window as f64,
+            recovery_until: None,
+            path_airtime: Duration::ZERO,
             send_buf: BTreeMap::new(),
             send_times: BTreeMap::new(),
             send_rtos: BTreeMap::new(),
@@ -168,6 +191,13 @@ impl ReliableState {
         }
     }
 
+    /// Timeout for a packet with `queued` packets (itself included) in
+    /// flight: the RTT-based timeout plus twice their airtime.
+    fn rto_with_queue_ms(&self, queued: usize) -> u64 {
+        let airtime = self.path_airtime.as_millis() as u64 * 2 * queued as u64;
+        (self.base_rto_ms() + airtime).min(MAX_RTO_MS.max(airtime))
+    }
+
     fn sample_rtt(&mut self, rtt: Duration) {
         match self.srtt {
             None => {
@@ -180,6 +210,34 @@ impl ReliableState {
                 self.srtt = Some((srtt * 7 + rtt) / 8);
             }
         }
+    }
+
+    /// Grow the congestion window for newly acknowledged packets.
+    fn on_acked(&mut self, packets: usize, ack_seq: u32) {
+        for _ in 0..packets {
+            if self.cwnd < self.ssthresh {
+                self.cwnd += 1.0;
+            } else {
+                self.cwnd += 1.0 / self.cwnd;
+            }
+        }
+        self.cwnd = self.cwnd.min(self.send_window as f64);
+        if self
+            .recovery_until
+            .is_some_and(|r| seq_after_eq(ack_seq, r))
+        {
+            self.recovery_until = None;
+        }
+    }
+
+    /// Halve the congestion window for a lost packet, once per loss event.
+    fn on_loss(&mut self, seq: u32) {
+        if self.recovery_until.is_some_and(|r| seq_after(r, seq)) {
+            return;
+        }
+        self.ssthresh = (self.cwnd / 2.0).max(MIN_CWND);
+        self.cwnd = self.ssthresh;
+        self.recovery_until = Some(self.send_seq);
     }
 
     fn forget(&mut self, seq: u32) -> Option<Instant> {
@@ -304,7 +362,7 @@ impl Channel {
                 state.send_seq = state.send_seq.wrapping_add(1);
                 state.send_buf.insert(seq, data.clone());
                 state.send_times.insert(seq, Instant::now());
-                let rto = state.base_rto_ms();
+                let rto = state.rto_with_queue_ms(state.send_buf.len());
                 state.send_rtos.insert(seq, rto);
                 vec![(seq, data)]
             }
@@ -451,6 +509,7 @@ impl Channel {
         if acked.is_empty() {
             return acked;
         }
+        state.on_acked(acked.len(), ack_seq);
         state.last_ack_at = now;
         state.retries_since_ack = 0;
         if let Some(rtt) = rtt_sample {
@@ -458,7 +517,7 @@ impl Channel {
         }
 
         // The path is alive: clear backoff on everything still outstanding.
-        let base = state.base_rto_ms();
+        let base = state.rto_with_queue_ms(state.send_buf.len());
         for rto in state.send_rtos.values_mut() {
             *rto = base;
         }
@@ -481,6 +540,9 @@ impl Channel {
                         .is_some_and(|&t| now.duration_since(t) >= in_flight_floor)
                 })
                 .collect();
+            if let Some(&first) = holes.iter().find(|seq| !state.fast_due.contains(seq)) {
+                state.on_loss(first);
+            }
             state.fast_due.extend(holes);
         }
 
@@ -506,10 +568,21 @@ impl Channel {
         }
     }
 
+    /// Tell the channel how long one packet takes on the slowest link of its
+    /// path that this node knows of (usually its own first link).
+    pub fn set_path_airtime(&mut self, airtime: Duration) {
+        if let Some(state) = self.state.reliable_state_mut() {
+            state.path_airtime = airtime;
+        }
+    }
+
     /// Check if the send window allows more data.
     pub fn can_send(&self) -> bool {
         match self.state.reliable_state() {
-            Some(state) => (state.send_buf.len() as u32) < state.send_window,
+            Some(state) => {
+                let window = (state.cwnd as u32).clamp(MIN_CWND as u32, state.send_window);
+                (state.send_buf.len() as u32) < window
+            }
             None => true,
         }
     }
@@ -548,10 +621,16 @@ impl Channel {
                 }
             }
         }
+        // A retransmission timeout is a loss too.
+        if let Some(&(first, _)) = due.first() {
+            state.on_loss(first);
+        }
         if !due.is_empty() {
             state.retries_since_ack = state.retries_since_ack.saturating_add(1);
         }
-        let backoff_cap = state.base_rto_ms().max(MAX_BACKOFF_MS);
+        let backoff_cap = state
+            .rto_with_queue_ms(state.send_buf.len())
+            .max(MAX_BACKOFF_MS);
         for &(seq, _) in &due {
             // Exponential backoff with jitter (±25%) to desynchronize
             // retransmits across channels/nodes that hit the same loss event.
@@ -782,11 +861,105 @@ mod reliability_tests {
             assert_eq!(channel.retransmit_due().len(), 2);
         }
         let rto_before = channel.state.reliable_state().unwrap().send_rtos[&first.0];
-        assert!(rto_before >= 3 * INITIAL_RTO_MS);
+        // Two doublings with ±25% jitter: at least 1000 · 1.5 · 1.5 = 2250 ms.
+        assert!(rto_before > 2 * INITIAL_RTO_MS);
         // The second arrives: the path is alive, so the first's backoff resets.
         channel.process_ack(0, &[1]);
         let state = channel.state.reliable_state().unwrap();
         assert!(state.send_rtos[&first.0] <= INITIAL_RTO_MS);
+    }
+
+    fn cwnd(c: &Channel) -> f64 {
+        c.state.reliable_state().unwrap().cwnd
+    }
+
+    /// Send until the window closes; returns how many went out.
+    fn fill(c: &mut Channel) -> Vec<(u32, Vec<u8>)> {
+        let mut sent = Vec::new();
+        while c.can_send() {
+            sent.push(c.prepare_send(vec![0; 10]).remove(0));
+        }
+        sent
+    }
+
+    #[test]
+    fn congestion_window_starts_small_and_grows_with_acks() {
+        let mut sender = Channel::new(0, [0; 32], true, true);
+        let mut receiver = Channel::new(0, [0; 32], true, true);
+        let first = fill(&mut sender);
+        assert_eq!(first.len(), INITIAL_CWND as usize);
+        for (seq, data) in first {
+            receiver.receive_data(seq, data);
+        }
+        let (ack, sel) = receiver.generate_ack().unwrap();
+        sender.process_ack(ack, &sel);
+        // Slow start: every ACKed packet opens one more slot.
+        assert_eq!(cwnd(&sender), 2.0 * INITIAL_CWND);
+        let second = fill(&mut sender);
+        assert_eq!(second.len(), 2 * INITIAL_CWND as usize);
+        for (seq, data) in second {
+            receiver.receive_data(seq, data);
+        }
+        // Never past the send window.
+        for _ in 0..20 {
+            let mut receiver_round = Vec::new();
+            for (seq, data) in fill(&mut sender) {
+                receiver_round.push((seq, data));
+            }
+            for (seq, data) in receiver_round {
+                receiver.receive_data(seq, data);
+            }
+            let (ack, sel) = receiver.generate_ack().unwrap();
+            sender.process_ack(ack, &sel);
+        }
+        assert_eq!(cwnd(&sender), DEFAULT_WINDOW_SIZE as f64);
+    }
+
+    #[test]
+    fn congestion_window_halves_once_per_loss_event() {
+        let mut sender = Channel::new(0, [0; 32], true, true);
+        let mut receiver = Channel::new(0, [0; 32], true, true);
+        // Open the window to 16.
+        for _ in 0..2 {
+            for (seq, data) in fill(&mut sender) {
+                receiver.receive_data(seq, data);
+            }
+            let (ack, sel) = receiver.generate_ack().unwrap();
+            sender.process_ack(ack, &sel);
+        }
+        assert_eq!(cwnd(&sender), 16.0);
+        // Lose two packets of the same window: one halving, not two.
+        let window = fill(&mut sender);
+        age_all(&mut sender, Duration::from_millis(FAST_RETRANSMIT_FLOOR_MS));
+        for (i, (seq, data)) in window.into_iter().enumerate() {
+            if i != 1 && i != 3 {
+                receiver.receive_data(seq, data);
+            }
+        }
+        let (ack, sel) = receiver.generate_ack().unwrap();
+        sender.process_ack(ack, &sel);
+        assert!(sender.has_fast_retransmit());
+        // The 14 delivered packets grew the window to 30 in slow start; the
+        // loss then halved it.
+        assert_eq!(cwnd(&sender), 15.0);
+        let after_first = cwnd(&sender);
+        // Retransmitting those holes is the same event.
+        sender.retransmit_due();
+        assert_eq!(cwnd(&sender), after_first);
+    }
+
+    #[test]
+    fn timeouts_cover_airtime_of_queued_packets() {
+        let mut c = Channel::new(0, [0; 32], true, true);
+        c.set_path_airtime(Duration::from_millis(400));
+        let sent = fill(&mut c);
+        assert_eq!(sent.len(), 4);
+        let state = c.state.reliable_state().unwrap();
+        // The fourth packet waits behind three others on a slow first link.
+        assert!(state.send_rtos[&3] >= INITIAL_RTO_MS + 4 * 2 * 400);
+        // Nothing is due after the plain initial timeout.
+        age_all(&mut c, Duration::from_millis(INITIAL_RTO_MS + 100));
+        assert!(c.retransmit_due().is_empty());
     }
 
     #[test]

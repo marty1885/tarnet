@@ -179,16 +179,7 @@ impl Node {
     /// they have their own timer). Owners republishing is what keeps records
     /// alive; there is no replication sweep.
     pub(crate) async fn dht_republish_own(&self) {
-        let records: Vec<DhtRecord> = {
-            let store = self.dht_store.lock().await;
-            store
-                .records_by_origin()
-                .0
-                .into_iter()
-                .filter(|r| r.record_type != RecordType::Hello)
-                .cloned()
-                .collect()
-        };
+        let records = self.own_records_to_republish().await;
         for record in &records {
             let encoded = record.to_put_msg().to_wire().encode();
             let count = self.dht_walker.walk_count().await;
@@ -197,6 +188,26 @@ impl Node {
         if !records.is_empty() {
             log::debug!("Republished {} own DHT records", records.len());
         }
+    }
+
+    /// The records [`dht_republish_own`](Self::dht_republish_own) sends: our
+    /// own records minus hellos and minus anything signed by a Hidden identity.
+    ///
+    /// This republish runs on link-up and alongside the node's other records,
+    /// so a Hidden identity's records in it would leave together with records
+    /// tied to this node — a watcher could open a link to a suspected host and
+    /// see the hidden service's re-PUT follow. Hidden identities republish only
+    /// from `maintain_hidden_services`, on their own timer.
+    pub(super) async fn own_records_to_republish(&self) -> Vec<DhtRecord> {
+        let hidden = self.hidden_identity_signers().await;
+        let store = self.dht_store.lock().await;
+        store
+            .records_by_origin()
+            .0
+            .into_iter()
+            .filter(|r| r.record_type != RecordType::Hello && !hidden.contains(&r.signer))
+            .cloned()
+            .collect()
     }
 
     /// Relaunch watch walks for every live local watch (fresh tokens), and

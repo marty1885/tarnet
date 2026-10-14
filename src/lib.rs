@@ -10,6 +10,8 @@ pub mod identity;
 pub mod identity_store;
 pub mod key_exchange;
 pub mod link;
+pub(crate) mod link_frame;
+pub(crate) mod link_sched;
 pub mod multipath;
 pub mod node;
 pub mod peer_transport;

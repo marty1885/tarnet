@@ -129,6 +129,7 @@ impl Node {
             origin: self.peer_id(),
             destination: ke.initiator_peer_id,
             ttl: 64,
+            hints: Vec::new(),
             data: response.to_wire().encode(),
         };
         let encoded = msg.to_wire().encode();
@@ -467,6 +468,7 @@ impl Node {
             origin: self.peer_id(),
             destination: *dest,
             ttl: 64,
+            hints: Vec::new(),
             data: payload.to_vec(),
         };
         let encoded = msg.to_wire().encode();
@@ -574,6 +576,7 @@ impl Node {
             origin: self.peer_id(),
             destination: dest,
             ttl: 64,
+            hints: Vec::new(),
             data: inner,
         };
 
@@ -642,6 +645,7 @@ impl Node {
             origin: self.peer_id(),
             destination: *dest,
             ttl: 64,
+            hints: Vec::new(),
             data: encrypted,
         };
         self.route_message(dest, &msg.to_wire_encrypted().encode())

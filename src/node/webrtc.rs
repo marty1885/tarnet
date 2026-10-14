@@ -448,6 +448,7 @@ async fn send_on_channel(
             origin: our_peer_id,
             destination: dest,
             ttl: 64,
+            hints: Vec::new(),
             data: encrypted,
         };
         let encoded = enc_msg.to_wire_encrypted().encode();

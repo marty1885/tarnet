@@ -4,6 +4,20 @@ use super::*;
 /// `CREATE_RESEND_INTERVAL` meanwhile.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(8);
 const CREATE_RESEND_INTERVAL: Duration = Duration::from_secs(1);
+/// Floor for one EXTEND step's wait; see [`Node::extend_step_timeout`].
+const EXTEND_STEP_FLOOR: Duration = Duration::from_millis(1500);
+/// Per built hop allowance in an EXTEND step's wait, on top of airtime.
+const EXTEND_PER_HOP: Duration = Duration::from_millis(500);
+/// Tries at one EXTEND step before the circuit fails. Between tries the
+/// circuit is truncated back to the hops already built.
+const EXTEND_ATTEMPTS: usize = 3;
+/// Tries at getting TRUNCATED back from the last built hop.
+const TRUNCATE_ATTEMPTS: usize = 3;
+/// A multi-cell relay message whose next piece doesn't arrive within this
+/// is abandoned.
+const RELAY_ASSEMBLY_TTL: Duration = Duration::from_secs(60);
+/// Inbound circuits with a multi-cell message in reassembly at once.
+const MAX_RELAY_ASSEMBLIES: usize = 1024;
 /// How long a hop keeps its CircuitCreated reply for answering resent CREATEs.
 const CREATED_REPLY_TTL: Duration = Duration::from_secs(30);
 
@@ -33,6 +47,7 @@ mod audit_tests {
             forward_nonce: 0,
             nonce_domain: rand::random(),
             backward_replay: CellReplayWindow::new(),
+            assembler: Default::default(),
         }
     }
 
@@ -481,6 +496,30 @@ pub(super) fn encrypt_backward_cell(
     data: &[u8],
 ) -> Vec<u8> {
     let body = write_cell_body(command, 0, data, &bwd_digest);
+    encrypt_backward_body(bwd_key, bwd_digest, nonce_prefix, nonce, circuit_id, body)
+}
+
+/// Encrypt one piece of a (possibly multi-cell) backward relay message.
+fn encrypt_backward_piece(
+    bwd_key: [u8; 32],
+    bwd_digest: [u8; 32],
+    nonce_prefix: [u8; 16],
+    nonce: u64,
+    circuit_id: u32,
+    piece: &RelayPiece,
+) -> Vec<u8> {
+    let body = piece.to_cell(&bwd_digest);
+    encrypt_backward_body(bwd_key, bwd_digest, nonce_prefix, nonce, circuit_id, body)
+}
+
+fn encrypt_backward_body(
+    bwd_key: [u8; 32],
+    bwd_digest: [u8; 32],
+    nonce_prefix: [u8; 16],
+    nonce: u64,
+    circuit_id: u32,
+    body: [u8; CELL_BODY_SIZE],
+) -> Vec<u8> {
     let mut cell = [0u8; CELL_SIZE];
     cell[..CELL_BODY_SIZE].copy_from_slice(&body);
     set_cell_nonce(&mut cell, &backward_nonce_domain(&nonce_prefix), nonce);
@@ -559,6 +598,19 @@ impl Node {
                         if !hop_crypto.process_cell(&mut cell) {
                             return Ok(());
                         }
+                        // A forwarding hop still recognises TRUNCATE addressed
+                        // to it: the initiator uses it to undo an EXTEND whose
+                        // reply never came. Any other cell fails our digest.
+                        if hop_crypto.op == CryptoOp::Decrypt {
+                            let body: &[u8; CELL_BODY_SIZE] =
+                                cell[..CELL_BODY_SIZE].try_into().unwrap();
+                            if let Ok(piece) = RelayPiece::from_cell(body, &hop_crypto.digest_key) {
+                                if piece.command == RelayCellCommand::Truncate {
+                                    drop(table);
+                                    return self.handle_truncate(from, circuit_id).await;
+                                }
+                            }
+                        }
                         encode_circuit_relay_cell(next_id, &cell)
                     } else {
                         encode_circuit_relay_cell(next_id, cell_data)
@@ -606,12 +658,25 @@ impl Node {
                     if from == circuit.first_hop && cell_data.len() == CELL_SIZE {
                         let mut cell = [0u8; CELL_SIZE];
                         cell.copy_from_slice(cell_data);
-                        let decoded = circuit.recv_relay_cell(&mut cell);
+                        let decoded = circuit.recv_relay_message(&mut cell);
                         if decoded.is_ok() {
                             circuit.last_activity = Instant::now();
                         }
                         drop(circuits);
+                        let decoded = match decoded {
+                            // Piece of a multi-cell message; more to come.
+                            Ok(None) => return Ok(()),
+                            Ok(Some(relay_cell)) => Ok(relay_cell),
+                            Err(e) => Err(e),
+                        };
                         if let Ok(relay_cell) = decoded {
+                            if relay_cell.command == RelayCellCommand::Truncated {
+                                let mut pending = self.circuits.pending_truncates.lock().await;
+                                if let Some(tx) = pending.remove(&circuit_id) {
+                                    let _ = tx.send(());
+                                }
+                                return Ok(());
+                            }
                             if relay_cell.command == RelayCellCommand::Extended {
                                 // This is an EXTENDED reply during circuit construction.
                                 let mut pending = self.circuits.pending_extends.lock().await;
@@ -754,8 +819,8 @@ impl Node {
         drop(table);
 
         let body: &[u8; CELL_BODY_SIZE] = cell_data[..CELL_BODY_SIZE].try_into().unwrap();
-        let relay_cell = match RelayCell::from_cell(body, &digest_key) {
-            Ok(rc) => rc,
+        let piece = match RelayPiece::from_cell(body, &digest_key) {
+            Ok(piece) => piece,
             Err(e) => {
                 log::warn!(
                     "Relay cell parse failed at endpoint circuit_id={}: {}",
@@ -765,8 +830,33 @@ impl Node {
                 return Ok(());
             }
         };
+        let relay_cell = if !piece.more && piece.command != RelayCellCommand::Continue {
+            RelayCell {
+                command: piece.command,
+                stream_id: piece.stream_id,
+                data: piece.data,
+            }
+        } else {
+            let mut assembly = self.circuits.relay_assembly.lock().await;
+            let now = Instant::now();
+            assembly.retain(|_, (at, _)| now.duration_since(*at) < RELAY_ASSEMBLY_TTL);
+            if assembly.len() >= MAX_RELAY_ASSEMBLIES && !assembly.contains_key(&key) {
+                return Ok(());
+            }
+            let entry = assembly.entry(key).or_insert_with(|| (now, Default::default()));
+            entry.0 = now;
+            let done = entry.1.push(piece);
+            if entry.1.is_empty() {
+                assembly.remove(&key);
+            }
+            match done {
+                Some(relay_cell) => relay_cell,
+                None => return Ok(()),
+            }
+        };
 
         match relay_cell.command {
+            RelayCellCommand::Truncate => self.handle_truncate(from, circuit_id).await,
             RelayCellCommand::Extend => {
                 self.handle_extend_at_relay(from, circuit_id, &relay_cell.data)
                     .await
@@ -820,21 +910,81 @@ impl Node {
         command: RelayCellCommand,
         data: &[u8],
     ) -> Result<()> {
-        let (bwd_key, bwd_digest, nonce_prefix, nonce) = self
-            .get_hop_backward_crypto(circuit_id, from)
-            .await
-            .ok_or_else(|| Error::Protocol("no backward keys for circuit".into()))?;
-
-        let encoded = encrypt_backward_cell(
-            bwd_key,
-            bwd_digest,
-            nonce_prefix,
-            nonce,
-            circuit_id,
+        let message = RelayCell {
             command,
-            data,
-        );
-        self.send_to_peer_critical(&from, &encoded).await
+            stream_id: 0,
+            data: data.to_vec(),
+        };
+        for piece in message.pieces()? {
+            let (bwd_key, bwd_digest, nonce_prefix, nonce) = self
+                .get_hop_backward_crypto(circuit_id, from)
+                .await
+                .ok_or_else(|| Error::Protocol("no backward keys for circuit".into()))?;
+            let encoded = encrypt_backward_piece(
+                bwd_key,
+                bwd_digest,
+                nonce_prefix,
+                nonce,
+                circuit_id,
+                &piece,
+            );
+            self.send_to_peer_critical(&from, &encoded).await?;
+        }
+        Ok(())
+    }
+
+    /// Handle TRUNCATE at the hop it is addressed to: undo whatever this hop
+    /// started downstream (an EXTEND whose reply the initiator never got),
+    /// become the circuit's endpoint again and answer TRUNCATED. Idempotent:
+    /// a hop with nothing downstream just answers.
+    async fn handle_truncate(&self, from: PeerId, circuit_id: u32) -> Result<()> {
+        let key = CircuitKey {
+            circuit_id,
+            from_peer: from,
+        };
+        let downstream = {
+            let mut table = self.circuits.table.lock().await;
+            match table.lookup(&key).cloned() {
+                Some(CircuitAction::Forward {
+                    next_hop,
+                    next_circuit_id,
+                    crypto: Some(crypto),
+                }) if crypto.op == CryptoOp::Decrypt => {
+                    table.remove(&CircuitKey {
+                        circuit_id: next_circuit_id,
+                        from_peer: next_hop,
+                    });
+                    table.insert(
+                        key,
+                        CircuitAction::Endpoint {
+                            origin_hop: from,
+                            crypto: Some(crypto),
+                        },
+                    );
+                    Some((next_hop, next_circuit_id))
+                }
+                Some(CircuitAction::Endpoint { .. }) => None,
+                _ => return Ok(()),
+            }
+        };
+        if let Some((next_hop, next_circuit_id)) = downstream {
+            log::debug!(
+                "TRUNCATE on circuit_id={} from {:?}: dropping leg to {:?}",
+                circuit_id,
+                from,
+                next_hop
+            );
+            self.circuits.relay_extend_pending.lock().await.remove(&CircuitKey {
+                circuit_id: next_circuit_id,
+                from_peer: next_hop,
+            });
+            let destroy = CircuitDestroyMsg {
+                circuit_id: next_circuit_id,
+            };
+            let _ = self.send_to_peer(&next_hop, &destroy.to_wire().encode()).await;
+        }
+        self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::Truncated, &[])
+            .await
     }
 
     /// Handle STREAM_BEGIN at the endpoint — the client wants to open a connection.
@@ -976,7 +1126,12 @@ impl Node {
         inbound_circuit_id: u32,
         extend_data: &[u8],
     ) -> Result<()> {
-        let (kem_algo, initiator_ephemeral, destination) = parse_extend_payload(extend_data)?;
+        let ExtendRequest {
+            kem_algo,
+            eph_pk: initiator_ephemeral,
+            destination,
+            hints: _,
+        } = parse_extend_payload(extend_data)?;
 
         // DV routing: if destination is our direct neighbor, extend there (reached).
         // Otherwise, look up our routing table for the best next_hop.
@@ -1278,10 +1433,13 @@ impl Node {
             // Wrap the CircuitCreated reply as an EXTENDED relay cell and send
             // it back through the inbound circuit.
 
-            // Get the backward crypto for the inbound circuit.
+            // The backward crypto for the inbound circuit must still exist.
             let bwd_info = self
-                .get_hop_backward_crypto(inbound_circuit_id, inbound_from)
-                .await;
+                .circuits
+                .hop_backward_keys
+                .lock()
+                .await
+                .contains_key(&(inbound_circuit_id, inbound_from));
 
             // The CircuitCreated encrypted_reply already has the flags byte
             // (from build_extended_payload). Set the reached flag if this
@@ -1290,24 +1448,17 @@ impl Node {
             if reached && !reply_data.is_empty() {
                 reply_data[0] |= EXTENDED_FLAG_REACHED;
             }
-            let reply_cell = RelayCell {
-                command: RelayCellCommand::Extended,
-                stream_id: 0,
-                data: reply_data,
-            };
-
-            let (key, digest, prefix, nonce) =
-                bwd_info.ok_or_else(|| Error::Protocol("backward circuit gone".into()))?;
-            let encoded = encrypt_backward_cell(
-                key,
-                digest,
-                prefix,
-                nonce,
-                inbound_circuit_id,
-                reply_cell.command,
-                &reply_cell.data,
-            );
-            return self.send_to_peer_critical(&inbound_from, &encoded).await;
+            if !bwd_info {
+                return Err(Error::Protocol("backward circuit gone".into()));
+            }
+            return self
+                .send_endpoint_relay_cell(
+                    inbound_from,
+                    inbound_circuit_id,
+                    RelayCellCommand::Extended,
+                    &reply_data,
+                )
+                .await;
         }
 
         // Otherwise, this is for the circuit initiator.
@@ -1562,30 +1713,14 @@ impl Node {
         drop(regs);
 
         // Send the (still-sealed) INTRODUCE data as a relay cell to the service.
-        let intro_cell = RelayCell {
-            command: RelayCellCommand::Introduce,
-            stream_id: 0,
-            data: sealed.to_vec(),
-        };
-        let bwd_info = self
-            .get_hop_backward_crypto(service_circuit_id.circuit_id, service_from)
+        let _ = self
+            .send_endpoint_relay_cell(
+                service_from,
+                service_circuit_id.circuit_id,
+                RelayCellCommand::Introduce,
+                sealed,
+            )
             .await;
-        let (bwd_key, bwd_digest, nonce_prefix, nonce) =
-            bwd_info.ok_or_else(|| Error::Protocol("backward circuit gone".into()))?;
-        let body = intro_cell.to_cell(&bwd_digest);
-        let mut cell = [0u8; CELL_SIZE];
-        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
-        set_cell_nonce(&mut cell, &backward_nonce_domain(&nonce_prefix), nonce);
-        let mut crypto = HopCrypto {
-            key: bwd_key,
-            digest_key: bwd_digest,
-            nonce_prefix,
-            op: CryptoOp::Encrypt,
-            replay: CellReplayWindow::new(),
-        };
-        crypto.process_cell(&mut cell);
-        let encoded = encode_circuit_relay_cell(service_circuit_id.circuit_id, &cell);
-        let _ = self.send_to_peer_critical(&service_from, &encoded).await;
 
         // Send IntroduceAck back to the client
         let ack = RelayCell {
@@ -1746,6 +1881,117 @@ impl Node {
         Some((entry.0, entry.1, entry.2, nonce))
     }
 
+    /// How long to wait for one EXTEND step: a floor, plus per built hop an
+    /// allowance and the airtime of the step's cells on our first link. The
+    /// first link is the only one whose speed we know; on a slow chain it is
+    /// usually the slow part.
+    async fn extend_step_timeout(&self, first_hop: PeerId, hops_built: usize, bytes: usize) -> Duration {
+        let airtime = self
+            .links
+            .lock()
+            .await
+            .get(&first_hop)
+            .map(|l| l.tx_time(bytes as u64))
+            .unwrap_or_default();
+        EXTEND_STEP_FLOOR.max((EXTEND_PER_HOP + airtime * 4) * hops_built as u32)
+    }
+
+    /// Send a relay message to the circuit's current last hop.
+    async fn send_to_last_hop(&self, circuit_id: u32, message: &RelayCell) -> Result<usize> {
+        let mut circuits = self.circuits.outbound.lock().await;
+        let circuit = circuits
+            .get_mut(&circuit_id)
+            .ok_or_else(|| Error::Protocol("circuit gone during extension".into()))?;
+        let hops_built = circuit.hop_keys.len();
+        let (first_hop, cid, cells) = circuit.send_relay_message(message)?;
+        drop(circuits);
+        for cell in &cells {
+            let encoded = encode_circuit_relay_cell(cid, cell);
+            self.send_to_peer_critical(&first_hop, &encoded).await?;
+        }
+        Ok(hops_built)
+    }
+
+    /// One EXTEND step toward `waypoint`. If the reply doesn't come in time,
+    /// truncate back to the hops already built and try again, so a lost cell
+    /// costs one step rather than the whole circuit.
+    async fn extend_step(
+        &self,
+        circuit_id: u32,
+        first_hop: PeerId,
+        kem_algo: tarnet_api::types::KemAlgo,
+        waypoint: &PeerId,
+    ) -> Result<(KexOffer, Vec<u8>)> {
+        for attempt in 1..=EXTEND_ATTEMPTS {
+            let kex = KexOffer::new(kem_algo);
+            let extend_cell = RelayCell {
+                command: RelayCellCommand::Extend,
+                stream_id: 0,
+                data: build_extend_payload(kex.algo_byte(), &kex.pubkey_bytes(), waypoint, &[]),
+            };
+
+            // Register before sending: a fast EXTENDED reply must not be lost.
+            let (tx, rx) = oneshot::channel();
+            self.circuits
+                .pending_extends
+                .lock()
+                .await
+                .insert(circuit_id, tx);
+
+            let hops_built = self.send_to_last_hop(circuit_id, &extend_cell).await?;
+            // The reply carries a ciphertext about as large as the key.
+            let timeout = self
+                .extend_step_timeout(first_hop, hops_built, extend_cell.data.len() * 2)
+                .await;
+
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(data)) => return Ok((kex, data)),
+                Ok(Err(_)) => {
+                    self.circuits.pending_extends.lock().await.remove(&circuit_id);
+                    return Err(Error::Protocol("circuit extend channel dropped".into()));
+                }
+                Err(_) => {
+                    self.circuits.pending_extends.lock().await.remove(&circuit_id);
+                    if attempt == EXTEND_ATTEMPTS {
+                        break;
+                    }
+                    log::debug!(
+                        "EXTEND toward {:?} on circuit {} timed out (try {}), truncating",
+                        waypoint,
+                        circuit_id,
+                        attempt
+                    );
+                    self.truncate_circuit(circuit_id, timeout).await?;
+                }
+            }
+        }
+        Err(Error::Protocol("circuit extend timed out".into()))
+    }
+
+    /// Ask the circuit's last built hop to drop anything it started
+    /// downstream, and wait for it to confirm.
+    async fn truncate_circuit(&self, circuit_id: u32, timeout: Duration) -> Result<()> {
+        let truncate = RelayCell {
+            command: RelayCellCommand::Truncate,
+            stream_id: 0,
+            data: Vec::new(),
+        };
+        for _ in 0..TRUNCATE_ATTEMPTS {
+            let (tx, rx) = oneshot::channel();
+            self.circuits
+                .pending_truncates
+                .lock()
+                .await
+                .insert(circuit_id, tx);
+            self.send_to_last_hop(circuit_id, &truncate).await?;
+            if let Ok(Ok(())) = tokio::time::timeout(timeout, rx).await {
+                return Ok(());
+            }
+        }
+        self.circuits.pending_truncates.lock().await.remove(&circuit_id);
+        Err(Error::Protocol("circuit truncate timed out".into()))
+    }
+
     pub async fn build_circuit(&self, first_hop: PeerId, waypoints: Vec<PeerId>) -> Result<u32> {
         if waypoints.is_empty() {
             return Err(Error::Protocol("circuit waypoints are empty".into()));
@@ -1810,11 +2056,20 @@ impl Node {
 
         // Wait for CircuitCreated, resending the identical CREATE meanwhile:
         // either message may be lost, and the hop answers a repeat with the
-        // same reply.
-        let deadline = tokio::time::Instant::now() + CREATE_TIMEOUT;
+        // same reply. On a slow link, wait for the CREATE and its reply to be
+        // on the air before resending.
+        let airtime = self
+            .links
+            .lock()
+            .await
+            .get(&first_hop)
+            .map(|l| l.tx_time(2 * create.len() as u64))
+            .unwrap_or_default();
+        let resend_interval = CREATE_RESEND_INTERVAL.max(airtime * 2);
+        let deadline = tokio::time::Instant::now() + CREATE_TIMEOUT.max(resend_interval * 8);
         let mut rx = rx;
         let reply = loop {
-            let wait = CREATE_RESEND_INTERVAL
+            let wait = resend_interval
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
             match tokio::time::timeout(wait, &mut rx).await {
                 Ok(r) => {
@@ -1850,6 +2105,7 @@ impl Node {
                 forward_nonce: 0,
                 nonce_domain: rand::random(),
                 backward_replay: CellReplayWindow::new(),
+                assembler: Default::default(),
             };
             let managed = self.manage_circuit(circuit_id, circuit);
             self.circuits
@@ -1873,53 +2129,9 @@ impl Node {
             let waypoint = waypoints[wp_idx];
 
             for extend_count in 0..MAX_EXTENDS_PER_WAYPOINT {
-                let kex = KexOffer::new(kem_algo);
-
-                let extend_data =
-                    build_extend_payload(kex.algo_byte(), &kex.pubkey_bytes(), &waypoint);
-
-                let extend_cell = RelayCell {
-                    command: RelayCellCommand::Extend,
-                    stream_id: 0,
-                    data: extend_data,
-                };
-
-                // Register before sending: a fast EXTENDED reply must not be lost.
-                let (tx, rx) = oneshot::channel();
-                self.circuits
-                    .pending_extends
-                    .lock()
-                    .await
-                    .insert(circuit_id, tx);
-
-                // Get the current circuit from outbound_circuits to wrap the cell.
-                {
-                    let mut circuits = self.circuits.outbound.lock().await;
-                    let circuit = circuits
-                        .get_mut(&circuit_id)
-                        .ok_or_else(|| Error::Protocol("circuit gone during extension".into()))?;
-                    let current_endpoint_idx = circuit.hop_keys.len() - 1;
-                    let (first_hop_send, cid, cell_bytes) =
-                        circuit.send_to_hop(&extend_cell, current_endpoint_idx);
-
-                    drop(circuits);
-
-                    let encoded = encode_circuit_relay_cell(cid, &cell_bytes);
-                    self.send_to_peer_critical(&first_hop_send, &encoded)
-                        .await?;
-                }
-
-                let reply = match tokio::time::timeout(Duration::from_millis(1500), rx).await {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(_)) => {
-                        self.circuits.pending_extends.lock().await.remove(&circuit_id);
-                        return Err(Error::Protocol("circuit extend channel dropped".into()));
-                    }
-                    Err(_) => {
-                        self.circuits.pending_extends.lock().await.remove(&circuit_id);
-                        return Err(Error::Protocol("circuit extend timed out".into()));
-                    }
-                };
+                let (kex, reply) = self
+                    .extend_step(circuit_id, first_hop, kem_algo, &waypoint)
+                    .await?;
 
                 if reply.is_empty() {
                     return Err(Error::Protocol(format!(

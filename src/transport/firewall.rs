@@ -28,6 +28,11 @@ pub enum FirewallPolicy {
     Delay { max: Duration },
     /// Combine drop + delay: surviving packets get a random delay.
     DropAndDelay { drop_rate: f64, max_delay: Duration },
+    /// A slow serial line (HC-12-class radio): each packet occupies the line
+    /// for `len / bytes_per_sec` before it arrives, packets queue behind each
+    /// other, and each is lost with `drop_rate` after its airtime. The
+    /// transport reports the rate as its bandwidth hint.
+    RateLimit { bytes_per_sec: u64, drop_rate: f64 },
 }
 
 /// Wraps a `Transport`, applying a `FirewallPolicy` to both send and recv.
@@ -47,6 +52,8 @@ pub struct FirewallTransport {
 struct Shared {
     policy: FirewallPolicy,
     rng: std::sync::Mutex<StdRng>,
+    /// Held while a packet is on a rate-limited line.
+    line: Mutex<()>,
 }
 
 /// Largest packet the recv pump will read from the wrapped transport.
@@ -62,6 +69,7 @@ impl Shared {
                 drop_rate,
                 max_delay,
             } => (*drop_rate, *max_delay),
+            FirewallPolicy::RateLimit { drop_rate, .. } => (*drop_rate, Duration::ZERO),
         };
         let mut rng = self.rng.lock().unwrap();
         if rate > 0.0 && rng.gen::<f64>() < rate {
@@ -82,6 +90,7 @@ impl FirewallTransport {
         let shared = Arc::new(Shared {
             policy,
             rng: std::sync::Mutex::new(StdRng::seed_from_u64(seed)),
+            line: Mutex::new(()),
         });
         let (tx, rx) = mpsc::channel(1024);
         let pump = tokio::spawn(Self::pump(inner.clone(), shared.clone(), tx));
@@ -109,7 +118,12 @@ impl FirewallTransport {
                     return;
                 }
             };
-            let Some(delay) = shared.verdict() else {
+            // A rate-limited line loses packets on the sending side only.
+            let verdict = match shared.policy {
+                FirewallPolicy::RateLimit { .. } => Some(Duration::ZERO),
+                _ => shared.verdict(),
+            };
+            let Some(delay) = verdict else {
                 continue; // dropped
             };
             let packet = buf[..n].to_vec();
@@ -137,6 +151,15 @@ impl Drop for FirewallTransport {
 #[async_trait]
 impl Transport for FirewallTransport {
     async fn send(&self, data: &[u8]) -> Result<()> {
+        if let FirewallPolicy::RateLimit { bytes_per_sec, .. } = self.shared.policy {
+            let _line = self.shared.line.lock().await;
+            let airtime = Duration::from_secs_f64(data.len() as f64 / bytes_per_sec.max(1) as f64);
+            tokio::time::sleep(airtime).await;
+            if self.shared.verdict().is_none() {
+                return Ok(());
+            }
+            return self.inner.send(data).await;
+        }
         let Some(delay) = self.shared.verdict() else {
             // Silently eat the packet — looks like network loss
             return Ok(());
@@ -184,6 +207,13 @@ impl Transport for FirewallTransport {
 
     fn name(&self) -> &'static str {
         self.inner.name()
+    }
+
+    fn bandwidth_hint(&self) -> Option<u64> {
+        match self.shared.policy {
+            FirewallPolicy::RateLimit { bytes_per_sec, .. } => Some(bytes_per_sec),
+            _ => self.inner.bandwidth_hint(),
+        }
     }
 }
 

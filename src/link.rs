@@ -19,44 +19,61 @@ use crate::wire::{
 };
 use tarnet_api::types::{KemAlgo, SigningAlgo};
 
-/// Outbound cells buffered per link before dropping.
+/// Outbound messages buffered per link before dropping.
 /// When the drain task can't keep up (slow peer / congested link),
-/// new cells are silently dropped. Reliable end-to-end Channels retain their
+/// new messages are silently dropped. Reliable end-to-end Channels retain their
 /// packets until acknowledged and retransmit them; links do not track delivery.
 const OUTBOUND_QUEUE_SIZE: usize = 4096;
 
-/// Minimum size for all link-layer frames after padding.
-/// Matches a CircuitRelay message: HEADER + circuit_id + CELL_SIZE.
-/// All smaller messages are padded to this size before encryption so an observer
-/// cannot classify messages by ciphertext length.
-const LINK_PAD_SIZE: usize = HEADER_SIZE + 4 + crate::circuit::CELL_SIZE;
+/// Frame plaintext size on fast links: one full circuit relay message
+/// (`HEADER + circuit_id + CELL_SIZE`) plus its record header, so a cell never
+/// fragments. Every frame a node sends on a link has the same size, so an
+/// observer cannot classify messages by ciphertext length; small messages
+/// share a frame instead of each being padded to it.
+const FAST_FRAME_PLAIN: usize = 1452;
+const _: () = assert!(FAST_FRAME_PLAIN >= HEADER_SIZE + 4 + crate::circuit::CELL_SIZE + 3);
+
+/// Frame plaintext size on slow links: 256 bytes on the wire with seq and tag.
+const SLOW_FRAME_PLAIN: usize = 256 - SEQ_SIZE - TAG_SIZE;
+/// Links whose transport reports less bandwidth than this (bytes/s) are slow.
+const SLOW_LINK_BPS: u64 = 100_000;
 
 /// Maximum time a deferred (non-critical) message waits before being flushed,
-/// even if no high-priority message arrives to piggyback on.
+/// even if no high-priority message arrives to share its frame.
 const DEFERRED_FLUSH_MS: u64 = 30;
 
 const TAG_SIZE: usize = 16;
 const SEQ_SIZE: usize = 8;
-/// XChaCha20 nonce length, prepended to every frame.
-const NONCE_SIZE: usize = 24;
-/// Largest plaintext wire message the link will encrypt or accept: a full wire
-/// header plus the maximum wire payload. This is the single frame-size contract
-/// both ends agree on — the send path rejects anything larger (so a too-big
-/// message can never reach the wire and corrupt the receiver), and the recv
-/// buffer below is sized to hold exactly this much.
+/// Largest plaintext wire message the link will carry: a full wire header plus
+/// the maximum wire payload. The send path rejects anything larger; anything
+/// larger than a frame is fragmented.
 const MAX_LINK_MESSAGE: usize = HEADER_SIZE + MAX_PAYLOAD;
-/// Largest on-the-wire frame: nonce || seq || MAX_LINK_MESSAGE || tag. The recv
-/// buffer must be at least this big or a maximum-size message is rejected as
-/// "exceeds buffer" and the link is torn down.
-const MAX_LINK_FRAME: usize = NONCE_SIZE + SEQ_SIZE + MAX_LINK_MESSAGE + TAG_SIZE;
+/// Largest frame plaintext accepted from a peer. Frame size is the sender's
+/// local policy; a receiver accepts any size up to one unfragmented maximum
+/// message.
+const MAX_FRAME_PLAIN: usize = MAX_LINK_MESSAGE + 3;
+/// Largest on-the-wire frame: seq || ciphertext || tag.
+const MAX_LINK_FRAME: usize = SEQ_SIZE + MAX_FRAME_PLAIN + TAG_SIZE;
+/// Partially reassembled messages kept per link.
+const MAX_PARTIAL_MESSAGES: usize = 8;
+/// Sender buffer of recently sent fragments, for NACK repair.
+const FRAGMENT_REPAIR_BYTES: usize = 16 * 1024;
+/// Record batches (NACKs, repaired fragments) waiting for the drain task.
+const REPAIR_QUEUE_SIZE: usize = 256;
 /// Sliding window size for replay detection.
 const REPLAY_WINDOW: u64 = 128;
 /// Re-key after this many messages sent.
 pub const REKEY_INTERVAL: u64 = 65536;
 /// Maximum allowed timestamp drift in seconds.
 const MAX_TIMESTAMP_DRIFT: u64 = 300;
-/// Maximum time allowed for the entire handshake (hello + auth + confirm).
+/// Handshake deadline floor. A handshake fails after this long without
+/// receiving anything from the peer; see [`handshake_deadline`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Approximate total size of a handshake, for scaling its deadline to slow links.
+const HANDSHAKE_BYTES: u64 = 12 * 1024;
+/// A handshake that keeps trickling bytes is still cut off after this many
+/// deadlines, so a peer can't hold a handshake slot open forever.
+const HANDSHAKE_HARD_CAP_FACTOR: u32 = 10;
 /// Hard ceiling on a single recv: if the transport produces nothing within
 /// this window, treat it as a dead link. Slightly longer than the node-level
 /// `KEEPALIVE_DEAD_TIMEOUT` (180s) so the app-level path has first crack at
@@ -193,61 +210,58 @@ impl LinkCrypto {
         self.send_seq >= REKEY_INTERVAL || self.recv_window >= REKEY_INTERVAL
     }
 
+    /// Frame nonce: 16 zero bytes followed by the frame's `seq`. Safe because
+    /// a `(key, seq)` pair never repeats: each direction has its own key, and
+    /// `seq` restarts at 0 only when [`install_keys`] installs a fresh key.
+    fn frame_nonce(seq: u64) -> [u8; 24] {
+        let mut nonce = [0u8; 24];
+        nonce[16..].copy_from_slice(&seq.to_be_bytes());
+        nonce
+    }
+
+    /// Wire: `seq(8) || ciphertext || tag(16)`, with `seq` as associated data.
     fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let seq = self.send_seq;
         self.send_seq += 1;
-
-        let mut nonce = [0u8; 24];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
-
-        // Build plaintext: seq(8) || payload
-        let mut msg = Vec::with_capacity(SEQ_SIZE + plaintext.len());
-        msg.extend_from_slice(&seq.to_be_bytes());
-        msg.extend_from_slice(plaintext);
+        let seq_bytes = seq.to_be_bytes();
 
         let cipher = XChaCha20Poly1305::new((&self.send_enc_key).into());
         let ciphertext = cipher
             .encrypt(
-                (&nonce).into(),
+                (&Self::frame_nonce(seq)).into(),
                 Payload {
-                    msg: &msg,
-                    aad: b"",
+                    msg: plaintext,
+                    aad: &seq_bytes,
                 },
             )
             .expect("AEAD encryption should not fail");
 
-        // Wire: nonce(24) || ciphertext+tag
-        let mut out = Vec::with_capacity(24 + ciphertext.len());
-        out.extend_from_slice(&nonce);
+        let mut out = Vec::with_capacity(SEQ_SIZE + ciphertext.len());
+        out.extend_from_slice(&seq_bytes);
         out.extend_from_slice(&ciphertext);
         out
     }
 
-    /// AEAD-open `data` under `key`, returning (payload_without_seq, seq).
+    /// AEAD-open `data` under `key`, returning (payload, seq).
     /// Does not run replay detection — the caller picks the matching window.
     fn aead_open(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, u64)> {
-        let nonce = &data[..24];
-        let ciphertext_with_tag = &data[24..];
+        let seq_bytes: [u8; SEQ_SIZE] = data[..SEQ_SIZE].try_into().unwrap();
+        let seq = u64::from_be_bytes(seq_bytes);
         let cipher = XChaCha20Poly1305::new(key.into());
-        let mut plaintext = cipher
+        let plaintext = cipher
             .decrypt(
-                nonce.into(),
+                (&Self::frame_nonce(seq)).into(),
                 Payload {
-                    msg: ciphertext_with_tag,
-                    aad: b"",
+                    msg: &data[SEQ_SIZE..],
+                    aad: &seq_bytes,
                 },
             )
             .map_err(|_| Error::Crypto("AEAD decryption failed".into()))?;
-        if plaintext.len() < SEQ_SIZE {
-            return Err(Error::Crypto("decrypted payload too short for seq".into()));
-        }
-        let seq = u64::from_be_bytes(plaintext[..SEQ_SIZE].try_into().unwrap());
-        plaintext.drain(..SEQ_SIZE);
         Ok((plaintext, seq))
     }
 
     fn decrypt(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        if data.len() < 24 + SEQ_SIZE + TAG_SIZE {
+        if data.len() < SEQ_SIZE + TAG_SIZE {
             return Err(Error::Crypto("encrypted message too short".into()));
         }
 
@@ -333,6 +347,17 @@ impl LinkCrypto {
     }
 }
 
+/// The drain task's channels and the state it shares with the receive path.
+struct LinkPipes {
+    outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    critical_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    deferred_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    repair_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
+    sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
 /// Initiator-side state of a rekey awaiting its reply.
 struct PendingRekey {
     eph_kem: KemKeypair,
@@ -382,6 +407,88 @@ fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Time to send `bytes` at the transport's bandwidth hint (zero if unknown).
+fn tx_time(transport: &dyn Transport, bytes: u64) -> Duration {
+    match transport.bandwidth_hint() {
+        Some(bps) if bps > 0 => Duration::from_secs_f64(bytes as f64 / bps as f64),
+        _ => Duration::ZERO,
+    }
+}
+
+/// Frame plaintext size this side uses on the link (local policy).
+fn frame_plain_for(transport: &dyn Transport) -> usize {
+    let policy = match transport.bandwidth_hint() {
+        Some(bps) if bps < SLOW_LINK_BPS => SLOW_FRAME_PLAIN,
+        _ => FAST_FRAME_PLAIN,
+    };
+    policy
+        .min(transport.mtu().saturating_sub(SEQ_SIZE + TAG_SIZE))
+        .max(crate::link_frame::MIN_FRAME_PLAIN)
+}
+
+/// Send scheduler tuning for the link (local policy). Fast links keep a few
+/// milliseconds of queue; slow links about two cells' worth of airtime, and at
+/// most two seconds of sending.
+fn sched_config(transport: &dyn Transport, frame_plain: usize) -> crate::link_sched::SchedConfig {
+    use crate::link_sched::SchedConfig;
+    match transport.bandwidth_hint() {
+        Some(bps) if bps < SLOW_LINK_BPS => {
+            // A full relay cell spans several slow-link frames.
+            let cell_msg = HEADER_SIZE + 4 + crate::circuit::CELL_SIZE + 3;
+            let frames_per_cell = cell_msg.div_ceil(frame_plain.saturating_sub(9).max(1));
+            let cell_time = tx_time(transport, (frames_per_cell * (frame_plain + SEQ_SIZE + TAG_SIZE)) as u64);
+            let target = cell_time * 2;
+            SchedConfig {
+                target,
+                interval: target * 5,
+                byte_cap: (16 * 1024).max(2 * bps as usize),
+                msg_cap: OUTBOUND_QUEUE_SIZE,
+            }
+        }
+        _ => SchedConfig {
+            target: Duration::from_millis(5),
+            interval: Duration::from_millis(100),
+            byte_cap: 8 * 1024 * 1024,
+            msg_cap: OUTBOUND_QUEUE_SIZE,
+        },
+    }
+}
+
+/// How long a handshake may go without receiving anything from the peer:
+/// `max(30 s, 3 · tx_time(handshake))`. A whole handshake takes ~25 s on an
+/// HC-12-class link, so a fixed 30 s total would fail on any loss.
+fn handshake_deadline(transport: &dyn Transport) -> Duration {
+    HANDSHAKE_TIMEOUT.max(tx_time(transport, HANDSHAKE_BYTES) * 3)
+}
+
+/// When the handshake last heard from the peer.
+type HandshakeProgress = Arc<std::sync::Mutex<std::time::Instant>>;
+
+/// Run a handshake, failing on silence rather than on elapsed time: the
+/// deadline restarts whenever a handshake frame arrives, up to a hard cap.
+async fn with_handshake_deadline<T>(
+    deadline: Duration,
+    progress: HandshakeProgress,
+    handshake: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let started = std::time::Instant::now();
+    let hard_cap = deadline * HANDSHAKE_HARD_CAP_FACTOR;
+    tokio::pin!(handshake);
+    loop {
+        let quiet = progress.lock().unwrap().elapsed();
+        let left = deadline
+            .saturating_sub(quiet)
+            .min(hard_cap.saturating_sub(started.elapsed()));
+        if left.is_zero() {
+            return Err(Error::Wire("handshake timed out".into()));
+        }
+        tokio::select! {
+            r = &mut handshake => return r,
+            _ = tokio::time::sleep(left) => {}
+        }
+    }
+}
+
 /// First handshake retransmission timeout, doubling up to the max. Longer on
 /// transports that claim reliability, where a resend is only ever needed if
 /// something between the two ends drops after all.
@@ -407,15 +514,18 @@ struct HandshakeIo<'a> {
     is_initiator: bool,
     rto_initial: Duration,
     rto: Duration,
+    progress: HandshakeProgress,
 }
 
 impl<'a> HandshakeIo<'a> {
-    fn new(transport: &'a dyn Transport, is_initiator: bool) -> Self {
+    fn new(transport: &'a dyn Transport, is_initiator: bool, progress: HandshakeProgress) -> Self {
+        // Never resend before our own message has had time to go out.
         let rto_initial = if transport.is_reliable() {
             HS_RTO_RELIABLE
         } else {
             HS_RTO_LOSSY
-        };
+        }
+        .max(tx_time(transport, HS_BUF as u64) * 2);
         Self {
             transport,
             last_sent: Vec::new(),
@@ -423,6 +533,7 @@ impl<'a> HandshakeIo<'a> {
             is_initiator,
             rto_initial,
             rto: rto_initial,
+            progress,
         }
     }
 
@@ -447,10 +558,12 @@ impl<'a> HandshakeIo<'a> {
     /// between desyncs the stream for good). The timer runs beside it.
     async fn recv_raw(&mut self) -> Result<Vec<u8>> {
         let transport = self.transport;
+        let progress = self.progress.clone();
         let recv = async move {
             let mut buf = vec![0u8; HS_BUF];
             let n = transport.recv(&mut buf).await?;
             buf.truncate(n);
+            *progress.lock().unwrap() = std::time::Instant::now();
             Ok::<_, Error>(buf)
         };
         tokio::pin!(recv);
@@ -461,7 +574,7 @@ impl<'a> HandshakeIo<'a> {
             tokio::select! {
                 r = &mut recv => return r,
                 _ = tokio::time::sleep(self.rto) => {
-                    self.rto = (self.rto * 2).min(HS_RTO_MAX);
+                    self.rto = (self.rto * 2).min(HS_RTO_MAX.max(self.rto_initial));
                     self.resend().await?;
                 }
             }
@@ -496,17 +609,27 @@ fn is_handshake_type(t: MessageType) -> bool {
 
 /// Authenticated encrypted link to a direct neighbor.
 ///
-/// Outbound messages are encrypted and placed into a bounded channel.
-/// A background drain task writes them to the transport. When the peer
-/// is slower than the sender, the channel fills and new cells are
-/// silently dropped — TCP/WS backpressure propagates naturally from
-/// the slow peer through the drain task into the bounded channel.
+/// Outbound wire messages are placed into bounded channels. A background
+/// drain task packs them into fixed-size frames (see [`crate::link_frame`]),
+/// encrypts each frame and writes it to the transport. When the peer is
+/// slower than the sender, the channels fill and new messages are silently
+/// dropped — TCP/WS backpressure propagates naturally from the slow peer
+/// through the drain task into the bounded channels.
 pub struct PeerLink {
     transport: Arc<dyn Transport>,
-    crypto: tokio::sync::Mutex<LinkCrypto>,
+    /// Shared with the drain task, which encrypts frames as it sends them so
+    /// frame seqs go out in order.
+    crypto: Arc<tokio::sync::Mutex<LinkCrypto>>,
     outbound_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// Non-critical messages coalesced with the next high-priority send.
+    /// Sends that must not be dropped for queueing delay (circuit control).
+    critical_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Non-critical messages, sent in the next frame that has room.
     deferred_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Encoded records (NACKs, repaired fragments) sent ahead of messages.
+    repair_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
+    /// Fragments recently sent, for NACK repair.
+    sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
     remote_peer: PeerId,
     remote_signing_algo: SigningAlgo,
     remote_signing_pubkey: Vec<u8>,
@@ -526,9 +649,9 @@ pub struct PeerLink {
     _drain_task: tokio::task::JoinHandle<()>,
     /// Transport name captured at construction for status display.
     transport_name: &'static str,
-    /// Initiator: link frames that arrived before the responder's
-    /// HandshakeConfirm (reordered, or the confirm was lost). Delivered first.
-    early_frames: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    /// Wire messages decoded from frames but not yet returned by
+    /// [`recv_message`]. A frame can carry several.
+    inbox: std::sync::Mutex<std::collections::VecDeque<Vec<u8>>>,
     /// Responder: (initiator's HandshakeConfirm, our HandshakeConfirm) until
     /// the initiator is known to be done. A repeat of its confirm means ours
     /// was lost; we answer it so the initiator can finish instead of leaving
@@ -547,15 +670,17 @@ impl PeerLink {
         identity: &Keypair,
         expected_peer: Option<PeerId>,
     ) -> Result<Self> {
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::initiator_inner(transport, identity, expected_peer))
-            .await
-            .map_err(|_| Error::Wire("handshake timed out".into()))?
+        let deadline = handshake_deadline(transport.as_ref());
+        let progress = HandshakeProgress::new(std::time::Instant::now().into());
+        let inner = Self::initiator_inner(transport, identity, expected_peer, progress.clone());
+        with_handshake_deadline(deadline, progress, inner).await
     }
 
     async fn initiator_inner(
         transport: Box<dyn Transport>,
         identity: &Keypair,
         expected_peer: Option<PeerId>,
+        progress: HandshakeProgress,
     ) -> Result<Self> {
         let mut rng = rand::rngs::OsRng;
         let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
@@ -582,7 +707,7 @@ impl PeerLink {
             min_version: WIRE_VERSION_MIN,
             max_version: WIRE_VERSION_MAX,
         };
-        let mut io = HandshakeIo::new(transport.as_ref(), true);
+        let mut io = HandshakeIo::new(transport.as_ref(), true, progress);
         io.send(my_hello.to_wire().encode()).await?;
 
         // Receive peer hello
@@ -718,7 +843,7 @@ impl PeerLink {
         let expected_peer_confirm = compute_confirm_hash(&shared_bytes, false);
         loop {
             let raw = io.recv_raw().await?;
-            if raw.len() >= NONCE_SIZE + SEQ_SIZE + TAG_SIZE {
+            if raw.len() >= SEQ_SIZE + TAG_SIZE {
                 if let Ok(plaintext) = crypto.decrypt(&raw) {
                     early_frames.push_back(plaintext);
                     break;
@@ -749,12 +874,17 @@ impl PeerLink {
         );
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
-        let (outbound_tx, deferred_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
-        Ok(Self {
+        let crypto = Arc::new(tokio::sync::Mutex::new(crypto));
+        let pipes = Self::spawn_drain(transport.clone(), crypto.clone(), remote_peer);
+        let link = Self {
             transport,
-            crypto: tokio::sync::Mutex::new(crypto),
-            outbound_tx,
-            deferred_tx,
+            crypto,
+            outbound_tx: pipes.outbound_tx,
+            critical_tx: pipes.critical_tx,
+            deferred_tx: pipes.deferred_tx,
+            repair_tx: pipes.repair_tx,
+            reassembler: pipes.reassembler,
+            sent_fragments: pipes.sent_fragments,
             remote_peer,
             remote_signing_algo,
             remote_signing_pubkey: peer_hello.signing_pubkey,
@@ -767,21 +897,30 @@ impl PeerLink {
             identity: std::sync::Arc::new(
                 Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
             ),
-            _drain_task,
+            _drain_task: pipes.task,
             transport_name,
-            early_frames: std::sync::Mutex::new(early_frames),
+            inbox: std::sync::Mutex::new(std::collections::VecDeque::new()),
             handshake_tail: std::sync::Mutex::new(None),
-        })
+        };
+        for frame in early_frames {
+            link.ingest_frame(&frame);
+        }
+        Ok(link)
     }
 
     /// Perform handshake as the responder (the side that called accept).
     pub async fn responder(transport: Box<dyn Transport>, identity: &Keypair) -> Result<Self> {
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, Self::responder_inner(transport, identity))
-            .await
-            .map_err(|_| Error::Wire("handshake timed out".into()))?
+        let deadline = handshake_deadline(transport.as_ref());
+        let progress = HandshakeProgress::new(std::time::Instant::now().into());
+        let inner = Self::responder_inner(transport, identity, progress.clone());
+        with_handshake_deadline(deadline, progress, inner).await
     }
 
-    async fn responder_inner(transport: Box<dyn Transport>, identity: &Keypair) -> Result<Self> {
+    async fn responder_inner(
+        transport: Box<dyn Transport>,
+        identity: &Keypair,
+        progress: HandshakeProgress,
+    ) -> Result<Self> {
         let mut rng = rand::rngs::OsRng;
         let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
         let eph_public = X25519Public::from(&eph_secret);
@@ -791,7 +930,7 @@ impl PeerLink {
         let eph_kem = KemKeypair::generate_ephemeral(my_kem_algo);
 
         // Receive peer hello
-        let mut io = HandshakeIo::new(transport.as_ref(), false);
+        let mut io = HandshakeIo::new(transport.as_ref(), false, progress);
         let wire = io.expect(MessageType::HandshakeHello).await?;
         let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
 
@@ -951,12 +1090,17 @@ impl PeerLink {
         );
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
-        let (outbound_tx, deferred_tx, _drain_task) = Self::spawn_drain(transport.clone(), remote_peer);
-        Ok(Self {
+        let crypto = Arc::new(tokio::sync::Mutex::new(crypto));
+        let pipes = Self::spawn_drain(transport.clone(), crypto.clone(), remote_peer);
+        let link = Self {
             transport,
-            crypto: tokio::sync::Mutex::new(crypto),
-            outbound_tx,
-            deferred_tx,
+            crypto,
+            outbound_tx: pipes.outbound_tx,
+            critical_tx: pipes.critical_tx,
+            deferred_tx: pipes.deferred_tx,
+            repair_tx: pipes.repair_tx,
+            reassembler: pipes.reassembler,
+            sent_fragments: pipes.sent_fragments,
             remote_peer,
             remote_signing_algo,
             remote_signing_pubkey: peer_hello.signing_pubkey,
@@ -969,11 +1113,12 @@ impl PeerLink {
             identity: std::sync::Arc::new(
                 Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
             ),
-            _drain_task,
+            _drain_task: pipes.task,
             transport_name,
-            early_frames: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            inbox: std::sync::Mutex::new(std::collections::VecDeque::new()),
             handshake_tail: std::sync::Mutex::new(handshake_tail),
-        })
+        };
+        Ok(link)
     }
 
     /// Compute handshake transcript for signing.
@@ -1016,104 +1161,191 @@ impl PeerLink {
         hash.as_bytes().to_vec()
     }
 
-    /// Spawn the background drain task that writes queued cells to the transport.
+    /// Spawn the background drain task that packs queued messages into
+    /// frames, encrypts them and writes them to the transport.
     ///
-    /// Returns (high_priority_tx, deferred_tx, join_handle).
-    /// High-priority messages are sent immediately.  Deferred messages are held
-    /// for up to [`DEFERRED_FLUSH_MS`] and piggyback on the next high-priority
-    /// send, reducing the number of distinctly-timed frames on the wire.
+    /// High-priority messages go out at once, sharing their frame with
+    /// whatever else is queued. Deferred messages wait up to
+    /// [`DEFERRED_FLUSH_MS`] (jittered) for a high-priority message to ride
+    /// with, so fewer distinctly-timed frames appear on the wire. Repair
+    /// records (NACKs, resent fragments) go ahead of both.
     fn spawn_drain(
         transport: Arc<dyn Transport>,
+        crypto: Arc<tokio::sync::Mutex<LinkCrypto>>,
         remote: PeerId,
-    ) -> (
-        tokio::sync::mpsc::Sender<Vec<u8>>,
-        tokio::sync::mpsc::Sender<Vec<u8>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
-        let (def_tx, mut def_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
+    ) -> LinkPipes {
+        use crate::link_frame::{encode_message_into, pack_frame, Reassembler, SentFragments};
+        use std::collections::VecDeque;
 
+        let frame_plain = frame_plain_for(transport.as_ref());
+        let frame_time = tx_time(transport.as_ref(), (frame_plain + SEQ_SIZE + TAG_SIZE) as u64);
+        // Repair runs whatever the local transport claims: a "reliable" TCP
+        // socket here says nothing about the far end, and either side may sit
+        // behind a lossy path. On a link that loses nothing it costs only the
+        // sender's repair buffer.
+        // Silence on a partial message before the receiver NACKs it. The link
+        // has no RTT estimate yet, so a fixed floor stands in for SRTT.
+        let stall = Duration::from_millis(200).max(frame_time * 2);
+        let reassembler = Arc::new(std::sync::Mutex::new(Reassembler::new(
+            MAX_PARTIAL_MESSAGES,
+            Duration::from_secs(5).max(tx_time(transport.as_ref(), MAX_LINK_MESSAGE as u64) * 4),
+            stall,
+        )));
+        let sent_fragments = Arc::new(std::sync::Mutex::new(SentFragments::new(
+            FRAGMENT_REPAIR_BYTES,
+            Duration::from_secs(5).max(frame_time * 16),
+        )));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
+        let (crit_tx, mut crit_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
+        let (def_tx, mut def_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOUND_QUEUE_SIZE);
+        let (repair_tx, mut repair_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(REPAIR_QUEUE_SIZE);
+        let sched_cfg = sched_config(transport.as_ref(), frame_plain);
+
+        let task_reassembler = reassembler.clone();
+        let task_sent = sent_fragments.clone();
         let task = tokio::spawn(async move {
-            /// Flush all pending deferred messages.
-            async fn flush_deferred(
-                def_rx: &mut tokio::sync::mpsc::Receiver<Vec<u8>>,
-                transport: &Arc<dyn Transport>,
-                remote: PeerId,
-            ) -> bool {
+            use crate::link_sched::Scheduler;
+            let mut sched = Scheduler::new(sched_cfg);
+            // Records past the scheduler, packed into frames in order: at most
+            // one frame's worth plus the rest of a fragmented message.
+            let mut ready: VecDeque<Vec<u8>> = VecDeque::new();
+            let mut next_msg_id: u16 = 0;
+            let mut nack_tick = tokio::time::interval(stall / 2);
+            nack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut reported_drops = 0;
+            let mut next_nack_poll = std::time::Instant::now();
+
+            // Queue a wire message's records, remembering fragments for repair.
+            // The next message starts in whatever room the frame being
+            // filled has left.
+            let mut enqueue = |ready: &mut VecDeque<Vec<u8>>, data: Vec<u8>| {
+                let used = ready.iter().map(Vec::len).sum::<usize>() % frame_plain;
+                let room = if ready.is_empty() { frame_plain } else { frame_plain - used };
+                let records = encode_message_into(&data, frame_plain, room, &mut next_msg_id);
+                if records.len() > 1 {
+                    task_sent.lock().unwrap().remember(&records, std::time::Instant::now());
+                }
+                ready.extend(records);
+            };
+
+            'drain: loop {
+                // Take in everything already waiting.
+                let now = std::time::Instant::now();
+                let mut repairs = Vec::new();
+                while let Ok(rec) = repair_rx.try_recv() {
+                    repairs.push(rec);
+                }
+                for rec in repairs.into_iter().rev() {
+                    ready.push_front(rec);
+                }
+                while let Ok(data) = crit_rx.try_recv() {
+                    sched.push(data, true, now);
+                }
+                while let Ok(data) = rx.try_recv() {
+                    sched.push(data, false, now);
+                }
                 while let Ok(data) = def_rx.try_recv() {
-                    if let Err(e) = transport.send(&data).await {
-                        log::debug!("link drain (deferred) to {:?}: {}", remote, e);
-                        return false;
+                    sched.push(data, false, now);
+                }
+
+                if ready.is_empty() && sched.is_empty() {
+                    tokio::select! {
+                        biased;
+                        rec = repair_rx.recv() => {
+                            let Some(rec) = rec else { break };
+                            ready.push_back(rec);
+                        }
+                        msg = crit_rx.recv() => {
+                            let Some(data) = msg else { break };
+                            sched.push(data, true, std::time::Instant::now());
+                        }
+                        msg = rx.recv() => {
+                            let Some(data) = msg else { break };
+                            sched.push(data, false, std::time::Instant::now());
+                        }
+                        msg = def_rx.recv() => {
+                            let Some(data) = msg else { break };
+                            sched.push(data, false, std::time::Instant::now());
+                            // Wait briefly for a high-priority message to share
+                            // the frame with; it ends the wait early.
+                            let jitter = {
+                                use rand::Rng;
+                                rand::thread_rng().gen_range(0..DEFERRED_FLUSH_MS)
+                            };
+                            let wait = Duration::from_millis(DEFERRED_FLUSH_MS + jitter);
+                            tokio::select! {
+                                biased;
+                                msg = crit_rx.recv() => {
+                                    let Some(data) = msg else { break 'drain };
+                                    sched.push(data, true, std::time::Instant::now());
+                                }
+                                msg = rx.recv() => {
+                                    let Some(data) = msg else { break 'drain };
+                                    sched.push(data, false, std::time::Instant::now());
+                                }
+                                _ = tokio::time::sleep(wait) => {}
+                            }
+                        }
+                        _ = nack_tick.tick() => {
+                            let nacks = {
+                                let mut r = task_reassembler.lock().unwrap();
+                                if r.is_empty() { Vec::new() } else { r.poll(std::time::Instant::now()) }
+                            };
+                            ready.extend(nacks);
+                        }
+                    }
+                    continue;
+                }
+
+                // Stalled partials still get NACKed while the link is busy.
+                let now = std::time::Instant::now();
+                if now >= next_nack_poll {
+                    next_nack_poll = now + stall / 2;
+                    let mut r = task_reassembler.lock().unwrap();
+                    if !r.is_empty() {
+                        ready.extend(r.poll(now));
                     }
                 }
-                true
-            }
 
-            loop {
-                tokio::select! {
-                    biased;
+                // Fill the frame from the scheduler, highest class first.
+                while ready.iter().map(Vec::len).sum::<usize>() < frame_plain {
+                    let Some(data) = sched.pop(now) else { break };
+                    enqueue(&mut ready, data);
+                }
+                if sched.dropped() > reported_drops {
+                    log::trace!(
+                        "link to {:?}: dropped {} queued message(s)",
+                        remote,
+                        sched.dropped() - reported_drops
+                    );
+                    reported_drops = sched.dropped();
+                }
 
-                    // High-priority: send immediately, then piggyback deferred.
-                    msg = rx.recv() => {
-                        let Some(data) = msg else { break };
-                        if let Err(e) = transport.send(&data).await {
-                            log::debug!("link drain to {:?}: {}", remote, e);
-                            break;
-                        }
-                        if !flush_deferred(&mut def_rx, &transport, remote).await {
-                            break;
-                        }
-                    }
-
-                    // Deferred: wait briefly for a high-priority message to coalesce with.
-                    msg = def_rx.recv() => {
-                        let Some(data) = msg else { break };
-                        // Short sleep — if a circuit cell arrives during this window it
-                        // will be handled by the biased high-priority branch above and
-                        // then flush_deferred drains the rest.
-                        let jitter = {
-                            use rand::Rng;
-                            rand::thread_rng().gen_range(0..DEFERRED_FLUSH_MS)
-                        };
-                        tokio::time::sleep(Duration::from_millis(
-                            DEFERRED_FLUSH_MS + jitter,
-                        )).await;
-
-                        // After the wait, send the deferred message plus any others
-                        // that queued up in the meantime.
-                        if let Err(e) = transport.send(&data).await {
-                            log::debug!("link drain (deferred) to {:?}: {}", remote, e);
-                            break;
-                        }
-                        if !flush_deferred(&mut def_rx, &transport, remote).await {
-                            break;
-                        }
-                    }
+                let Some(frame) = pack_frame(&mut ready, frame_plain) else {
+                    // Everything popped was dropped by the scheduler.
+                    continue;
+                };
+                let encrypted = crypto.lock().await.encrypt(&frame);
+                if let Err(e) = transport.send(&encrypted).await {
+                    log::debug!("link drain to {:?}: {}", remote, e);
+                    break;
                 }
             }
         });
-        (tx, def_tx, task)
-    }
-
-    /// Pad a wire message to [`LINK_PAD_SIZE`] so all link-layer frames are
-    /// the same ciphertext length, preventing message-type classification by size.
-    fn pad(data: &[u8]) -> Vec<u8> {
-        if data.len() >= LINK_PAD_SIZE {
-            return data.to_vec();
+        LinkPipes {
+            outbound_tx: tx,
+            critical_tx: crit_tx,
+            deferred_tx: def_tx,
+            repair_tx,
+            reassembler,
+            sent_fragments,
+            task,
         }
-        let mut padded = Vec::with_capacity(LINK_PAD_SIZE);
-        padded.extend_from_slice(data);
-        padded.resize(LINK_PAD_SIZE, 0);
-        padded
     }
 
-    /// Pad and encrypt a message into a wire frame, enforcing the size contract.
-    fn encrypt_frame(crypto: &mut LinkCrypto, data: &[u8], remote: PeerId) -> Result<Vec<u8>> {
-        // Enforce the frame-size contract at the one send chokepoint. A message
-        // larger than MAX_LINK_MESSAGE would encrypt to a frame that overflows
-        // the peer's recv buffer (tearing down the link) and whose wire LEN
-        // field would silently truncate. Reject it here instead of emitting a
-        // frame the peer cannot receive.
+    /// Reject a message the link can't carry.
+    fn check_size(data: &[u8], remote: PeerId) -> Result<()> {
         if data.len() > MAX_LINK_MESSAGE {
             log::warn!(
                 "refusing to send {}-byte message to {:?}: exceeds max link message {}",
@@ -1127,21 +1359,16 @@ impl PeerLink {
                 MAX_LINK_MESSAGE
             )));
         }
-        Ok(crypto.encrypt(&Self::pad(data)))
+        Ok(())
     }
 
-    /// Encrypt and enqueue a message (pad → encrypt → channel).
-    fn encrypt_and_enqueue(
-        crypto: &mut LinkCrypto,
-        tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-        data: &[u8],
-        remote: PeerId,
-    ) -> Result<()> {
-        let encrypted = Self::encrypt_frame(crypto, data, remote)?;
-        match tx.try_send(encrypted) {
+    /// Enqueue a message, dropping it if the queue is full.
+    fn enqueue(&self, tx: &tokio::sync::mpsc::Sender<Vec<u8>>, data: &[u8]) -> Result<()> {
+        Self::check_size(data, self.remote_peer)?;
+        match tx.try_send(data.to_vec()) {
             Ok(()) => Ok(()),
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                log::trace!("outbound queue full to {:?}, dropping", remote);
+                log::trace!("outbound queue full to {:?}, dropping", self.remote_peer);
                 Ok(())
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -1150,14 +1377,12 @@ impl PeerLink {
         }
     }
 
-    /// Send an encrypted message over the high-priority (data) queue.
+    /// Send a message over the high-priority (data) queue.
     ///
-    /// Messages are padded to [`LINK_PAD_SIZE`] before encryption.
-    /// If the queue is full (peer is congested), the cell is silently
+    /// If the queue is full (peer is congested), the message is silently
     /// dropped — reliable end-to-end Channels handle recovery.
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
-        let mut crypto = self.crypto.lock().await;
-        Self::encrypt_and_enqueue(&mut crypto, &self.outbound_tx, data, self.remote_peer)
+        self.enqueue(&self.outbound_tx, data)
     }
 
     /// Send over the high-priority queue, awaiting capacity instead of
@@ -1169,14 +1394,9 @@ impl PeerLink {
     /// correct policy for them. Bulk stream data keeps using
     /// [`send_message`], where reliable Channels recover dropped packets.
     pub async fn send_message_critical(&self, data: &[u8]) -> Result<()> {
-        // The crypto lock is held across the awaited enqueue so frames enter
-        // the queue in seq order even when this send has to wait. The drain
-        // task never takes this lock, so it keeps draining and the wait is
-        // bounded by transport progress.
-        let mut crypto = self.crypto.lock().await;
-        let encrypted = Self::encrypt_frame(&mut crypto, data, self.remote_peer)?;
-        self.outbound_tx
-            .send(encrypted)
+        Self::check_size(data, self.remote_peer)?;
+        self.critical_tx
+            .send(data.to_vec())
             .await
             .map_err(|_| Error::Wire("link closed".into()))
     }
@@ -1184,40 +1404,77 @@ impl PeerLink {
     /// Send a non-critical message via the deferred queue.
     ///
     /// The drain task holds deferred messages for up to [`DEFERRED_FLUSH_MS`]
-    /// and flushes them alongside the next high-priority message, reducing the
-    /// number of distinctly-timed link-layer frames an observer can see.
+    /// and sends them in the frame of the next high-priority message, reducing
+    /// the number of distinctly-timed link-layer frames an observer can see.
     pub async fn send_deferred(&self, data: &[u8]) -> Result<()> {
-        let mut crypto = self.crypto.lock().await;
-        Self::encrypt_and_enqueue(&mut crypto, &self.deferred_tx, data, self.remote_peer)
+        self.enqueue(&self.deferred_tx, data)
     }
 
-    /// Receive and decrypt a message from the link.
-    pub async fn recv_message(&self) -> Result<Vec<u8>> {
-        if let Some(early) = self.early_frames.lock().unwrap().pop_front() {
-            return Ok(early);
-        }
-        let mut buf = vec![0u8; MAX_LINK_FRAME];
-        let n = tokio::time::timeout(RECV_STALL_TIMEOUT, self.transport.recv(&mut buf))
-            .await
-            .map_err(|_| Error::Wire("link recv stalled".into()))??;
-        let result = self.crypto.lock().await.decrypt(&buf[..n]);
-        let tail = {
-            let mut tail = self.handshake_tail.lock().unwrap();
-            if result.is_ok() {
-                // The initiator only sends link frames once it has finished.
-                *tail = None;
-                None
-            } else {
-                tail.as_ref()
-                    .filter(|(theirs, _)| theirs.as_slice() == &buf[..n])
-                    .map(|(_, ours)| ours.clone())
+    /// Unpack a decrypted frame: queue its messages, reassemble fragments,
+    /// answer NACKs and send NACKs for gaps.
+    fn ingest_frame(&self, frame: &[u8]) {
+        use crate::link_frame::{parse_frame, Record};
+        let now = std::time::Instant::now();
+        let mut repairs = Vec::new();
+        let mut inbox = self.inbox.lock().unwrap();
+        for record in parse_frame(frame) {
+            match record {
+                Record::Message(data) => inbox.push_back(data.to_vec()),
+                Record::Fragment {
+                    msg_id,
+                    index,
+                    count,
+                    bytes,
+                } => {
+                    let (done, nacks) =
+                        self.reassembler
+                            .lock()
+                            .unwrap()
+                            .insert(msg_id, index, count, bytes, now);
+                    inbox.extend(done);
+                    repairs.extend(nacks);
+                }
+                Record::Nack { msg_id, missing } => {
+                    repairs.extend(self.sent_fragments.lock().unwrap().lookup(msg_id, &missing, now));
+                }
             }
-        };
-        if let Some(our_confirm) = tail {
-            log::debug!("Handshake confirm from {:?} repeated, resending ours", self.remote_peer);
-            self.transport.send(&our_confirm).await?;
         }
-        result
+        drop(inbox);
+        for rec in repairs {
+            // Best effort: a full repair queue costs only the repair.
+            let _ = self.repair_tx.try_send(rec);
+        }
+    }
+
+    /// Receive and decrypt the next wire message from the link.
+    pub async fn recv_message(&self) -> Result<Vec<u8>> {
+        loop {
+            if let Some(msg) = self.inbox.lock().unwrap().pop_front() {
+                return Ok(msg);
+            }
+            let mut buf = vec![0u8; MAX_LINK_FRAME];
+            let n = tokio::time::timeout(RECV_STALL_TIMEOUT, self.transport.recv(&mut buf))
+                .await
+                .map_err(|_| Error::Wire("link recv stalled".into()))??;
+            let result = self.crypto.lock().await.decrypt(&buf[..n]);
+            let tail = {
+                let mut tail = self.handshake_tail.lock().unwrap();
+                if result.is_ok() {
+                    // The initiator only sends link frames once it has finished.
+                    *tail = None;
+                    None
+                } else {
+                    tail.as_ref()
+                        .filter(|(theirs, _)| theirs.as_slice() == &buf[..n])
+                        .map(|(_, ours)| ours.clone())
+                }
+            };
+            if let Some(our_confirm) = tail {
+                log::debug!("Handshake confirm from {:?} repeated, resending ours", self.remote_peer);
+                self.transport.send(&our_confirm).await?;
+            }
+            self.ingest_frame(&result?);
+        }
     }
 
     pub fn remote_peer(&self) -> PeerId {
@@ -1252,24 +1509,36 @@ impl PeerLink {
         &self.remote_signing_pubkey
     }
 
+    /// Time to send `bytes` over this link at its transport's bandwidth hint
+    /// (zero when unknown or fast). Used to keep timers from firing while a
+    /// message is still on the air.
+    pub fn tx_time(&self, bytes: u64) -> Duration {
+        tx_time(self.transport.as_ref(), bytes)
+    }
+
+    /// Time a wire message of `len` bytes takes on this link, counting the
+    /// whole frames it occupies (zero when fast or unknown).
+    pub fn message_airtime(&self, len: usize) -> Duration {
+        let frame_plain = frame_plain_for(self.transport.as_ref());
+        let frames = if len + 3 <= frame_plain {
+            1
+        } else {
+            len.div_ceil(frame_plain.saturating_sub(9).max(1))
+        };
+        tx_time(self.transport.as_ref(), (frames * (frame_plain + SEQ_SIZE + TAG_SIZE)) as u64)
+    }
+
     /// Transport name (e.g. "tcp", "ws", "webrtc").
     pub fn transport_name(&self) -> &'static str {
         self.transport_name
     }
 
-    /// Largest encoded wire message that fits this link's transport in a single
-    /// frame, after link encryption overhead. Senders that build oversized
-    /// payloads (e.g. route advertisements) must pre-split to this size; the
-    /// send path rejects anything larger. Bounded by both the transport MTU
-    /// (which carries the encrypted frame: nonce ‖ seq ‖ ciphertext ‖ tag) and
-    /// the link's own plaintext ceiling. Shrinks automatically for small-MTU
-    /// datagram transports (e.g. UDP).
+    /// Largest encoded wire message the link carries. Senders that build
+    /// oversized payloads (e.g. route advertisements) must pre-split to this
+    /// size; the send path rejects anything larger. Messages bigger than a
+    /// frame are fragmented, so this doesn't depend on the transport MTU.
     pub fn max_wire_message(&self) -> usize {
-        const FRAME_OVERHEAD: usize = NONCE_SIZE + SEQ_SIZE + TAG_SIZE;
-        self.transport
-            .mtu()
-            .saturating_sub(FRAME_OVERHEAD)
-            .min(MAX_LINK_MESSAGE)
+        MAX_LINK_MESSAGE
     }
 
     /// Negotiated wire protocol version for this link.
@@ -1472,8 +1741,8 @@ mod tests {
         let mut responder = LinkCrypto::derive(&shared, false);
 
         let mut encrypted = initiator.encrypt(b"data");
-        // Flip a ciphertext byte (after nonce)
-        encrypted[24] ^= 0xff;
+        // Flip a ciphertext byte (after seq)
+        encrypted[SEQ_SIZE] ^= 0xff;
         assert!(responder.decrypt(&encrypted).is_err());
     }
 
@@ -1655,8 +1924,13 @@ mod tests {
     struct LossyMem {
         tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
         rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>,
-        drop: Vec<usize>,
-        sent: std::sync::atomic::AtomicUsize,
+        /// Indices of sent frames to drop. Shared so a test can add drops
+        /// after the handshake.
+        drop: Arc<std::sync::Mutex<Vec<usize>>>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+        /// Sizes of the frames sent, dropped or not.
+        sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+        bps: Option<u64>,
     }
 
     fn lossy_pair(drop_a: &[usize], drop_b: &[usize]) -> (LossyMem, LossyMem) {
@@ -1665,8 +1939,10 @@ mod tests {
         let mk = |tx, rx, drop: &[usize]| LossyMem {
             tx,
             rx: tokio::sync::Mutex::new(rx),
-            drop: drop.to_vec(),
+            drop: Arc::new(std::sync::Mutex::new(drop.to_vec())),
             sent: Default::default(),
+            sizes: Default::default(),
+            bps: None,
         };
         (mk(tx_a, rx_b, drop_a), mk(tx_b, rx_a, drop_b))
     }
@@ -1675,7 +1951,8 @@ mod tests {
     impl Transport for LossyMem {
         async fn send(&self, data: &[u8]) -> Result<()> {
             let i = self.sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if !self.drop.contains(&i) {
+            self.sizes.lock().unwrap().push(data.len());
+            if !self.drop.lock().unwrap().contains(&i) {
                 let _ = self.tx.send(data.to_vec());
             }
             Ok(())
@@ -1694,6 +1971,158 @@ mod tests {
         fn name(&self) -> &'static str {
             "lossy-mem"
         }
+        fn bandwidth_hint(&self) -> Option<u64> {
+            self.bps
+        }
+    }
+
+    /// Handle on one side's sent frames that outlives moving the transport
+    /// into a link.
+    struct SentLog {
+        drop: Arc<std::sync::Mutex<Vec<usize>>>,
+        sent: Arc<std::sync::atomic::AtomicUsize>,
+        sizes: Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    impl SentLog {
+        fn of(t: &LossyMem) -> Self {
+            Self {
+                drop: t.drop.clone(),
+                sent: t.sent.clone(),
+                sizes: t.sizes.clone(),
+            }
+        }
+        fn count(&self) -> usize {
+            self.sent.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        /// Drop the frames that will be the `nth` (0-based) sent from now.
+        fn drop_upcoming(&self, nth: &[usize]) {
+            let base = self.count();
+            self.drop.lock().unwrap().extend(nth.iter().map(|n| base + n));
+        }
+    }
+
+    /// Keep a link's receive path running so it answers NACKs.
+    fn pump(l: Arc<PeerLink>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { while l.recv_message().await.is_ok() || true {} })
+    }
+
+    #[test]
+    fn frame_seq_is_authenticated() {
+        let shared = [42u8; 32];
+        let mut initiator = LinkCrypto::derive(&shared, true);
+        let mut responder = LinkCrypto::derive(&shared, false);
+        initiator.encrypt(b"first");
+        let mut frame = initiator.encrypt(b"second");
+        assert_eq!(&frame[..SEQ_SIZE], &1u64.to_be_bytes(), "seq travels in clear");
+        frame[SEQ_SIZE - 1] = 5; // claim another seq
+        assert!(responder.decrypt(&frame).is_err());
+    }
+
+    #[tokio::test]
+    async fn slow_link_uses_small_frames_and_fragments_large_messages() {
+        let (mut a, mut b) = lossy_pair(&[], &[]);
+        a.bps = Some(1000);
+        b.bps = Some(1000);
+        let log = SentLog::of(&a);
+        let (la, lb) = handshake_over(a, b).await;
+        let before = log.count();
+        let big: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
+        la.send_message(&big).await.unwrap();
+        la.send_message(&ping()).await.unwrap();
+        assert_eq!(recv_good(&lb).await, big);
+        assert_eq!(recv_good(&lb).await, ping());
+        let sizes = log.sizes.lock().unwrap()[before..].to_vec();
+        assert!(sizes.len() >= 3000 / SLOW_FRAME_PLAIN);
+        assert!(sizes.iter().all(|&n| n == 256), "every slow-link frame is 256 B: {:?}", sizes);
+    }
+
+    #[tokio::test]
+    async fn small_messages_share_a_frame() {
+        let (a, b) = lossy_pair(&[], &[]);
+        let log = SentLog::of(&a);
+        let (la, lb) = handshake_over(a, b).await;
+        let before = log.count();
+        for _ in 0..10 {
+            la.send_deferred(&ping()).await.unwrap();
+        }
+        for _ in 0..10 {
+            assert_eq!(recv_good(&lb).await, ping());
+        }
+        let frames = log.count() - before;
+        assert!(frames < 10, "10 keepalives took {} frames", frames);
+        let sizes = log.sizes.lock().unwrap()[before..].to_vec();
+        assert!(sizes.iter().all(|&n| n == FAST_FRAME_PLAIN + SEQ_SIZE + TAG_SIZE));
+    }
+
+    #[tokio::test]
+    async fn lost_middle_fragment_is_repaired_by_nack() {
+        let (a, b) = lossy_pair(&[], &[]);
+        let log = SentLog::of(&a);
+        let (la, lb) = handshake_over(a, b).await;
+        let _pump = pump(la.clone());
+        let big = vec![7u8; 6000]; // 5 fragments of a fast frame
+        log.drop_upcoming(&[2]);
+        la.send_message(&big).await.unwrap();
+        assert_eq!(recv_good(&lb).await, big);
+    }
+
+    #[tokio::test]
+    async fn lost_last_fragment_is_repaired_after_stall() {
+        let (a, b) = lossy_pair(&[], &[]);
+        let log = SentLog::of(&a);
+        let (la, lb) = handshake_over(a, b).await;
+        let _pump = pump(la.clone());
+        let big = vec![3u8; 6000];
+        let frags = 6000usize.div_ceil(FAST_FRAME_PLAIN - 9);
+        log.drop_upcoming(&[frags - 1]);
+        la.send_message(&big).await.unwrap();
+        assert_eq!(recv_good(&lb).await, big);
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_restarts_on_progress() {
+        let progress = HandshakeProgress::new(std::time::Instant::now().into());
+        let ticker = progress.clone();
+        let keep_alive = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                *ticker.lock().unwrap() = std::time::Instant::now();
+            }
+        });
+        let slow = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(())
+        };
+        with_handshake_deadline(Duration::from_millis(100), progress.clone(), slow)
+            .await
+            .expect("progress keeps a slow handshake alive");
+
+        // Still trickling, but past the hard cap.
+        let never = std::future::pending::<Result<()>>();
+        let t0 = std::time::Instant::now();
+        assert!(with_handshake_deadline(Duration::from_millis(30), progress.clone(), never)
+            .await
+            .is_err());
+        assert!(t0.elapsed() >= Duration::from_millis(30) * HANDSHAKE_HARD_CAP_FACTOR);
+        keep_alive.abort();
+
+        // Silence fails after one deadline.
+        let quiet = HandshakeProgress::new(std::time::Instant::now().into());
+        let t0 = std::time::Instant::now();
+        let never = std::future::pending::<Result<()>>();
+        assert!(with_handshake_deadline(Duration::from_millis(50), quiet, never)
+            .await
+            .is_err());
+        assert!(t0.elapsed() < Duration::from_millis(50) * HANDSHAKE_HARD_CAP_FACTOR);
+    }
+
+    #[test]
+    fn slow_link_handshake_deadline_covers_airtime() {
+        let (mut a, _b) = lossy_pair(&[], &[]);
+        assert_eq!(handshake_deadline(&a), HANDSHAKE_TIMEOUT);
+        a.bps = Some(500);
+        assert!(handshake_deadline(&a) >= Duration::from_secs(70));
     }
 
     async fn handshake_over(a: LossyMem, b: LossyMem) -> (Arc<PeerLink>, Arc<PeerLink>) {

@@ -22,8 +22,11 @@ use crate::types::{Error, PeerId, Result};
 const HOP_MAC_SIZE: usize = 16;
 /// Explicit nonce size in the cell trailer.
 pub const CELL_NONCE_SIZE: usize = 24;
-/// Size of the encrypted body within a cell (before nonce + hop MAC).
-pub const CELL_BODY_SIZE: usize = 1400;
+/// Size of the encrypted body within a cell (before nonce + hop MAC). Cells
+/// are 512 bytes on every circuit: small enough that an interactive cell
+/// isn't stuck behind seconds of airtime on a slow radio hop, the same
+/// everywhere so a relay can't tell interactive circuits from bulk ones.
+pub const CELL_BODY_SIZE: usize = 512 - CELL_NONCE_SIZE - HOP_MAC_SIZE;
 /// Full cell size on the wire: encrypted body + nonce + per-hop MAC.
 pub const CELL_SIZE: usize = CELL_BODY_SIZE + CELL_NONCE_SIZE + HOP_MAC_SIZE;
 /// Header: command(1) + stream_id(2) + length(2).
@@ -32,6 +35,16 @@ const CELL_HEADER_SIZE: usize = 5;
 const DIGEST_SIZE: usize = 16;
 /// Maximum payload bytes in a single relay cell.
 pub const CELL_PAYLOAD_MAX: usize = CELL_BODY_SIZE - CELL_HEADER_SIZE - DIGEST_SIZE;
+/// Set in a relay cell's length field when more cells of the same relay
+/// message follow.
+const LENGTH_MORE: u16 = 0x8000;
+/// Largest relay message carried across several cells. Bounds reassembly
+/// memory; a post-quantum EXTEND is ~1.3 KB.
+pub const RELAY_MESSAGE_MAX: usize = 16 * 1024;
+/// Payload bytes of the first cell of a multi-cell message (after total_len).
+const FIRST_PIECE_MAX: usize = CELL_PAYLOAD_MAX - 2;
+/// Payload bytes of a continuation cell (after its index).
+const CONTINUE_PIECE_MAX: usize = CELL_PAYLOAD_MAX - 1;
 
 // --- Flow control constants ---
 /// Initial congestion window. Must be > SENDME_INC so the sender can push
@@ -503,6 +516,13 @@ pub enum RelayCellCommand {
     Padding = 0x10,
     StreamAck = 0x11,
     RendezvousReady = 0x12,
+    /// Continuation of a relay message too large for one cell.
+    Continue = 0x13,
+    /// Ask the addressed hop to drop whatever it started downstream and
+    /// become the circuit's endpoint again.
+    Truncate = 0x14,
+    /// Reply to `Truncate`.
+    Truncated = 0x15,
 }
 
 impl RelayCellCommand {
@@ -526,6 +546,9 @@ impl RelayCellCommand {
             0x10 => Ok(Self::Padding),
             0x11 => Ok(Self::StreamAck),
             0x12 => Ok(Self::RendezvousReady),
+            0x13 => Ok(Self::Continue),
+            0x14 => Ok(Self::Truncate),
+            0x15 => Ok(Self::Truncated),
             _ => Err(Error::Wire(format!("unknown relay cell command: {:#x}", v))),
         }
     }
@@ -550,6 +573,16 @@ pub fn write_cell_body(
     data: &[u8],
     digest_key: &[u8; 32],
 ) -> [u8; CELL_BODY_SIZE] {
+    write_piece_body(command, stream_id, false, data, digest_key)
+}
+
+fn write_piece_body(
+    command: RelayCellCommand,
+    stream_id: u16,
+    more: bool,
+    data: &[u8],
+    digest_key: &[u8; 32],
+) -> [u8; CELL_BODY_SIZE] {
     assert!(
         data.len() <= CELL_PAYLOAD_MAX,
         "relay cell data ({} bytes) exceeds CELL_PAYLOAD_MAX ({} bytes) — caller must chunk",
@@ -558,9 +591,10 @@ pub fn write_cell_body(
     );
     let mut cell = [0u8; CELL_BODY_SIZE];
     let len = data.len();
+    let length_field = len as u16 | if more { LENGTH_MORE } else { 0 };
     cell[0] = command as u8;
     cell[1..3].copy_from_slice(&stream_id.to_be_bytes());
-    cell[3..5].copy_from_slice(&(len as u16).to_be_bytes());
+    cell[3..5].copy_from_slice(&length_field.to_be_bytes());
 
     let digest = relay_cell_digest(digest_key, &cell[..5], &data[..len]);
     cell[5..5 + DIGEST_SIZE].copy_from_slice(&digest);
@@ -569,19 +603,33 @@ pub fn write_cell_body(
     cell
 }
 
-impl RelayCell {
-    /// Serialize into a fixed-size cell body with digest, ready for onion wrapping.
-    /// `digest_key` is the endpoint's forward digest key.
+/// One cell's worth of a relay message.
+///
+/// A message that fits one cell is a single piece with `more == false`. A
+/// larger one is split: the first piece carries the real command, `more`,
+/// and `total_len(u16) || bytes`; each following piece is a `Continue` with
+/// `index(u8) || bytes`, `more` set on all but the last. Every piece has its
+/// own end-to-end digest, so pieces can be lost but not forged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayPiece {
+    pub command: RelayCellCommand,
+    pub stream_id: u16,
+    pub more: bool,
+    pub data: Vec<u8>,
+}
+
+impl RelayPiece {
     pub fn to_cell(&self, digest_key: &[u8; 32]) -> [u8; CELL_BODY_SIZE] {
-        write_cell_body(self.command, self.stream_id, &self.data, digest_key)
+        write_piece_body(self.command, self.stream_id, self.more, &self.data, digest_key)
     }
 
     /// Parse a fully-decrypted cell body and verify its digest.
-    /// `digest_key` is the endpoint's forward digest key.
     pub fn from_cell(cell: &[u8; CELL_BODY_SIZE], digest_key: &[u8; 32]) -> Result<Self> {
         let command = RelayCellCommand::from_u8(cell[0])?;
         let stream_id = u16::from_be_bytes([cell[1], cell[2]]);
-        let length = u16::from_be_bytes([cell[3], cell[4]]) as usize;
+        let length_field = u16::from_be_bytes([cell[3], cell[4]]);
+        let more = length_field & LENGTH_MORE != 0;
+        let length = (length_field & !LENGTH_MORE) as usize;
 
         if length > CELL_PAYLOAD_MAX {
             return Err(Error::Wire("relay cell length exceeds max".into()));
@@ -598,7 +646,177 @@ impl RelayCell {
         Ok(Self {
             command,
             stream_id,
+            more,
             data: payload.to_vec(),
+        })
+    }
+}
+
+impl RelayCell {
+    /// Serialize into a fixed-size cell body with digest, ready for onion wrapping.
+    /// `digest_key` is the endpoint's forward digest key. Panics if the data
+    /// doesn't fit one cell; use [`RelayCell::pieces`] for messages that may not.
+    pub fn to_cell(&self, digest_key: &[u8; 32]) -> [u8; CELL_BODY_SIZE] {
+        write_cell_body(self.command, self.stream_id, &self.data, digest_key)
+    }
+
+    /// Parse a fully-decrypted single-cell message and verify its digest.
+    /// A piece of a multi-cell message is an error here; receivers that may
+    /// get one feed [`RelayPiece`]s to a [`RelayAssembler`].
+    pub fn from_cell(cell: &[u8; CELL_BODY_SIZE], digest_key: &[u8; 32]) -> Result<Self> {
+        let piece = RelayPiece::from_cell(cell, digest_key)?;
+        if piece.more || piece.command == RelayCellCommand::Continue {
+            return Err(Error::Wire("relay cell is part of a multi-cell message".into()));
+        }
+        Ok(Self {
+            command: piece.command,
+            stream_id: piece.stream_id,
+            data: piece.data,
+        })
+    }
+
+    /// Split into the cells that carry this message.
+    pub fn pieces(&self) -> Result<Vec<RelayPiece>> {
+        if self.data.len() <= CELL_PAYLOAD_MAX {
+            return Ok(vec![RelayPiece {
+                command: self.command,
+                stream_id: self.stream_id,
+                more: false,
+                data: self.data.clone(),
+            }]);
+        }
+        if self.data.len() > RELAY_MESSAGE_MAX {
+            return Err(Error::Wire(format!(
+                "relay message {} bytes exceeds {}",
+                self.data.len(),
+                RELAY_MESSAGE_MAX
+            )));
+        }
+        let (first, rest) = self.data.split_at(FIRST_PIECE_MAX);
+        let mut first_data = Vec::with_capacity(CELL_PAYLOAD_MAX);
+        first_data.extend_from_slice(&(self.data.len() as u16).to_be_bytes());
+        first_data.extend_from_slice(first);
+        let mut pieces = vec![RelayPiece {
+            command: self.command,
+            stream_id: self.stream_id,
+            more: true,
+            data: first_data,
+        }];
+        let chunks: Vec<&[u8]> = rest.chunks(CONTINUE_PIECE_MAX).collect();
+        let last = chunks.len() - 1;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let mut data = Vec::with_capacity(1 + chunk.len());
+            data.push((i + 1) as u8);
+            data.extend_from_slice(chunk);
+            pieces.push(RelayPiece {
+                command: RelayCellCommand::Continue,
+                stream_id: self.stream_id,
+                more: i != last,
+                data,
+            });
+        }
+        Ok(pieces)
+    }
+}
+
+struct PartialRelayMessage {
+    command: RelayCellCommand,
+    total: usize,
+    buf: Vec<u8>,
+    next_index: u8,
+}
+
+/// Reassembles multi-cell relay messages for one circuit direction.
+///
+/// Cells of a circuit arrive in order, but may be lost, and single-cell
+/// messages may arrive between the pieces of a larger one. One message is
+/// assembled per stream id; a piece that doesn't continue it exactly drops
+/// the partial message.
+#[derive(Default)]
+pub struct RelayAssembler {
+    partials: HashMap<u16, PartialRelayMessage>,
+}
+
+/// Streams with a message in reassembly at once, per circuit direction.
+const MAX_PARTIAL_RELAY_MESSAGES: usize = 4;
+
+impl std::fmt::Debug for RelayAssembler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "RelayAssembler({} partial)", self.partials.len())
+    }
+}
+
+impl RelayAssembler {
+    pub fn is_empty(&self) -> bool {
+        self.partials.is_empty()
+    }
+
+    /// Add a piece. Returns a complete message when this piece finishes one
+    /// (or is a whole single-cell message).
+    pub fn push(&mut self, piece: RelayPiece) -> Option<RelayCell> {
+        let RelayPiece {
+            command,
+            stream_id,
+            more,
+            data,
+        } = piece;
+        if command != RelayCellCommand::Continue {
+            if !more {
+                return Some(RelayCell {
+                    command,
+                    stream_id,
+                    data,
+                });
+            }
+            if data.len() < 2 {
+                self.partials.remove(&stream_id);
+                return None;
+            }
+            let total = u16::from_be_bytes([data[0], data[1]]) as usize;
+            if total > RELAY_MESSAGE_MAX || total <= data.len() - 2 {
+                self.partials.remove(&stream_id);
+                return None;
+            }
+            if self.partials.len() >= MAX_PARTIAL_RELAY_MESSAGES
+                && !self.partials.contains_key(&stream_id)
+            {
+                return None;
+            }
+            let mut buf = Vec::with_capacity(total);
+            buf.extend_from_slice(&data[2..]);
+            self.partials.insert(
+                stream_id,
+                PartialRelayMessage {
+                    command,
+                    total,
+                    buf,
+                    next_index: 1,
+                },
+            );
+            return None;
+        }
+
+        let Some(partial) = self.partials.get_mut(&stream_id) else {
+            return None;
+        };
+        let Some((&index, bytes)) = data.split_first() else {
+            self.partials.remove(&stream_id);
+            return None;
+        };
+        if index != partial.next_index || partial.buf.len() + bytes.len() > partial.total {
+            self.partials.remove(&stream_id);
+            return None;
+        }
+        partial.buf.extend_from_slice(bytes);
+        partial.next_index = partial.next_index.wrapping_add(1);
+        if more {
+            return None;
+        }
+        let partial = self.partials.remove(&stream_id).unwrap();
+        (partial.buf.len() == partial.total).then(|| RelayCell {
+            command: partial.command,
+            stream_id,
+            data: partial.buf,
         })
     }
 }
@@ -772,6 +990,8 @@ pub struct OutboundCircuit {
     pub forward_nonce: u64,
     pub nonce_domain: [u8; 16],
     pub backward_replay: CellReplayWindow,
+    /// Multi-cell messages arriving from the circuit's hops.
+    pub assembler: RelayAssembler,
 }
 
 impl OutboundCircuit {
@@ -843,7 +1063,52 @@ impl OutboundCircuit {
         self.recv_from_hop(cell, last)
     }
 
-    /// Send a relay cell to a specific intermediate hop (for EXTEND during construction).
+    /// Send a relay message of any size to a hop, as one cell or several.
+    /// Returns (first_hop, circuit_id, encrypted cells in sending order).
+    pub fn send_message_to_hop(
+        &mut self,
+        relay_cell: &RelayCell,
+        hop_index: usize,
+    ) -> Result<(PeerId, CircuitId, Vec<[u8; CELL_SIZE]>)> {
+        let cells = relay_cell
+            .pieces()?
+            .iter()
+            .map(|piece| self.wrap_piece_to_hop(piece, hop_index))
+            .collect();
+        Ok((self.first_hop, self.first_hop_circuit_id, cells))
+    }
+
+    /// Send a relay message of any size to the circuit's last hop.
+    pub fn send_relay_message(
+        &mut self,
+        relay_cell: &RelayCell,
+    ) -> Result<(PeerId, CircuitId, Vec<[u8; CELL_SIZE]>)> {
+        let last = self.hop_keys.len() - 1;
+        self.send_message_to_hop(relay_cell, last)
+    }
+
+    fn wrap_piece_to_hop(&mut self, piece: &RelayPiece, hop_index: usize) -> [u8; CELL_SIZE] {
+        let digest_key = self.hop_keys[hop_index].forward_digest;
+        let body = piece.to_cell(&digest_key);
+        let mut cell = [0u8; CELL_SIZE];
+        cell[..CELL_BODY_SIZE].copy_from_slice(&body);
+        let (domain, nonce) = self.next_forward_nonce();
+        set_cell_nonce(&mut cell, &domain, nonce);
+        for hop in self.hop_keys[..=hop_index].iter().rev() {
+            hop.encrypt_forward(&mut cell);
+        }
+        cell
+    }
+
+    /// Receive a cell from the circuit's last hop, returning a relay message
+    /// once one is complete.
+    pub fn recv_relay_message(&mut self, cell: &mut [u8; CELL_SIZE]) -> Result<Option<RelayCell>> {
+        let last = self.hop_keys.len() - 1;
+        let piece = self.recv_piece_from_hop(cell, last)?;
+        Ok(self.assembler.push(piece))
+    }
+
+    /// Send a single-cell relay message to a specific intermediate hop.
     /// `hop_index` is 0-based (0 = first hop, which is the current endpoint during extension).
     pub fn send_to_hop(
         &mut self,
@@ -870,6 +1135,22 @@ impl OutboundCircuit {
         cell: &mut [u8; CELL_SIZE],
         hop_index: usize,
     ) -> Result<RelayCell> {
+        let piece = self.recv_piece_from_hop(cell, hop_index)?;
+        if piece.more || piece.command == RelayCellCommand::Continue {
+            return Err(Error::Wire("relay cell is part of a multi-cell message".into()));
+        }
+        Ok(RelayCell {
+            command: piece.command,
+            stream_id: piece.stream_id,
+            data: piece.data,
+        })
+    }
+
+    fn recv_piece_from_hop(
+        &mut self,
+        cell: &mut [u8; CELL_SIZE],
+        hop_index: usize,
+    ) -> Result<RelayPiece> {
         let nonce = cell_nonce(cell);
         for hop in self.hop_keys[..=hop_index].iter() {
             if !hop.decrypt_backward(cell) {
@@ -878,11 +1159,11 @@ impl OutboundCircuit {
         }
         let digest_key = self.hop_keys[hop_index].backward_digest;
         let body: &[u8; CELL_BODY_SIZE] = cell[..CELL_BODY_SIZE].try_into().unwrap();
-        let relay = RelayCell::from_cell(body, &digest_key)?;
+        let piece = RelayPiece::from_cell(body, &digest_key)?;
         if !self.backward_replay.accept(nonce) {
             return Err(Error::Crypto("backward cell replay".into()));
         }
-        Ok(relay)
+        Ok(piece)
     }
 }
 
@@ -1018,36 +1299,70 @@ impl CongestionWindow {
 
 /// Build an EXTEND relay cell payload.
 /// Format: kem_algo(1) || eph_pk_len(2 BE) || eph_pk(variable) || destination(32)
+///         || hint_count(u8) || hint_count × hint(32)
 ///
 /// The destination is the waypoint target — the relay routes toward it via DV,
 /// extending to its own best next_hop rather than requiring a direct link.
-pub fn build_extend_payload(kem_algo: u8, eph_pk: &[u8], destination: &PeerId) -> Vec<u8> {
+/// Hints are peers known to be on the way to the destination, for relays that
+/// don't know it themselves.
+pub fn build_extend_payload(
+    kem_algo: u8,
+    eph_pk: &[u8],
+    destination: &PeerId,
+    hints: &[PeerId],
+) -> Vec<u8> {
     let len = eph_pk.len() as u16;
-    let mut payload = Vec::with_capacity(3 + eph_pk.len() + 32);
+    let mut payload = Vec::with_capacity(3 + eph_pk.len() + 32 + 1 + 32 * hints.len());
     payload.push(kem_algo);
     payload.extend_from_slice(&len.to_be_bytes());
     payload.extend_from_slice(eph_pk);
     payload.extend_from_slice(destination.as_bytes());
+    payload.push(hints.len() as u8);
+    for hint in hints {
+        payload.extend_from_slice(hint.as_bytes());
+    }
     payload
 }
 
+/// A parsed EXTEND payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendRequest {
+    pub kem_algo: u8,
+    pub eph_pk: Vec<u8>,
+    pub destination: PeerId,
+    pub hints: Vec<PeerId>,
+}
+
 /// Parse an EXTEND relay cell payload.
-/// Returns (kem_algo, ephemeral_pubkey, destination).
-pub fn parse_extend_payload(data: &[u8]) -> Result<(u8, Vec<u8>, PeerId)> {
+pub fn parse_extend_payload(data: &[u8]) -> Result<ExtendRequest> {
+    let short = || Error::Wire("EXTEND payload too short".into());
     if data.len() < 3 {
-        return Err(Error::Wire("EXTEND payload too short".into()));
+        return Err(short());
     }
     let kem_algo = data[0];
     let eph_pk_len = u16::from_be_bytes([data[1], data[2]]) as usize;
-    let min_len = 3 + eph_pk_len + 32;
-    if data.len() < min_len {
-        return Err(Error::Wire("EXTEND payload too short".into()));
-    }
-    let eph_pk = data[3..3 + eph_pk_len].to_vec();
     let offset = 3 + eph_pk_len;
-    let mut peer_bytes = [0u8; 32];
-    peer_bytes.copy_from_slice(&data[offset..offset + 32]);
-    Ok((kem_algo, eph_pk, PeerId(peer_bytes)))
+    if data.len() < offset + 32 + 1 {
+        return Err(short());
+    }
+    let eph_pk = data[3..offset].to_vec();
+    let destination = PeerId(data[offset..offset + 32].try_into().unwrap());
+    let hint_count = data[offset + 32] as usize;
+    if hint_count > crate::wire::MAX_HINTS {
+        return Err(Error::Wire(format!("EXTEND carries {} hints", hint_count)));
+    }
+    let hints_at = offset + 33;
+    let hint_bytes = data.get(hints_at..hints_at + 32 * hint_count).ok_or_else(short)?;
+    let hints = hint_bytes
+        .chunks_exact(32)
+        .map(|h| PeerId(h.try_into().unwrap()))
+        .collect();
+    Ok(ExtendRequest {
+        kem_algo,
+        eph_pk,
+        destination,
+        hints,
+    })
 }
 
 /// Build an EXTENDED relay cell payload.
@@ -1674,11 +1989,21 @@ mod tests {
     fn extend_payload_roundtrip_x25519() {
         let pubkey = [0xAA; 32];
         let dest = pid(5);
-        let payload = build_extend_payload(0x00, &pubkey, &dest);
-        let (algo, parsed_key, parsed_dest) = parse_extend_payload(&payload).unwrap();
-        assert_eq!(algo, 0x00);
-        assert_eq!(parsed_key, pubkey);
-        assert_eq!(parsed_dest, dest);
+        let payload = build_extend_payload(0x00, &pubkey, &dest, &[]);
+        let req = parse_extend_payload(&payload).unwrap();
+        assert_eq!(req.kem_algo, 0x00);
+        assert_eq!(req.eph_pk, pubkey);
+        assert_eq!(req.destination, dest);
+        assert!(req.hints.is_empty());
+    }
+
+    #[test]
+    fn extend_payload_carries_hints() {
+        let hints = [pid(1), pid(2), pid(3)];
+        let payload = build_extend_payload(0x01, &[0xCC; 64], &pid(9), &hints);
+        let req = parse_extend_payload(&payload).unwrap();
+        assert_eq!(req.hints, hints);
+        assert!(parse_extend_payload(&payload[..payload.len() - 1]).is_err());
     }
 
     #[test]
@@ -1686,11 +2011,102 @@ mod tests {
         // Simulate a 1216-byte MlkemX25519 public key
         let pubkey = vec![0xBB; 1216];
         let dest = pid(7);
-        let payload = build_extend_payload(0x01, &pubkey, &dest);
-        let (algo, parsed_key, parsed_dest) = parse_extend_payload(&payload).unwrap();
-        assert_eq!(algo, 0x01);
-        assert_eq!(parsed_key, pubkey);
-        assert_eq!(parsed_dest, dest);
+        let payload = build_extend_payload(0x01, &pubkey, &dest, &[]);
+        let req = parse_extend_payload(&payload).unwrap();
+        assert_eq!(req.kem_algo, 0x01);
+        assert_eq!(req.eph_pk, pubkey);
+        assert_eq!(req.destination, dest);
+    }
+
+    fn pieces_of(len: usize, stream_id: u16) -> (RelayCell, Vec<RelayPiece>) {
+        let cell = RelayCell {
+            command: RelayCellCommand::Extend,
+            stream_id,
+            data: (0..len).map(|i| i as u8).collect(),
+        };
+        let pieces = cell.pieces().unwrap();
+        (cell, pieces)
+    }
+
+    #[test]
+    fn cells_are_512_bytes() {
+        assert_eq!(CELL_SIZE, 512);
+    }
+
+    #[test]
+    fn small_message_is_one_unflagged_piece() {
+        let (cell, pieces) = pieces_of(CELL_PAYLOAD_MAX, 0);
+        assert_eq!(pieces.len(), 1);
+        assert!(!pieces[0].more);
+        let mut a = RelayAssembler::default();
+        assert_eq!(a.push(pieces[0].clone()).unwrap().data, cell.data);
+    }
+
+    #[test]
+    fn post_quantum_extend_spans_cells_and_reassembles() {
+        let key = [7u8; 32];
+        let (cell, pieces) = pieces_of(1216 + 32 + 1, 0);
+        assert!(pieces.len() >= 3);
+        assert!(pieces[..pieces.len() - 1].iter().all(|p| p.more));
+        assert!(!pieces.last().unwrap().more);
+        let mut a = RelayAssembler::default();
+        let mut out = None;
+        for p in &pieces {
+            // Through the wire format, digest included.
+            let parsed = RelayPiece::from_cell(&p.to_cell(&key), &key).unwrap();
+            assert_eq!(&parsed, p);
+            assert!(RelayCell::from_cell(&p.to_cell(&key), &key).is_err());
+            out = a.push(parsed);
+        }
+        let out = out.unwrap();
+        assert_eq!(out.command, RelayCellCommand::Extend);
+        assert_eq!(out.data, cell.data);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn single_cells_may_interleave_with_a_multi_cell_message() {
+        let (cell, pieces) = pieces_of(1000, 0);
+        let mut a = RelayAssembler::default();
+        assert!(a.push(pieces[0].clone()).is_none());
+        let padding = RelayPiece {
+            command: RelayCellCommand::Padding,
+            stream_id: 0,
+            more: false,
+            data: vec![],
+        };
+        assert_eq!(a.push(padding).unwrap().command, RelayCellCommand::Padding);
+        let mut out = None;
+        for p in &pieces[1..] {
+            out = a.push(p.clone());
+        }
+        assert_eq!(out.unwrap().data, cell.data);
+    }
+
+    #[test]
+    fn lost_piece_drops_the_message() {
+        let (_, pieces) = pieces_of(1400, 3);
+        assert!(pieces.len() >= 4);
+        let mut a = RelayAssembler::default();
+        for (i, p) in pieces.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            assert!(a.push(p.clone()).is_none());
+        }
+        assert!(a.is_empty());
+        // A stray continuation with no message in progress is ignored.
+        assert!(a.push(pieces[2].clone()).is_none());
+    }
+
+    #[test]
+    fn oversized_relay_message_is_refused() {
+        let cell = RelayCell {
+            command: RelayCellCommand::Introduce,
+            stream_id: 0,
+            data: vec![0; RELAY_MESSAGE_MAX + 1],
+        };
+        assert!(cell.pieces().is_err());
     }
 
     #[test]

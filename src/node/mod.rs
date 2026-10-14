@@ -20,8 +20,8 @@ use crate::circuit::{
     parse_introduce_cell, parse_introduce_payload, parse_rendezvous_establish_payload,
     parse_rendezvous_join_payload, parse_stream_begin_payload, set_cell_nonce, write_cell_body,
     CellReplayWindow, CircuitAction, CircuitKey, CircuitState as CircuitPhase, CircuitTable,
-    CryptoOp, HopCrypto, HopKey, OutboundCircuit, RelayCell, RelayCellCommand, CELL_BODY_SIZE,
-    CELL_PAYLOAD_MAX, CELL_SIZE, EXTENDED_FLAG_REACHED,
+    CryptoOp, ExtendRequest, HopCrypto, HopKey, OutboundCircuit, RelayCell, RelayCellCommand,
+    RelayPiece, CELL_BODY_SIZE, CELL_PAYLOAD_MAX, CELL_SIZE, EXTENDED_FLAG_REACHED,
 };
 use crate::dht::{
     DhtNeighbor, DhtRecord, DhtStore, DhtWatchTable, KBucketTable, RecordSource, WalkStep,
@@ -211,13 +211,17 @@ impl Default for NodeConfig {
 const HELLO_PUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 const HELLO_TTL: u32 = 600;
 
-/// How often we check and re-publish hidden service intro points.
-/// TNS TTL is 600s; we re-publish well before that.
+/// How often we scan for Hidden identities that have no maintenance task yet.
+/// Also paces the Public identities' peer-record maintenance.
 const HIDDEN_SERVICE_MAINTAIN_INTERVAL: Duration = Duration::from_secs(240);
 
-/// Re-publish hidden service intro points after this many seconds.
-/// Must be less than the TNS TTL (600s) to avoid gaps.
-const HIDDEN_SERVICE_REPUBLISH_AFTER: Duration = Duration::from_secs(480);
+/// TTL of a hidden service's TNS intro records.
+const HIDDEN_SERVICE_TTL: u32 = 600;
+
+/// How often each Hidden identity's task checks its intro circuits, drawn
+/// uniformly from this range per check so identities stay unsynchronised.
+const HIDDEN_SERVICE_CHECK_INTERVAL: std::ops::Range<Duration> =
+    Duration::from_secs(20)..Duration::from_secs(40);
 
 /// How often the daemon refreshes active pool-endpoint claims (leases). Must be
 /// well under the claim TTL (default 45s) so a single missed refresh is tolerated
@@ -272,6 +276,11 @@ pub struct CircuitState {
     pub relay_queues: Arc<Mutex<HashMap<(u32, PeerId), mpsc::Sender<WireMessage>>>>,
     /// Multipath circuit groups: destination → CircuitGroup.
     pub groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
+    /// Multi-cell relay messages being reassembled at this hop, per inbound
+    /// circuit, with when the last piece arrived.
+    pub relay_assembly: Arc<Mutex<HashMap<CircuitKey, (Instant, crate::circuit::RelayAssembler)>>>,
+    /// Initiator: circuits waiting for TRUNCATED from their last built hop.
+    pub pending_truncates: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>,
 }
 
 impl CircuitState {
@@ -286,6 +295,8 @@ impl CircuitState {
             hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
             relay_queues: Arc::new(Mutex::new(HashMap::new())),
             groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
+            relay_assembly: Arc::new(Mutex::new(HashMap::new())),
+            pending_truncates: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -330,6 +341,8 @@ pub struct HiddenServiceState {
     pub intros: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Vec<(PeerId, u32)>>>>,
     /// Tracks when each hidden service was last successfully published.
     pub last_publish: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Instant>>>,
+    /// Hidden identities that have a running maintenance task.
+    pub(super) maintained: Arc<Mutex<HashSet<tarnet_api::types::ServiceId>>>,
     /// Introduction point registrations: circuit_id → registered ServiceId
     pub intro_registrations:
         Arc<Mutex<HashMap<CircuitKey, (tarnet_api::types::ServiceId, PeerId)>>>,
@@ -342,6 +355,7 @@ impl HiddenServiceState {
         Self {
             intros: Arc::new(Mutex::new(HashMap::new())),
             last_publish: Arc::new(Mutex::new(HashMap::new())),
+            maintained: Arc::new(Mutex::new(HashSet::new())),
             intro_registrations: Arc::new(Mutex::new(HashMap::new())),
             rendezvous: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1680,6 +1694,7 @@ impl Node {
                         origin: retransmit_identity.peer_id(),
                         destination: remote,
                         ttl: 64,
+                        hints: Vec::new(),
                         data: encrypted,
                     };
                     let encoded = msg.to_wire_encrypted().encode();
@@ -1735,6 +1750,7 @@ impl Node {
                             origin: retransmit_identity.peer_id(),
                             destination: remote,
                             ttl: 64,
+                            hints: Vec::new(),
                             data: encrypted,
                         };
                         encoded_msgs.push((*seq, msg.to_wire_encrypted().encode()));

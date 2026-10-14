@@ -1,9 +1,9 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
 /// Minimum wire protocol version this node supports.
-pub const WIRE_VERSION_MIN: u8 = 4;
+pub const WIRE_VERSION_MIN: u8 = 5;
 /// Maximum (current) wire protocol version this node supports.
-pub const WIRE_VERSION_MAX: u8 = 4;
+pub const WIRE_VERSION_MAX: u8 = 5;
 /// Current wire version used in outgoing messages.
 pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
@@ -1267,35 +1267,54 @@ pub struct DataMsg {
     pub origin: PeerId,
     pub destination: PeerId,
     pub ttl: u8,
+    /// Forwarding hints toward the destination (its landmark and path).
+    /// Reserved: always sent empty, carried unchanged when forwarding.
+    pub hints: Vec<PeerId>,
     pub data: Vec<u8>,
 }
+
+/// Most forwarding hints a Data message or EXTEND may carry: a landmark plus
+/// a path of up to `PATH_MAX` (8) peers.
+pub const MAX_HINTS: usize = 9;
 
 /// Type alias preserving the old name for callers that used EncryptedDataMsg.
 pub type EncryptedDataMsg = DataMsg;
 
 impl DataMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(65 + self.data.len());
+        let mut buf = Vec::with_capacity(66 + 32 * self.hints.len() + self.data.len());
         buf.extend_from_slice(self.origin.as_bytes());
         buf.extend_from_slice(self.destination.as_bytes());
         buf.push(self.ttl);
+        buf.push(self.hints.len() as u8);
+        for hint in &self.hints {
+            buf.extend_from_slice(hint.as_bytes());
+        }
         buf.extend_from_slice(&self.data);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 65 {
+        if data.len() < 66 {
             return Err(Error::Wire("Data too short".into()));
         }
         let mut r = Reader::new(data);
         let origin = r.read_array::<32>()?;
         let destination = r.read_array::<32>()?;
         let ttl = r.read_u8()?;
+        let hint_count = r.read_u8()? as usize;
+        if hint_count > MAX_HINTS {
+            return Err(Error::Wire(format!("Data carries {} hints", hint_count)));
+        }
+        let hints = (0..hint_count)
+            .map(|_| r.read_array::<32>().map(PeerId))
+            .collect::<Result<Vec<_>>>()?;
         let rest = r.read_rest();
         Ok(Self {
             origin: PeerId(origin),
             destination: PeerId(destination),
             ttl,
+            hints,
             data: rest,
         })
     }
@@ -2495,6 +2514,7 @@ mod tests {
             origin: PeerId([0x11; 32]),
             destination: PeerId([0x22; 32]),
             ttl: 42,
+            hints: Vec::new(),
             data: b"encrypted payload".to_vec(),
         };
         let bytes = msg.to_bytes();
@@ -2504,6 +2524,23 @@ mod tests {
         assert_eq!(decoded.ttl, 42);
         assert_eq!(decoded.data, b"encrypted payload");
     }
+
+    #[test]
+    fn data_msg_hints_roundtrip_and_bound() {
+        let mut msg = DataMsg {
+            origin: PeerId([1; 32]),
+            destination: PeerId([2; 32]),
+            ttl: 7,
+            hints: vec![PeerId([3; 32]), PeerId([4; 32])],
+            data: b"payload".to_vec(),
+        };
+        let decoded = DataMsg::from_bytes(&msg.to_bytes()).unwrap();
+        assert_eq!(decoded.hints, msg.hints);
+        assert_eq!(decoded.data, msg.data);
+        msg.hints = vec![PeerId([5; 32]); MAX_HINTS + 1];
+        assert!(DataMsg::from_bytes(&msg.to_bytes()).is_err());
+    }
+
 
     #[test]
     fn channel_open_flags_roundtrip() {

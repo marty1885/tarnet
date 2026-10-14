@@ -30,6 +30,12 @@ pub trait Transport: Send + Sync {
     /// Human-readable transport name (e.g. "tcp", "ws", "webrtc").
     /// Pluggable transports return their own name (e.g. "obfs4", "rs232").
     fn name(&self) -> &'static str;
+    /// Approximate bandwidth in bytes/s, if known. Links use it to size frames
+    /// and to scale timers, so a slow radio link isn't timed out while a
+    /// message is still on the air. `None` means fast or unknown.
+    fn bandwidth_hint(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Accepts and initiates transport connections.
