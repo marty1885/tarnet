@@ -1507,6 +1507,11 @@ impl PeerLink {
         tx_time(self.transport.as_ref(), (frames * (frame_plain + SEQ_SIZE + TAG_SIZE)) as u64)
     }
 
+    /// Whether the transport is below the slow-link threshold.
+    pub fn is_slow(&self) -> bool {
+        matches!(self.transport.bandwidth_hint(), Some(bps) if bps < SLOW_LINK_BPS)
+    }
+
     /// Transport name (e.g. "tcp", "ws", "webrtc").
     pub fn transport_name(&self) -> &'static str {
         self.transport_name
@@ -2009,8 +2014,10 @@ mod tests {
         let big: Vec<u8> = (0..3000u32).map(|i| i as u8).collect();
         la.send_message(&big).await.unwrap();
         la.send_message(&ping()).await.unwrap();
-        assert_eq!(recv_good(&lb).await, big);
-        assert_eq!(recv_good(&lb).await, ping());
+        // The keepalive is control class and may overtake the bulk message.
+        let mut got = vec![recv_good(&lb).await, recv_good(&lb).await];
+        got.sort_by_key(|m| m.len());
+        assert_eq!(got, vec![ping(), big]);
         let sizes = log.sizes.lock().unwrap()[before..].to_vec();
         assert!(sizes.len() >= 3000 / SLOW_FRAME_PLAIN);
         assert!(sizes.iter().all(|&n| n == 256), "every slow-link frame is 256 B: {:?}", sizes);

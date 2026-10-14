@@ -34,7 +34,6 @@ use crate::link::PeerLink;
 use crate::peer_transport::LinkTable;
 use crate::pool::PoolStore;
 use crate::pubkey_cache::PubkeyCache;
-use crate::routing::dv;
 use crate::routing::RoutingTable;
 use crate::state::{PersistedIdentity, PersistedRecord, StateDb, StorageLimits};
 use crate::transport::webrtc::WebRtcConnector;
@@ -51,12 +50,10 @@ mod dht;
 mod hidden_service;
 mod identity_mgmt;
 mod pool;
-mod route_probe;
+mod route;
 mod stream;
 mod tunnel;
 mod webrtc;
-
-const ROUTE_AD_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Create an interval that starts after a random jitter of `0..period/2`,
 /// then ticks at `period`.  Desynchronizes periodic timers across nodes.
@@ -67,7 +64,6 @@ fn jittered_interval(period: Duration) -> tokio::time::Interval {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval
 }
-const ROUTE_EXPIRY: Duration = Duration::from_secs(120);
 const DHT_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How often a node republishes the (non-hello) records it published itself.
 /// Owners republishing is what keeps DHT records alive.
@@ -529,13 +525,8 @@ pub struct Node {
             HashMap<tarnet_api::types::ServiceId, std::collections::BTreeMap<String, Vec<u8>>>,
         >,
     >,
-    /// RouteProbe reverse-path table: nonce → (sender, timestamp).
-    /// Used to forward RouteProbeFound replies back to the originator.
-    probe_reverse: Arc<Mutex<HashMap<[u8; 16], (PeerId, Instant)>>>,
-    /// RouteProbe seen nonces for duplicate suppression.
-    probe_seen: Arc<Mutex<HashMap<[u8; 16], Instant>>>,
-    /// Pending route probes: target → list of completion notifiers.
-    pending_probes: Arc<Mutex<HashMap<PeerId, Vec<oneshot::Sender<u16>>>>>,
+    /// When we last sent each neighbour a full route dump on request.
+    route_dumps_sent: Arc<Mutex<HashMap<PeerId, Instant>>>,
     /// Discovery handle for reconnection. Set by `run()`.
     discovery: Arc<Mutex<Option<Arc<Box<dyn Discovery>>>>>,
     /// Bootstrap addresses for isolation recovery. Set by `run()`.
@@ -774,9 +765,7 @@ impl Node {
             started_at: std::time::Instant::now(),
             tns_cache: Arc::new(Mutex::new(crate::tns::TnsCache::new())),
             zone_published: Arc::new(Mutex::new(HashMap::new())),
-            probe_reverse: Arc::new(Mutex::new(HashMap::new())),
-            probe_seen: Arc::new(Mutex::new(HashMap::new())),
-            pending_probes: Arc::new(Mutex::new(HashMap::new())),
+            route_dumps_sent: Arc::new(Mutex::new(HashMap::new())),
             discovery: Arc::new(Mutex::new(None)),
             bootstrap_addrs: Arc::new(Mutex::new(Vec::new())),
             isolation_recovery_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1243,64 +1232,15 @@ impl Node {
             .take()
             .ok_or_else(|| Error::Protocol("event loop already running".into()))?;
 
-        // Periodic route advertisement timer
-        let links_ref = self.links.clone();
-        let routing_ref = self.routing_table.clone();
-        let identity = self.identity.clone();
-        let probe_seen_ref = self.probe_seen.clone();
-        let probe_reverse_ref = self.probe_reverse.clone();
-        tokio::spawn(async move {
-            let mut interval = jittered_interval(ROUTE_AD_INTERVAL);
-            loop {
-                interval.tick().await;
-
-                // Collect (peer_id, link_arc, encoded_msg) under lock, then release
-                // both locks before doing any I/O. Holding locks across send_message
-                // (which awaits the per-link crypto lock) starves the message handler.
-                let to_send: Vec<(PeerId, Arc<PeerLink>, Vec<u8>)> = {
-                    let links = links_ref.lock().await;
-                    let table = routing_ref.lock().await;
-                    links
-                        .iter()
-                        .flat_map(|(peer_id, link)| {
-                            // Split into per-frame-sized chunks for this link's MTU.
-                            let budget = link.max_wire_message();
-                            let peer_id = *peer_id;
-                            let link = link.clone();
-                            dv::generate_advertisements(&identity, &table, &peer_id, budget)
-                                .into_iter()
-                                .map(move |ad| (peer_id, link.clone(), ad.to_wire().encode()))
-                                .collect::<Vec<_>>()
-                        })
-                        .collect()
-                };
-                for (peer_id, link, msg) in to_send {
-                    if let Err(e) = link.send_deferred(&msg).await {
-                        log::warn!("Failed to send route ad to {:?}: {}", peer_id, e);
-                    }
-                }
-
-                // Also expire old routes and stale probe state
-                routing_ref.lock().await.expire(ROUTE_EXPIRY);
-                let cutoff = Instant::now() - Duration::from_secs(60);
-                probe_seen_ref.lock().await.retain(|_, t| *t > cutoff);
-                probe_reverse_ref
-                    .lock()
-                    .await
-                    .retain(|_, (_, t)| *t > cutoff);
-            }
-        });
+        self.spawn_routing_task();
 
         // Per-link heartbeat / cover-traffic / liveness task. Every tick:
         //   1. Fire LinkDown for any link that hasn't received in DEAD_TIMEOUT.
         //   2. For each link whose Poisson-scheduled next-fire has elapsed,
         //      send a heartbeat with random padding (so heartbeats aren't a
-        //      fixed-size class on the wire), and refresh the direct-neighbor
-        //      route's last_updated so the DV expirer never wipes a live
-        //      neighbor's direct route.
+        //      fixed-size class on the wire).
         let hb_links = self.links.clone();
         let hb_event_tx = self.lifecycle_tx.clone();
-        let hb_routing = self.routing_table.clone();
         tokio::spawn(async move {
             let mut interval = jittered_interval(HEARTBEAT_TICK);
             loop {
@@ -1335,15 +1275,6 @@ impl Node {
 
                 if due.is_empty() {
                     continue;
-                }
-
-                // Refresh direct-neighbor route freshness for every peer we're
-                // about to heartbeat. Cheap and idempotent.
-                {
-                    let mut rt = hb_routing.lock().await;
-                    for (peer, _, _) in &due {
-                        rt.refresh_neighbor(peer);
-                    }
                 }
 
                 let now_us = std::time::SystemTime::now()
@@ -2040,7 +1971,6 @@ impl Node {
 
         if is_first {
             self.governor.lock().await.peer_connected(peer_id);
-            self.routing_table.lock().await.add_neighbor(peer_id);
             let dht_id = dht_id_from_peer_id(&peer_id);
             self.kbucket.lock().await.insert(peer_id, dht_id);
         }
@@ -2095,25 +2025,7 @@ impl Node {
             }
         });
 
-        // Send initial route advertisement(s) to the new peer
-        {
-            let link = self.links.lock().await.get(&peer_id).cloned();
-            if let Some(link) = link {
-                let budget = link.max_wire_message();
-                let ads = {
-                    let table = self.routing_table.lock().await;
-                    dv::generate_advertisements(&self.identity, &table, &peer_id, budget)
-                };
-                for ad in ads {
-                    if let Err(e) = link.send_deferred(&ad.to_wire().encode()).await {
-                        log::warn!("Failed to send initial route ad to {:?}: {}", peer_id, e);
-                    }
-                }
-            }
-        }
-
-        // Triggered update: tell all OTHER neighbors about the new peer
-        self.send_triggered_updates(&peer_id).await;
+        self.routing_link_up(&peer_id).await;
 
         // Relay-only nodes say so, so a relay-only neighbour can steer DELIVER
         // detours to a storing node. Storing is the assumed default, so a
@@ -2179,7 +2091,7 @@ impl Node {
                 gone
             };
             if peer_gone {
-                self.routing_table.lock().await.remove_next_hop(peer_id);
+                self.routing_link_down(peer_id).await;
                 self.dht_watches.lock().await.remove_peer(peer_id);
                 self.dht_walker.neighbor_stores.lock().await.remove(peer_id);
                 self.cleanup_peer_circuits(*peer_id).await;
@@ -2205,7 +2117,7 @@ impl Node {
         let peer_gone = self.links.lock().await.remove_link(&peer_id, link_id);
         if peer_gone {
             self.governor.lock().await.peer_disconnected(&peer_id);
-            self.routing_table.lock().await.remove_next_hop(&peer_id);
+            self.routing_link_down(&peer_id).await;
             self.dht_watches.lock().await.remove_peer(&peer_id);
             self.dht_walker.neighbor_stores.lock().await.remove(&peer_id);
             self.cleanup_peer_circuits(peer_id).await;
@@ -2222,7 +2134,7 @@ impl Node {
         let peer_gone = self.links.lock().await.remove_link(&peer_id, link_id);
         if peer_gone {
             self.governor.lock().await.peer_disconnected(&peer_id);
-            self.routing_table.lock().await.remove_next_hop(&peer_id);
+            self.routing_link_down(&peer_id).await;
             self.dht_watches.lock().await.remove_peer(&peer_id);
             self.dht_walker.neighbor_stores.lock().await.remove(&peer_id);
             self.cleanup_peer_circuits(peer_id).await;
@@ -2503,20 +2415,14 @@ impl Node {
         }
 
         match msg.msg_type {
-            MessageType::RouteAdvertisement => {
-                let ad = RouteAdvertisement::from_bytes(&msg.payload)?;
-                let mut table = self.routing_table.lock().await;
-                let changed = dv::process_advertisement(
-                    &mut table,
-                    &ad,
-                    &mut *self.pubkey_cache.lock().await,
-                )?;
-                if changed {
-                    log::debug!("Routing table updated from {:?}", from);
-                    // Triggered update: re-advertise to other neighbors
-                    drop(table);
-                    self.send_triggered_updates(&from).await;
-                }
+            MessageType::RouteUpdate => {
+                self.handle_route_update(from, &msg.payload).await?;
+            }
+            MessageType::RouteDigest => {
+                self.handle_route_digest(from, &msg.payload).await?;
+            }
+            MessageType::RouteRequest => {
+                self.handle_route_request(from, &msg.payload).await?;
             }
             MessageType::DhtPut => {
                 // Charge before parsing further or verifying: the budget bounds
@@ -2977,43 +2883,10 @@ impl Node {
             MessageType::CircuitDestroy => {
                 self.handle_circuit_destroy(from, &msg.payload).await?;
             }
-            MessageType::RouteProbe => {
-                self.handle_route_probe(from, &msg.payload).await?;
-            }
-            MessageType::RouteProbeFound => {
-                self.handle_route_probe_found(from, &msg.payload).await?;
-            } // Unknown message types are handled by the match's default
-              // (from_u16 returns None, so they never reach this match)
+            // Unknown message types never reach this match: from_u16
+            // returns None for them.
         }
         Ok(())
-    }
-
-    /// Send triggered route updates to all neighbors except the source.
-    async fn send_triggered_updates(&self, exclude: &PeerId) {
-        // Collect chunked advertisements under lock, then send without holding
-        // the routing/link locks across the per-link crypto await.
-        let to_send: Vec<(PeerId, Arc<PeerLink>, Vec<u8>)> = {
-            let links = self.links.lock().await;
-            let table = self.routing_table.lock().await;
-            links
-                .iter()
-                .filter(|(peer_id, _)| *peer_id != exclude)
-                .flat_map(|(peer_id, link)| {
-                    let budget = link.max_wire_message();
-                    let peer_id = *peer_id;
-                    let link = link.clone();
-                    dv::generate_advertisements(&self.identity, &table, &peer_id, budget)
-                        .into_iter()
-                        .map(move |ad| (peer_id, link.clone(), ad.to_wire().encode()))
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
-        for (peer_id, link, msg) in to_send {
-            if let Err(e) = link.send_deferred(&msg).await {
-                log::warn!("Failed triggered update to {:?}: {}", peer_id, e);
-            }
-        }
     }
 
     async fn send_to_peer(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
@@ -3078,6 +2951,11 @@ impl Node {
     /// Get the list of connected peers.
     pub async fn connected_peers(&self) -> Vec<PeerId> {
         self.links.lock().await.keys().copied().collect()
+    }
+
+    /// Cost of the best route to `dest`, if any.
+    pub async fn route_cost(&self, dest: &PeerId) -> Option<u32> {
+        self.routing_table.lock().await.lookup(dest).map(|r| r.cost)
     }
 
     /// Get routing table entries for display.

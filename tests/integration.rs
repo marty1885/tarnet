@@ -5,8 +5,6 @@ use tarnet::dht::{BloomFilter, KBucketTable};
 use tarnet::identity::{self, dht_id_from_peer_id, Keypair};
 use tarnet::link::PeerLink;
 use tarnet::node::Node;
-use tarnet::pubkey_cache::{CachedPubkey, PubkeyCache};
-use tarnet::routing::dv;
 use tarnet::routing::RoutingTable;
 use tarnet::state::{StateDb, StorageLimits};
 use tarnet::transport::tcp::{TcpDiscovery, TcpTransport};
@@ -23,20 +21,6 @@ fn hash_64(input: &[u8]) -> [u8; 64] {
         .finalize_xof()
         .fill(&mut out);
     out
-}
-
-fn make_pubkey_cache(kp: &Keypair) -> PubkeyCache {
-    let mut cache = PubkeyCache::new(100);
-    cache.insert(
-        kp.peer_id(),
-        CachedPubkey {
-            signing_algo: kp.identity.signing_algo(),
-            signing_pk: kp.identity.signing.signing_pubkey_bytes(),
-            kem_algo: kp.identity.kem_algo(),
-            kem_pk: kp.identity.kem.kem_pubkey_bytes(),
-        },
-    );
-    cache
 }
 
 const TEST_MODE: PortMode = PortMode::ReliableOrdered;
@@ -237,50 +221,42 @@ async fn peer_link_encrypted_messages() {
     assert_eq!(decoded.payload, reply);
 }
 
-/// Test route advertisement propagation across 3 nodes.
+/// Test route update propagation across 3 nodes.
 #[tokio::test]
 async fn route_propagation_three_nodes() {
-    let kp_a = Keypair::generate();
-    let kp_b = Keypair::generate();
-    let kp_c = Keypair::generate();
+    use tarnet::routing::COST_FAST;
+    let (a, b, c) = (PeerId([1; 32]), PeerId([2; 32]), PeerId([3; 32]));
 
-    // Build routing tables: A -- B -- C
-    let mut table_a = RoutingTable::new(kp_a.peer_id());
-    let mut table_b = RoutingTable::new(kp_b.peer_id());
-    let mut table_c = RoutingTable::new(kp_c.peer_id());
+    // A -- B -- C
+    let mut table_a = RoutingTable::new(a);
+    let mut table_b = RoutingTable::new(b);
+    let mut table_c = RoutingTable::new(c);
+    let dump_a_to_b = table_a.neighbour_up(b, COST_FAST);
+    let dump_c_to_b = table_c.neighbour_up(b, COST_FAST);
+    table_b.neighbour_up(a, COST_FAST);
+    table_b.neighbour_up(c, COST_FAST);
+    for m in dump_a_to_b {
+        table_b.apply_update(&a, &m);
+    }
+    for m in dump_c_to_b {
+        table_b.apply_update(&c, &m);
+    }
 
-    // B is neighbor of A and C
-    table_a.add_neighbor(kp_b.peer_id());
-    table_b.add_neighbor(kp_a.peer_id());
-    table_b.add_neighbor(kp_c.peer_id());
-    table_c.add_neighbor(kp_b.peer_id());
+    // B's batched changes reach A and C.
+    table_a.neighbour_up(b, COST_FAST);
+    table_c.neighbour_up(b, COST_FAST);
+    for m in table_b.take_pending(&a) {
+        table_a.apply_update(&b, &m);
+    }
+    for m in table_b.take_pending(&c) {
+        table_c.apply_update(&b, &m);
+    }
 
-    // B advertises to A (including C). Small table → a single chunk.
-    let ad_b_to_a = dv::generate_advertisements(&kp_b, &table_b, &kp_a.peer_id(), usize::MAX)
-        .into_iter()
-        .next()
-        .unwrap();
-    let mut cache = make_pubkey_cache(&kp_b);
-    let changed = dv::process_advertisement(&mut table_a, &ad_b_to_a, &mut cache).unwrap();
-    assert!(changed);
-
-    // A should now know about C through B
-    let route = table_a.lookup(&kp_c.peer_id()).unwrap();
-    assert_eq!(route.next_hop, kp_b.peer_id());
+    let route = table_a.lookup(&c).unwrap();
+    assert_eq!(route.next_hop, b);
     assert_eq!(route.cost, 2); // A→B (1) + B→C (1) = 2
-
-    // B advertises to C (including A). Small table → a single chunk.
-    let ad_b_to_c = dv::generate_advertisements(&kp_b, &table_b, &kp_c.peer_id(), usize::MAX)
-        .into_iter()
-        .next()
-        .unwrap();
-    let mut cache = make_pubkey_cache(&kp_b);
-    let changed = dv::process_advertisement(&mut table_c, &ad_b_to_c, &mut cache).unwrap();
-    assert!(changed);
-
-    // C should now know about A through B
-    let route = table_c.lookup(&kp_a.peer_id()).unwrap();
-    assert_eq!(route.next_hop, kp_b.peer_id());
+    let route = table_c.lookup(&a).unwrap();
+    assert_eq!(route.next_hop, b);
     assert_eq!(route.cost, 2);
 }
 

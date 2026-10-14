@@ -124,9 +124,9 @@ fn proto_category(mt: MessageType) -> ProtoCategory {
         | MessageType::Rekey
         | MessageType::Keepalive => ProtoCategory::Link,
 
-        MessageType::RouteAdvertisement
-        | MessageType::RouteProbe
-        | MessageType::RouteProbeFound => ProtoCategory::Routing,
+        MessageType::RouteUpdate
+        | MessageType::RouteDigest
+        | MessageType::RouteRequest => ProtoCategory::Routing,
 
         MessageType::DhtPut
         | MessageType::DhtGet

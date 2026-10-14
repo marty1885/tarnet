@@ -1,6 +1,8 @@
 # Routing protocol (v2, draft)
 
-Status: **draft for review, not implemented.** Replaces the routing part of wire
+Status: **draft, partly implemented** (link framing, scheduler, distance
+vector; landmarks, directory, hints, route search, sampling and the onion
+changes are not). Replaces the routing part of wire
 v4 (`RouteAdvertisement`, `RouteProbe`, `RouteProbeFound`) and changes link
 framing, `Data` and circuit `EXTEND`. Ships as wire version 5, a hard break
 (`WIRE_VERSION_MIN = WIRE_VERSION_MAX = 5`); after it the wire is frozen or
@@ -252,8 +254,9 @@ its seqno and advertising. This removes count-to-infinity without hop limits.
 
 ### Metric
 
-Additive per-link cost, chosen locally per link (a fast link costs 1, a slow or
-lossy link more). `0xFFFF` is a retraction.
+Additive per-link cost, chosen locally per link (a fast link costs 1, a slow
+link 16). `0xFFFF` is a retraction. A route whose metric would reach `0xFFFF`
+is unusable.
 
 ### Table budget
 
@@ -273,9 +276,19 @@ KB); the slow-link constraint is handled by sending changes only.
 * **Changes only.** Updates are sent when something changes, batched for a
   short delay and rate-limited per link. There is no periodic full dump.
 * **Digests.** Each node periodically sends each neighbour a 16-byte digest of
-  the route set it has advertised to that neighbour. The neighbour compares it
-  with what it holds from that sender. A match refreshes all those routes; a
-  mismatch (lost update) triggers a `RouteRequest` with `FULL_DUMP`.
+  the route set it has advertised to that neighbour, but only once every
+  change for that neighbour has been sent. The neighbour compares it with
+  everything it holds from that sender, including the entry for itself (which
+  it never selects). A mismatch (lost update) triggers a `RouteRequest` with
+  `FULL_DUMP`, answered at most once per 10 s per neighbour.
+* **Full dumps** go to a new neighbour on link-up and on request. They are
+  bracketed by `FULL_START` and `FULL_END`: the receiver collects the dump and
+  replaces everything it held from that sender when the dump ends, so entries
+  whose retraction was lost disappear. A dump whose end is lost changes
+  nothing until the next digest asks again. Ordinary updates arriving during a
+  dump apply to both.
+* Every node sends the same entries to every neighbour (no split horizon); the
+  feasibility condition already prevents loops.
 * **Link death** retracts every route via that neighbour immediately and sends
   triggered updates.
 * **No signatures.** Updates only travel between direct neighbours over the
@@ -441,8 +454,9 @@ path only when nobody earlier knows x.
 
 ### Circuits
 
-* **Cell size is 512 B** (v4: 1,440 B), the same on every circuit: body 472 B,
-  nonce 24 B, hop MAC 16 B, so up to 451 B of payload per relay cell. One
+* **Cell size is 512 B** (v4: 1,440 B), the same on every circuit: body 480 B,
+  tag 16 B, trailer 16 B, so up to 475 B of payload per relay cell (see
+  "Cell crypto"). One
   global size, because a size chosen per circuit would tell every relay
   whether the circuit is interactive or bulk. On fast links several cells
   share a frame, so the smaller cell costs little there. On an HC-12 hop a cell
@@ -452,7 +466,7 @@ path only when nobody earlier knows x.
   spans several cells. The first cell carries the real command, bit 15 of its
   length field set ("more follows"), and `total_len(u16) || bytes`. Each
   further cell is `Continue` with `index(u8) || bytes`, the bit set on all but
-  the last. Every cell keeps its own end-to-end digest, so pieces can be lost
+  the last. Every cell keeps its own end-to-end tag, so pieces can be lost
   but not forged. The receiving hop reassembles one message per stream id;
   single-cell messages may arrive in between; any gap drops the partial
   message. Messages are capped at 16 KB.
@@ -463,6 +477,8 @@ path only when nobody earlier knows x.
   unreliable streams keep message boundaries.
 * A waypoint is `(peer, hints)`. The initiator includes the segment's hints in
   each EXTEND. Relays only ever see hints for the segment they are extending.
+* **Onion layers only at waypoints, and waypoints are authenticated.** See
+  "Onion circuits" below.
 * **EXTEND step timeout** is link-aware: `max(1.5 s, hops_built · (0.5 s +
   4 · tx_time(step cells on the first link)))`, not a fixed 1.5 s. The first
   hop's CREATE resend interval likewise covers its airtime.
@@ -477,6 +493,145 @@ path only when nobody earlier knows x.
   sends `TRUNCATE` to the last built hop. That hop destroys whatever it started
   downstream, answers `TRUNCATED`, and the initiator retries the step from
   there. A failed step no longer discards the whole circuit.
+
+### Onion circuits
+
+Status: **design, not implemented.** Fixes from the 2026-10 audit: hop
+authentication (A1), cell integrity (C2, C3), the visible cell counter (C4),
+relay state limits (C5), the signature downgrade (C7) and one-hop hidden
+services (A2–A4, B4, B5).
+
+#### Layers only at waypoints
+
+v4 adds an onion layer at every node on the routed path: each EXTEND moves
+the circuit one link, so a circuit over L links takes L sequential steps, each
+crossing every hop built so far. v5 adds layers only at waypoints.
+
+* A **routed CREATE** carries a destination and hints. A node that is not the
+  destination picks the next hop by the forwarding rule, allocates a circuit
+  id on that link, installs keyless forwarding entries both ways and passes
+  the CREATE on. The destination answers CREATED, which travels back along
+  the entries.
+* The initiator sends a routed CREATE toward the first waypoint. EXTEND asks
+  the current last waypoint to send a routed CREATE toward the next one.
+  Building takes one step per waypoint.
+* A relay that can't forward (no route, link down, limits) sends DESTROY
+  back. A waypoint whose routed CREATE is destroyed answers EXTEND with an
+  empty EXTENDED, as in v4. The initiator retries from the built prefix
+  (TRUNCATE, as in v4).
+* **No hop counter.** A counter visible to relays would tell each one how far
+  it is from whoever started the segment, which for the first segment is the
+  initiator. Distance-vector forwarding is loop-free. Hint forwarding is
+  checked by remembering each CREATE's ephemeral key for 30 s: a node that
+  sees the same key again drops the CREATE and sends DESTROY.
+* Each relay rewrites the circuit id, so no id is shared by two links.
+* Keyless relays drop cells of the wrong size (C2).
+
+#### Waypoint authentication
+
+The node at the end of a routed CREATE proves it is the destination by
+signing. The initiator needs no key in advance: a peer id is the hash of the
+signing public key, so CREATED carries the key and the initiator checks it
+against the waypoint's id.
+
+* CREATED: `kem_ct`, the destination's signing public key, and a signature
+  over `"tarnet circuit created v1" || version || destination ||
+  eph_pk || kem_ct`.
+* The initiator verifies `peer_id(signing_pk) == waypoint` and the signature.
+  A relay on the segment can't answer for the waypoint, and can't swap the
+  ephemeral key, which the signature covers. The `reached` flag is gone.
+* The hop key is `KDF(kem_secret, H(transcript))`, transcript as signed. The
+  ephemeral KEM keeps forward secrecy; the signature only authenticates.
+* Cost: 96 B for an Ed25519 identity, about 1.7 KB for Falcon+Ed25519, once
+  per waypoint.
+* **The algorithm is implied by the key (fixes C7).** `verify` requires the
+  exact key and signature lengths of the stated algorithm, so a hybrid key
+  can't be checked as Ed25519 alone. Peer ids don't change.
+* Relays between waypoints stay unauthenticated by design.
+
+#### Cell crypto (version 1)
+
+```
+cell   = region(496) || trailer(16)            512 B, as before
+region = body(480) || tag(16)                  encrypted by every layer
+body   = command(1) || stream_id(2) || length(2) || payload || zero padding
+tag    = MAC(digest_key, counter || body)      16 B keyed BLAKE3
+```
+
+* Every layer XORs a XChaCha20 keystream over the whole region (body and
+  tag). Its nonce is the 16-byte trailer as it arrives, padded with 8 zero
+  bytes.
+* **The trailer changes at every layer (fixes C4).** Each layer replaces the
+  trailer `t` with `AES-256(p, t)`, `p` a per-hop, per-direction key. The
+  receiving end of a direction sees the plain 128-bit counter. The initiator
+  computes the forward trailers by inverting the layers. Relays see unrelated
+  values, so colluding relays get nothing to match except timing.
+* **Integrity is end to end (fixes C3).** Only the node a cell is addressed to
+  checks the tag. A relay recognises cells addressed to it (EXTEND, TRUNCATE,
+  rendezvous commands) by checking the tag with its own digest key after
+  peeling its layer. The tag covers the whole body including padding, so
+  flipping any bit kills the cell. A tagging attack makes the circuit fail
+  rather than marking it. The tag is under the layers, so relays never see
+  the same tag value.
+* **Replay.** The end of a direction keeps an ordered window on the counter.
+  Relays keep a set of the last 2048 trailers they peeled and drop repeats,
+  so a replayed cell dies at the first honest relay. Replays older than that
+  still die at the end of the direction.
+* Payload per cell: 475 B (v4: 451 B).
+* CREATE carries a cell-crypto version (1). A wide-block construction such as
+  Tor's CGO, which would make a tampered cell undecryptable at the next hop,
+  can be added later as version 2 without a wire break.
+
+#### Relay limits (local policy, fixes C5)
+
+* Half-open entries (CREATE seen, no CREATED) expire after the routed-CREATE
+  timeout; established entries idle for 10 min expire.
+* CREATE is rate-limited per incoming link.
+* The ephemeral-key cache that detects loops is bounded.
+
+#### Hidden services
+
+Every circuit used by a hidden service, on either side, is a normal
+multi-waypoint circuit. Intro and rendezvous points are sampled relays (see
+Relay sampling), never just a direct neighbour, and never the service host or
+the client.
+
+* **Service to intro point:** at least 2 waypoints before the intro point.
+* **IntroRegister is signed (fixes B4):** `service signing_pk || sig` over
+  `"tarnet intro register v1" || intro point id || H(transcript of the
+  service's handshake with the intro point)`. The intro point checks that the
+  key hashes to the service id. The signature is bound to this circuit, so it
+  can't be replayed on another one.
+* **INTRODUCE:** `service_id || ext_len(u16) || ext || sealed`. `sealed` is
+  encrypted to the service's KEM key and contains the rendezvous point, its
+  hints, the cookie, mode, port and a fresh client KEM public key. `ext` holds
+  typed extensions the intro point and service ignore when unknown, so
+  proof-of-work can be added later without a break.
+* **At the service (fixes B5):** INTRODUCE is handled off the circuit's message
+  queue and rate-limited. A replay cache, keyed by the hash of `sealed` and
+  kept for the descriptor lifetime, drops repeats.
+* **Service to rendezvous point:** at least 2 waypoints before the
+  rendezvous point. `RendezvousJoin` carries the cookie plus `join =
+  kem_ct_to_client_eph || confirm_tag`, which the rendezvous point passes to
+  the client in `RendezvousJoined`.
+* **End-to-end key, with forward secrecy:** `KDF(static_secret ||
+  eph_secret, H(INTRODUCE transcript || join))`. v4 used the static KEM
+  secret alone, so a later compromise of the service key exposed past
+  sessions.
+* **The rendezvous point splices with crypto.** A cell from the client loses
+  the rendezvous point's layer of the client circuit and gains its layer of
+  the service circuit, and the reverse the other way. Both sides keep every
+  hop key and add the end-to-end key as an extra innermost layer. v4 replaced
+  all hop keys with the end-to-end key, which is why its hidden-service
+  circuits could only be one hop.
+* **Client side:** the client's own identity sets its hop count to the
+  rendezvous and intro points.
+* **Direct streams refused (fixes A3).** A Hidden identity refuses
+  `StreamBegin` arriving other than through its rendezvous circuits.
+* **No peer record (fixes A4).** A Hidden identity never publishes the `"peer"`
+  record, and switching an identity to Hidden deletes it.
+* **No silent downgrade.** A Hidden identity's connection fails if it can't
+  get enough distinct relays, instead of using fewer hops.
 
 ### Fallback: bounded route search
 
@@ -560,7 +715,7 @@ Properties v4 aims for, and how v2 keeps them:
 | Link observers can't classify traffic by size | Fixed frame size per link plus coalescing. On slow links a cell spans several frames, so bursts reveal data vs control. Accepted (open decision 2): padding bursts would cost most of the saving. |
 | DHT walks and lookups carry no originator | Unchanged for the DHT. Directory lookups, route search and sample walks also carry none. |
 | Reaching a known node involves no third party | Unchanged inside the local area. Outside it, a directory landmark learns "x was looked up", not by whom. |
-| Hidden identities never expose the host | Unchanged. Their records leave event-triggered republish (this also fixes the v4 leak). Hidden lookups go over circuits once phase 3 lands. |
+| Hidden identities never expose the host | **Fixed** (v4 used one-hop circuits to direct neighbours). Intro and rendezvous circuits are multi-waypoint on both sides, see Hidden services. Their records leave event-triggered republish (this also fixes the v4 leak). Hidden lookups go over circuits once phase 3 lands. |
 | Circuit waypoints random over the whole network | Relay sampling by Metropolis–Hastings walks. |
 | No network-wide census | **Improved.** In v4 every node learns every node ID and its distance. In v2 a node learns its local area plus landmarks. |
 
@@ -586,6 +741,12 @@ Accepted residuals:
   this intro or rendezvous point" to the directory landmark, without the origin.
 * `Data` still carries origin and destination in clear to every relay, as in v4.
   Hints add the destination's address, which is public anyway.
+* **Relays between two waypoints see identical cells.** Without a layer of
+  their own, colluding relays on one segment can match a circuit by its bytes
+  instead of by timing, which already matches them. These relays are chosen
+  by routing, not by the client, so their layers never added real
+  unlinkability. Bytes still change at every waypoint. They learn the next
+  waypoint from the routed CREATE, as they learned it from EXTEND in v4.
 
 ## Wire format (version 5)
 
@@ -597,7 +758,9 @@ Retired: `RouteAdvertisement (0x0100)`, `RouteProbe (0x0101)`,
 
 ```
 RouteUpdate        (0x0110)
-  flags(u8)          bit0 FULL (this update is a full dump); others reserved, sent 0, ignored
+  flags(u8)          bit0 FULL (part of a full dump), bit1 FULL_START (first
+                     message of a dump), bit2 FULL_END (last message of a dump);
+                     others reserved, sent 0, ignored
   degree(u8)         sender's number of links, saturating at 255
   count(u16)
   count × ( dest(32) || seqno(u16) || metric(u16) || eflags(u8) )
@@ -647,9 +810,32 @@ Data / EncryptedData (0x0500 / 0x0501)
   origin(32) || destination(32) || ttl(u8) ||
   hint_count(u8) || hint_count × peer(32) || data
 
+CircuitCreate (0x0700)
+  circuit_id(u32) || version(u8) || flags(u8) ||
+  kem_algo(u8) || pk_len(u16) || eph_pk ||
+  [destination(32) || hint_count(u8) || hint_count × peer(32)]   iff flags bit0 ROUTED
+                     version: cell crypto, 1
+
+CircuitCreated (0x0701)
+  circuit_id(u32) || kem_ct_len(u16) || kem_ct ||
+  signing_pk_len(u16) || signing_pk || sig_len(u16) || sig
+                     sig over "tarnet circuit created v1" || version ||
+                     destination || eph_pk || kem_ct
+
 EXTEND payload (relay cell 0x05)
-  kem_algo(u8) || pk_len(u16) || pk || destination(32) ||
-  hint_count(u8) || hint_count × peer(32)
+  the routed CREATE's fields after circuit_id (destination always present)
+
+EXTENDED payload (relay cell 0x06)
+  the CREATED's fields after circuit_id; empty = failed
+
+IntroRegister (relay cell 0x0C)
+  service_id(32) || signing_pk_len(u16) || signing_pk || sig_len(u16) || sig
+
+Introduce (relay cell 0x07)
+  service_id(32) || ext_len(u16) || ext || sealed
+
+RendezvousJoin (relay cell 0x0A)    cookie(32) || join
+RendezvousJoined (relay cell 0x0B)  join
 
 Continue  (relay cell 0x13)   index(u8) || bytes      piece of a multi-cell message
 TRUNCATE  (relay cell 0x14)   empty payload
@@ -683,7 +869,10 @@ Hello record: `capabilities` gains bit `LANDMARK_ELIGIBLE` and bit `LANDMARK`.
 | Retransmit timers | `max(floor, SRTT + 4·RTTVAR + 2 · tx_time(msg))`; floors are today's constants |
 | Link death, TCP/WS | transport error immediately; probe after 15 s idle; dead after 45 s silent |
 | Link death, slow links | probe after 30 s idle; dead after 120 s silent |
-| Triggered update batching | 200 ms, at most 4 updates/s per link (slow: 1 per 2 s) |
+| Triggered update batching | 250 ms, so at most 4 updates/s per link (slow: 1 per 2 s) |
+| Link cost | fast 1, slow 16 |
+| Feasibility distance kept after last use | 180 s |
+| Seqno request hop count, duplicate window | 64, 10 s |
 | Digest interval | 30 s fast, 120 s slow |
 | Routes kept per destination | 3 |
 | `B_MIN` | 1024 (tests: as low as 4) |

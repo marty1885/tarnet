@@ -117,7 +117,7 @@ impl fmt::Display for KemAlgo {
 }
 
 /// BLAKE3-derived hash of signing public key, used as peer identity (32 bytes).
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PeerId(pub [u8; 32]);
 
 /// Service identity: BLAKE3-derived hash of signing public key (32 bytes).

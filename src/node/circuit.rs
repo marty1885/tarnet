@@ -2492,43 +2492,13 @@ impl Node {
         min_hops: usize,
         connected: &[PeerId],
     ) -> Option<tarnet_api::service::Connection> {
-        let (waypoints, mut first_hops) =
+        let (waypoints, first_hops) =
             self.plan_circuit_path(dest_peer, min_hops, connected).await;
 
-        // If no first hops found (destination beyond DV horizon), try a route probe.
-        // The probe walks the network and caches the route on success.
+        // No route: bounded route search (RouteSearch) is not implemented yet.
         if first_hops.is_empty() {
-            log::info!(
-                "try_connect_to_peer: no route to {:?}, starting route probe",
-                dest_peer
-            );
-            if let Some(_cost) = self.route_probe(*dest_peer).await {
-                log::info!(
-                    "try_connect_to_peer: route probe found {:?}, re-planning",
-                    dest_peer
-                );
-                let (new_waypoints, new_first_hops) =
-                    self.plan_circuit_path(dest_peer, min_hops, connected).await;
-                // Use the freshly discovered route.
-                first_hops = new_first_hops;
-                // Re-plan may give different waypoints too.
-                return self
-                    .try_build_with_hops(
-                        service_id,
-                        mode,
-                        port,
-                        dest_peer,
-                        &new_waypoints,
-                        &first_hops,
-                    )
-                    .await;
-            } else {
-                log::info!(
-                    "try_connect_to_peer: route probe for {:?} failed",
-                    dest_peer
-                );
-                return None;
-            }
+            log::info!("try_connect_to_peer: no route to {:?}", dest_peer);
+            return None;
         }
 
         self.try_build_with_hops(service_id, mode, port, dest_peer, &waypoints, &first_hops)

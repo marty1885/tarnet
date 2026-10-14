@@ -148,7 +148,7 @@ After the settle window, the simulator picks probe pairs from:
 - same city
 - inter-city
 
-It then calls the real `route_probe()` path on live nodes. Probe progress is printed as it runs:
+For each pair it waits (up to 12 s) for the source's distance-vector table to hold a route to the destination. Probe progress is printed as it runs:
 
 ```plaintext
 probe 17/50: 140 -> 892 ok cost=7 in 842ms

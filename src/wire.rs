@@ -119,9 +119,9 @@ enum_with_u16! {
         Rekey = 0x0004,
         Keepalive = 0x0005,
         // Routing (0x01xx)
-        RouteAdvertisement = 0x0100,
-        RouteProbe = 0x0101,
-        RouteProbeFound = 0x0102,
+        RouteUpdate = 0x0110,
+        RouteDigest = 0x0111,
+        RouteRequest = 0x0112,
         // DHT (0x02xx)
         DhtPut = 0x0200,
         DhtGet = 0x0201,
@@ -510,151 +510,178 @@ impl HandshakeAuth {
     }
 }
 
-/// RouteAdvertisement: peer_id(32) || entry_count(u16) || entries || sig_len(u16 BE) || signature
-/// Entry: dest_peer_id(32) || cost(u32)
-#[derive(Debug, Clone)]
-pub struct RouteAdvertisement {
-    pub advertiser: PeerId,
-    pub entries: Vec<RouteEntry>,
-    pub signature: Vec<u8>,
-}
+/// Metric value that retracts a route.
+pub const ROUTE_INFINITY: u16 = 0xFFFF;
+/// `RouteUpdate` flag: these entries are part of a full dump.
+pub const ROUTE_FULL: u8 = 0x01;
+/// `RouteUpdate` flag: first message of a full dump.
+pub const ROUTE_FULL_START: u8 = 0x02;
+/// `RouteUpdate` flag: last message of a full dump.
+pub const ROUTE_FULL_END: u8 = 0x04;
+/// Route entry flag: the destination is a landmark.
+pub const ROUTE_LANDMARK: u8 = 0x01;
+/// `RouteRequest` flag: send a full dump.
+pub const ROUTE_REQ_FULL_DUMP: u8 = 0x01;
+/// `RouteRequest` flag: ask for a newer seqno for one destination.
+pub const ROUTE_REQ_SEQNO: u8 = 0x02;
+/// Wire size of one route entry.
+pub const ROUTE_ENTRY_SIZE: usize = 32 + 2 + 2 + 1;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RouteEntry {
-    pub destination: PeerId,
-    pub cost: u32,
+    pub dest: PeerId,
+    pub seqno: u16,
+    pub metric: u16,
+    pub eflags: u8,
 }
 
-impl RouteAdvertisement {
-    /// The signed portion (everything except the signature).
-    pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(self.advertiser.as_bytes());
-        buf.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
-        for entry in &self.entries {
-            buf.extend_from_slice(entry.destination.as_bytes());
-            buf.extend_from_slice(&entry.cost.to_be_bytes());
-        }
-        buf
+impl RouteEntry {
+    pub fn write(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.dest.as_bytes());
+        buf.extend_from_slice(&self.seqno.to_be_bytes());
+        buf.extend_from_slice(&self.metric.to_be_bytes());
+        buf.push(self.eflags);
     }
+}
+
+/// RouteUpdate: flags(u8) || degree(u8) || count(u16) || count × entry.
+/// Entry: dest(32) || seqno(u16) || metric(u16) || eflags(u8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteUpdateMsg {
+    pub flags: u8,
+    pub degree: u8,
+    pub entries: Vec<RouteEntry>,
+}
+
+impl RouteUpdateMsg {
+    /// Entries that fit one wire message.
+    pub const MAX_ENTRIES: usize = (MAX_PAYLOAD - 4) / ROUTE_ENTRY_SIZE;
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = self.signable_bytes();
-        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signature);
+        let mut buf = Vec::with_capacity(4 + self.entries.len() * ROUTE_ENTRY_SIZE);
+        buf.push(self.flags);
+        buf.push(self.degree);
+        buf.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
+        for e in &self.entries {
+            e.write(&mut buf);
+        }
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 36 {
-            return Err(Error::Wire("RouteAdvertisement too short".into()));
-        }
         let mut r = Reader::new(data);
-        let advertiser = r.read_array::<32>()?;
-        let entry_count = r.read_u16()? as usize;
-        if r.remaining() < entry_count * 36 + 2 {
-            return Err(Error::Wire("RouteAdvertisement truncated".into()));
+        let flags = r.read_u8()?;
+        let degree = r.read_u8()?;
+        let count = r.read_u16()? as usize;
+        if r.remaining() < count * ROUTE_ENTRY_SIZE {
+            return Err(Error::Wire("RouteUpdate truncated".into()));
         }
-        let mut entries = Vec::with_capacity(entry_count);
-        for _ in 0..entry_count {
-            let dest = r.read_array::<32>()?;
-            let cost = r.read_u32()?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
             entries.push(RouteEntry {
-                destination: PeerId(dest),
-                cost,
+                dest: PeerId(r.read_array::<32>()?),
+                seqno: r.read_u16()?,
+                metric: r.read_u16()?,
+                eflags: r.read_u8()?,
             });
         }
-        let sig_len = r.read_u16()? as usize;
-        let signature = r.read_bytes(sig_len)?;
         Ok(Self {
-            advertiser: PeerId(advertiser),
+            flags,
+            degree,
             entries,
-            signature,
         })
     }
 
     pub fn to_wire(&self) -> WireMessage {
-        WireMessage::new(MessageType::RouteAdvertisement, self.to_bytes())
+        WireMessage::new(MessageType::RouteUpdate, self.to_bytes())
     }
 }
 
-/// RouteProbe: lightweight non-circuit route discovery.
-/// nonce(16) || target(32) || ttl(u16 BE) || hops(u16 BE)
-#[derive(Debug, Clone)]
-pub struct RouteProbeMsg {
-    pub nonce: [u8; 16],
-    pub target: PeerId,
-    pub ttl: u16,
-    pub hops: u16,
+/// RouteDigest: digest(16) || count(u16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDigestMsg {
+    pub digest: [u8; 16],
+    pub count: u16,
 }
 
-impl RouteProbeMsg {
+impl RouteDigestMsg {
+    /// Digest of a route set: entries sorted by destination, encoded as in
+    /// `RouteUpdate`.
+    pub fn of<'a>(entries: impl Iterator<Item = &'a RouteEntry>) -> Self {
+        let mut buf = Vec::new();
+        let mut count = 0usize;
+        for e in entries {
+            e.write(&mut buf);
+            count += 1;
+        }
+        let key = blake3::derive_key("tarnet route digest v1", &buf);
+        Self {
+            digest: key[..16].try_into().unwrap(),
+            count: count.min(u16::MAX as usize) as u16,
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(52);
-        buf.extend_from_slice(&self.nonce);
-        buf.extend_from_slice(self.target.as_bytes());
-        buf.extend_from_slice(&self.ttl.to_be_bytes());
-        buf.extend_from_slice(&self.hops.to_be_bytes());
+        let mut buf = self.digest.to_vec();
+        buf.extend_from_slice(&self.count.to_be_bytes());
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 52 {
-            return Err(Error::Wire("RouteProbe too short".into()));
-        }
         let mut r = Reader::new(data);
-        let nonce = r.read_array::<16>()?;
-        let target = PeerId(r.read_array::<32>()?);
-        let ttl = r.read_u16()?;
-        let hops = r.read_u16()?;
         Ok(Self {
-            nonce,
-            target,
-            ttl,
-            hops,
+            digest: r.read_array::<16>()?,
+            count: r.read_u16()?,
         })
     }
 
     pub fn to_wire(&self) -> WireMessage {
-        WireMessage::new(MessageType::RouteProbe, self.to_bytes())
+        WireMessage::new(MessageType::RouteDigest, self.to_bytes())
     }
 }
 
-/// RouteProbeFound: reply to a RouteProbe when the target is found.
-/// nonce(16) || target(32) || cost(u16 BE)
-#[derive(Debug, Clone)]
-pub struct RouteProbeFoundMsg {
-    pub nonce: [u8; 16],
-    pub target: PeerId,
-    pub cost: u16,
+/// RouteRequest: flags(u8) || [dest(32) || seqno(u16) || hop_count(u8)] iff SEQNO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRequestMsg {
+    pub full_dump: bool,
+    /// `(dest, seqno, hop_count)`
+    pub seqno: Option<(PeerId, u16, u8)>,
 }
 
-impl RouteProbeFoundMsg {
+impl RouteRequestMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(50);
-        buf.extend_from_slice(&self.nonce);
-        buf.extend_from_slice(self.target.as_bytes());
-        buf.extend_from_slice(&self.cost.to_be_bytes());
+        let mut flags = 0;
+        if self.full_dump {
+            flags |= ROUTE_REQ_FULL_DUMP;
+        }
+        if self.seqno.is_some() {
+            flags |= ROUTE_REQ_SEQNO;
+        }
+        let mut buf = vec![flags];
+        if let Some((dest, seqno, hops)) = self.seqno {
+            buf.extend_from_slice(dest.as_bytes());
+            buf.extend_from_slice(&seqno.to_be_bytes());
+            buf.push(hops);
+        }
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 50 {
-            return Err(Error::Wire("RouteProbeFound too short".into()));
-        }
         let mut r = Reader::new(data);
-        let nonce = r.read_array::<16>()?;
-        let target = PeerId(r.read_array::<32>()?);
-        let cost = r.read_u16()?;
+        let flags = r.read_u8()?;
+        let seqno = if flags & ROUTE_REQ_SEQNO != 0 {
+            Some((PeerId(r.read_array::<32>()?), r.read_u16()?, r.read_u8()?))
+        } else {
+            None
+        };
         Ok(Self {
-            nonce,
-            target,
-            cost,
+            full_dump: flags & ROUTE_REQ_FULL_DUMP != 0,
+            seqno,
         })
     }
 
     pub fn to_wire(&self) -> WireMessage {
-        WireMessage::new(MessageType::RouteProbeFound, self.to_bytes())
+        WireMessage::new(MessageType::RouteRequest, self.to_bytes())
     }
 }
 

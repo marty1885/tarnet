@@ -299,10 +299,17 @@ impl LocalRuntime {
             let completed = completed.clone();
             handles.push(tokio::spawn(async move {
                 let started = Instant::now();
-                let cost = tokio::time::timeout(Duration::from_secs(12), src.route_probe(dst_peer))
-                    .await
-                    .ok()
-                    .flatten();
+                // Wait for distance-vector routing to learn the destination.
+                let cost = tokio::time::timeout(Duration::from_secs(12), async {
+                    loop {
+                        if let Some(c) = src.route_cost(&dst_peer).await {
+                            break c.min(u16::MAX as u32) as u16;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .ok();
                 let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
                 println!(
                     "  probe {done}/{total}: {src_global_idx} -> {dst_global_idx} {} in {:.0}ms",

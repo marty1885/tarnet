@@ -59,7 +59,7 @@ pub(crate) fn classify(msg: &[u8]) -> (Class, Option<u64>) {
     use MessageType::*;
     match msg_type {
         HandshakeHello | HandshakeAuth | HandshakeConfirm | Rekey | Keepalive
-        | RouteAdvertisement | RouteProbe | RouteProbeFound => (Class::Control, None),
+        | RouteUpdate | RouteDigest | RouteRequest => (Class::Control, None),
         CircuitCreate | CircuitCreated | CircuitDestroy | TunnelKeyExchange
         | TunnelKeyResponse | ChannelOpen | ChannelClose => (Class::CircuitControl, None),
         // Keyed by circuit id.
