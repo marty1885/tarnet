@@ -3,7 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use tarnet_api::types::LinkStatus;
+use tarnet_api::types::{LinkStatus, PrivacyLevel};
 
 use super::{short_record, App, DHT, LOOKUP, NODE, ROUTING, SERVICES, TNS};
 
@@ -374,6 +374,28 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect, title: &str) {
                 lines.push(section("SELECTED IDENTITY"));
                 lines.push(kv("Name", name));
                 lines.push(kv("Service ID", sid.to_string()));
+                if let Some((privacy, hops)) = app.identity_privacy.get(app.selected) {
+                    lines.push(Line::raw(""));
+                    lines.push(section("PRIVACY"));
+                    let (inbound, color) = match privacy {
+                        PrivacyLevel::Public => ("public (direct or circuit)".to_string(), YELLOW),
+                        PrivacyLevel::Hidden { intro_points } => {
+                            (format!("hidden ({intro_points} intro points)"), GREEN)
+                        }
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("In   ", Style::default().fg(MUTED)),
+                        Span::styled(inbound, Style::default().fg(color)),
+                    ]));
+                    let out = match hops {
+                        0 => "direct (no relay hops)".to_string(),
+                        n => format!("{n} relay hop{}", if *n == 1 { "" } else { "s" }),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("Out  ", Style::default().fg(MUTED)),
+                        Span::styled(out, Style::default().fg(if *hops == 0 { YELLOW } else { GREEN })),
+                    ]));
+                }
                 lines.push(Line::raw(""));
             }
             if let Some(s) = &app.status {

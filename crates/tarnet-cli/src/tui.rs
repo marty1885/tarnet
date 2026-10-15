@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use tarnet_api::service::{ServiceApi, TnsRecord, TnsResolution};
-use tarnet_api::types::{ContentHandle, LinkStatus, NodeStatus, PeerId, ServiceId};
+use tarnet_api::types::{ContentHandle, LinkStatus, NodeStatus, PeerId, PrivacyLevel, ServiceId};
 use tarnet_client::IpcServiceApi;
 use tarnet_expose::expose::ServiceConfig;
 
@@ -51,6 +51,8 @@ struct App {
     detail_scroll: u16,
     identity: usize,
     identities: Vec<Identity>,
+    /// Per-identity (inbound privacy, outbound hops), parallel to `identities`.
+    identity_privacy: Vec<(PrivacyLevel, u8)>,
     labels: Vec<Label>,
     services: Vec<ServiceFile>,
     status: Option<NodeStatus>,
@@ -140,6 +142,7 @@ pub(super) async fn run(cli: &Cli, services_dir: Option<&Path>) {
         detail_scroll: 0,
         identity: 0,
         identities: Vec::new(),
+        identity_privacy: Vec::new(),
         labels: Vec::new(),
         services: Vec::new(),
         status: None,
@@ -181,6 +184,7 @@ impl App {
         let old_name = self.identity_name().to_string();
         match self.client.list_identities().await {
             Ok(ids) => {
+                self.identity_privacy = ids.iter().map(|e| (e.2, e.3)).collect();
                 self.identities = ids.into_iter().map(|(name, sid, ..)| (name, sid)).collect();
                 self.identity = self
                     .identities
