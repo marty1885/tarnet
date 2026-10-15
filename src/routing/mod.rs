@@ -114,6 +114,27 @@ struct Neighbour {
     /// every other update, so one sender sends them all, in order: an update
     /// can't overtake a dump built before it and be undone by its end.
     dump_due: bool,
+    degree_dirty: bool,
+    needs_resync: bool,
+}
+
+/// Admission boundary for an authoritative route set. Apply the complete
+/// batch before checking capacity, so withdrawals can make room for additions.
+/// Failure leaves the previously committed set untouched.
+fn admit_routes(
+    base: &BTreeMap<PeerId, RouteEntry>,
+    changes: impl IntoIterator<Item = RouteEntry>,
+    cap: usize,
+) -> Option<BTreeMap<PeerId, RouteEntry>> {
+    let mut candidate = base.clone();
+    for e in changes {
+        if e.metric == ROUTE_INFINITY {
+            candidate.remove(&e.dest);
+        } else {
+            candidate.insert(e.dest, e);
+        }
+    }
+    (candidate.len() <= cap).then_some(candidate)
 }
 
 impl Neighbour {
@@ -383,8 +404,11 @@ impl RoutingTable {
                     first_dump: true,
                     pending: BTreeMap::new(),
                     dump_due: false,
+                    degree_dirty: false,
+                    needs_resync: false,
                 },
             );
+            self.topology_changed();
             Vec::new()
         };
         self.request_full_dump(&n);
@@ -410,7 +434,14 @@ impl RoutingTable {
         if self.neighbours.remove(n).is_none() {
             return Vec::new();
         }
+        self.topology_changed();
         self.decide()
+    }
+
+    fn topology_changed(&mut self) {
+        for nb in self.neighbours.values_mut() {
+            nb.degree_dirty = true;
+        }
     }
 
     pub fn is_neighbour(&self, n: &PeerId) -> bool {
@@ -426,7 +457,6 @@ impl RoutingTable {
         let Some(nb) = self.neighbours.get_mut(from) else {
             return Vec::new();
         };
-        nb.degree = msg.degree;
         let full = msg.flags & crate::wire::ROUTE_FULL != 0;
         let start = msg.flags & crate::wire::ROUTE_FULL_START != 0;
         let end = msg.flags & crate::wire::ROUTE_FULL_END != 0;
@@ -453,40 +483,41 @@ impl RoutingTable {
             // next digest asks again.
             return Vec::new();
         }
-        // A dump fills only the staging copy and takes effect when it ends,
-        // so a dump whose end is lost changes nothing. Ordinary updates
-        // apply to what we hold now and to a dump in progress, which they
-        // are newer than.
-        let live = !full || nb.first_dump;
-        for e in &msg.entries {
-            let mut targets: Vec<&mut BTreeMap<PeerId, RouteEntry>> = Vec::with_capacity(2);
-            if live {
-                targets.push(&mut nb.rib);
+        // All authoritative sets enter through the same admission boundary.
+        // The replay log is different: it retains withdrawals as tombstones.
+        let accepted = (|| -> Option<()> {
+            if !full || nb.first_dump {
+                nb.rib = admit_routes(&nb.rib, msg.entries.iter().copied(), cap)?;
             }
             if let Some((_, snapshot, changes)) = nb.staging.as_mut() {
-                targets.push(if full { snapshot } else { changes });
-            }
-            for rib in targets {
-                if e.metric == ROUTE_INFINITY {
-                    rib.remove(&e.dest);
-                } else if rib.len() < cap || rib.contains_key(&e.dest) {
-                    rib.insert(e.dest, *e);
-                }
-            }
-        }
-        if end {
-            if let Some((id, mut staging, changes)) = nb.staging.take() {
-                for (dest, entry) in changes {
-                    if entry.metric == ROUTE_INFINITY {
-                        staging.remove(&dest);
-                    } else {
-                        staging.insert(dest, entry);
+                if full {
+                    *snapshot = admit_routes(snapshot, msg.entries.iter().copied(), cap)?;
+                } else {
+                    for e in &msg.entries {
+                        changes.insert(e.dest, *e);
+                    }
+                    if changes.len() > cap {
+                        return None;
                     }
                 }
-                nb.rib = staging;
+            }
+            if end {
+                let (id, snapshot, changes) = nb.staging.take()?;
+                nb.rib = admit_routes(&snapshot, changes.into_values(), cap)?;
                 nb.first_dump = false;
                 nb.last_dump_id = Some(id);
+                nb.needs_resync = false;
             }
+            Some(())
+        })();
+        if accepted.is_none() {
+            nb.staging = None;
+            nb.needs_resync = true;
+            // Recovery replaces the partial first dump atomically. Applying
+            // it incrementally could overflow against that stale partial set.
+            nb.first_dump = false;
+        } else {
+            nb.degree = msg.degree;
         }
         self.decide()
     }
@@ -496,7 +527,7 @@ impl RoutingTable {
     pub fn digest_matches(&self, from: &PeerId, digest: &RouteDigestMsg) -> bool {
         self.neighbours
             .get(from)
-            .map_or(true, |nb| RouteDigestMsg::of(nb.rib.values()) == *digest)
+            .map_or(true, |nb| !nb.needs_resync && RouteDigestMsg::of_with_degree(nb.rib.values(), nb.degree) == *digest)
     }
 
     /// Handle a seqno request from `from`. Returns a request to forward, if
@@ -566,6 +597,10 @@ impl RoutingTable {
             return self.full_dump(n);
         }
         let entries: Vec<RouteEntry> = std::mem::take(&mut nb.pending).into_values().collect();
+        let degree_dirty = std::mem::take(&mut nb.degree_dirty);
+        if entries.is_empty() && degree_dirty {
+            return vec![RouteUpdateMsg { flags: 0, degree, dump_id: 0, entries }];
+        }
         entries
             .chunks(RouteUpdateMsg::MAX_ENTRIES)
             .map(|c| RouteUpdateMsg {
@@ -580,7 +615,7 @@ impl RoutingTable {
     pub fn has_pending(&self, n: &PeerId) -> bool {
         self.neighbours
             .get(n)
-            .is_some_and(|nb| nb.dump_due || !nb.pending.is_empty())
+            .is_some_and(|nb| nb.dump_due || nb.degree_dirty || !nb.pending.is_empty())
     }
 
     /// `n` is owed a full dump; [`take_pending`](Self::take_pending) hands it
@@ -597,6 +632,7 @@ impl RoutingTable {
         let dump_id = if let Some(nb) = self.neighbours.get_mut(n) {
             nb.pending.clear();
             nb.dump_due = false;
+            nb.degree_dirty = false;
             let id = nb.next_dump_id;
             nb.next_dump_id = nb.next_dump_id.wrapping_add(1).max(1);
             id
@@ -634,7 +670,7 @@ impl RoutingTable {
         if self.has_pending(n) {
             return None;
         }
-        Some(RouteDigestMsg::of(self.advertised.values()))
+        Some(RouteDigestMsg::of_with_degree(self.advertised.values(), self.degree()))
     }
 
     /// Forget old feasibility distances and request records. A destination

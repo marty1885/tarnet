@@ -307,8 +307,10 @@ KB); the slow-link constraint is handled by sending changes only.
 
 * **Changes only.** Updates are sent when something changes, batched for a
   short delay and rate-limited per link. There is no periodic full dump.
+  Link additions and removals queue degree updates for every neighbour,
+  including an empty-entry update when only the degree changed.
 * **Digests.** Each node periodically sends each neighbour a 16-byte digest of
-  the route set it has advertised to that neighbour, but only once every
+  the route set and degree it has advertised to that neighbour, but only once every
   change for that neighbour has been sent. The neighbour compares it with
   everything it holds from that sender, including the entry for itself (which
   it never selects). A mismatch (lost update) triggers a `RouteRequest` with
@@ -323,6 +325,11 @@ KB); the slow-link constraint is handled by sending changes only.
   undone by it; a receiver applies a neighbour's routing messages one at a
   time, in arrival order. A dump missing a middle part is not detected by
   itself; the next digest finds the mismatch and asks again.
+  Ordinary batches and completed snapshots share one capacity admission
+  boundary. Interleaved withdrawals remain tombstones until snapshot commit.
+  An overflowing batch is not committed; an overflowing assembly is discarded
+  and digest comparison continues to request repair until a valid dump completes.
+  The first dump still exposes admitted chunks incrementally for slow links.
 * Every node sends the same entries to every neighbour (no split horizon); the
   feasibility condition already prevents loops.
 * **Link death** retracts every route via that neighbour immediately and sends
@@ -987,9 +994,12 @@ RouteUpdate        (0x0110)
                      metric 0xFFFF = retraction; eflags bit0 LANDMARK, others reserved
 
 RouteDigest        (0x0111)
-  digest(16)         first 16 bytes of BLAKE3 derive_key("tarnet route digest v1",
-                     concatenation of the advertised entries, sorted by dest,
-                     encoded as in RouteUpdate)
+  digest(16)         first 16 bytes of BLAKE3 derive_key("tarnet route digest degree v1",
+                     route_digest(16) || degree(u8)); route_digest is the first
+                     16 bytes of BLAKE3 derive_key("tarnet route digest v1",
+                     concatenation of advertised entries sorted by dest,
+                     encoded as in RouteUpdate). This changes digest semantics;
+                     peers using the older entry-only digest cannot synchronize.
   count(u16)         number of entries covered
 
 RouteRequest       (0x0112)

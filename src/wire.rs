@@ -523,9 +523,20 @@ pub struct RouteDigestMsg {
 }
 
 impl RouteDigestMsg {
+    /// Synchronize topology metadata along with the route set. The wire
+    /// envelope is unchanged; degree is part of the digest input.
+    pub fn of_with_degree<'a>(entries: impl Iterator<Item = &'a RouteEntry>, degree: u8) -> Self {
+        let mut result = Self::of(entries);
+        let mut input = result.digest.to_vec();
+        input.push(degree);
+        let key = blake3::derive_key("tarnet route digest degree v1", &input);
+        result.digest.copy_from_slice(&key[..16]);
+        result
+    }
+
     /// Digest of a route set: entries sorted by destination, encoded as in
     /// `RouteUpdate`.
-    pub fn of<'a>(entries: impl Iterator<Item = &'a RouteEntry>) -> Self {
+    fn of<'a>(entries: impl Iterator<Item = &'a RouteEntry>) -> Self {
         let mut buf = Vec::new();
         let mut count = 0usize;
         for e in entries {
