@@ -450,7 +450,7 @@ impl Drop for CircuitAttemptGuard {
                 if let Some(peer) = first_hop {
                     let destroy = CircuitDestroyMsg { circuit_id: id }.to_wire().encode();
                     let _ = sender
-                        .to_peer(&peer, &destroy, super::sender::Queue::Critical, super::sender::Budget::Upkeep)
+                        .to_peer(&peer, &destroy, super::sender::Queue::Critical)
                         .await;
                 }
             }
@@ -543,7 +543,7 @@ impl Node {
                 }
                 drop(table);
                 let encoded = encode_circuit_relay_cell(next_id, &cell);
-                self.stats.record_relay(encoded.len() as u64);
+                self.stats.record_relay();
                 self.send_to_peer(&next_hop, &encoded).await
             }
             Some(CircuitAction::Endpoint {

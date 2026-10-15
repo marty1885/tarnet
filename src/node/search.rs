@@ -195,6 +195,7 @@ impl Node {
     pub async fn route_search(&self, target: &PeerId) -> Option<Vec<PeerId>> {
         let me = self.peer_id();
         for ttl in RINGS {
+            let deadline = Instant::now() + ring_wait(ttl);
             let links: Vec<PeerId> = self.links.lock().await.keys().copied().collect();
             if links.is_empty() {
                 return None;
@@ -222,11 +223,7 @@ impl Node {
             }
             .to_wire()
             .encode();
-            for peer in &links {
-                let _ = self.send_to_peer_deferred(peer, &msg).await;
-            }
-            let answer = tokio::time::timeout(ring_wait(ttl), rx).await;
-            let Ok(Ok(hints)) = answer else { continue };
+            let Some(hints) = self.sender.request_until(&links, &msg, rx, deadline).await else { continue };
             log::info!("Route search found {:?} within {} hops", target, ttl);
             let _ = self.search.found.lock().await.upsert(*target, hints.clone());
             return Some(hints);

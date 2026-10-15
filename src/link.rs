@@ -70,13 +70,6 @@ const HANDSHAKE_BYTES: u64 = 12 * 1024;
 /// A handshake that keeps trickling bytes is still cut off after this many
 /// deadlines, so a peer can't hold a handshake slot open forever.
 const HANDSHAKE_HARD_CAP_FACTOR: u32 = 10;
-/// Hard ceiling on a single recv: if the transport produces nothing within
-/// this window, treat it as a dead link. Slightly longer than the node-level
-/// `KEEPALIVE_DEAD_TIMEOUT` (180s) so the app-level path has first crack at
-/// declaring it dead, but a zombie socket (e.g. after suspend/resume) still
-/// unblocks.
-const RECV_STALL_TIMEOUT: Duration = Duration::from_secs(210);
-
 /// Session keys for bidirectional encrypted communication.
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct LinkCrypto {
@@ -853,6 +846,7 @@ impl PeerLink {
             remote_peer,
             negotiated_version
         );
+        transport.authenticated(remote_peer);
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
         let crypto = Arc::new(tokio::sync::Mutex::new(crypto));
@@ -1050,6 +1044,7 @@ impl PeerLink {
             remote_peer,
             negotiated_version
         );
+        transport.authenticated(remote_peer);
         let transport_name = transport.name();
         let transport: Arc<dyn Transport> = Arc::from(transport);
         let crypto = Arc::new(tokio::sync::Mutex::new(crypto));
@@ -1130,7 +1125,7 @@ impl PeerLink {
         crypto: Arc<tokio::sync::Mutex<LinkCrypto>>,
         remote: PeerId,
     ) -> LinkPipes {
-        use crate::link_frame::{encode_message_into, pack_frame, Reassembler, SentFragments};
+        use crate::link_frame::{encode_message_into, pack_frame_with, Reassembler, SentFragments};
         use std::collections::VecDeque;
 
         let frame_plain = frame_plain_for(transport.as_ref());
@@ -1162,7 +1157,11 @@ impl PeerLink {
             let mut sched = Scheduler::new(sched_cfg);
             // Records past the scheduler, packed into frames in order: at most
             // one frame's worth plus the rest of a fragmented message.
-            let mut ready: VecDeque<Vec<u8>> = VecDeque::new();
+            struct ReadyRecord { bytes: Vec<u8>, control: bool }
+            impl AsRef<[u8]> for ReadyRecord {
+                fn as_ref(&self) -> &[u8] { &self.bytes }
+            }
+            let mut ready: VecDeque<ReadyRecord> = VecDeque::new();
             let mut next_msg_id: u16 = 0;
             let mut reported_drops = 0;
             let mut next_nack_poll = std::time::Instant::now();
@@ -1170,22 +1169,25 @@ impl PeerLink {
             // Queue a wire message's records, remembering fragments for repair.
             // The next message starts in whatever room the frame being
             // filled has left.
-            let mut enqueue = |ready: &mut VecDeque<Vec<u8>>, data: Vec<u8>| {
-                let used = ready.iter().map(Vec::len).sum::<usize>() % frame_plain;
+            let mut enqueue = |ready: &mut VecDeque<ReadyRecord>, data: Vec<u8>| {
+                let control = crate::link_sched::classify(&data).0 == crate::link_sched::Class::Control;
+                let used = ready.iter().map(|r| r.bytes.len()).sum::<usize>() % frame_plain;
                 let room = if ready.is_empty() { frame_plain } else { frame_plain - used };
                 let records = encode_message_into(&data, frame_plain, room, &mut next_msg_id);
                 if records.len() > 1 {
                     task_sent.lock().unwrap().remember(&records, std::time::Instant::now());
                 }
-                ready.extend(records);
+                ready.extend(records.into_iter().map(|bytes| ReadyRecord { bytes, control }));
             };
             // Messages go to the scheduler; repair records skip it.
-            let take = |sched: &mut Scheduler, ready: &mut VecDeque<Vec<u8>>, out: Outgoing| {
+            let take = |sched: &mut Scheduler, ready: &mut VecDeque<ReadyRecord>, out: Outgoing| {
                 let now = std::time::Instant::now();
                 match out {
                     Outgoing::Message(data) | Outgoing::Deferred(data) => sched.push(data, false, now),
                     Outgoing::Critical(data) => sched.push(data, true, now),
-                    Outgoing::Repair(rec) => ready.push_front(rec),
+                    Outgoing::Repair(rec) => {
+                        ready.push_front(ReadyRecord { bytes: rec, control: true });
+                    },
                 }
             };
 
@@ -1200,7 +1202,8 @@ impl PeerLink {
                     next_nack_poll = now + stall / 2;
                     let mut r = task_reassembler.lock().unwrap();
                     if !r.is_empty() {
-                        ready.extend(r.poll(now));
+                        let repairs = r.poll(now);
+                        ready.extend(repairs.into_iter().map(|bytes| ReadyRecord { bytes, control: true }));
                     }
                 }
 
@@ -1247,7 +1250,7 @@ impl PeerLink {
                 }
 
                 // Fill the frame from the scheduler, highest class first.
-                while ready.iter().map(Vec::len).sum::<usize>() < frame_plain {
+                while ready.iter().map(|r| r.bytes.len()).sum::<usize>() < frame_plain {
                     let Some(data) = sched.pop(now) else { break };
                     enqueue(&mut ready, data);
                 }
@@ -1260,12 +1263,13 @@ impl PeerLink {
                     reported_drops = sched.dropped();
                 }
 
-                let Some(frame) = pack_frame(&mut ready, frame_plain) else {
+                let mut control = false;
+                let Some(frame) = pack_frame_with(&mut ready, frame_plain, |r| control |= r.control) else {
                     // Everything popped was dropped by the scheduler.
                     continue;
                 };
                 let encrypted = crypto.lock().await.encrypt(&frame);
-                if let Err(e) = transport.send(&encrypted).await {
+                if let Err(e) = transport.send_frame(&encrypted, control).await {
                     log::debug!("link drain to {:?}: {}", remote, e);
                     break;
                 }
@@ -1410,9 +1414,7 @@ impl PeerLink {
                 return Ok(msg);
             }
             let mut buf = vec![0u8; MAX_LINK_FRAME];
-            let n = tokio::time::timeout(RECV_STALL_TIMEOUT, self.transport.recv(&mut buf))
-                .await
-                .map_err(|_| Error::Wire("link recv stalled".into()))??;
+            let n = self.transport.recv_frame(&mut buf).await?;
             let result = self.crypto.lock().await.decrypt(&buf[..n]);
             let tail = {
                 let mut tail = self.handshake_tail.lock().unwrap();
@@ -1430,8 +1432,35 @@ impl PeerLink {
                 log::debug!("Handshake confirm from {:?} repeated, resending ours", self.remote_peer);
                 self.transport.send(&our_confirm).await?;
             }
-            self.ingest_frame(&result?);
+            // The decrypted result and its charge travel together. Delivery
+            // owns the result, so callers cannot accidentally apply an
+            // authenticated liveness pause to a rejected frame.
+            struct FrameDelivery<'a> {
+                transport: &'a dyn Transport,
+                bytes: usize,
+                plaintext: Result<Vec<u8>>,
+            }
+            impl FrameDelivery<'_> {
+                async fn finish(self) -> Result<Vec<u8>> {
+                    let authenticated = self.plaintext.is_ok();
+                    if authenticated {
+                        self.transport.authenticated_frame();
+                    }
+                    self.transport.deliver_frame(self.bytes, authenticated).await;
+                    self.plaintext
+                }
+            }
+            let frame = FrameDelivery {
+                transport: self.transport.as_ref(),
+                bytes: n,
+                plaintext: result,
+            };
+            self.ingest_frame(&frame.finish().await?);
         }
+    }
+
+    pub(crate) fn receive_activity(&self) -> Option<std::time::Instant> {
+        self.transport.receive_activity()
     }
 
     pub fn remote_peer(&self) -> PeerId {

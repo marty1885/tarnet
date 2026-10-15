@@ -21,11 +21,6 @@ fn hash_64(input: &[u8]) -> [u8; 64] {
     out
 }
 
-/// Replication factor.
-pub const DHT_K: usize = 20;
-/// Maximum entries per k-bucket.
-pub const KBUCKET_SIZE: usize = 20;
-
 /// Probability that a node receiving a walking message ends the random phase
 /// (spec: *q*). Mean random-phase length is 1/q hops.
 pub const WALK_END_PROBABILITY: f64 = 1.0 / 3.0;

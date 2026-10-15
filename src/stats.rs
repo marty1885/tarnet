@@ -197,33 +197,31 @@ impl StatsRegistry {
         }
     }
 
-    /// Convenience: record bytes + packet count on send.
-    pub fn record_send(&self, peer: &PeerId, bytes: u64) {
+    pub(crate) fn record_link_send(&self, peer: Option<&PeerId>, bytes: u64) {
         let ts = now_millis();
         self.record(StatKey::BytesUp, ts, bytes);
         self.record(StatKey::PacketsUp, ts, 1);
-        self.record(StatKey::PeerBytesUp(*peer), ts, bytes);
-        self.record(StatKey::PeerPacketsUp(*peer), ts, 1);
+        if let Some(peer) = peer {
+            self.record(StatKey::PeerBytesUp(*peer), ts, bytes);
+            self.record(StatKey::PeerPacketsUp(*peer), ts, 1);
+        }
     }
 
-    /// Convenience: record bytes + packet count on recv.
-    pub fn record_recv(&self, peer: &PeerId, bytes: u64) {
+    pub(crate) fn record_link_recv(&self, peer: Option<&PeerId>, bytes: u64) {
         let ts = now_millis();
         self.record(StatKey::BytesDown, ts, bytes);
         self.record(StatKey::PacketsDown, ts, 1);
-        self.record(StatKey::PeerBytesDown(*peer), ts, bytes);
-        self.record(StatKey::PeerPacketsDown(*peer), ts, 1);
+        if let Some(peer) = peer {
+            self.record(StatKey::PeerBytesDown(*peer), ts, bytes);
+            self.record(StatKey::PeerPacketsDown(*peer), ts, 1);
+        }
     }
 
     /// Convenience: record a relayed cell.
-    pub fn record_relay(&self, bytes: u64) {
+    pub fn record_relay(&self) {
         let ts = now_millis();
         self.record(StatKey::CellsRelayed, ts, 1);
-        // Relayed bytes count as both up and down for the relay node.
-        self.record(StatKey::BytesUp, ts, bytes);
-        self.record(StatKey::BytesDown, ts, bytes);
-        self.record(StatKey::PacketsUp, ts, 1);
-        self.record(StatKey::PacketsDown, ts, 1);
+        // Bytes and packets are counted exclusively at link I/O.
     }
 
     /// Read traffic summary (global).
@@ -316,8 +314,8 @@ mod tests {
         let reg = StatsRegistry::new();
         let peer = PeerId([0u8; 32]);
 
-        reg.record_send(&peer, 1024);
-        reg.record_recv(&peer, 2048);
+        reg.record_link_send(Some(&peer), 1024);
+        reg.record_link_recv(Some(&peer), 2048);
 
         let summary = reg.traffic_summary();
         assert_eq!(summary.bytes_up.total, 1024);

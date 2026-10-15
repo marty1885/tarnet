@@ -4,7 +4,7 @@
 use super::*;
 use crate::routing::{SeqnoRequest, COST_FAST, COST_SLOW};
 use crate::wire::{RouteDigestMsg, RouteRequestMsg, RouteUpdateMsg};
-use super::sender::{Budget, Queue};
+use super::sender::Queue;
 
 /// Changes are batched for this long before they are sent.
 const UPDATE_BATCH: Duration = Duration::from_millis(250);
@@ -24,11 +24,10 @@ fn link_cost(link: &PeerLink) -> u16 {
     }
 }
 
-/// The one way routing messages leave: routing is link upkeep, never held
-/// back by the upload limit, and shares the deferred queue so a neighbour
-/// receives them in the order they were sent.
+/// Routing shares the deferred queue so a neighbour receives updates in
+/// order. The link scheduler classifies it as control within the I/O budget.
 async fn send_route(sender: &super::sender::Sender, to: &PeerId, bytes: &[u8]) -> bool {
-    if let Err(e) = sender.to_peer(to, bytes, Queue::Deferred, Budget::Upkeep).await {
+    if let Err(e) = sender.to_peer(to, bytes, Queue::Deferred).await {
         log::debug!("Failed to send routing message to {:?}: {}", to, e);
         false
     } else {
@@ -160,7 +159,7 @@ impl Node {
                     .collect();
                 timers.retain(|p, _| peers.iter().any(|(q, _)| q == p));
 
-                let mut to_send: Vec<(PeerId, Arc<PeerLink>, Vec<u8>)> = Vec::new();
+                let mut to_send: Vec<(PeerId, Vec<u8>)> = Vec::new();
                 {
                     let mut rt = routing.lock().await;
                     let mut requests = Vec::new();
@@ -176,12 +175,12 @@ impl Node {
                     }
                     requests.extend(rt.retry_starving());
                     for r in requests {
-                        if let Some((_, link)) = peers.iter().find(|(p, _)| *p == r.to) {
+                        if peers.iter().any(|(p, _)| *p == r.to) {
                             let msg = RouteRequestMsg {
                                 full_dump: false,
                                 seqno: Some((r.dest, r.seqno, r.hops)),
                             };
-                            to_send.push((r.to, link.clone(), msg.to_wire().encode()));
+                            to_send.push((r.to, msg.to_wire().encode()));
                         }
                     }
                     for (peer, link) in &peers {
@@ -205,18 +204,18 @@ impl Node {
                         {
                             *last_update = now;
                             for m in rt.take_pending(peer) {
-                                to_send.push((*peer, link.clone(), m.to_wire().encode()));
+                                to_send.push((*peer, m.to_wire().encode()));
                             }
                         }
                         if now >= *next_digest {
                             if let Some(d) = rt.digest_for(peer) {
                                 *next_digest = now + digest_interval;
-                                to_send.push((*peer, link.clone(), d.to_wire().encode()));
+                                to_send.push((*peer, d.to_wire().encode()));
                             }
                         }
                     }
                 }
-                for (peer, _link, msg) in to_send {
+                for (peer, msg) in to_send {
                     if !send_route(&sender, &peer, &msg).await {
                         // take_pending transfers the outbox to this task. Failed
                         // admission must put an authoritative replacement back.

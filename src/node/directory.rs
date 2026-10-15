@@ -701,6 +701,7 @@ impl Node {
     /// Look `target` up at `landmark` directly, without a walk. For checking
     /// our own record, which names us anyway.
     async fn lookup_at(&self, landmark: PeerId, target: PeerId, replica: u8) -> Option<dir::VerifiedAddress> {
+        let deadline = Instant::now() + LOOKUP_TIMEOUT;
         let next = self.sender.next_hop(&landmark, &[], None).await?;
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
@@ -712,19 +713,14 @@ impl Node {
             replica,
             landmark,
         };
-        let _ = self
-            .send_to_peer_deferred(&next, &msg.to_wire().encode())
-            .await;
-        let result = tokio::time::timeout(LOOKUP_TIMEOUT, rx).await;
-        result
-            .ok()?
-            .ok()?
+        self.sender.request_until(&[next], &msg.to_wire().encode(), rx, deadline).await?
             .and_then(|r| dir::VerifiedAddress::verify_for(r, &target))
     }
 
     /// The nodes from us to `target` along our routes: us first, `target`
     /// last. `None` if the trace got no answer.
     async fn trace_path(&self, target: PeerId) -> Option<Vec<PeerId>> {
+        let deadline = Instant::now() + TRACE_TIMEOUT;
         let me = self.peer_id();
         let next = self.sender.next_hop(&target, &[], None).await?;
         let token: [u8; 32] = rand::random();
@@ -735,11 +731,7 @@ impl Node {
             target,
             path: vec![me],
         };
-        let _ = self
-            .send_to_peer_deferred(&next, &msg.to_wire().encode())
-            .await;
-        let result = tokio::time::timeout(TRACE_TIMEOUT, rx).await;
-        let path = result.ok()?.ok()?;
+        let path = self.sender.request_until(&[next], &msg.to_wire().encode(), rx, deadline).await?;
         (path.len() >= 2 && path[0] == me && path.last() == Some(&target)).then_some(path)
     }
 
@@ -1009,6 +1001,7 @@ impl Node {
     /// One lookup of one replica: a walk from a random neighbour, then
     /// routed to a responsible landmark.
     async fn lookup_once(&self, target: PeerId, replica: u8) -> Option<dir::VerifiedAddress> {
+        let deadline = Instant::now() + LOOKUP_TIMEOUT;
         use rand::seq::SliceRandom;
         let first = {
             let links = self.links.lock().await;
@@ -1028,13 +1021,7 @@ impl Node {
             replica,
             landmark: PeerId([0; 32]),
         };
-        let _ = self
-            .send_to_peer_deferred(&first, &msg.to_wire().encode())
-            .await;
-        let result = tokio::time::timeout(LOOKUP_TIMEOUT, rx).await;
-        result
-            .ok()?
-            .ok()?
+        self.sender.request_until(&[first], &msg.to_wire().encode(), rx, deadline).await?
             .and_then(|r| dir::VerifiedAddress::verify_for(r, &target))
     }
 

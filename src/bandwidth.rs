@@ -22,6 +22,7 @@ struct BucketState {
 
 struct TokenBucket {
     state: Mutex<BucketState>,
+    changed: tokio::sync::Notify,
 }
 
 impl TokenBucket {
@@ -29,6 +30,7 @@ impl TokenBucket {
         let rate_f = rate as f64;
         let burst = if rate > 0 { rate_f } else { 0.0 };
         Self {
+            changed: tokio::sync::Notify::new(),
             state: Mutex::new(BucketState {
                 tokens: burst, // start with a full burst
                 rate: rate_f,
@@ -39,8 +41,15 @@ impl TokenBucket {
     }
 
     async fn acquire(&self, nbytes: usize) {
+        self.acquire_class(nbytes, true).await;
+    }
+
+    async fn acquire_class(&self, nbytes: usize, control: bool) {
         let nbytes = nbytes as f64;
         loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             let sleep_dur = {
                 let mut s = self.state.lock().unwrap();
 
@@ -58,7 +67,10 @@ impl TokenBucket {
                 // A message larger than the burst could never fit: it waits
                 // for a full bucket and leaves it in debt, which later
                 // messages wait out.
-                let need = nbytes.min(s.burst);
+                // Ordinary frames leave 10% of the burst available for link
+                // upkeep. Both classes spend the same total bucket.
+                let reserve = if control { 0.0 } else { s.burst * 0.10 };
+                let need = nbytes.min(s.burst - reserve) + reserve;
                 if s.tokens >= need {
                     s.tokens -= nbytes;
                     return;
@@ -69,20 +81,33 @@ impl TokenBucket {
                 std::time::Duration::from_secs_f64(deficit / s.rate)
             };
             // Sleep outside the lock so other tasks can proceed
-            tokio::time::sleep(sleep_dur).await;
+            tokio::select! {
+                _ = tokio::time::sleep(sleep_dur) => {},
+                _ = &mut changed => {},
+            }
         }
     }
 
     fn update_rate(&self, rate: u64) {
         let mut s = self.state.lock().unwrap();
+        // Settle elapsed time at the old rate before applying a reload.
+        let now = tokio::time::Instant::now();
+        s.tokens = (s.tokens + now.duration_since(s.last_refill).as_secs_f64() * s.rate).min(s.burst);
+        s.last_refill = now;
+        let was_unlimited = s.rate == 0.0;
         let rate_f = rate as f64;
         s.rate = rate_f;
         s.burst = rate_f;
+        if was_unlimited && rate > 0 {
+            s.tokens = s.burst;
+        }
         // When switching to unlimited, leave tokens as-is (harmless).
         // When switching to limited, clamp tokens to new burst.
         if rate > 0 && s.tokens > s.burst {
             s.tokens = s.burst;
         }
+        drop(s);
+        self.changed.notify_waiters();
     }
 }
 
@@ -98,6 +123,17 @@ impl BandwidthLimiter {
     /// Wait until `nbytes` worth of upload capacity is available.
     pub async fn acquire_upload(&self, nbytes: usize) {
         self.upload.acquire(nbytes).await;
+    }
+
+    pub(crate) async fn acquire_frame(&self, nbytes: usize, control: bool) {
+        self.upload.acquire_class(nbytes, control).await;
+    }
+
+    /// Upper bound used to size link frames and scale protocol timers.
+    pub(crate) fn rate_hint(&self) -> Option<u64> {
+        let up = self.upload.state.lock().unwrap().rate as u64;
+        let down = self.download.state.lock().unwrap().rate as u64;
+        [up, down].into_iter().filter(|r| *r > 0).min()
     }
 
     /// Wait until `nbytes` worth of download capacity is available.
@@ -200,6 +236,15 @@ fn try_parse_bits_per_sec(lower: &str, original: &str) -> Option<Result<u64, Str
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn enabling_a_limit_starts_with_one_burst() {
+        let limiter = BandwidthLimiter::new(0, 0);
+        limiter.set_rates(100, 0);
+        tokio::time::timeout(std::time::Duration::from_millis(50), limiter.acquire_upload(100))
+            .await
+            .expect("a newly enabled limit stalled its first burst");
+    }
 
     #[test]
     fn parse_empty_and_zero() {

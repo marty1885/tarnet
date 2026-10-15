@@ -205,13 +205,24 @@ fn fragment_ids(rec: &[u8]) -> Option<(u16, u16)> {
 
 /// Pack records into one frame of exactly `frame_plain` bytes, taking them
 /// from the front of `ready` while they fit. Returns `None` if nothing fit.
+#[cfg(test)]
 pub(crate) fn pack_frame(ready: &mut VecDeque<Vec<u8>>, frame_plain: usize) -> Option<Vec<u8>> {
+    pack_frame_with(ready, frame_plain, |_| {})
+}
+
+/// Pack records while preserving their caller-owned metadata until consumed.
+pub(crate) fn pack_frame_with<T: AsRef<[u8]>>(
+    ready: &mut VecDeque<T>,
+    frame_plain: usize,
+    mut consume: impl FnMut(&T),
+) -> Option<Vec<u8>> {
     let mut frame = Vec::with_capacity(frame_plain);
     while let Some(rec) = ready.front() {
-        if frame.len() + rec.len() > frame_plain {
+        if frame.len() + rec.as_ref().len() > frame_plain {
             break;
         }
-        frame.extend_from_slice(rec);
+        frame.extend_from_slice(rec.as_ref());
+        consume(rec);
         ready.pop_front();
     }
     if frame.is_empty() {

@@ -200,7 +200,8 @@ impl PeerTransport {
     fn unconfirmed_links(&self, timeout: Duration) -> Vec<LinkId> {
         self.links
             .iter()
-            .filter(|(_, sl)| sl.created_at.elapsed() >= timeout && sl.link.awaiting_peer())
+            .filter(|(_, sl)| sl.created_at.elapsed() >= timeout && sl.link.awaiting_peer()
+                && sl.link.receive_activity().map_or(true, |at| at.elapsed() >= timeout))
             .map(|(&id, _)| id)
             .collect()
     }
@@ -210,7 +211,7 @@ impl PeerTransport {
         let cutoff = Instant::now() - timeout;
         self.links
             .iter()
-            .filter(|(_, sl)| sl.last_recv < cutoff)
+            .filter(|(_, sl)| sl.link.receive_activity().unwrap_or(sl.last_recv).max(sl.last_recv) < cutoff)
             .map(|(&id, _)| id)
             .collect()
     }
@@ -222,7 +223,8 @@ impl PeerTransport {
         let now = Instant::now();
         let mut out = Vec::new();
         for (&id, sl) in self.links.iter_mut() {
-            let quiet = now.saturating_duration_since(sl.last_recv) >= PROBE_AFTER;
+            let received = sl.link.receive_activity().unwrap_or(sl.last_recv).max(sl.last_recv);
+            let quiet = now.saturating_duration_since(received) >= PROBE_AFTER;
             if quiet {
                 // Pull a far-off heartbeat in to probing cadence.
                 sl.next_heartbeat_at = sl.next_heartbeat_at.min(now + PROBE_MAX);
@@ -790,6 +792,44 @@ mod tests {
         // A late copy of the request is ignored, not re-answered.
         b.handle_rekey_msg(&req).await.unwrap();
         assert_eq!(b.key_epoch().await, 1);
+    }
+
+    #[tokio::test]
+    async fn local_download_pause_does_not_reap_a_live_or_unconfirmed_link() {
+        use crate::{bandwidth::BandwidthLimiter, stats::StatsRegistry, transport::metered::MeteredTransport};
+        use crate::wire::KeepaliveMsg;
+        let (a, b) = mem_transport_pair();
+        let budget = Arc::new(BandwidthLimiter::new(0, 0));
+        let b = MeteredTransport::wrap(Box::new(b), budget.clone(), Arc::new(StatsRegistry::new()));
+        let ka = Keypair::generate_ed25519();
+        let kb = Keypair::generate_ed25519();
+        let (a, b) = tokio::join!(PeerLink::initiator(Box::new(a), &ka, None), PeerLink::responder(b, &kb));
+        let a = a.unwrap();
+        let b = Arc::new(b.unwrap());
+        let mut pt = PeerTransport::new();
+        pt.add_link(0, b.clone());
+        let timeout = Duration::from_millis(2);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(pt.dead_links(timeout), vec![0]);
+        budget.set_rates(0, 1);
+        budget.acquire_download(1).await;
+        let msg = KeepaliveMsg { ping_id: None, padding: vec![0; 8] }.to_wire().encode();
+        a.send_message(&msg).await.unwrap();
+        {
+            let receive = b.recv_message();
+            tokio::pin!(receive);
+            tokio::select! {
+                _ = &mut receive => panic!("download did not throttle"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(pt.dead_links(timeout).is_empty());
+            assert!(pt.unconfirmed_links(timeout).is_empty());
+        }
+        // Cancelling a local wait resumes the clock from the authenticated
+        // frame, rather than from the earlier period of silence.
+        assert!(pt.dead_links(timeout).is_empty());
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(pt.dead_links(timeout), vec![0]);
     }
 
     // ── PeerTransport unit tests ──

@@ -606,8 +606,11 @@ const PEER_LANE_SIZE: usize = 1024;
 /// order per lane: protocol state machines (routing dumps, DHT walks) see a
 /// neighbour's messages in the order it sent them, never two at once. Data
 /// has its own lane so control traffic doesn't wait behind an application
-/// that is slow to read. Circuits have their own queues (see the event loop).
+/// that is slow to read. Routing has its own ordered lane so throttled
+/// application protocol replies cannot delay withdrawals or dump repair.
+/// Circuits have their own queues (see the event loop).
 struct PeerLanes {
+    routing: mpsc::Sender<(LinkId, WireMessage)>,
     control: mpsc::Sender<(LinkId, WireMessage)>,
     data: mpsc::Sender<(LinkId, WireMessage)>,
     /// Cleared when the peer's last link goes: what is still queued is
@@ -635,6 +638,7 @@ impl PeerLanes {
             tx
         };
         Self {
+            routing: lane(),
             control: lane(),
             data: lane(),
             alive,
@@ -643,6 +647,7 @@ impl PeerLanes {
 
     fn lane(&self, mt: MessageType) -> &mpsc::Sender<(LinkId, WireMessage)> {
         match mt {
+            MessageType::RouteUpdate | MessageType::RouteDigest | MessageType::RouteRequest => &self.routing,
             MessageType::Data
             | MessageType::EncryptedData
             | MessageType::TunnelKeyExchange
@@ -819,7 +824,7 @@ impl Node {
         let routing_table = Arc::new(Mutex::new(RoutingTable::new(peer_id)));
         let stats = Arc::new(crate::stats::StatsRegistry::new());
         let bandwidth = Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0));
-        let sender = sender::Sender::new(links.clone(), routing_table.clone(), bandwidth.clone(), stats.clone());
+        let sender = sender::Sender::new(links.clone(), routing_table.clone());
         let query_tokens = Arc::new(std::sync::Mutex::new(dht::QueryTokens::new(
             dht::MAX_QUERY_TOKENS,
             dht::QUERY_TOKEN_TTL,
@@ -1012,6 +1017,9 @@ impl Node {
         discovery_addrs: Vec<String>,
     ) -> Result<()> {
         let _ = self.weak_self.set(Arc::downgrade(&self));
+        let discovery: Box<dyn Discovery> = Box::new(crate::transport::metered::MeteredDiscovery::new(
+            discovery, self.bandwidth.clone(), self.stats.clone(),
+        ));
         let discovery = Arc::new(discovery);
         *self.discovery.lock().await = Some(discovery.clone());
         *self.bootstrap_addrs.lock().await = bootstrap.clone();
@@ -1446,7 +1454,6 @@ impl Node {
                         &ev.first_hop,
                         &destroy.to_wire().encode(),
                         sender::Queue::Critical,
-                        sender::Budget::Upkeep,
                     )
                     .await;
 
@@ -1537,9 +1544,9 @@ impl Node {
                         drop(circuits);
 
                         let encoded = encode_circuit_relay_cell(relay_cid, &cell);
-                        // Cover traffic: not held back by the upload limit.
+                        // Cover traffic shares the same link I/O budget.
                         let _ = ck_sender
-                            .to_peer(&first_hop, &encoded, sender::Queue::Data, sender::Budget::Upkeep)
+                            .to_peer(&first_hop, &encoded, sender::Queue::Data)
                             .await;
                     }
                 }
@@ -2036,14 +2043,10 @@ impl Node {
         let lifecycle_tx = self.lifecycle_tx.clone();
         let remote = peer_id;
         let recv_link_id = link_id;
-        let stats = self.stats.clone();
-        let bandwidth = self.bandwidth.clone();
         let recv_task = tokio::spawn(async move {
             loop {
                 match link.recv_message().await {
                     Ok(data) => {
-                        bandwidth.acquire_download(data.len()).await;
-                        stats.record_recv(&remote, data.len() as u64);
                         match WireMessage::decode(&data) {
                             Ok(msg) => {
                                 if event_tx
@@ -2094,7 +2097,7 @@ impl Node {
             let msg = crate::wire::DhtNeighborMsg { flags: 0 }.to_wire().encode();
             let _ = self
                 .sender
-                .to_peer(&peer_id, &msg, sender::Queue::Deferred, sender::Budget::Upkeep)
+                .to_peer(&peer_id, &msg, sender::Queue::Deferred)
                 .await;
         }
     }
@@ -2228,7 +2231,7 @@ impl Node {
                 let destroy = CircuitDestroyMsg { circuit_id: *cid }.to_wire().encode();
                 let _ = self
                     .sender
-                    .to_peer(from, &destroy, sender::Queue::Critical, sender::Budget::Upkeep)
+                    .to_peer(from, &destroy, sender::Queue::Critical)
                     .await;
             }
             let stream_key = CircuitKey {
@@ -2553,7 +2556,7 @@ impl Node {
                     };
                     let _ = self
                         .sender
-                        .to_peer(&from, &pong.to_wire().encode(), sender::Queue::Deferred, sender::Budget::Upkeep)
+                        .to_peer(&from, &pong.to_wire().encode(), sender::Queue::Deferred)
                         .await;
                 }
                 // Pong — activity is already tracked by touch_recv above.
@@ -2587,7 +2590,7 @@ impl Node {
     }
 
     async fn send_to_peer(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
-        self.sender.to_peer(peer, data, sender::Queue::Data, sender::Budget::Limited).await
+        self.sender.to_peer(peer, data, sender::Queue::Data).await
     }
 
     /// Send a circuit-control message, awaiting link queue capacity instead
@@ -2599,14 +2602,14 @@ impl Node {
     /// The link Arc is cloned out of the table before the awaited send so the
     /// global links lock is never held while waiting for queue space.
     async fn send_to_peer_critical(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
-        self.sender.to_peer(peer, data, sender::Queue::Critical, sender::Budget::Limited).await
+        self.sender.to_peer(peer, data, sender::Queue::Critical).await
     }
 
     /// Send a non-critical message via the deferred (coalescing) queue.
     /// The link drain task holds these briefly and flushes them alongside
     /// the next high-priority send.
     async fn send_to_peer_deferred(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
-        self.sender.to_peer(peer, data, sender::Queue::Deferred, sender::Budget::Limited).await
+        self.sender.to_peer(peer, data, sender::Queue::Deferred).await
     }
 
     /// Rekey every link this node initiated on the next sweep (testing).
@@ -2777,7 +2780,9 @@ impl Node {
         self.max_outbound = max_outbound;
     }
 
-    /// Configure bandwidth limits. Rates are in bytes/sec; 0 = unlimited.
+    /// Configure total link-message bandwidth, including encryption, padding,
+    /// handshakes and repairs. Rates are bytes/sec; 0 = unlimited. Lower-layer
+    /// transport framing (TCP/WebSocket/IP) is outside these totals.
     pub fn set_bandwidth_limits(&mut self, upload_rate: u64, download_rate: u64) {
         self.bandwidth.set_rates(upload_rate, download_rate);
     }

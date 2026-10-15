@@ -71,19 +71,12 @@ impl DhtWalker {
         (0..count).map(|i| peers[i % peers.len()]).collect()
     }
 
-    /// Send each walk to its first hop.
-    pub(super) async fn send_walks(&self, walks: Vec<(PeerId, Vec<u8>)>) {
-        use super::sender::{Budget, Queue};
-        for (peer, bytes) in walks {
-            let _ = self.sender.to_peer(&peer, &bytes, Queue::Deferred, Budget::Limited).await;
-        }
-    }
-
     /// Send one round of PUT walks for `put`.
     pub(super) async fn launch_put(&self, put: &DhtPutMsg) {
+        let deadline = Instant::now() + Duration::from_secs(put.ttl as u64);
         let encoded = put.to_wire().encode();
         let walks = self.first_hops().await.into_iter().map(|p| (p, encoded.clone())).collect();
-        self.send_walks(walks).await;
+        self.sender.batch_until(walks, deadline).await;
     }
 
     /// Launch one round of GET walks for `key`, each under a fresh query token
@@ -149,13 +142,9 @@ impl DhtWalker {
                 (hop, get.to_wire().encode())
             })
             .collect();
-        let walker = self.clone();
+        let sender = self.sender.clone();
         registration.task = Some(tokio::spawn(async move {
-            let _ = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(send_deadline),
-                walker.send_walks(msgs),
-            )
-            .await;
+            sender.batch_until(msgs, send_deadline).await;
         }));
         registration
     }
@@ -205,6 +194,7 @@ const MAX_TOLD_SIGNERS: usize = 256;
 
 /// A key this node watches.
 pub(super) struct LocalWatch {
+    task: Option<tokio::task::JoinHandle<()>>,
     pub(super) expires_at: Instant,
     /// Every live walk's token, its first hop, and registration deadline.
     /// Notifications come only from that hop until that deadline.
@@ -218,6 +208,7 @@ pub(super) struct LocalWatch {
 impl LocalWatch {
     fn new(expires_at: Instant) -> Self {
         Self {
+            task: None,
             expires_at,
             tokens: Vec::new(),
             last_round: None,
@@ -276,6 +267,14 @@ impl LocalWatch {
                 }
                 true
             }
+        }
+    }
+}
+
+impl Drop for LocalWatch {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
         }
     }
 }
@@ -887,13 +886,21 @@ impl Node {
     /// are relaunched every [`WATCH_REFRESH_INTERVAL`] meanwhile.
     pub async fn dht_watch(&self, key: &DhtId, expiration_secs: u32) {
         let secs = expiration_secs.min(crate::dht::MAX_WATCH_EXPIRATION_SECS);
+        if secs == 0 {
+            self.dht_unwatch(key).await;
+            return;
+        }
         let expires_at = Instant::now() + Duration::from_secs(secs as u64);
-        self.local_watches
-            .lock()
-            .await
-            .entry(*key.as_bytes())
-            .or_insert_with(|| LocalWatch::new(expires_at))
-            .expires_at = expires_at;
+        {
+            let mut watches = self.local_watches.lock().await;
+            let watch = watches.entry(*key.as_bytes()).or_insert_with(|| LocalWatch::new(expires_at));
+            if expires_at < watch.expires_at {
+                if let Some(task) = watch.task.take() {
+                    task.abort();
+                }
+            }
+            watch.expires_at = expires_at;
+        }
         self.launch_watch_round(key.as_bytes()).await;
         log::debug!("Watching DHT key {:?}", key);
     }
@@ -928,8 +935,8 @@ impl Node {
             .into_iter()
             .map(|hop| (random_token(), hop))
             .collect();
-        let secs = {
-            let mut watches = self.local_watches.lock().await;
+        let mut watches = self.local_watches.lock().await;
+        let (secs, deadline) = {
             let Some(w) = watches.get_mut(key).filter(|w| w.live()) else {
                 return;
             };
@@ -942,7 +949,7 @@ impl Node {
             if !w.new_round(walks.clone(), Duration::from_secs(secs as u64)) {
                 return;
             }
-            secs
+            (secs, (Instant::now() + Duration::from_secs(secs as u64)).min(w.expires_at))
         };
         let msgs = walks
             .into_iter()
@@ -956,7 +963,14 @@ impl Node {
                 (hop, watch.to_wire().encode())
             })
             .collect();
-        self.dht_walker.send_walks(msgs).await;
+        let sender = self.sender.clone();
+        let w = watches.get_mut(key).expect("watch held across registration");
+        if let Some(task) = w.task.take() {
+            task.abort();
+        }
+        w.task = Some(tokio::spawn(async move {
+            sender.batch_until(msgs, deadline).await;
+        }));
     }
 
     /// Take the DHT watch notification receiver.
@@ -1154,6 +1168,17 @@ impl DhtSearch {
 mod lifetime_regressions {
     use super::*;
 
+    #[tokio::test]
+    async fn dropping_a_watch_cancels_its_pending_batch() {
+        let mut watch = LocalWatch::new(Instant::now() + WATCH_REGISTRATION);
+        let task = tokio::spawn(std::future::pending::<()>());
+        let cancelled = task.abort_handle();
+        watch.task = Some(task);
+        drop(watch);
+        tokio::task::yield_now().await;
+        assert!(cancelled.is_finished());
+    }
+
     #[test]
     fn refresh_keeps_all_unexpired_watch_paths() {
         let peer = PeerId([1; 32]);
@@ -1186,7 +1211,7 @@ mod lifetime_regressions {
     }
 
     #[tokio::test]
-    async fn throttled_search_deadline_and_cancellation_own_all_resources() {
+    async fn search_deadline_and_cancellation_own_all_resources() {
         use crate::transport::tcp::TcpTransport;
         use tokio::net::{TcpListener, TcpStream};
         let local = Keypair::generate_ed25519();
@@ -1200,10 +1225,7 @@ mod lifetime_regressions {
         let stream = TcpStream::connect(addr).await.unwrap();
         let link = PeerLink::initiator(Box::new(TcpTransport::new(stream)), &local, None).await.unwrap();
         let _remote_link = server.await.unwrap();
-        let mut node = Node::new(local);
-        node.set_bandwidth_limits(1, 0);
-        // Drain the burst so every outbound walk must wait for bandwidth.
-        node.bandwidth.acquire_upload(1).await;
+        let node = Node::new(local);
         node.links.lock().await.insert(link.remote_peer(), Arc::new(link));
         let key = DhtId([7; 64]);
         let (held, _) = VerifiedRecord::new_content(b"held", WATCH_REGISTRATION);
@@ -1220,7 +1242,6 @@ mod lifetime_regressions {
         let task = search.rounds[0].task.as_ref().unwrap().abort_handle();
         assert!(!node.query_tokens.lock().unwrap().is_empty());
         tokio::task::yield_now().await;
-        assert!(!task.is_finished(), "DHT sender bypassed the configured shared limiter");
         assert!(tokio::time::timeout(Duration::from_millis(100), search.next()).await.unwrap().is_none());
         assert!(node.query_tokens.lock().unwrap().is_empty(), "deadline retained reverse-path capacity");
         assert!(node.dht_searches.lock().unwrap().is_empty());

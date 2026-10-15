@@ -1313,16 +1313,14 @@ async fn hidden_service_rendezvous() {
         "A should NOT be directly connected to C"
     );
 
-    // Publish C's intro records on A's local DHT store
-    // (simulating TNS resolution propagation).
-    let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
-        relay_peer_id: node_b.peer_id(),
-        kem_algo: default_kp_c.identity.kem_algo() as u8,
-        kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
-    }];
-    tarnet::tns::publish(&*node_a, &default_kp_c, "intro", &intro_records)
-        .await
-        .unwrap();
+    // Simulate propagation by copying C's signed root. Signing C's zone on
+    // A would fork its owner sequence counter and race C's real publication.
+    let root_key = tarnet::dht::zone_root_key(&service_id_c);
+    let roots = node_c.dht_held(&root_key).await;
+    assert!(!roots.is_empty(), "C did not publish its introduction root");
+    for record in roots {
+        node_a.dht_store_insert_local_for_test(record).await;
+    }
 
     // Verify TNS records are resolvable from A
     let resolution = tarnet::tns::resolve(&*node_a, service_id_c, "intro").await;

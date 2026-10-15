@@ -1,4 +1,5 @@
 pub mod firewall;
+pub(crate) mod metered;
 pub mod tcp;
 pub mod webrtc;
 pub mod ws;
@@ -16,6 +17,20 @@ use crate::types::{Error, Result};
 pub trait Transport: Send + Sync {
     /// Send a complete message.
     async fn send(&self, data: &[u8]) -> Result<()>;
+    /// Send an encrypted link frame with its scheduler class. Handshake sends
+    /// use `send`; both paths are charged by the common I/O policy.
+    async fn send_frame(&self, data: &[u8], _control: bool) -> Result<()> {
+        self.send(data).await
+    }
+    /// Bind subsequent I/O statistics to the authenticated peer.
+    fn authenticated(&self, _peer: crate::types::PeerId) {}
+    /// Mark successful frame authentication, before any delivery throttle.
+    fn authenticated_frame(&self) {}
+    /// Account for local delivery time after frame authentication. The
+    /// receive itself must finish before authentication can be checked.
+    async fn deliver_frame(&self, _bytes: usize, _authenticated: bool) {}
+    /// Authenticated activity, adjusted for time paused by local throttling.
+    fn receive_activity(&self) -> Option<std::time::Instant> { None }
     /// Receive a complete message into the buffer. Returns bytes written.
     ///
     /// Not required to be cancel-safe: dropping an in-progress `recv` may
@@ -23,6 +38,13 @@ pub trait Transport: Send + Sync {
     /// must let a started `recv` finish unless they are abandoning the
     /// transport.
     async fn recv(&self, buf: &mut [u8]) -> Result<usize>;
+    /// Receive an established-link frame. The network stall deadline is
+    /// slightly longer than the node heartbeat timeout (180 s). I/O policies
+    /// apply delivery throttling outside that deadline.
+    async fn recv_frame(&self, buf: &mut [u8]) -> Result<usize> {
+        tokio::time::timeout(std::time::Duration::from_secs(210), self.recv(buf))
+            .await.map_err(|_| crate::types::Error::Wire("link recv stalled".into()))?
+    }
     /// Maximum transmission unit (payload size per message).
     fn mtu(&self) -> usize;
     /// Whether this transport guarantees ordered, reliable delivery.

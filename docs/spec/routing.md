@@ -223,6 +223,30 @@ the measured rate if there is no hint. Messages are classified by wire type:
   starts in whatever room the frame being filled has left; only the remainder
   is fragmented.
 
+### Node-wide I/O budget
+
+The node's configured upload and download rates apply at the shared link I/O
+boundary, across every physical transport and peer. Accounting counts transport
+message bytes, including encrypted frame headers, tags, padding, handshake
+traffic and fragment repairs. TCP/WebSocket/IP framing below the `Transport`
+interface is excluded. Failed queue admission is not transmitted traffic, and
+relayed cells do not add a second byte charge. Before authentication, handshake
+traffic contributes to global totals without attribution to a peer.
+
+The upload token bucket reserves 10% of its burst capacity for frames carrying
+link control or repairs. All frames spend the same total bucket: control has no
+unlimited bypass. Existing per-link scheduling still selects messages. A frame
+already waiting to transmit can delay later control on that link; frames larger
+than the bucket are admitted against a full bucket and leave debt, so very low
+limits necessarily imply long frame times. Rate reloads wake pending I/O.
+
+Download limiting applies backpressure after receiving a transport message;
+it cannot undo bytes already received from the network. Local download waits
+are excluded from link silence and receive-stall detection. Successful frame
+authentication updates link activity independently of router dispatch. Shared
+rate limits also provide an upper-bound bandwidth hint for frame sizing and
+link timers; established links keep their chosen frame size across reloads.
+
 ### Drops by queueing delay
 
 * CoDel, per data flow and for background: when the time a message has spent

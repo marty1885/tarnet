@@ -179,7 +179,7 @@ async fn send_cell(
     };
     // Loss here is safe: reliable channels retain the plaintext until its ACK.
     sender
-        .to_peer(&key.from_peer, &encoded, super::sender::Queue::Data, super::sender::Budget::Limited)
+        .to_peer(&key.from_peer, &encoded, super::sender::Queue::Data)
         .await
 }
 

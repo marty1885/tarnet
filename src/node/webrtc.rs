@@ -84,6 +84,8 @@ impl Node {
             .await
             .insert(port_hash, listener_tx);
 
+        let io_budget = self.bandwidth.clone();
+        let io_stats = self.stats.clone();
         let event_tx = self.lifecycle_tx.clone();
         let identity = self.identity.clone();
         let channel_data_handlers = self.channel_state.data_handlers.clone();
@@ -97,6 +99,8 @@ impl Node {
 
         tokio::spawn(async move {
             while let Some((remote_peer, channel_id, mut data_rx)) = listener_rx.recv().await {
+                let io_budget = io_budget.clone();
+                let io_stats = io_stats.clone();
                 let connector = connector.clone();
                 let event_tx = event_tx.clone();
                 let identity = identity.clone();
@@ -194,11 +198,14 @@ impl Node {
                                 let identity = identity.clone();
                                 let channel_data_handlers = channel_data_handlers.clone();
                                 let channels3 = channels.clone();
+                                let io_budget = io_budget.clone();
+                                let io_stats = io_stats.clone();
                                 tokio::spawn(async move {
                                     match transport_rx.await {
                                         Ok(transport) => {
                                             let transport: Box<dyn crate::transport::Transport> =
-                                                Box::new(transport);
+                                                crate::transport::metered::MeteredTransport::wrap(
+                                                    Box::new(transport), io_budget.clone(), io_stats.clone());
                                             match crate::link::PeerLink::responder(
                                                 transport, &identity,
                                             )
@@ -358,12 +365,15 @@ impl Node {
         });
 
         // Wait for transport and do PeerLink handshake
+        let io_budget = self.bandwidth.clone();
+        let io_stats = self.stats.clone();
         let event_tx2 = self.lifecycle_tx.clone();
         let identity2 = self.identity.clone();
         tokio::spawn(async move {
             match transport_rx.await {
                 Ok(transport) => {
-                    let transport: Box<dyn crate::transport::Transport> = Box::new(transport);
+                    let transport = crate::transport::metered::MeteredTransport::wrap(
+                        Box::new(transport), io_budget, io_stats);
                     match crate::link::PeerLink::initiator(transport, &identity2, Some(peer_id))
                         .await
                     {
