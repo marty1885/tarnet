@@ -123,22 +123,6 @@ struct OwnAddress {
     change_due: Option<Instant>,
 }
 
-/// A resolved address, and the landmarks whose entries failed us.
-struct CachedAddress {
-    record: AddressRecord,
-    expires: Instant,
-    failed: Vec<PeerId>,
-}
-
-impl CachedAddress {
-    /// The record without the entries that failed.
-    fn usable(&self) -> AddressRecord {
-        let mut rec = self.record.clone();
-        rec.entries.retain(|e| !self.failed.contains(&e.landmark));
-        rec
-    }
-}
-
 /// What a landmark's own hello says about its flag.
 #[derive(Clone, Copy)]
 enum Verification {
@@ -152,6 +136,7 @@ enum Verification {
 
 /// A lookup that passed us.
 struct LookupPath {
+    target: PeerId,
     /// Where it came from: results go back there.
     prev: PeerId,
     /// It came through in the routed phase (not walking).
@@ -167,14 +152,17 @@ pub(super) struct DirectoryState {
     store: Mutex<DirStore>,
     own: Mutex<OwnAddress>,
     /// Resolved addresses.
-    cache: Mutex<crate::bounded::BoundedMap<PeerId, CachedAddress>>,
-    traces: Mutex<HashMap<[u8; 32], oneshot::Sender<Vec<PeerId>>>>,
+    cache: Mutex<dir::AddressCache>,
+    traces: crate::bounded::Requests<[u8; 32], (oneshot::Sender<Vec<PeerId>>, PeerId, PeerId)>,
     /// Lookup token → previous hop, whether it was routed (not walking)
     /// through us, and when.
     reverse: Mutex<crate::bounded::BoundedMap<[u8; 32], LookupPath>>,
     /// Our own lookups in flight: the answer, and the neighbour the lookup
     /// left through (only it may answer).
-    waiters: Mutex<HashMap<[u8; 32], (oneshot::Sender<Option<AddressRecord>>, PeerId)>>,
+    waiters: crate::bounded::Requests<
+        [u8; 32],
+        (oneshot::Sender<Option<AddressRecord>>, PeerId, PeerId),
+    >,
     verified: Mutex<crate::bounded::BoundedMap<PeerId, Verification>>,
     /// Peers every entry of whose address failed us: the record's seq, and
     /// when. Until a newer record turns up, attempts use route search.
@@ -189,10 +177,10 @@ impl DirectoryState {
             role: Mutex::new(Role::default()),
             store: Mutex::new(DirStore::new(DIR_STORE_MAX)),
             own: Mutex::new(OwnAddress::default()),
-            cache: Mutex::new(crate::bounded::BoundedMap::new(MAX_TRACKED_PEERS, CACHE_MAX_AGE)),
-            traces: Mutex::new(HashMap::new()),
+            cache: Mutex::new(dir::AddressCache::new(MAX_TRACKED_PEERS, CACHE_MAX_AGE)),
+            traces: crate::bounded::Requests::new(MAX_TOKENS, TRACE_TIMEOUT),
             reverse: Mutex::new(crate::bounded::BoundedMap::new(MAX_TOKENS, TOKEN_LIFETIME)),
-            waiters: Mutex::new(HashMap::new()),
+            waiters: crate::bounded::Requests::new(MAX_TOKENS, TOKEN_LIFETIME),
             // A landmark's verdict is checked again after this long.
             verified: Mutex::new(crate::bounded::BoundedMap::new(MAX_TRACKED_PEERS, VERIFIED_FOR)),
             exhausted: Mutex::new(crate::bounded::BoundedMap::new(MAX_TRACKED_PEERS, EXHAUSTED_FOR)),
@@ -274,7 +262,12 @@ impl Node {
         if self.is_client_only() {
             return None;
         }
-        self.directory.own.lock().await.record.clone()
+        let own = self.directory.own.lock().await;
+        let mut record = own.record.clone()?;
+        record.ttl_secs = Duration::from_secs(record.ttl_secs as u64)
+            .saturating_sub(own.published_at?.elapsed())
+            .as_secs() as u32;
+        (record.ttl_secs > 0).then_some(record)
     }
 
     /// Records we store as a landmark.
@@ -605,12 +598,13 @@ impl Node {
             }
             own.seq = own.seq.saturating_add(1);
             self.db_set_metadata("address_sequence", own.seq as u64);
-            let record = AddressRecord::sign(
+            let record = dir::VerifiedAddress::sign(
                 &self.identity,
                 own.seq,
                 ADDRESS_TTL.as_secs() as u32,
                 own.entries.clone(),
-            );
+            )
+            .into_inner();
             own.record = Some(record.clone());
             own.published_at = Some(now);
             own.change_due = None;
@@ -628,11 +622,11 @@ impl Node {
         for replica in 0..dir::REPLICAS {
             for landmark in dir::responsible(&me, replica, placeable) {
                 if landmark == me {
-                    self.directory
-                        .store
-                        .lock()
-                        .await
-                        .put(dir::VerifiedAddress::signed_here(record.clone()), Instant::now());
+                    self.directory.store.lock().await.put(
+                        dir::VerifiedAddress::verify(record.clone())
+                            .expect("locally signed address"),
+                        Instant::now(),
+                    );
                     continue;
                 }
                 self.send_publish(landmark, replica, &record).await;
@@ -710,7 +704,7 @@ impl Node {
         let next = self.sender.next_hop(&landmark, &[], None).await?;
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
-        self.directory.waiters.lock().await.insert(token, (tx, next));
+        let _request = self.directory.waiters.register(token, (tx, next, target))?;
         let msg = DirLookupMsg {
             walking: false,
             token,
@@ -722,7 +716,6 @@ impl Node {
             .send_to_peer_deferred(&next, &msg.to_wire().encode())
             .await;
         let result = tokio::time::timeout(LOOKUP_TIMEOUT, rx).await;
-        self.directory.waiters.lock().await.remove(&token);
         result
             .ok()?
             .ok()?
@@ -736,7 +729,7 @@ impl Node {
         let next = self.sender.next_hop(&target, &[], None).await?;
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
-        self.directory.traces.lock().await.insert(token, tx);
+        let _request = self.directory.traces.register(token, (tx, next, target))?;
         let msg = PathTraceMsg {
             token,
             target,
@@ -746,7 +739,6 @@ impl Node {
             .send_to_peer_deferred(&next, &msg.to_wire().encode())
             .await;
         let result = tokio::time::timeout(TRACE_TIMEOUT, rx).await;
-        self.directory.traces.lock().await.remove(&token);
         let path = result.ok()?.ok()?;
         (path.len() >= 2 && path[0] == me && path.last() == Some(&target)).then_some(path)
     }
@@ -788,7 +780,13 @@ impl Node {
             return Ok(());
         }
         if i == 0 {
-            if let Some(tx) = self.directory.traces.lock().await.remove(&msg.token) {
+            if let Some((tx, _, _)) = self
+                .directory
+                .traces
+                .take_if(&msg.token, |(_, next, target)| {
+                    *next == from && msg.path.last() == Some(target)
+                })
+            {
                 let _ = tx.send(msg.path);
             }
             return Ok(());
@@ -830,12 +828,21 @@ impl Node {
 
     /// Remember where a lookup came from. Returns false if it already came
     /// through us in the routed phase (a loop).
-    async fn remember_lookup(&self, token: [u8; 32], from: PeerId, routed: bool) -> bool {
+    async fn remember_lookup(
+        &self,
+        token: [u8; 32],
+        from: PeerId,
+        target: PeerId,
+        routed: bool,
+    ) -> bool {
         let mut reverse = self.directory.reverse.lock().await;
         match reverse.get_mut(&token) {
             // A walk that passes us twice returns the first way it came,
             // which erases the loop.
             Some(path) => {
+                if path.target != target {
+                    return false;
+                }
                 if routed {
                     if path.routed {
                         return false;
@@ -848,6 +855,7 @@ impl Node {
                 .try_insert(
                     token,
                     LookupPath {
+                        target,
                         prev: from,
                         routed,
                         next: None,
@@ -869,7 +877,9 @@ impl Node {
 
     async fn answer_lookup(&self, to: PeerId, token: [u8; 32], record: Option<AddressRecord>) -> Result<()> {
         // A node that is the origin answers itself.
-        if let Some((tx, _)) = self.directory.waiters.lock().await.remove(&token) {
+        if let Some((tx, _, _)) = self.directory.waiters.take_if(&token, |(_, _, target)| {
+            record.as_ref().map_or(true, |r| r.peer == *target)
+        }) {
             let _ = tx.send(record);
             return Ok(());
         }
@@ -882,7 +892,12 @@ impl Node {
         let mut msg = DirLookupMsg::from_bytes(payload)?;
         let me = self.peer_id();
         if msg.walking {
-            self.remember_lookup(msg.token, from, false).await;
+            if !self
+                .remember_lookup(msg.token, from, msg.target, false)
+                .await
+            {
+                return Ok(());
+            }
             use rand::seq::SliceRandom;
             use rand::Rng;
             let others: Vec<PeerId> = self
@@ -906,7 +921,10 @@ impl Node {
             };
             msg.walking = false;
             msg.landmark = landmark;
-        } else if !self.remember_lookup(msg.token, from, true).await {
+        } else if !self
+            .remember_lookup(msg.token, from, msg.target, true)
+            .await
+        {
             return Ok(());
         }
 
@@ -916,8 +934,7 @@ impl Node {
                 .store
                 .lock()
                 .await
-                .get(&msg.target, Instant::now())
-                .cloned();
+                .get(&msg.target, Instant::now());
             let record = match record {
                 Some(r) => Some(r),
                 None if msg.target == me => self.own_address().await,
@@ -952,22 +969,29 @@ impl Node {
             .lock()
             .await
             .get(&msg.token)
-            .map(|path| (path.prev, path.next));
-        {
-            let mut waiters = self.directory.waiters.lock().await;
-            if let Some((_, first)) = waiters.get(&msg.token) {
-                let expected = passed_on.and_then(|(_, next)| next).unwrap_or(*first);
-                if expected == from {
-                    if let Some((tx, _)) = waiters.remove(&msg.token) {
-                        let _ = tx.send(msg.record);
-                    }
-                    self.directory.reverse.lock().await.remove(&msg.token);
-                }
-                return Ok(());
+            .map(|path| (path.prev, path.next, path.target));
+        if self.directory.waiters.contains(&msg.token) {
+            if let Some((tx, _, _)) =
+                self.directory
+                    .waiters
+                    .take_if(&msg.token, |(_, first, target)| {
+                        let expected = passed_on.and_then(|(_, next, _)| next).unwrap_or(*first);
+                        expected == from
+                            && msg
+                                .record
+                                .as_ref()
+                                .map_or(true, |r| r.peer == *target && r.verify())
+                    })
+            {
+                let _ = tx.send(msg.record);
+                self.directory.reverse.lock().await.remove(&msg.token);
             }
+            return Ok(());
         }
         let prev = match passed_on {
-            Some((prev, Some(next))) if next == from => {
+            Some((prev, Some(next), target))
+                if next == from && msg.record.as_ref().map_or(true, |r| r.peer == target) =>
+            {
                 self.directory.reverse.lock().await.remove(&msg.token);
                 Some(prev)
             }
@@ -993,7 +1017,10 @@ impl Node {
         };
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
-        self.directory.waiters.lock().await.insert(token, (tx, first));
+        let _request = self
+            .directory
+            .waiters
+            .register(token, (tx, first, target))?;
         let msg = DirLookupMsg {
             walking: true,
             token,
@@ -1005,7 +1032,6 @@ impl Node {
             .send_to_peer_deferred(&first, &msg.to_wire().encode())
             .await;
         let result = tokio::time::timeout(LOOKUP_TIMEOUT, rx).await;
-        self.directory.waiters.lock().await.remove(&token);
         result
             .ok()?
             .ok()?
@@ -1032,8 +1058,11 @@ impl Node {
             .collect();
         while let Some(found) = lookups.next().await {
             if let Some(rec) = found {
-                self.cache_address(rec.clone()).await;
-                return Some(rec.into_inner());
+                if self.cache_address(rec).await {
+                    if let Some(cached) = self.cached_address(target).await {
+                        return Some(cached);
+                    }
+                }
             }
         }
         None
@@ -1041,37 +1070,13 @@ impl Node {
 
     /// A cached address, without the entries that failed us.
     async fn cached_address(&self, peer: &PeerId) -> Option<AddressRecord> {
-        let now = Instant::now();
-        self.directory
-            .cache
-            .lock()
-            .await
-            .get(peer)
-            .filter(|c| c.expires > now)
-            .map(|c| c.usable())
+        self.directory.cache.lock().await.get(peer, Instant::now())
     }
 
-    /// Keep a verified address until it expires (at most `CACHE_MAX_AGE`).
-    /// A newer seq replaces an older one; the same record again keeps the
-    /// expiry held (its TTL is relative, so a copy can't extend it).
-    pub(super) async fn cache_address(&self, rec: dir::VerifiedAddress) {
-        let rec = rec.into_inner();
-        let expires = Instant::now()
-            + Duration::from_secs(rec.ttl_secs as u64).min(CACHE_MAX_AGE);
-        let mut cache = self.directory.cache.lock().await;
-        match cache.get_mut(&rec.peer) {
-            Some(c) if c.record.seq >= rec.seq => {}
-            _ => {
-                let _ = cache.upsert(
-                    rec.peer,
-                    CachedAddress {
-                        record: rec,
-                        expires,
-                        failed: Vec::new(),
-                    },
-                );
-            }
-        }
+    /// Cache admission, expiry and replay protection use the directory's
+    /// central version policy; copies cannot restart a version's deadline.
+    pub(super) async fn cache_address(&self, rec: dir::VerifiedAddress) -> bool {
+        self.directory.cache.lock().await.put(rec, Instant::now())
     }
 
     /// A build using `peer`'s address failed: stop using the entry we used,
@@ -1081,26 +1086,24 @@ impl Node {
         let me = self.peer_id();
         let used = {
             let cache = self.directory.cache.lock().await;
-            let Some(c) = cache.get(peer) else {
+            let Some(record) = cache.get(peer, Instant::now()) else {
                 // The hints came from a route search, if any.
                 drop(cache);
                 self.forget_search(peer).await;
                 return;
             };
             let rt = self.routing_table.lock().await;
-            dir::hints_from(&c.usable(), &me, |p| rt.lookup(p).map(|r| r.cost))
+            dir::hints_from(&record, &me, |p| rt.lookup(p).map(|r| r.cost))
                 .first()
                 .copied()
         };
-        let mut cache = self.directory.cache.lock().await;
-        let Some(c) = cache.get_mut(peer) else { return };
-        if let Some(landmark) = used {
-            c.failed.push(landmark);
-        }
-        if used.is_none() || c.usable().entries.is_empty() {
-            let seq = c.record.seq;
-            cache.remove(peer);
-            drop(cache);
+        let exhausted = self
+            .directory
+            .cache
+            .lock()
+            .await
+            .fail(peer, used, Instant::now());
+        if let Some(seq) = exhausted {
             let _ = self.directory.exhausted.lock().await.upsert(*peer, seq);
         }
     }
@@ -1161,7 +1164,11 @@ impl Node {
         if directory {
             if let Some(rec) = self.lookup_address(peer).await {
                 if failed_seq.is_some_and(|s| rec.seq <= s) {
-                    self.directory.cache.lock().await.remove(peer);
+                    self.directory
+                        .cache
+                        .lock()
+                        .await
+                        .fail(peer, None, Instant::now());
                 } else {
                     self.directory.exhausted.lock().await.remove(peer);
                     let hints = self.cached_hints(peer).await;
@@ -1194,7 +1201,7 @@ impl Node {
                 let now = Instant::now();
                 node.directory.store.lock().await.gc(now);
                 node.directory.reverse.lock().await.expire(now);
-                node.directory.cache.lock().await.retain(|_, c| c.expires > now);
+                node.directory.cache.lock().await.gc(now);
                 node.directory.exhausted.lock().await.expire(now);
                 node.directory.verified.lock().await.expire(now);
                 if !node.routing_table.lock().await.is_landmark() {
@@ -1232,5 +1239,54 @@ mod tests {
         let wb = crowded_wait(&b, t1, &a, Some(merge), h);
         assert_eq!(wa.is_some() as u8 + wb.is_some() as u8, 1);
         assert_eq!(wa.or(wb), Some(2 * h));
+    }
+}
+
+#[cfg(test)]
+mod cache_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_expired_cache_version_cannot_be_replayed() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let kp = Keypair::generate_ed25519();
+        let entries = vec![AddressEntry {
+            landmark: PeerId([7; 32]),
+            path: Vec::new(),
+        }];
+        let record = dir::VerifiedAddress::sign(&kp, 1, 60, entries.clone());
+        node.cache_address(record.clone()).await;
+        node.directory
+            .cache
+            .lock()
+            .await
+            .gc(Instant::now() + Duration::from_secs(61));
+        node.cache_address(record).await;
+        assert!(node.cached_address(&kp.peer_id()).await.is_none());
+        node.cache_address(dir::VerifiedAddress::sign(&kp, 2, 60, entries))
+            .await;
+        assert_eq!(node.cached_address(&kp.peer_id()).await.unwrap().seq, 2);
+    }
+    #[tokio::test]
+    async fn a_directory_token_cannot_be_reused_for_a_different_target() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let from = PeerId([1; 32]);
+        let target = PeerId([2; 32]);
+        assert!(node.remember_lookup([3; 32], from, target, false).await);
+        assert!(
+            !node
+                .remember_lookup([3; 32], from, PeerId([4; 32]), false)
+                .await
+        );
+        assert_eq!(
+            node.directory
+                .reverse
+                .lock()
+                .await
+                .get(&[3; 32])
+                .unwrap()
+                .target,
+            target
+        );
     }
 }

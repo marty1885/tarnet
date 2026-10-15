@@ -26,13 +26,14 @@ const MAX_TARGETS: usize = 4096;
 /// A search that passed us.
 struct Seen {
     prev: PeerId,
+    target: PeerId,
     /// An answer already went back through us.
     answered: bool,
 }
 
 pub(super) struct SearchState {
     seen: Mutex<crate::bounded::BoundedMap<[u8; 16], Seen>>,
-    waiters: Mutex<HashMap<[u8; 16], oneshot::Sender<Vec<PeerId>>>>,
+    waiters: crate::bounded::Requests<[u8; 16], (oneshot::Sender<Vec<PeerId>>, PeerId)>,
     /// Hints a search found, by target.
     found: Mutex<crate::bounded::BoundedMap<PeerId, Vec<PeerId>>>,
     /// Targets searched for recently: one search each per `SEARCH_PER_TARGET`.
@@ -43,7 +44,7 @@ impl SearchState {
     pub(super) fn new() -> Self {
         Self {
             seen: Mutex::new(crate::bounded::BoundedMap::new(MAX_SEEN, NONCE_LIFETIME)),
-            waiters: Mutex::new(HashMap::new()),
+            waiters: crate::bounded::Requests::new(MAX_TARGETS, NONCE_LIFETIME),
             found: Mutex::new(crate::bounded::BoundedMap::new(MAX_TARGETS, FOUND_LIFETIME)),
             last_search: Mutex::new(crate::bounded::BoundedMap::new(MAX_TARGETS, SEARCH_PER_TARGET)),
         }
@@ -63,18 +64,34 @@ fn hints_from_hops(hops: &[PeerId], reach: impl Fn(&PeerId) -> bool) -> Option<V
 
 impl Node {
     /// Remember a search. False if we have seen it already.
-    async fn remember_search(&self, nonce: [u8; 16], prev: PeerId, answered: bool) -> bool {
+    async fn remember_search(
+        &self,
+        nonce: [u8; 16],
+        prev: PeerId,
+        target: PeerId,
+        answered: bool,
+    ) -> bool {
         self.search
             .seen
             .lock()
             .await
-            .try_insert(nonce, Seen { prev, answered })
+            .try_insert(
+                nonce,
+                Seen {
+                    prev,
+                    target,
+                    answered,
+                },
+            )
             .is_ok()
     }
 
     pub(super) async fn handle_route_search(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let msg = RouteSearchMsg::from_bytes(payload)?;
-        if !self.remember_search(msg.nonce, from, false).await {
+        if !self
+            .remember_search(msg.nonce, from, msg.target, false)
+            .await
+        {
             return Ok(());
         }
         let me = self.peer_id();
@@ -111,8 +128,18 @@ impl Node {
         if msg.hops.last() != Some(&from) {
             return Ok(());
         }
-        if let Some(tx) = self.search.waiters.lock().await.remove(&msg.nonce) {
-            let _ = tx.send(msg.hops);
+        let me = self.peer_id();
+        if msg.hops.contains(&me) || msg.hops.len() >= ROUTE_SEARCH_PATH_MAX {
+            return Ok(());
+        }
+        if self.search.waiters.contains(&msg.nonce) {
+            if let Some((tx, _)) = self
+                .search
+                .waiters
+                .take_if(&msg.nonce, |(_, target)| *target == msg.target)
+            {
+                let _ = tx.send(msg.hops);
+            }
             return Ok(());
         }
         let prev = {
@@ -121,17 +148,13 @@ impl Node {
                 // The first answer goes back; the rest add nothing. We sent
                 // the search to every neighbour but `prev`, so an answer
                 // can't come from it.
-                Some(s) if !s.answered && s.prev != from => {
+                Some(s) if !s.answered && s.prev != from && s.target == msg.target => {
                     s.answered = true;
                     s.prev
                 }
                 _ => return Ok(()),
             }
         };
-        let me = self.peer_id();
-        if msg.hops.contains(&me) || msg.hops.len() >= ROUTE_SEARCH_PATH_MAX {
-            return Ok(());
-        }
         msg.hops.push(me);
         self.send_to_peer_deferred(&prev, &msg.to_wire().encode())
             .await
@@ -163,9 +186,9 @@ impl Node {
             }
             let nonce: [u8; 16] = rand::random();
             // Our own flood coming back is not forwarded again.
-            self.remember_search(nonce, me, true).await;
+            self.remember_search(nonce, me, *target, true).await;
             let (tx, rx) = oneshot::channel();
-            self.search.waiters.lock().await.insert(nonce, tx);
+            let _request = self.search.waiters.register(nonce, (tx, *target))?;
             let msg = RouteSearchMsg {
                 nonce,
                 target: *target,
@@ -177,7 +200,6 @@ impl Node {
                 let _ = self.send_to_peer_deferred(peer, &msg).await;
             }
             let answer = tokio::time::timeout(ring_wait(ttl), rx).await;
-            self.search.waiters.lock().await.remove(&nonce);
             let Ok(Ok(hops)) = answer else { continue };
             let linked: HashSet<PeerId> = self.links.lock().await.keys().copied().collect();
             let hints = {
@@ -235,5 +257,47 @@ mod tests {
         let long: Vec<PeerId> = (1..=12).rev().map(pid).collect();
         assert_eq!(hints_from_hops(&long, |p| *p == pid(1)), None);
         assert!(hints_from_hops(&long, |p| *p == pid(4)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod response_regressions {
+    use super::*;
+
+    #[tokio::test]
+    async fn invalid_first_answers_do_not_consume_local_or_relay_requests() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let from = PeerId([1; 32]);
+        let target = PeerId([2; 32]);
+        let nonce = [3; 16];
+        node.remember_search(nonce, PeerId([4; 32]), target, false)
+            .await;
+        let mut msg = RouteSearchFoundMsg {
+            nonce,
+            target,
+            hops: vec![node.peer_id(), from],
+        };
+        node.handle_route_search_found(from, &msg.to_bytes())
+            .await
+            .unwrap();
+        assert!(!node.search.seen.lock().await.get(&nonce).unwrap().answered);
+        msg.hops = vec![from];
+        msg.target = PeerId([5; 32]);
+        node.handle_route_search_found(from, &msg.to_bytes())
+            .await
+            .unwrap();
+        assert!(!node.search.seen.lock().await.get(&nonce).unwrap().answered);
+
+        let (tx, rx) = oneshot::channel();
+        let _request = node.search.waiters.register(nonce, (tx, target)).unwrap();
+        node.handle_route_search_found(from, &msg.to_bytes())
+            .await
+            .unwrap();
+        assert!(node.search.waiters.contains(&nonce));
+        msg.target = target;
+        node.handle_route_search_found(from, &msg.to_bytes())
+            .await
+            .unwrap();
+        assert_eq!(rx.await.unwrap(), vec![from]);
     }
 }

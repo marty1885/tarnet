@@ -319,6 +319,16 @@ pub fn verify_incoming_record(
     signature: &[u8],
 ) -> std::result::Result<(), &'static str> {
     if record_type == RecordType::Content {
+        // These fields participate in storage identity and watch deduplication.
+        // Unsigned content has exactly one canonical identity and version.
+        if *signer != PeerId([0; 32])
+            || sequence != 0
+            || signer_algo != 0
+            || !signer_pubkey.is_empty()
+            || !signature.is_empty()
+        {
+            return Err("noncanonical unsigned content metadata");
+        }
         // Unsigned but self-certifying: the blob's hash fixes its key.
         if content_key_of_blob(value).as_bytes() != key {
             return Err("content not stored at its own key");
@@ -362,12 +372,12 @@ pub fn verify_incoming_record(
 }
 
 /// A [`DhtRecord`] that is safe to store: it either passed the trust gate
-/// ([`verify_incoming`](Self::verify_incoming)) or originated from a source this
-/// node already trusts ([`locally_trusted`](Self::locally_trusted)).
+/// ([`verify_incoming`](Self::verify_incoming)) or was minted by this node
+/// through a typed constructor.
 ///
 /// This is "parse, don't validate" applied to the DHT store: the inner record is
-/// private and there is no public constructor that skips both checks, so the only
-/// way to obtain a `VerifiedRecord` is to go through one of the two paths below.
+/// private; production constructors either verify a received record or mint
+/// and sign a new one. The unchecked fixture constructor exists only in tests.
 /// Because [`DhtStore::put`] accepts *only* `VerifiedRecord`, it is impossible —
 /// on any present or future code path — to store a record whose signature was
 /// never checked. The compiler enforces what call-site discipline used to.
@@ -393,20 +403,10 @@ impl VerifiedRecord {
         Ok(Self(record))
     }
 
-    /// Trust a record by origin rather than by re-checking its signature: one
-    /// this node just minted and signed itself (the publish path), or a test
-    /// fixture. Callers must have produced the signature themselves — never pass
-    /// an externally-sourced record here; use [`verify_incoming`](Self::verify_incoming)
-    /// for that.
-    ///
-    /// Prefer the typed publish constructors ([`new_content`](Self::new_content),
-    /// [`new_signed_content`](Self::new_signed_content),
-    /// [`new_signed_at_key`](Self::new_signed_at_key), [`new_hello`](Self::new_hello))
-    /// over this: they apply the correct encryption and signing for the record
-    /// type *by construction*, so there is no per-call-site chance to forget a
-    /// step. This bare escape hatch exists for self-minted records that don't fit
-    /// a constructor and for test fixtures with dummy signatures.
-    pub fn locally_trusted(record: DhtRecord) -> Self {
+    /// Unchecked fixtures exist only in unit-test builds. Production callers
+    /// must use verification or one of the typed signing constructors.
+    #[cfg(test)]
+    fn locally_trusted(record: DhtRecord) -> Self {
         Self(record)
     }
 
@@ -748,12 +748,62 @@ impl DhtStore {
 
         let key = *record.key.as_bytes();
         let (signer, sequence, record_type) = (record.signer, record.sequence, record.record_type);
+        // Reserve the space that eviction cannot recover. Refuse a new local
+        // publication before mutating anything if pinned records exhaust a cap.
+        let candidate = StoredRecord::new(record, source);
+        let record = &candidate.record;
+        let cost = candidate.cost;
+        if cost > self.limits.max_bytes_per_key || cost > self.limits.max_total_bytes {
+            return refused;
+        }
+        let owned = source == RecordSource::Local
+            || self.records.get(&key).is_some_and(|v| {
+                v.iter()
+                    .any(|e| e.record.signer == signer && e.source == RecordSource::Local)
+            });
+        let replacing = |e: &&StoredRecord| e.record.key == record.key && e.record.signer == signer;
+        let pinned: Vec<&StoredRecord> = self
+            .records
+            .values()
+            .flatten()
+            .filter(|e| !replacing(e) && e.source == RecordSource::Local)
+            .collect();
+        if owned
+            && (pinned.len() + 1 > self.limits.max_records
+                || pinned.iter().map(|e| e.cost).sum::<usize>() + cost
+                    > self.limits.max_total_bytes)
+        {
+            return refused;
+        }
+        let key_pinned: Vec<&StoredRecord> = self
+            .records
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .filter(|e| {
+                !replacing(e)
+                    && (e.source == RecordSource::Local || is_owner_bound(e.record.record_type))
+            })
+            .collect();
+        if (owned || is_owner_bound(record_type))
+            && (key_pinned.len() + 1 > self.limits.max_records_per_key
+                || key_pinned.iter().map(|e| e.cost).sum::<usize>() + cost
+                    > self.limits.max_bytes_per_key)
+        {
+            return refused;
+        }
         let entries = self.records.entry(key).or_default();
-        let held = entries.iter().find(|e| e.record.signer == signer).map(|e| e.record.sequence);
+        let was_local = entries
+            .iter()
+            .any(|e| e.record.signer == signer && e.source == RecordSource::Local);
+        let held = entries
+            .iter()
+            .find(|e| e.record.signer == signer)
+            .map(|e| e.record.sequence);
         // `SignedContent` and `Content` also accept a repeat of the version
         // held (it keeps the deadline held).
         let allow_equal = matches!(record_type, RecordType::SignedContent | RecordType::Content);
-        if !upsert_by_signer(entries, record, source, allow_equal) {
+        if !upsert_by_signer(entries, candidate, allow_equal) {
             self.records.retain(|_, v| !v.is_empty());
             return refused;
         }
@@ -771,7 +821,7 @@ impl DhtStore {
             return refused;
         };
         let news = held.map_or(true, |seq| sequence > seq);
-        if news {
+        if news || (!was_local && e.source == RecordSource::Local) {
             self.mirror_put(e);
         }
         PutOutcome { stored: true, news }
@@ -829,6 +879,14 @@ impl DhtStore {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Verified snapshots from the store's private, already verified entries.
+    pub(crate) fn verified_at(&self, key: &DhtId) -> Vec<VerifiedRecord> {
+        self.get(key)
+            .into_iter()
+            .map(|r| VerifiedRecord(r.clone()))
+            .collect()
     }
 
     /// Remove expired records, remembering each as dead here. Unsigned
@@ -1059,27 +1117,43 @@ fn fair_share_victim<'a, I: Copy>(
 /// Returns whether the record was stored.
 fn upsert_by_signer(
     entries: &mut Vec<StoredRecord>,
-    record: DhtRecord,
-    source: RecordSource,
+    mut incoming: StoredRecord,
     allow_equal: bool,
 ) -> bool {
-    if let Some(existing) = entries.iter_mut().find(|e| e.record.signer == record.signer) {
+    let record = &incoming.record;
+    let source = incoming.source;
+    if let Some(existing) = entries
+        .iter_mut()
+        .find(|e| e.record.signer == record.signer)
+    {
         // A strictly higher sequence is a genuinely newer record (sequence is
         // signed, so only the owner can produce one) — take it wholesale.
         if record.sequence > existing.record.sequence {
-            *existing = StoredRecord::new(record, source);
+            if existing.source == RecordSource::Local {
+                incoming.source = RecordSource::Local;
+            }
+            *existing = incoming;
             return true;
         }
         // An equal sequence is the same signed record again (a republish, or
         // a replay by anyone who saw it). `ttl` is not signed, so the copy
         // gains nothing: the record keeps its absolute deadline, which only a
         // higher sequence (signed, so only the owner's) can renew.
-        if allow_equal && record.sequence == existing.record.sequence {
+        if (allow_equal || source == RecordSource::Local)
+            && record.sequence == existing.record.sequence
+            && record.record_type == existing.record.record_type
+            && record.value == existing.record.value
+            && record.signer_algo == existing.record.signer_algo
+            && record.signer_pubkey == existing.record.signer_pubkey
+        {
+            if source == RecordSource::Local {
+                existing.source = RecordSource::Local;
+            }
             return true;
         }
         false
     } else {
-        entries.push(StoredRecord::new(record, source));
+        entries.push(incoming);
         true
     }
 }
@@ -3116,5 +3190,78 @@ mod tests {
     fn signed_record_short_blob_fails() {
         let dht_key = DhtId([0xAB; 64]);
         assert!(signed_record_decrypt(&dht_key, &[0u8; 10]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admission_regressions {
+    use super::*;
+
+    #[test]
+    fn unsigned_metadata_cannot_impersonate_a_signed_content_version() {
+        let kp = Keypair::generate_ed25519();
+        let (signed, handle) =
+            VerifiedRecord::new_signed_content(&kp, b"blob", 1, Duration::from_secs(60));
+        let (content, _) = VerifiedRecord::new_content(b"blob", Duration::from_secs(60));
+        assert_eq!(signed.record().key, content_key(&handle));
+        for field in 0..5 {
+            let mut forged = content.record().clone();
+            match field {
+                0 => forged.signer = kp.peer_id(),
+                1 => forged.sequence = u64::MAX,
+                2 => forged.signer_algo = 1,
+                3 => forged.signer_pubkey.push(1),
+                _ => forged.signature.push(1),
+            }
+            assert!(VerifiedRecord::verify_incoming(forged).is_err());
+        }
+    }
+
+    #[test]
+    fn local_capacity_refusal_preserves_the_previous_publication() {
+        let kp = Keypair::generate_ed25519();
+        let mut limits = StorageLimits::default();
+        limits.max_records = 1;
+        let mut store = DhtStore::with_limits(&kp.peer_id(), limits);
+        let (first, _) = VerifiedRecord::new_content(b"first", Duration::from_secs(60));
+        let key = first.record().key;
+        assert!(store.put(first));
+        let (second, _) = VerifiedRecord::new_content(b"second", Duration::from_secs(60));
+        assert!(!store.put(second));
+        assert_eq!(store.record_count(), 1);
+        assert_eq!(store.get(&key).len(), 1);
+        assert_eq!(store.export_records().len(), 1);
+    }
+
+    #[test]
+    fn oversized_local_replacement_does_not_destroy_the_previous_version() {
+        let kp = Keypair::generate_ed25519();
+        let key = DhtId([1; 64]);
+        let record = |seq, value: &[u8]| {
+            VerifiedRecord::new_signed_at_key(&kp, key, value, seq, Duration::from_secs(60))
+        };
+        let first = record(1, b"small");
+        let mut limits = StorageLimits::default();
+        limits.max_total_bytes =
+            StoredRecord::new(first.record().clone(), RecordSource::Local).cost;
+        let mut store = DhtStore::with_limits(&kp.peer_id(), limits);
+        assert!(store.put(first));
+        assert!(!store.put(record(2, &[0; 1024])));
+        assert_eq!(store.get(&key)[0].sequence, 1);
+    }
+
+    #[test]
+    fn publishing_a_replica_acquires_and_persists_ownership() {
+        let peer = PeerId([7; 32]);
+        let mut store = DhtStore::new(&peer);
+        let (content, _) = VerifiedRecord::new_content(b"shared", Duration::from_secs(60));
+        let deadline = content.record().expires;
+        assert!(store.put_from(content.clone(), RecordSource::Peer(peer)));
+        assert!(store.put(content));
+        assert_eq!(store.own_records().len(), 1);
+        assert_eq!(store.own_records()[0].expires, deadline);
+        assert_eq!(store.export_records()[0].source, None);
+        store.drop_replicas();
+        assert_eq!(store.record_count(), 1);
     }
 }

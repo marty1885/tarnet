@@ -195,3 +195,84 @@ mod tests {
         assert!(m.len() <= 2);
     }
 }
+
+/// Bounded requests whose registrations are owned by the requesting future.
+/// Dropping a request (including cancellation of a race's losing futures)
+/// removes its waiter synchronously, without spawning cleanup work.
+pub(crate) struct Requests<K, V> {
+    entries: std::sync::Arc<std::sync::Mutex<BoundedMap<K, (std::sync::Arc<()>, V)>>>,
+}
+
+pub(crate) struct Request<K: Hash + Eq + Clone, V> {
+    key: K,
+    generation: std::sync::Arc<()>,
+    entries: std::sync::Arc<std::sync::Mutex<BoundedMap<K, (std::sync::Arc<()>, V)>>>,
+}
+
+impl<K: Hash + Eq + Clone, V> Requests<K, V> {
+    pub(crate) fn new(cap: usize, ttl: Duration) -> Self {
+        Self {
+            entries: std::sync::Arc::new(std::sync::Mutex::new(BoundedMap::new(cap, ttl))),
+        }
+    }
+
+    pub(crate) fn register(&self, key: K, value: V) -> Option<Request<K, V>> {
+        let generation = std::sync::Arc::new(());
+        self.entries
+            .lock()
+            .unwrap()
+            .try_insert(key.clone(), (generation.clone(), value))
+            .ok()?;
+        Some(Request {
+            key,
+            generation,
+            entries: self.entries.clone(),
+        })
+    }
+
+    pub(crate) fn contains(&self, key: &K) -> bool {
+        self.entries.lock().unwrap().contains_key(key)
+    }
+
+    pub(crate) fn take_if(&self, key: &K, accept: impl FnOnce(&V) -> bool) -> Option<V> {
+        let mut entries = self.entries.lock().unwrap();
+        if !entries.get(key).is_some_and(|(_, value)| accept(value)) {
+            return None;
+        }
+        entries.remove(key).map(|(_, value)| value)
+    }
+}
+
+impl<K: Hash + Eq + Clone, V> Drop for Request<K, V> {
+    fn drop(&mut self) {
+        let mut entries = self.entries.lock().unwrap();
+        if entries
+            .get(&self.key)
+            .is_some_and(|(generation, _)| std::sync::Arc::ptr_eq(generation, &self.generation))
+        {
+            entries.remove(&self.key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_releases_capacity_and_invalid_answers_do_not_consume_requests() {
+        let requests = Requests::new(1, Duration::from_secs(30));
+        let pending = async {
+            let _registration = requests.register(1, "expected").unwrap();
+            assert!(requests.register(2, "other").is_none());
+            assert!(requests.take_if(&1, |v| *v == "wrong").is_none());
+            std::future::pending::<()>().await;
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(1), pending)
+            .await
+            .is_err());
+        assert!(!requests.contains(&1));
+        let _registration = requests.register(2, "other").unwrap();
+        assert_eq!(requests.take_if(&2, |_| true), Some("other"));
+    }
+}

@@ -1,9 +1,9 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
 /// Minimum wire protocol version this node supports.
-pub const WIRE_VERSION_MIN: u8 = 5;
+pub const WIRE_VERSION_MIN: u8 = 6;
 /// Maximum (current) wire protocol version this node supports.
-pub const WIRE_VERSION_MAX: u8 = 5;
+pub const WIRE_VERSION_MAX: u8 = 6;
 /// Current wire version used in outgoing messages.
 pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
@@ -725,7 +725,7 @@ pub struct AddressEntry {
 /// `peer(32) || seq(u32) || ttl_secs(u32) || count(u8) ||
 /// count × (landmark(32) || path_len(u8) || path(32 × path_len)) ||
 /// signer_algo(u8) || pk_len(u16) || signer_pubkey || sig_len(u16) || signature`,
-/// signed over `"tarnet address v1"` and every field before `signer_algo`.
+/// signed over `"tarnet address v2"` and the body except its mutable TTL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressRecord {
     pub peer: PeerId,
@@ -773,9 +773,19 @@ impl AddressRecord {
 
     /// The bytes the signature covers.
     pub fn signed_bytes(&self) -> Vec<u8> {
-        let mut msg = b"tarnet address v1".to_vec();
-        msg.extend_from_slice(&self.body());
+        let body = self.body();
+        let mut msg = b"tarnet address v2".to_vec();
+        msg.extend_from_slice(&body[..36]); // peer and sequence
+        msg.extend_from_slice(&body[40..]); // entries; remaining TTL is mutable
         msg
+    }
+
+    /// Whether two copies carry the same authenticated record. A relay may
+    /// reduce the unsigned remaining TTL without changing the version.
+    pub fn same_version(&self, other: &Self) -> bool {
+        self.signed_bytes() == other.signed_bytes()
+            && self.signer_algo == other.signer_algo
+            && self.signer_pubkey == other.signer_pubkey
     }
 
     /// The signer key hashes to `peer` and signs the record.
@@ -3144,5 +3154,15 @@ mod tests {
         let decoded3 = ChannelOpenMsg::from_bytes(&bytes3).unwrap();
         assert!(!decoded3.reliable);
         assert!(!decoded3.ordered);
+    }
+    #[test]
+    fn address_ttl_is_mutable_but_previous_wire_version_is_rejected() {
+        let kp = crate::identity::Keypair::generate();
+        let mut record = AddressRecord::sign(&kp, 1, 600, Vec::new());
+        record.ttl_secs = 10;
+        assert!(record.verify());
+        let mut message = WireMessage::new(MessageType::DirResult, Vec::new()).encode();
+        message[0] = 5;
+        assert!(WireMessage::decode(&message).is_err());
     }
 }

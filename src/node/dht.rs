@@ -128,6 +128,11 @@ impl DhtWalker {
                 reg.insert(*t, tx.clone());
             }
         }
+        let mut registration = SearchLaunch {
+            registry: search.0,
+            tokens: &tokens,
+            committed: false,
+        };
         let msgs = walks
             .into_iter()
             .map(|(token, hop)| {
@@ -140,11 +145,31 @@ impl DhtWalker {
             })
             .collect();
         self.send_walks(msgs).await;
+        registration.committed = true;
+        drop(registration);
         tokens
     }
 }
 
 pub(super) type SearchRegistry = std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<VerifiedRecord>>>;
+
+/// Roll back registration if a launch is cancelled while sending its walks.
+struct SearchLaunch<'a> {
+    registry: &'a SearchRegistry,
+    tokens: &'a [[u8; 32]],
+    committed: bool,
+}
+
+impl Drop for SearchLaunch<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut registry = self.registry.lock().unwrap();
+            for token in self.tokens {
+                registry.remove(token);
+            }
+        }
+    }
+}
 
 fn random_token() -> [u8; 32] {
     let mut t = [0u8; 32];
@@ -159,11 +184,10 @@ const MAX_TOLD_SIGNERS: usize = 256;
 /// A key this node watches.
 pub(super) struct LocalWatch {
     pub(super) expires_at: Instant,
-    /// Tokens of this round's and the previous round's watch walks, each
-    /// with the neighbour it left through: notifications under a token come
-    /// only from there. Older rounds' registrations have expired.
-    tokens: Vec<([u8; 32], PeerId)>,
-    prev_tokens: Vec<([u8; 32], PeerId)>,
+    /// Every live walk's token, its first hop, and registration deadline.
+    /// Notifications come only from that hop until that deadline.
+    tokens: Vec<([u8; 32], PeerId, Instant)>,
+    last_round: Option<Instant>,
     /// Newest sequence handed to the app, per signer: the app hears of each
     /// version once, however many walks report it, and never of an older one.
     told: HashMap<PeerId, u64>,
@@ -174,7 +198,7 @@ impl LocalWatch {
         Self {
             expires_at,
             tokens: Vec::new(),
-            prev_tokens: Vec::new(),
+            last_round: None,
             told: HashMap::new(),
         }
     }
@@ -184,12 +208,36 @@ impl LocalWatch {
     }
 
     fn owns(&self, token: &[u8; 32], from: &PeerId) -> bool {
-        let t = (*token, *from);
-        self.tokens.contains(&t) || self.prev_tokens.contains(&t)
+        self.tokens
+            .iter()
+            .any(|(t, peer, expires)| t == token && peer == from && *expires > Instant::now())
     }
 
-    fn new_round(&mut self, tokens: Vec<([u8; 32], PeerId)>) {
-        self.prev_tokens = std::mem::replace(&mut self.tokens, tokens);
+    fn new_round(&mut self, tokens: Vec<([u8; 32], PeerId)>, lifetime: Duration) -> bool {
+        let now = Instant::now();
+        self.tokens.retain(|(_, _, expires)| *expires > now);
+        // Limit overlap, but allow a short subscription to be extended
+        // before its old registrations expire. Never discard a live path.
+        let covered = self
+            .tokens
+            .iter()
+            .any(|(_, _, expires)| *expires >= now + WATCH_REFRESH_INTERVAL);
+        if tokens.is_empty()
+            || self.tokens.len() + tokens.len() > 4 * crate::dht::MAX_WALKS
+            || (covered
+                && self
+                    .last_round
+                    .is_some_and(|at| at.elapsed() < Duration::from_secs(30)))
+        {
+            return false;
+        }
+        self.tokens.extend(
+            tokens
+                .into_iter()
+                .map(|(t, peer)| (t, peer, now + lifetime)),
+        );
+        self.last_round = Some(now);
+        true
     }
 
     /// Whether `signer`'s `sequence` is news to the app (and now told).
@@ -502,6 +550,9 @@ impl Node {
                 Err(_) => return,
             },
         };
+        if record.record().is_expired() {
+            return;
+        }
         if remote {
             let watchers = self
                 .dht_watches
@@ -527,14 +578,22 @@ impl Node {
     /// Hand a record for a key we watch to the app, if it is news to it.
     async fn tell_app(&self, record: VerifiedRecord) {
         let r = record.into_inner();
-        let news = self
-            .local_watches
-            .lock()
-            .await
-            .get_mut(r.key.as_bytes())
-            .is_some_and(|w| w.live() && w.news(&r.signer, r.sequence));
-        if news {
-            let _ = self.dht_watch_tx.send((r.key, r)).await;
+        if r.is_expired() {
+            return;
+        }
+        let mut watches = self.local_watches.lock().await;
+        let Some(w) = watches.get_mut(r.key.as_bytes()).filter(|w| w.live()) else {
+            return;
+        };
+        if w.told.get(&r.signer).is_some_and(|seq| *seq >= r.sequence) {
+            return;
+        }
+        let signer = r.signer;
+        let sequence = r.sequence;
+        if self.dht_watch_tx.try_send((r.key, r)).is_ok() {
+            w.news(&signer, sequence);
+        } else {
+            log::debug!("DHT watch application queue full or closed; notification dropped");
         }
     }
 
@@ -601,10 +660,16 @@ impl Node {
             )));
         }
         let put = record.record().to_put_msg();
-        self.dht_store
+        let outcome = self
+            .dht_store
             .lock()
             .await
             .put_record(record.clone(), RecordSource::Local);
+        if !outcome.stored {
+            return Err(Error::Protocol(
+                "DHT publication refused by storage admission".into(),
+            ));
+        }
         self.dht_put_seen(&put, Some(record), None).await;
         self.dht_walker.launch_put(&put).await;
         Ok(())
@@ -780,7 +845,7 @@ impl Node {
         self.dht_store
             .lock()
             .await
-            .put(VerifiedRecord::locally_trusted(record));
+            .put(VerifiedRecord::verify_incoming(record).expect("test record must verify"));
     }
 
     // ── Watching ──
@@ -835,12 +900,16 @@ impl Node {
             let Some(w) = watches.get_mut(key).filter(|w| w.live()) else {
                 return;
             };
-            w.new_round(walks.clone());
-            w.expires_at
+            let secs = w
+                .expires_at
                 .saturating_duration_since(Instant::now())
                 .min(WATCH_REGISTRATION)
                 .as_secs()
-                .max(1) as u32
+                .max(1) as u32;
+            if !w.new_round(walks.clone(), Duration::from_secs(secs as u64)) {
+                return;
+            }
+            secs
         };
         let msgs = walks
             .into_iter()
@@ -877,9 +946,8 @@ impl Node {
             .dht_store
             .lock()
             .await
-            .get(&key)
+            .verified_at(&key)
             .into_iter()
-            .map(|r| VerifiedRecord::locally_trusted(r.clone()))
             .collect();
         // Bounded: past this many records waiting, responses are dropped.
         let (tx, rx) = mpsc::channel(SEARCH_BUFFER);
@@ -1006,6 +1074,7 @@ impl DhtSearch {
                     tokio::select! {
                         r = self.rx.recv() => r?,
                         _ = tokio::time::sleep(wake.saturating_duration_since(now)) => {
+                            if Instant::now() >= self.deadline { return None; }
                             if relaunch && Instant::now() >= self.next_round {
                                 self.rounds_left -= 1;
                                 self.next_round = Instant::now() + SEARCH_RELAUNCH_INTERVAL;
@@ -1021,7 +1090,15 @@ impl DhtSearch {
                 }
             };
             let r = rec.record();
-            let id = (r.signer, r.sequence, r.record_type, *blake3::hash(&r.value).as_bytes());
+            if r.is_expired() {
+                continue;
+            }
+            let id = (
+                r.signer,
+                r.sequence,
+                r.record_type,
+                *blake3::hash(&r.value).as_bytes(),
+            );
             if self.seen.insert(id) {
                 return Some(rec);
             }
@@ -1036,5 +1113,106 @@ impl Drop for DhtSearch {
                 reg.remove(token);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod lifetime_regressions {
+    use super::*;
+
+    #[test]
+    fn refresh_keeps_all_unexpired_watch_paths() {
+        let peer = PeerId([1; 32]);
+        let mut watch = LocalWatch::new(Instant::now() + WATCH_REGISTRATION);
+        for token in 0..3 {
+            watch.last_round = Instant::now().checked_sub(Duration::from_secs(31));
+            assert!(watch.new_round(vec![([token; 32], peer)], WATCH_REGISTRATION));
+        }
+        assert!(!watch.new_round(vec![([4; 32], peer)], WATCH_REGISTRATION));
+        for token in 0..3 {
+            assert!(watch.owns(&[token; 32], &peer));
+        }
+        watch.tokens[0].2 = Instant::now();
+        assert!(!watch.owns(&[0; 32], &peer));
+    }
+
+    #[test]
+    fn cancelling_a_get_launch_rolls_back_search_registrations() {
+        let registry = SearchRegistry::new(HashMap::new());
+        let (tx, _rx) = mpsc::channel(1);
+        registry.lock().unwrap().insert([1; 32], tx);
+        let tokens = [[1; 32]];
+        let launch = SearchLaunch {
+            registry: &registry,
+            tokens: &tokens,
+            committed: false,
+        };
+        drop(launch);
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn full_application_queue_does_not_block_watch_protocols() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let kp = Keypair::generate_ed25519();
+        let key = DhtId([42; 64]);
+        node.local_watches.lock().await.insert(
+            *key.as_bytes(),
+            LocalWatch::new(Instant::now() + WATCH_REGISTRATION),
+        );
+        for sequence in 0..257 {
+            let record =
+                VerifiedRecord::new_signed_at_key(&kp, key, b"news", sequence, WATCH_REGISTRATION);
+            tokio::time::timeout(Duration::from_secs(1), node.tell_app(record))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            node.local_watches.lock().await[key.as_bytes()].told[&kp.peer_id()],
+            255
+        );
+        let mut receiver = node.take_dht_watch_receiver().await.unwrap();
+        receiver.recv().await.unwrap();
+        node.tell_app(VerifiedRecord::new_signed_at_key(
+            &kp,
+            key,
+            b"news",
+            256,
+            WATCH_REGISTRATION,
+        ))
+        .await;
+        assert_eq!(
+            node.local_watches.lock().await[key.as_bytes()].told[&kp.peer_id()],
+            256
+        );
+    }
+    #[tokio::test]
+    async fn refused_publications_report_failure() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let mut limits = StorageLimits::default();
+        limits.max_records = 0;
+        *node.dht_store.lock().await = DhtStore::with_limits(&node.peer_id(), limits);
+        assert!(node.dht_put_content(b"no capacity").await.is_err());
+        assert_eq!(node.dht_store.lock().await.record_count(), 0);
+    }
+
+    #[test]
+    fn an_offline_watch_does_not_delay_its_first_real_launch() {
+        let mut watch = LocalWatch::new(Instant::now() + WATCH_REGISTRATION);
+        assert!(!watch.new_round(Vec::new(), WATCH_REGISTRATION));
+        assert!(watch.new_round(vec![([1; 32], PeerId([2; 32]))], WATCH_REGISTRATION));
+    }
+    #[test]
+    fn short_watch_extensions_remain_bounded_without_dropping_live_paths() {
+        let mut watch = LocalWatch::new(Instant::now() + WATCH_REGISTRATION);
+        for round in 0..4 {
+            assert!(watch.new_round(
+                vec![([round; 32], PeerId([2; 32])); crate::dht::MAX_WALKS],
+                Duration::from_secs(1)
+            ));
+        }
+        assert!(!watch.new_round(vec![([9; 32], PeerId([2; 32]))], Duration::from_secs(1)));
+        assert!(watch.owns(&[0; 32], &PeerId([2; 32])));
+        assert_eq!(watch.tokens.len(), 4 * crate::dht::MAX_WALKS);
     }
 }

@@ -132,11 +132,14 @@ key is `H64("tarnet content key v2" || chk)`.
 A storing node sees only the blob, but recomputes its key from it, and drops a
 content record stored anywhere else. Exactly one blob is valid per key, so
 there are no competing candidates for junk to crowd out, and content needs no
-special case anywhere: it is kept, deduplicated and expired like any other
+special case in eviction: it is kept, deduplicated and expired like any other
 record, one version per (key, signer), its signer being zero. A reader checks
 `chk` against the blob, decrypts with `enc_key`, and checks `enc_key` against
 the plaintext. The same plaintext always gives the same handle (convergent),
-so honest copies from different publishers are identical.
+so honest copies from different publishers are identical. Incoming unsigned
+content must use canonical metadata: sequence 0, zero signer and algorithm,
+and empty public key and signature. Those fields cannot claim a signed
+record's identity or version.
 
 `SignedContent` at a content key wraps the same blob, encrypted under the DHT
 key and signed; different signers keep separate records.
@@ -166,7 +169,10 @@ written only while the store holds it, together with who handed it over (this
 node, or which link peer), records the caps evict or that expire lose their
 rows, and on start-up rows the caps no longer admit are deleted. A node's own
 records are never evicted for others' (nothing would put them back), and a
-relay-only node drops the replicas it held when it was storing. The store caps
+relay-only node drops the replicas it held when it was storing. New local
+publications are refused when pinned records leave insufficient capacity.
+Publishing an already held replica acquires local ownership without extending
+its deadline; later replicas cannot remove that ownership. The store caps
 therefore bound the database too, and a restarted node republishes only the
 records it published itself, never replicas it held for others. The table is
 a cache owners refill: a layout change drops it rather than migrating it.
@@ -230,3 +236,17 @@ L2NSE estimate from the k-bucket, and `hop_count`/`hop_limit`.
 * Each hop knows its predecessor and successor. Hidden identities need DHT
   operations carried over a circuit (planned; no change to this format).
 * Only relay-only nodes on a `DELIVER` detour enter the bloom.
+
+### Request and watch lifetime policy
+
+Local directory lookups, route searches and path traces reserve bounded request
+registrations owned by the requesting future. Completion, timeout and cancellation
+release the registration. Responses must match the registered target; directory
+and trace replies also match the expected first hop.
+
+Watch tokens are retained until their actual registration deadline, at most
+128 live tokens per key. Relaunches are at least 30 s apart while an existing
+round covers the next refresh; short subscriptions may be extended sooner.
+A full application notification queue drops the notification without marking it
+delivered, so a later copy may retry.
+Application backpressure never blocks a peer's routing control lane.

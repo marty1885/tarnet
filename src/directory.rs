@@ -31,7 +31,17 @@ impl VerifiedAddress {
     }
 
     /// A record this node just signed.
-    pub fn signed_here(record: AddressRecord) -> Self {
+    pub fn sign(
+        keypair: &crate::identity::Keypair,
+        seq: u32,
+        ttl_secs: u32,
+        entries: Vec<crate::wire::AddressEntry>,
+    ) -> Self {
+        Self(AddressRecord::sign(keypair, seq, ttl_secs, entries))
+    }
+
+    #[cfg(test)]
+    fn signed_here(record: AddressRecord) -> Self {
         Self(record)
     }
 
@@ -165,14 +175,21 @@ impl DirStore {
         if self.records.get(&record.peer).is_some_and(|(_, t)| *t <= now) {
             self.gc(now);
         }
-        if self.dead.get(&record.peer).is_some_and(|seq| record.seq <= *seq) {
+        if record.ttl_secs == 0 {
+            return false;
+        }
+        if self
+            .dead
+            .get(&record.peer)
+            .is_some_and(|seq| record.seq <= *seq)
+        {
             return false;
         }
         if let Some((old, _)) = self.records.get(&record.peer) {
-            if old.seq > record.seq || (old.seq == record.seq && *old != record) {
+            if old.seq > record.seq || (old.seq == record.seq && !old.same_version(&record)) {
                 return false;
             }
-            if *old == record {
+            if old.same_version(&record) {
                 return true;
             }
         } else if self.records.len() >= self.max {
@@ -194,11 +211,18 @@ impl DirStore {
         true
     }
 
-    pub fn get(&self, peer: &PeerId, now: Instant) -> Option<&AddressRecord> {
+    pub fn get(&self, peer: &PeerId, now: Instant) -> Option<AddressRecord> {
         self.records
             .get(peer)
             .filter(|(_, t)| *t > now)
-            .map(|(r, _)| r)
+            .and_then(|(r, expires)| {
+                let mut copy = r.clone();
+                copy.ttl_secs = expires
+                    .saturating_duration_since(now)
+                    .as_secs()
+                    .min(u32::MAX as u64) as u32;
+                (copy.ttl_secs > 0).then_some(copy)
+            })
     }
 
     pub fn gc(&mut self, now: Instant) {
@@ -228,6 +252,79 @@ impl DirStore {
 
     pub fn clear(&mut self) {
         self.records.clear();
+    }
+}
+
+/// Resolver cache using the directory's version and expiry policy. Failed
+/// paths are metadata on that version, never a reason to forget its lifetime.
+pub(crate) struct AddressCache {
+    store: DirStore,
+    failed: HashMap<PeerId, (u32, Vec<PeerId>)>,
+    max_age: Duration,
+}
+
+impl AddressCache {
+    pub(crate) fn new(max: usize, max_age: Duration) -> Self {
+        Self {
+            store: DirStore::new(max),
+            failed: HashMap::new(),
+            max_age,
+        }
+    }
+
+    pub(crate) fn put(&mut self, mut record: VerifiedAddress, now: Instant) -> bool {
+        record.0.ttl_secs = record.0.ttl_secs.min(self.max_age.as_secs() as u32);
+        let peer = record.0.peer;
+        let seq = record.0.seq;
+        if !self.store.put(record, now) {
+            return false;
+        }
+        if self.failed.get(&peer).is_some_and(|(old, _)| *old != seq) {
+            self.failed.remove(&peer);
+        }
+        self.gc(now);
+        true
+    }
+
+    pub(crate) fn get(&self, peer: &PeerId, now: Instant) -> Option<AddressRecord> {
+        let mut record = self.store.get(peer, now)?;
+        if let Some((seq, failed)) = self.failed.get(peer) {
+            if *seq == record.seq {
+                record.entries.retain(|e| !failed.contains(&e.landmark));
+            }
+        }
+        (!record.entries.is_empty()).then_some(record)
+    }
+
+    /// Mark the path actually used as failed; None invalidates every path.
+    /// Return the sequence when every path is exhausted. The record remains
+    /// held so a refetch cannot restart its deadline or clear its failures.
+    pub(crate) fn fail(
+        &mut self,
+        peer: &PeerId,
+        landmark: Option<PeerId>,
+        now: Instant,
+    ) -> Option<u32> {
+        let record = self.store.get(peer, now)?;
+        let (_, failed) = self.failed.entry(*peer).or_insert((record.seq, Vec::new()));
+        if let Some(landmark) = landmark {
+            if !failed.contains(&landmark) {
+                failed.push(landmark);
+            }
+        } else {
+            *failed = record.entries.iter().map(|e| e.landmark).collect();
+        }
+        self.get(peer, now).is_none().then_some(record.seq)
+    }
+
+    pub(crate) fn gc(&mut self, now: Instant) {
+        self.store.gc(now);
+        self.failed.retain(|peer, (seq, _)| {
+            self.store
+                .records
+                .get(peer)
+                .is_some_and(|(r, _)| r.seq == *seq)
+        });
     }
 }
 
@@ -403,5 +500,64 @@ mod tests {
             vec![pid(4), pid(5)]
         );
         assert!(hints_from(&rec, &me, costs(vec![])).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod lifetime_regressions {
+    use super::*;
+    use crate::identity::Keypair;
+
+    #[test]
+    fn replies_age_without_invalidating_signatures_or_extending_duplicates() {
+        let kp = Keypair::generate_ed25519();
+        let now = Instant::now();
+        let mut store = DirStore::new(4);
+        let record = VerifiedAddress::sign(&kp, 1, 60, Vec::new());
+        assert!(store.put(record.clone(), now));
+        let reply = store
+            .get(&kp.peer_id(), now + Duration::from_secs(50))
+            .unwrap();
+        assert_eq!(reply.ttl_secs, 10);
+        assert!(reply.verify());
+        assert!(store.put(
+            VerifiedAddress::verify(reply).unwrap(),
+            now + Duration::from_secs(50)
+        ));
+        assert!(store
+            .get(&kp.peer_id(), now + Duration::from_secs(61))
+            .is_none());
+        assert!(!store.put(record, now + Duration::from_secs(61)));
+    }
+}
+
+#[cfg(test)]
+mod cache_failure_regressions {
+    use super::*;
+
+    #[test]
+    fn refetching_a_failed_version_cannot_restore_its_paths_or_deadline() {
+        let kp = crate::identity::Keypair::generate_ed25519();
+        let peer = kp.peer_id();
+        let now = Instant::now();
+        let landmark = PeerId([8; 32]);
+        let entries = vec![crate::wire::AddressEntry {
+            landmark,
+            path: Vec::new(),
+        }];
+        let record = VerifiedAddress::sign(&kp, 1, 60, entries.clone());
+        let mut cache = AddressCache::new(4, Duration::from_secs(3600));
+        assert!(cache.put(record.clone(), now));
+        assert_eq!(cache.fail(&peer, Some(landmark), now), Some(1));
+        assert!(cache.put(record, now + Duration::from_secs(50)));
+        assert!(cache.get(&peer, now + Duration::from_secs(50)).is_none());
+        assert!(cache.put(
+            VerifiedAddress::sign(&kp, 2, 60, entries),
+            now + Duration::from_secs(50)
+        ));
+        assert_eq!(
+            cache.get(&peer, now + Duration::from_secs(50)).unwrap().seq,
+            2
+        );
     }
 }

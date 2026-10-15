@@ -3,8 +3,8 @@
 Status: **draft, mostly implemented**. Not yet: per-transport link-death
 timing and Hidden-identity lookups over circuits. Replaces the routing part of wire
 v4 (`RouteAdvertisement`, `RouteProbe`, `RouteProbeFound`) and changes link
-framing, `Data` and circuit `EXTEND`. Ships as wire version 5, a hard break
-(`WIRE_VERSION_MIN = WIRE_VERSION_MAX = 5`); after it the wire is frozen or
+framing, `Data` and circuit `EXTEND`. Ships as wire version 6, a hard break
+(`WIRE_VERSION_MIN = WIRE_VERSION_MAX = 6`); after it the wire is frozen or
 extensible. Everything under "Local policy" may change between releases
 without a compatibility break. Open decisions are collected at the end.
 
@@ -449,7 +449,7 @@ address_record:
   count × ( landmark(32) || path_len(u8) || path(32 × path_len) ) ||
   signer_algo(u8) || pk_len(u16) || signer_pubkey ||
   sig_len(u16) || signature
-signature over "tarnet address v1" || every field before signer_algo
+signature over "tarnet address v2" || peer || seq || count || entries (TTL excluded)
 ```
 
 * `count ≤ 3`: one entry per nearest landmark, so one failing landmark doesn't
@@ -966,10 +966,10 @@ Accepted residuals:
   unlinkability. Bytes still change at every waypoint. They learn the next
   waypoint from the routed CREATE, as they learned it from EXTEND in v4.
 
-## Wire format (version 5)
+## Wire format (version 6)
 
 All multi-byte integers are big-endian. `peer` is 32 bytes. The wire message
-header `VER(u8) | TYPE(u16) | LEN(u16)` is unchanged, with `VER = 5`.
+header `VER(u8) | TYPE(u16) | LEN(u16)` is unchanged, with `VER = 6`.
 
 Retired: `RouteAdvertisement (0x0100)`, `RouteProbe (0x0101)`,
 `RouteProbeFound (0x0102)`.
@@ -1098,7 +1098,7 @@ Hello record: `capabilities` gains bit 2 `LANDMARK_ELIGIBLE` and bit 3
 * **Status bytes** take only their defined values (0 or 1); others are
   rejected. CREATE's flags byte must be 0.
 * **Signed bytes** start with a domain label naming the object and version
-  (`"tarnet dht record v1"`, `"tarnet link rekey v1"`, `"tarnet address v1"`,
+  (`"tarnet dht record v1"`, `"tarnet link rekey v1"`, `"tarnet address v2"`,
   …), and length-prefix every variable-length field, so no two objects an
   identity signs can share signed bytes.
 * **TTLs** on overlay `Data` are clamped to the sender default (64) on
@@ -1275,3 +1275,16 @@ link.
    (DHT-over-circuits).
 6. ~~**Landmark eligibility defaults.**~~ Decided: reachable, relaying,
    storing, with a non-slow link; opting out always wins (see Eligibility).
+
+### Address lifetime correction (wire v6)
+
+Address signatures use the domain `tarnet address v2` and cover the peer,
+sequence and entries, excluding the remaining TTL. Stores and caches clamp
+TTL, never extend a held version, and replies carry only its remaining
+whole seconds. Wire v6 rejects earlier peers because v5 signed the TTL.
+
+Routing receive and outbox bounds derive from the maximum local area plus
+accepted landmarks. When feasibility-history capacity is exhausted, new
+destinations are refused until garbage collection frees history; live safety
+history is never evicted for capacity. Forwarding alternatives are checked
+against the feasibility distance after reselection.

@@ -112,6 +112,21 @@ struct Neighbour {
     dump_due: bool,
 }
 
+impl Neighbour {
+    /// Every update enters the same bounded outbox. A dump supersedes a
+    /// backlog of deltas without forgetting any withdrawal at the receiver.
+    fn queue(&mut self, entry: RouteEntry, cap: usize) {
+        if self.dump_due {
+            return;
+        }
+        self.pending.insert(entry.dest, entry);
+        if self.pending.len() > cap {
+            self.pending.clear();
+            self.dump_due = true;
+        }
+    }
+}
+
 /// A seqno request to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeqnoRequest {
@@ -160,7 +175,7 @@ impl RoutingTable {
         let mut t = Self {
             local,
             seqno: rand::random(),
-            budget,
+            budget: budget.max(1),
             neighbours: HashMap::new(),
             selected: HashMap::new(),
             advertised: BTreeMap::new(),
@@ -401,11 +416,7 @@ impl RoutingTable {
     /// Apply a `RouteUpdate` from neighbour `from`.
     pub fn apply_update(&mut self, from: &PeerId, msg: &RouteUpdateMsg) -> Vec<SeqnoRequest> {
         // A neighbour keeps its local area plus its accepted landmarks.
-        let cap = self
-            .budget
-            .saturating_mul(RIB_SLACK)
-            .saturating_add(self.limits.max)
-            + 1;
+        let cap = self.advertised_capacity().saturating_mul(RIB_SLACK);
         let Some(nb) = self.neighbours.get_mut(from) else {
             return Vec::new();
         };
@@ -680,35 +691,24 @@ impl RoutingTable {
                     *fd = (e.seqno, e.metric, now);
                 }
                 fd.2 = now;
-                self.bound_fd();
             }
         }
+        let pending_cap = self.advertised_capacity().saturating_mul(2);
         for nb in self.neighbours.values_mut() {
-            nb.pending.insert(e.dest, e);
+            nb.queue(e, pending_cap);
         }
     }
 
-    /// Keep the feasibility distances of destinations no longer selected
-    /// within a few times what we may select: a neighbour churning through
-    /// fresh destinations can't grow the map without bound. The oldest go
-    /// first.
-    fn bound_fd(&mut self) {
-        let cap = self.budget.saturating_add(self.limits.max).saturating_mul(4);
-        if self.fd.len() <= cap {
-            return;
-        }
-        let selected = &self.selected;
-        let mut idle: Vec<(Instant, PeerId)> = self
-            .fd
-            .iter()
-            .filter(|(d, _)| !selected.contains_key(*d))
-            .map(|(d, (_, _, t))| (*t, *d))
-            .collect();
-        idle.sort_unstable();
-        let excess = self.fd.len() - cap;
-        for (_, d) in idle.into_iter().take(excess) {
-            self.fd.remove(&d);
-        }
+    /// One bound for local-area plus landmark advertisements, including self.
+    fn advertised_capacity(&self) -> usize {
+        self.budget
+            .max(self.limits.max.saturating_add(1))
+            .saturating_add(self.limits.max)
+            .saturating_add(1)
+    }
+
+    fn fd_capacity(&self) -> usize {
+        self.advertised_capacity().saturating_mul(4)
     }
 
     /// Queue our current entry for `dest` (or a retraction) to `to` only.
@@ -719,8 +719,9 @@ impl RoutingTable {
             metric: ROUTE_INFINITY,
             eflags: 0,
         });
+        let pending_cap = self.advertised_capacity().saturating_mul(2);
         if let Some(nb) = self.neighbours.get_mut(to) {
-            nb.pending.insert(*dest, e);
+            nb.queue(e, pending_cap);
         }
     }
 
@@ -835,6 +836,19 @@ impl RoutingTable {
             })
             .collect();
         ranked.sort_by_key(|(cost, dest, _)| (*cost, dest.0));
+        // Capacity limits admission, never the loop-prevention history of
+        // an advertised destination. History is released only by gc().
+        let mut room = self.fd_capacity().saturating_sub(self.fd.len());
+        ranked.retain(|(_, dest, _)| {
+            if self.fd.contains_key(dest) {
+                return true;
+            }
+            if room == 0 {
+                return false;
+            }
+            room -= 1;
+            true
+        });
         self.observe_flags(&ranked);
         self.landmarks = self.accept_landmarks(&ranked);
         let area = self.budget.max(self.landmarks.len() + self.landmark as usize);
@@ -868,6 +882,20 @@ impl RoutingTable {
         }
         for e in changes {
             self.set_advertised(e);
+        }
+        // Advertising a better route may tighten the FD. Every forwarding
+        // alternative must satisfy that resulting FD, including mixed seqnos.
+        let fd = &self.fd;
+        let neighbours = &self.neighbours;
+        for (dest, routes) in &mut self.selected {
+            routes.retain(|r| {
+                let Some(e) = neighbours.get(&r.next_hop).and_then(|n| n.rib.get(dest)) else {
+                    return false;
+                };
+                fd.get(dest).map_or(true, |(s, m, _)| {
+                    seqno_newer(e.seqno, *s) || (e.seqno == *s && e.metric < *m)
+                })
+            });
         }
 
         for dest in old.keys() {
@@ -1493,5 +1521,63 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn alternatives_obey_the_new_feasibility_distance() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.neighbour_up(pid(3), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![entry(9, 1, 9)]));
+        a.apply_update(&pid(3), &update(vec![entry(9, 1, 8)]));
+        a.apply_update(&pid(2), &update(vec![entry(9, 1, 1)]));
+        assert_eq!(a.lookup_multi(&pid(9), 3), vec![pid(2)]);
+        assert_eq!(a.next_hop_hinted(&pid(9), &[], |p| *p == pid(3)), None);
+    }
+
+    #[test]
+    fn a_legitimate_landmark_dump_fits_the_receive_bound() {
+        let mut a = RoutingTable::with_budget(pid(1), 1);
+        let mut b = RoutingTable::with_budget(pid(2), 1);
+        for t in [&mut a, &mut b] {
+            t.set_landmark_limits(LandmarkLimits {
+                max: 4,
+                share_min: 4,
+                ..LandmarkLimits::default()
+            });
+        }
+        a.neighbour_up(pid(3), COST_FAST);
+        a.neighbour_up(pid(2), COST_FAST);
+        b.neighbour_up(pid(1), COST_FAST);
+        let entries = (10..14)
+            .map(|d| entry(d, 1, d as u16 - 9))
+            .chain((20..24).map(|d| landmark_entry(d, 1, 20)))
+            .collect();
+        a.apply_update(&pid(3), &update(entries));
+        assert_eq!(a.advertised.len(), 9);
+        for msg in a.take_pending(&pid(2)) {
+            b.apply_update(&pid(1), &msg);
+        }
+        assert!(b.digest_matches(&pid(1), &a.digest_for(&pid(2)).unwrap()));
+    }
+
+    #[test]
+    fn churn_refuses_new_routes_instead_of_forgetting_safety_history() {
+        let mut a = RoutingTable::with_budget(pid(1), 1);
+        a.set_landmark_limits(LandmarkLimits {
+            max: 0,
+            ..LandmarkLimits::default()
+        });
+        a.neighbour_up(pid(2), COST_FAST);
+        for dest in 3..30 {
+            let mut entries = vec![entry(dest, 1, 0)];
+            if dest > 3 {
+                entries.push(entry(dest - 1, 1, ROUTE_INFINITY));
+            }
+            a.apply_update(&pid(2), &update(entries));
+        }
+        assert_eq!(a.fd.len(), a.fd_capacity());
+        assert!(a.fd.contains_key(&pid(3)));
+        a.apply_update(&pid(2), &update(vec![entry(3, 1, 1)]));
+        assert!(a.lookup(&pid(3)).is_none());
     }
 }

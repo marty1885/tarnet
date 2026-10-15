@@ -273,18 +273,8 @@ async fn dht_content_addressed() {
     // Simulate storing and retrieving
     let peer = PeerId([1u8; 32]);
     let mut store = DhtStore::new(&peer);
-    store.put(VerifiedRecord::locally_trusted(DhtRecord {
-        key,
-        record_type: tarnet::types::RecordType::Content,
-        sequence: 0,
-        signer: tarnet::types::PeerId([0u8; 32]),
-        signer_algo: 1,
-        signer_pubkey: Vec::new(),
-        value: blob.clone(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(3600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0u8; 64],
-    }));
+    let (record, _) = VerifiedRecord::new_content(data, Duration::from_secs(3600));
+    store.put(record);
 
     let records = store.get(&key);
     assert_eq!(records.len(), 1);

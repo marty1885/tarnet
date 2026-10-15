@@ -1035,8 +1035,12 @@ mod tests {
         let hidden_kp = node.keypair_for_service(&hidden).await.unwrap();
         let public_kp = node.keypair_for_service(&public).await.unwrap();
         for kp in [&hidden_kp, &public_kp] {
-            let record =
-                crate::dht::VerifiedRecord::new_zone_root(kp, b"zone", 1, Duration::from_secs(600));
+            let record = crate::dht::VerifiedRecord::new_zone_root(
+                kp,
+                b"zone",
+                node.next_dht_sequence().await,
+                Duration::from_secs(600),
+            );
             node.dht_publish(record).await.unwrap();
         }
 

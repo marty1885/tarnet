@@ -10,12 +10,6 @@ use std::time::Duration;
 use tarnet::dht::DhtStore;
 use tarnet::firewall::{Action, Firewall, Match};
 
-/// Store a hand-built fixture record without going through the signature gate.
-/// Test fixtures carry dummy signatures by design; `locally_trusted` is the
-/// sanctioned bypass for records the test itself constructs.
-fn put_record(store: &mut DhtStore, record: tarnet::dht::DhtRecord) {
-    store.put(tarnet::dht::VerifiedRecord::locally_trusted(record));
-}
 use tarnet::identity::{self, Keypair};
 use tarnet::node::{ChannelEvent, Node};
 use tarnet::transport::firewall::{FirewallDiscovery, FirewallPolicy};
@@ -950,68 +944,18 @@ fn dht_wrong_signer_rejected() {
 /// Hello record: higher sequence replaces, lower is ignored.
 #[test]
 fn dht_hello_sequence_ordering() {
-    use tarnet::dht::DhtRecord;
-    use tarnet::types::DhtId;
-
-    let kp = Keypair::generate();
-    let key = DhtId([0xDD; 64]);
-    let peer = kp.peer_id();
-
-    let mut store = DhtStore::new(&peer);
-
-    // Put seq 5
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::Hello,
-        sequence: 5,
-        signer: peer,
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"seq5".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0; 64],
-    });
-
-    let records = store.get(&key);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].sequence, 5);
-
-    // Put seq 3 (lower) → should be ignored
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::Hello,
-        sequence: 3,
-        signer: peer,
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"seq3".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0; 64],
-    });
-
-    let records = store.get(&key);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].sequence, 5, "Lower sequence should be ignored");
-
-    // Put seq 7 (higher) → should replace
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::Hello,
-        sequence: 7,
-        signer: peer,
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"seq7".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0; 64],
-    });
-
-    let records = store.get(&key);
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].sequence, 7, "Higher sequence should replace");
+    let kp = Keypair::generate_ed25519();
+    let key = tarnet::dht::identity_address_key(&kp.peer_id());
+    let mut store = DhtStore::new(&kp.peer_id());
+    for (sequence, expected) in [(5, 5), (3, 5), (7, 7)] {
+        store.put(tarnet::dht::VerifiedRecord::new_hello(
+            &kp,
+            b"hello",
+            sequence,
+            Duration::from_secs(600),
+        ));
+        assert_eq!(store.get(&key)[0].sequence, expected);
+    }
 }
 
 /// Unsigned content is self-authenticating: wrong inner hash returns nothing.
@@ -1038,100 +982,43 @@ async fn dht_content_self_authenticating() {
 /// Signed content: multiple signers stored, same signer replaces on higher sequence.
 #[test]
 fn dht_signed_content_multi_signer() {
-    use tarnet::dht::DhtRecord;
-    use tarnet::types::DhtId;
-
-    let kp_a = Keypair::generate();
-    let kp_b = Keypair::generate();
-    let key = DhtId([0xEE; 64]);
-    let local_peer = kp_a.peer_id();
-
-    let mut store = DhtStore::new(&local_peer);
-
-    // Signer A puts
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::SignedContent,
-        sequence: 1,
-        signer: kp_a.peer_id(),
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"from A".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0; 64],
-    });
-
-    // Signer B puts at same key → supplemental (different signer)
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::SignedContent,
-        sequence: 1,
-        signer: kp_b.peer_id(),
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"from B".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0; 64],
-    });
-
+    let a = Keypair::generate_ed25519();
+    let b = Keypair::generate_ed25519();
+    let key = tarnet::types::DhtId([0xEE; 64]);
+    let mut store = DhtStore::new(&a.peer_id());
+    for (kp, seq, value) in [
+        (&a, 1, b"A".as_slice()),
+        (&b, 1, b"B".as_slice()),
+        (&a, 2, b"A2".as_slice()),
+    ] {
+        store.put(tarnet::dht::VerifiedRecord::new_signed_at_key(
+            kp,
+            key,
+            value,
+            seq,
+            Duration::from_secs(600),
+        ));
+    }
     let records = store.get(&key);
-    assert_eq!(records.len(), 2, "Different signers should both be stored");
-
-    // Signer A puts again with higher seq → replaces A's old record
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::SignedContent,
-        sequence: 2,
-        signer: kp_a.peer_id(),
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"from A v2".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
-        stored_at: std::time::Instant::now(),
-        signature: vec![0; 64],
-    });
-
-    let records = store.get(&key);
-    assert_eq!(records.len(), 2, "Still two signers");
-    let a_record = records
-        .iter()
-        .find(|r| r.signer == kp_a.peer_id())
-        .unwrap();
-    assert_eq!(a_record.sequence, 2, "Signer A's record should be updated");
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records
+            .iter()
+            .find(|r| r.signer == a.peer_id())
+            .unwrap()
+            .sequence,
+        2
+    );
 }
 
 /// Records with expired TTL are eventually cleaned up.
 #[test]
 fn dht_record_expiry() {
-    use tarnet::dht::DhtRecord;
-    use tarnet::types::DhtId;
-
-    let local = Keypair::generate().peer_id();
-    let key = DhtId([0xFF; 64]);
-
-    let mut store = DhtStore::new(&local);
-
-    // Put a record with 0-second TTL (already expired)
-    put_record(&mut store, DhtRecord {
-        key,
-        record_type: RecordType::Content,
-        sequence: 0,
-        signer: tarnet::types::PeerId([0; 32]),
-        signer_algo: 1,
-        signer_pubkey: vec![],
-        value: b"ephemeral".to_vec(),
-        expires: tarnet::dht::expires_in(Duration::from_secs(0)),
-        stored_at: std::time::Instant::now() - Duration::from_secs(1),
-        signature: vec![0; 64],
-    });
-
-    // Trigger expiry
+    let (record, handle) = tarnet::dht::VerifiedRecord::new_content(b"ephemeral", Duration::ZERO);
+    let mut store = DhtStore::new(&Keypair::generate_ed25519().peer_id());
+    assert!(!store.put(record));
     store.expire();
-
-    let records = store.get(&key);
-    assert!(records.is_empty(), "Expired record should be cleaned up");
+    assert!(store.get(&tarnet::dht::content_key(&handle)).is_empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1557,13 +1444,13 @@ async fn cross_algo_connect_pq_to_classic() {
     let service_id_c = c.node.default_service_id().await;
     let default_kp_c = c.node.keypair_for_service(&service_id_c).await.unwrap();
 
-    // Publish C's service via TNS on A's store (simulate propagation)
+    // C owns the zone and its sequence; publish from C.
     let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
         relay_peer_id: b.node.peer_id(),
         kem_algo: default_kp_c.identity.kem_algo() as u8,
         kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records)
+    tarnet::tns::publish(&*c.node, &default_kp_c, "intro", &intro_records)
         .await
         .unwrap();
 
@@ -1572,6 +1459,13 @@ async fn cross_algo_connect_pq_to_classic() {
         .publish_hidden_service(service_id_c, 1)
         .await
         .expect("publish_hidden_service failed");
+    for record in c
+        .node
+        .dht_held(&tarnet::dht::zone_root_key(&service_id_c))
+        .await
+    {
+        a.node.dht_store_insert_local_for_test(record).await;
+    }
 
     // C accepts in background
     let node_c_accept = c.node.clone();
@@ -1652,13 +1546,13 @@ async fn cross_algo_connect_classic_to_pq() {
     let service_id_c = c.node.default_service_id().await;
     let default_kp_c = c.node.keypair_for_service(&service_id_c).await.unwrap();
 
-    // Publish C's service via TNS on A's store
+    // C owns the zone and its sequence; publish from C.
     let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
         relay_peer_id: b.node.peer_id(),
         kem_algo: default_kp_c.identity.kem_algo() as u8,
         kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records)
+    tarnet::tns::publish(&*c.node, &default_kp_c, "intro", &intro_records)
         .await
         .unwrap();
 
@@ -1666,6 +1560,13 @@ async fn cross_algo_connect_classic_to_pq() {
         .publish_hidden_service(service_id_c, 1)
         .await
         .expect("publish_hidden_service failed");
+    for record in c
+        .node
+        .dht_held(&tarnet::dht::zone_root_key(&service_id_c))
+        .await
+    {
+        a.node.dht_store_insert_local_for_test(record).await;
+    }
 
     let node_c_accept = c.node.clone();
     let accept_handle = tokio::spawn(async move {
