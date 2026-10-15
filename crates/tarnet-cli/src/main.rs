@@ -327,15 +327,15 @@ enum IdentityCommand {
     Update {
         /// Identity label
         label: String,
-        /// Privacy level: public or hidden
-        #[arg(long, default_value = "public")]
-        privacy: String,
-        /// Number of introduction points (for hidden identities)
-        #[arg(long, default_value_t = 3)]
-        intro_points: u8,
-        /// Number of outbound hops
-        #[arg(long, default_value_t = 1)]
-        outbound_hops: u8,
+        /// Privacy level: public or hidden (default: keep current)
+        #[arg(long)]
+        privacy: Option<String>,
+        /// Number of introduction points (default: keep current; hidden identities only)
+        #[arg(long)]
+        intro_points: Option<u8>,
+        /// Number of outbound hops (default: keep current)
+        #[arg(long)]
+        outbound_hops: Option<u8>,
         /// Skip confirmation prompt
         #[arg(short = 'y', long)]
         yes: bool,
@@ -593,9 +593,8 @@ async fn cmd_identity(cli: &Cli, cmd: &IdentityCommand) {
             outbound_hops,
             yes,
         } => {
-            let privacy = parse_privacy(privacy, *intro_points);
-
-            // Fetch current state to detect downgrades.
+            // Fetch current state: unspecified fields keep their value, and
+            // it is needed to detect downgrades.
             let identities = client.list_identities().await.unwrap_or_default();
             let current = identities.iter().find(|(l, _, _, _, _, _, _)| l == label);
             if current.is_none() {
@@ -603,6 +602,25 @@ async fn cmd_identity(cli: &Cli, cmd: &IdentityCommand) {
                 std::process::exit(1);
             }
             let (_, _, old_privacy, old_hops, _, _, _) = current.unwrap();
+
+            let privacy = match (privacy, intro_points, *old_privacy) {
+                (Some(p), n, old) => {
+                    let default_n = match old {
+                        tarnet_api::types::PrivacyLevel::Hidden { intro_points } => intro_points,
+                        _ => 3,
+                    };
+                    parse_privacy(p, n.unwrap_or(default_n))
+                }
+                (None, Some(n), tarnet_api::types::PrivacyLevel::Hidden { .. }) => {
+                    parse_privacy("hidden", *n)
+                }
+                (None, Some(_), tarnet_api::types::PrivacyLevel::Public) => {
+                    eprintln!("--intro-points only applies to hidden identities; pass --privacy hidden to make '{}' hidden.", label);
+                    std::process::exit(1);
+                }
+                (None, None, old) => old,
+            };
+            let outbound_hops = &outbound_hops.unwrap_or(*old_hops);
 
             let downgraded = match (*old_privacy, privacy) {
                 (

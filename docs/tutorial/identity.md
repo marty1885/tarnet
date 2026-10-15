@@ -45,16 +45,16 @@ All identities have an anonymity level, set to `public` by default.
 
 A public identity publishes a peer record in TNS, mapping its ServiceId to the underlying peer ID. Anyone who resolves the ServiceId learns the peer ID and can look up the hello record - which advertises transports and addresses. This allows direct circuit building but means your node's network identity is discoverable.
 
-Hidden identities publish no peer record. Instead, they register introduction points - relay nodes that accept connections on the identity's behalf via rendezvous. The connecting peer never learns the hidden identity's peer ID or location. The tradeoff is that direct connections are impossible - a minimum of two hops is needed. This applies symmetrically: both the connecting and listening side independently choose their privacy level.
+Hidden identities publish no peer record and refuse direct connections. Instead, they register introduction points - relays that hold a circuit open to the identity and pass on connection requests - and meet the connecting peer at a rendezvous point. The connecting peer never learns the hidden identity's peer ID or location. The tradeoff is that direct connections are impossible: every connection takes at least two circuits, one from each side. This applies symmetrically: both the connecting and listening side independently choose their privacy level.
 
 ```plaintext
 tarnet identity update --privacy hidden alice
 Updated identity 'alice':
   Privacy:       Hidden { intro_points: 3 }
-  Outbound hops: 1
+  Outbound hops: 3
 ```
 
-`intro_points` controls the number of onion-routed hops guarding inbound connections. `outbound_hops` controls outbound hops. Both are independent.
+`intro_points` is the number of introduction points the identity registers (and so how many places a client can ask to be introduced). It does not add hops. `outbound_hops` is the length of every circuit the identity builds: the circuits to its introduction points, the circuits to rendezvous points, and its own outgoing connections. The two are independent. Hidden identities should use an `outbound_hops` of at least 3: with fewer, the circuits have few or no waypoints between you and the relay at the far end.
 
 ## Hop Counts
 
@@ -68,32 +68,27 @@ Updated identity 'alice':
    1 hop                    1 hop
 ```
 
-**Hidden Identities** add anonymity by routing through onion-routed hops. The outbound path depends on Alice's `outbound_hops`; the inbound path depends on Alice's `intro_points`. Bob's own hops are added on top:
+**Hidden Identities** reach each other through a rendezvous point. The client picks the rendezvous point and builds a circuit to it using the client's `outbound_hops`. It then sends an introduction request through one of the service's introduction points. The service builds its own circuit to the rendezvous point using the service's `outbound_hops`, and the rendezvous point joins the two:
 
 ```plaintext
-Outbound Connection (Alice connects to Bob):
-┌─────────────┐     ┌─────────┐           ┌─────────┐     ┌──────────────┐
-│   Alice     │────>│  Hop 1  │── ··· ───>│  Hop N  │────>│    Bob       │
-│  (Hidden)   │     │         │           │         │     │  (any type)  │
-└─────────────┘     └─────────┘           └─────────┘     └──────────────┘
-   Alice's outbound hops                    + Bob's intro_points (if hidden)
+Bob (any type) connects to Alice (Hidden):
 
-Inbound Connection (Bob connects to Alice):
-┌──────────────┐     ┌──────────┐           ┌──────────┐     ┌─────────────┐
-│    Bob       │────>│  Hop 1   │── ··· ───>│ Intro Pt │────>│   Alice     │
-│  (any type)  │     │          │           │    N     │     │  (Hidden)   │
-└──────────────┘     └──────────┘           └──────────┘     └─────────────┘
-   Bob's outbound hops                       + Alice's intro_points
+┌──────────────┐  Bob's outbound_hops   ┌────────────┐  Alice's outbound_hops  ┌─────────────┐
+│    Bob       │───> ··· ──────────────>│ Rendezvous │<────────────── ··· <────│   Alice     │
+│  (any type)  │                        │   point    │                         │  (Hidden)   │
+└──────────────┘                        └────────────┘                         └─────────────┘
+        │                                                                              ▲
+        └──── introduction request via one of Alice's intro_points ────────────────────┘
 ```
 
-Hop counts are additive. Bob with 3 `intro_points` and Alice with 2 outbound hops means 5 hops between the two machines:
+The introduction request is sealed to Alice's key, so the introduction point can't read it. Alice's circuits to her introduction points stay open, but they only carry the request. The data flows through the rendezvous point, with an extra end-to-end encryption layer that the rendezvous point can't remove.
+
+Hop counts are additive. If Bob uses 2 outbound hops and Alice uses 3, the path between the two machines is 2 + 3 hops, each ending at the rendezvous point:
 
 ```plaintext
-┌─────────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐     ┌─────────────┐
-│   Alice     │────>│  Hop 1   │────>│  Hop 2   │────>│ Intro Pt │────>│ Intro Pt │────>│    Bob      │
-│  (Hidden)   │     │          │     │          │     │    1     │     │    2     │     │  (Hidden)   │
-│out_hops:  2 │     └──────────┘     └──────────┘     └──────────┘     └──────────┘     │intro_pts: 3 │
-└─────────────┘                                                                         └─────────────┘
-               │<──────────── 2 out ────────────>│<──────── 3 intro_points (inbound) ───>│
-               │<──────────────────────────── 5 total hops ─────────────────────────────>│
+┌─────────────┐   ┌───────┐   ┌─────────────┐   ┌───────┐   ┌───────┐   ┌─────────────┐
+│    Bob      │──>│ Hop 1 │──>│ Rendezvous  │<──│ Hop 2 │<──│ Hop 1 │<──│   Alice     │
+│ out_hops: 2 │   └───────┘   │   point     │   └───────┘   └───────┘   │ out_hops: 3 │
+└─────────────┘               └─────────────┘                           └─────────────┘
+│<──── 2 hops ────>│          │<────────────── 3 hops ────────────────>│
 ```

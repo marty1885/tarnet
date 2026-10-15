@@ -7,7 +7,9 @@ use crate::wire;
 
 use crate::wire::MAX_SELECTIVE_ACKS;
 
-const DEFAULT_WINDOW_SIZE: u32 = 32;
+/// About 464 KiB of bulk stream payload in flight: enough for roughly
+/// 4.8 MB/s at 100 ms RTT. This is a cap; congestion control starts small.
+const DEFAULT_WINDOW_SIZE: u32 = 1024;
 /// Congestion window at the start, in packets. The send window above is its cap.
 const INITIAL_CWND: f64 = 4.0;
 /// Congestion window floor, in packets.
@@ -15,7 +17,7 @@ const MIN_CWND: f64 = 2.0;
 
 /// Maximum out-of-order packets buffered on the receive side.
 /// Caps memory usage from peers sending wildly out-of-order sequences.
-const MAX_RECV_BUF: usize = 128;
+const MAX_RECV_BUF: usize = 2 * DEFAULT_WINDOW_SIZE as usize;
 
 /// Maximum retransmit batch per call to avoid burst storms after outages.
 const MAX_RETRANSMIT_BATCH: usize = 8;
@@ -114,7 +116,7 @@ struct ReliableState {
     /// per RTT below `ssthresh`, one packet per RTT above it), halves on a
     /// loss. With a slow link dropping what queues too long in front of it,
     /// this keeps each channel near its share of the link rate instead of a
-    /// fixed 32 packets queued.
+    /// full send window queued.
     cwnd: f64,
     ssthresh: f64,
     /// Losses of packets sent before this sequence belong to the loss event
@@ -1087,6 +1089,38 @@ mod reliability_tests {
             sender.process_ack(ack, &sel);
         }
         assert_eq!(cwnd(&sender), DEFAULT_WINDOW_SIZE as f64);
+    }
+
+    #[test]
+    fn full_window_survives_a_delayed_first_packet() {
+        for ordered in [false, true] {
+            let mut sender = Channel::new(0, [0; 32], true, ordered);
+            let mut receiver = Channel::new(0, [0; 32], true, ordered);
+            // Warm up through slow start using real acknowledgements.
+            while cwnd(&sender) < DEFAULT_WINDOW_SIZE as f64 {
+                for (seq, data) in fill(&mut sender) {
+                    receiver.receive_data(seq, data);
+                }
+                let (ack, sack) = receiver.generate_ack().unwrap();
+                sender.process_ack(ack, &sack);
+            }
+            let mut window = fill(&mut sender).into_iter();
+            let (first_seq, first_data) = window.next().unwrap();
+            let mut delivered = Vec::new();
+            for (seq, data) in window {
+                delivered.extend(receiver.receive_data(seq, data));
+            }
+            if ordered {
+                assert!(delivered.is_empty());
+            }
+            delivered.extend(receiver.receive_data(first_seq, first_data));
+            assert_eq!(delivered.len(), DEFAULT_WINDOW_SIZE as usize);
+            let (ack, sack) = receiver.generate_ack().unwrap();
+            assert!(sack.is_empty());
+            sender.process_ack(ack, &sack);
+            assert!(sender.pending_retransmit().is_empty());
+            assert_eq!(fill(&mut sender).len(), DEFAULT_WINDOW_SIZE as usize);
+        }
     }
 
     #[test]
