@@ -367,7 +367,7 @@ fn render_left(frame: &mut Frame, app: &App, area: Rect, title: &str) {
 fn render_right(frame: &mut Frame, app: &App, area: Rect, title: &str) {
     let mut lines = Vec::new();
     match app.tab {
-        ROUTING => routing_details(app, &mut lines),
+        ROUTING => routing_details(app, (area.width as usize).saturating_sub(2), &mut lines),
         DHT => dht_details(app, &mut lines),
         NODE => {
             if let Some((name, sid)) = app.identities.get(app.selected) {
@@ -582,16 +582,95 @@ fn route_items(app: &App, inner: usize) -> Vec<ListItem<'static>> {
         .collect()
 }
 
-fn link_lines(link: &LinkStatus, lines: &mut Vec<Line<'static>>) {
-    lines.push(kv("Transport", &link.transport));
-    lines.push(kv("State", &link.state));
-    lines.push(kv("Direction", &link.direction));
-    lines.push(kv("RTT", format_rtt(link.rtt_us)));
-    lines.push(kv("Idle", format_secs(link.idle_secs)));
-    lines.push(kv("Link age", format_secs(link.age_secs)));
+/// One row per link: `● TCP/IPv4  ->  12.3ms  2s  4m10s`. Active links get a
+/// green dot; idle and age columns drop out when the pane is narrow.
+fn link_table(links: &[&LinkStatus], width: usize, lines: &mut Vec<Line<'static>>) {
+    const RTT_W: usize = 8;
+    const TIME_W: usize = 7;
+    let transport_w = links
+        .iter()
+        .map(|l| l.transport.chars().count())
+        .max()
+        .unwrap_or(0)
+        .clamp(9, 16);
+    // marker(2) + transport + dir(4) + rtt
+    let base = 2 + transport_w + 1 + 4 + RTT_W;
+    let show_idle = width >= base + TIME_W;
+    let show_age = width >= base + 2 * TIME_W;
+    let transport_w = if width < base {
+        transport_w.saturating_sub(base - width).max(6)
+    } else {
+        transport_w
+    };
+
+    let head =
+        |text: &str, w: usize| Span::styled(format!("{text:<w$}"), Style::default().fg(MUTED));
+    let mut header = vec![
+        head("", 2),
+        head("TRANSPORT", transport_w + 1),
+        head("DIR", 4),
+        head("RTT", RTT_W),
+    ];
+    if show_idle {
+        header.push(head("IDLE", TIME_W));
+    }
+    if show_age {
+        header.push(head("AGE", TIME_W));
+    }
+    lines.push(Line::from(header));
+
+    for link in links {
+        let active = link.state == "active";
+        let arrow = if link.direction == "outbound" {
+            "->"
+        } else {
+            "<-"
+        };
+        let mut row = vec![
+            Span::styled(
+                if active { "● " } else { "○ " },
+                Style::default().fg(if active { GREEN } else { MUTED }),
+            ),
+            Span::styled(
+                format!(
+                    "{:<w$} ",
+                    truncate(&link.transport, transport_w),
+                    w = transport_w
+                ),
+                if active {
+                    Style::default().fg(CYAN).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(MUTED)
+                },
+            ),
+            Span::raw(format!("{arrow:<4}")),
+            Span::raw(format!("{:<RTT_W$}", format_rtt(link.rtt_us))),
+        ];
+        let dim = Style::default().fg(MUTED);
+        if show_idle {
+            row.push(Span::styled(
+                format!("{:<TIME_W$}", format_secs(link.idle_secs)),
+                dim,
+            ));
+        }
+        if show_age {
+            row.push(Span::styled(
+                format!("{:<TIME_W$}", format_secs(link.age_secs)),
+                dim,
+            ));
+        }
+        lines.push(Line::from(row));
+    }
+    let standby = links.iter().filter(|l| l.state != "active").count();
+    if standby > 0 {
+        lines.push(Line::styled(
+            format!("● active  ○ standby ({standby})"),
+            Style::default().fg(MUTED),
+        ));
+    }
 }
 
-fn routing_details(app: &App, lines: &mut Vec<Line<'static>>) {
+fn routing_details(app: &App, width: usize, lines: &mut Vec<Line<'static>>) {
     let Some(status) = &app.status else {
         lines.push(Line::styled(
             "Waiting for daemon status…",
@@ -615,12 +694,7 @@ fn routing_details(app: &App, lines: &mut Vec<Line<'static>>) {
             Some(peer) => {
                 let mut links: Vec<_> = peer.links.iter().collect();
                 links.sort_by_key(|l| l.state != "active");
-                for (i, link) in links.into_iter().enumerate() {
-                    if i > 0 {
-                        lines.push(Line::styled("· other link", Style::default().fg(MUTED)));
-                    }
-                    link_lines(link, lines);
-                }
+                link_table(&links, width, lines);
             }
             None => lines.push(Line::styled(
                 "Next hop is not a connected peer (route may be stale)",
