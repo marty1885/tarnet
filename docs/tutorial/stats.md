@@ -51,10 +51,12 @@ Active links to other nodes. Each line shows:
 - Direction: `->` (you initiated) or `<-` (they initiated)
 - Peer ID (16 hex chars)
 - Transport (tcp, ws, webrtc)
-- RTT (round-trip time, blank if unknown)
+- RTT (smoothed observed keepalive response time; `-` if unknown or stale)
 - Idle time since last activity
 
 Standby links are summarised below the active link, grouped by transport and direction. A node may have multiple links to the same peer over different transports - only one is active at a time.
+
+RTT is timed locally using random challenges echoed on the same encrypted link. It includes remote processing, coalescing, and any deliberate delay; a peer can also prioritize probes. It is not a trusted measurement of physical latency and does not influence link selection. No timestamps or measured values are sent. Samples use the existing randomized heartbeat schedule, expire after five minutes without a valid reply, and are unavailable for older peers that do not echo challenges. Missed probes are not reported as packet loss.
 
 ## Routes
 

@@ -375,6 +375,10 @@ impl ServiceApi for LocalServiceApi {
         Ok(tns::resolve(&self.node, zone, name).await)
     }
 
+    async fn tns_lookup_label(&self, zone: ServiceId, name: &str) -> ApiResult<Vec<TnsRecord>> {
+        Ok(tns::lookup_label(&self.node, &zone, name).await)
+    }
+
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution> {
         // Local labels (published or not) are resolved by the node itself,
         // with the same alias / delegation / apex rules as any zone.

@@ -348,8 +348,69 @@ enum Outgoing {
     Repair(Vec<u8>),
 }
 
+// Observed challenge/response time, not a trusted estimate of propagation.
+// Peers may batch, delay or prioritize replies. Never use this for link scoring.
+const RTT_PROBE_TTL: Duration = Duration::from_secs(180);
+const RTT_STALE_AFTER: Duration = Duration::from_secs(300);
+const RTT_MAX_PENDING: usize = 4;
+
+#[derive(Default)]
+struct LinkRtt {
+    pending: std::collections::VecDeque<([u8; 16], std::time::Instant)>,
+    sample: Option<(u64, std::time::Instant)>,
+    last_reply: Option<std::time::Instant>,
+}
+
+impl LinkRtt {
+    fn sent(&mut self, nonce: [u8; 16], now: std::time::Instant) {
+        self.pending
+            .retain(|(_, at)| now.duration_since(*at) < RTT_PROBE_TTL);
+        // Retransmission must not restart the clock or admit a replay sample.
+        if self.pending.iter().any(|(id, _)| *id == nonce) {
+            return;
+        }
+        if self.pending.len() == RTT_MAX_PENDING {
+            self.pending.pop_front();
+        }
+        self.pending.push_back((nonce, now));
+    }
+
+    fn received(&mut self, nonce: [u8; 16], now: std::time::Instant) {
+        self.pending
+            .retain(|(_, at)| now.duration_since(*at) < RTT_PROBE_TTL);
+        let Some(i) = self.pending.iter().position(|(id, _)| *id == nonce) else {
+            return;
+        };
+        let (_, at) = self.pending.remove(i).unwrap();
+        let us = (now.duration_since(at).as_micros() as u64).max(1);
+        let smoothed = match self.sample {
+            Some((old, at)) if now.duration_since(at) < RTT_STALE_AFTER => (old * 3 + us) / 4,
+            _ => us,
+        };
+        self.sample = Some((smoothed, now));
+    }
+
+    fn observed_us(&self, now: std::time::Instant) -> u64 {
+        self.sample
+            .filter(|(_, at)| now.duration_since(*at) < RTT_STALE_AFTER)
+            .map_or(0, |(us, _)| us)
+    }
+
+    fn allow_reply(&mut self, now: std::time::Instant) -> bool {
+        if self
+            .last_reply
+            .is_some_and(|at| now.duration_since(at) < Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.last_reply = Some(now);
+        true
+    }
+}
+
 /// The drain task's channel and the state it shares with the receive path.
 struct LinkPipes {
+    rtt: Arc<std::sync::Mutex<LinkRtt>>,
     outbound_tx: tokio::sync::mpsc::Sender<Outgoing>,
     reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
     sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
@@ -608,6 +669,7 @@ fn is_handshake_type(t: MessageType) -> bool {
 /// transport. The scheduler drops what waits too long; if the channel itself
 /// fills, new messages are dropped, except critical ones, which wait.
 pub struct PeerLink {
+    rtt: Arc<std::sync::Mutex<LinkRtt>>,
     transport: Arc<dyn Transport>,
     /// Shared with the drain task, which encrypts frames as it sends them so
     /// frame seqs go out in order.
@@ -854,6 +916,7 @@ impl PeerLink {
         let link = Self {
             transport,
             crypto,
+            rtt: pipes.rtt,
             outbound_tx: pipes.outbound_tx,
             reassembler: pipes.reassembler,
             sent_fragments: pipes.sent_fragments,
@@ -1052,6 +1115,7 @@ impl PeerLink {
         let link = Self {
             transport,
             crypto,
+            rtt: pipes.rtt,
             outbound_tx: pipes.outbound_tx,
             reassembler: pipes.reassembler,
             sent_fragments: pipes.sent_fragments,
@@ -1150,6 +1214,8 @@ impl PeerLink {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Outgoing>(OUTBOUND_QUEUE_SIZE);
         let sched_cfg = sched_config(transport.as_ref(), frame_plain);
 
+        let rtt = Arc::new(std::sync::Mutex::new(LinkRtt::default()));
+        let task_rtt = rtt.clone();
         let task_reassembler = reassembler.clone();
         let task_sent = sent_fragments.clone();
         let task = tokio::spawn(async move {
@@ -1157,7 +1223,11 @@ impl PeerLink {
             let mut sched = Scheduler::new(sched_cfg);
             // Records past the scheduler, packed into frames in order: at most
             // one frame's worth plus the rest of a fragmented message.
-            struct ReadyRecord { bytes: Vec<u8>, control: bool }
+            struct ReadyRecord {
+                bytes: Vec<u8>,
+                control: bool,
+                probe: Option<[u8; 16]>,
+            }
             impl AsRef<[u8]> for ReadyRecord {
                 fn as_ref(&self) -> &[u8] { &self.bytes }
             }
@@ -1177,7 +1247,23 @@ impl PeerLink {
                 if records.len() > 1 {
                     task_sent.lock().unwrap().remember(&records, std::time::Instant::now());
                 }
-                ready.extend(records.into_iter().map(|bytes| ReadyRecord { bytes, control }));
+                let probe = (WireMessage::peek_type(&data) == Some(MessageType::Keepalive))
+                    .then(|| WireMessage::decode(&data).ok())
+                    .flatten()
+                    .and_then(|msg| crate::wire::KeepaliveMsg::from_bytes(&msg.payload).ok())
+                    .filter(|ka| ka.ping_id.is_some())
+                    .and_then(|ka| ka.probe_nonce);
+                let last = records.len().saturating_sub(1);
+                ready.extend(
+                    records
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, bytes)| ReadyRecord {
+                            bytes,
+                            control,
+                            probe: if i == last { probe } else { None },
+                        }),
+                );
             };
             // Messages go to the scheduler; repair records skip it.
             let take = |sched: &mut Scheduler, ready: &mut VecDeque<ReadyRecord>, out: Outgoing| {
@@ -1186,8 +1272,12 @@ impl PeerLink {
                     Outgoing::Message(data) | Outgoing::Deferred(data) => sched.push(data, false, now),
                     Outgoing::Critical(data) => sched.push(data, true, now),
                     Outgoing::Repair(rec) => {
-                        ready.push_front(ReadyRecord { bytes: rec, control: true });
-                    },
+                        ready.push_front(ReadyRecord {
+                            bytes: rec,
+                            control: true,
+                            probe: None,
+                        });
+                    }
                 }
             };
 
@@ -1203,7 +1293,11 @@ impl PeerLink {
                     let mut r = task_reassembler.lock().unwrap();
                     if !r.is_empty() {
                         let repairs = r.poll(now);
-                        ready.extend(repairs.into_iter().map(|bytes| ReadyRecord { bytes, control: true }));
+                        ready.extend(repairs.into_iter().map(|bytes| ReadyRecord {
+                            bytes,
+                            control: true,
+                            probe: None,
+                        }));
                     }
                 }
 
@@ -1264,11 +1358,24 @@ impl PeerLink {
                 }
 
                 let mut control = false;
-                let Some(frame) = pack_frame_with(&mut ready, frame_plain, |r| control |= r.control) else {
+                let mut probes = Vec::new();
+                let Some(frame) = pack_frame_with(&mut ready, frame_plain, |r| {
+                    control |= r.control;
+                    if let Some(nonce) = r.probe {
+                        probes.push(nonce);
+                    }
+                }) else {
                     // Everything popped was dropped by the scheduler.
                     continue;
                 };
                 let encrypted = crypto.lock().await.encrypt(&frame);
+                if !probes.is_empty() {
+                    let mut rtt = task_rtt.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    for nonce in probes {
+                        rtt.sent(nonce, now);
+                    }
+                }
                 if let Err(e) = transport.send_frame(&encrypted, control).await {
                     log::debug!("link drain to {:?}: {}", remote, e);
                     break;
@@ -1276,11 +1383,49 @@ impl PeerLink {
             }
         });
         LinkPipes {
+            rtt,
             outbound_tx: tx,
             reassembler,
             sent_fragments,
             task,
         }
+    }
+
+    /// Locally observed response time including remote batching/delay; zero
+    /// means unavailable or stale. Deliberately independent of link selection.
+    pub fn observed_rtt_us(&self) -> u64 {
+        self.rtt
+            .lock()
+            .unwrap()
+            .observed_us(std::time::Instant::now())
+    }
+
+    /// Process only authenticated keepalives delivered on this exact link.
+    /// Bound responses to one per second; replies never generate replies.
+    pub(crate) async fn handle_keepalive(&self, ka: &crate::wire::KeepaliveMsg) {
+        let now = std::time::Instant::now();
+        if ka.ping_id.is_none() {
+            if let Some(nonce) = ka.probe_nonce {
+                self.rtt.lock().unwrap().received(nonce, now);
+            }
+            return;
+        }
+        if !self.rtt.lock().unwrap().allow_reply(now) {
+            return;
+        }
+        use rand::Rng;
+        let padding = {
+            let mut rng = rand::thread_rng();
+            let mut padding = vec![0; rng.gen_range(0..=256)];
+            rng.fill_bytes(&mut padding);
+            padding
+        };
+        let pong = crate::wire::KeepaliveMsg {
+            ping_id: None,
+            probe_nonce: ka.probe_nonce,
+            padding,
+        };
+        let _ = self.send_deferred(&pong.to_wire().encode()).await;
     }
 
     /// Reject a message the link can't carry.
@@ -1709,6 +1854,125 @@ impl PeerLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rtt_rejects_unknown_replays_and_expired_challenges() {
+        let now = std::time::Instant::now();
+        let mut rtt = LinkRtt::default();
+        rtt.received([1; 16], now);
+        assert_eq!(rtt.observed_us(now), 0);
+        rtt.sent([1; 16], now);
+        rtt.received([2; 16], now + Duration::from_millis(5));
+        assert_eq!(rtt.observed_us(now), 0);
+        rtt.received([1; 16], now + Duration::from_millis(20));
+        assert_eq!(rtt.observed_us(now + Duration::from_millis(20)), 20_000);
+        rtt.received([1; 16], now + Duration::from_millis(100));
+        assert_eq!(rtt.sample.unwrap().0, 20_000);
+        rtt.sent([3; 16], now);
+        rtt.received([3; 16], now + RTT_PROBE_TTL);
+        assert_eq!(rtt.sample.unwrap().0, 20_000);
+        assert_eq!(
+            rtt.observed_us(now + RTT_STALE_AFTER + Duration::from_secs(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn rtt_bounds_state_smooths_and_resets_stale_samples() {
+        let now = std::time::Instant::now();
+        let mut rtt = LinkRtt::default();
+        for n in 0..10 {
+            rtt.sent([n; 16], now);
+        }
+        assert_eq!(rtt.pending.len(), RTT_MAX_PENDING);
+        rtt.received([0; 16], now + Duration::from_millis(10));
+        assert!(rtt.sample.is_none());
+        rtt.received([9; 16], now + Duration::from_millis(20));
+        rtt.received([8; 16], now + Duration::from_millis(60));
+        assert_eq!(rtt.sample.unwrap().0, 30_000);
+        let later = now + RTT_STALE_AFTER + Duration::from_secs(1);
+        rtt.sent([10; 16], later);
+        rtt.received([10; 16], later + Duration::from_millis(100));
+        assert_eq!(rtt.sample.unwrap().0, 100_000);
+        assert!(rtt.allow_reply(now));
+        assert!(!rtt.allow_reply(now));
+        assert!(rtt.allow_reply(now + Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn rtt_echo_stays_on_its_link_and_accepts_only_matching_replies() {
+        use crate::wire::KeepaliveMsg;
+        let (ia, ib) = (Keypair::generate(), Keypair::generate());
+        let mut links = Vec::new();
+        for _ in 0..2 {
+            let (a, b) = lossy_pair(&[], &[]);
+            let (la, lb) = tokio::join!(
+                PeerLink::initiator(Box::new(a), &ia, None),
+                PeerLink::responder(Box::new(b), &ib)
+            );
+            links.push((Arc::new(la.unwrap()), Arc::new(lb.unwrap())));
+        }
+        let (a, b) = &links[0];
+        let (other_a, other_b) = &links[1];
+        let mut table = crate::peer_transport::LinkTable::new();
+        let peer = a.remote_peer();
+        table.insert(peer, other_a.clone());
+        let (measured_id, _) = table.insert(peer, a.clone());
+        let active_before = table.get(&peer).unwrap().clone();
+        let request = KeepaliveMsg {
+            ping_id: Some(42),
+            probe_nonce: Some([7; 16]),
+            padding: vec![0; 256],
+        };
+        let crypto_guard = a.crypto.lock().await;
+        a.send_deferred(&request.to_wire().encode()).await.unwrap();
+        // Queue admission cannot start a measurement before encryption/send.
+        assert!(a.rtt.lock().unwrap().pending.is_empty());
+        drop(crypto_guard);
+        let wire = WireMessage::decode(&recv_good(b).await).unwrap();
+        let received = KeepaliveMsg::from_bytes(&wire.payload).unwrap();
+        assert_eq!(received.probe_nonce, request.probe_nonce);
+        // Sending is timestamped by the frame worker, not queue admission.
+        assert_eq!(a.rtt.lock().unwrap().pending.len(), 1);
+        b.handle_keepalive(&received).await;
+        let wire = WireMessage::decode(&recv_good(a).await).unwrap();
+        let reply = KeepaliveMsg::from_bytes(&wire.payload).unwrap();
+        assert!(reply.ping_id.is_none());
+        assert_eq!(reply.probe_nonce, request.probe_nonce);
+        other_a.handle_keepalive(&reply).await;
+        assert_eq!(other_a.observed_rtt_us(), 0);
+        a.handle_keepalive(&KeepaliveMsg {
+            ping_id: None,
+            probe_nonce: None,
+            padding: vec![],
+        })
+        .await;
+        assert_eq!(a.observed_rtt_us(), 0); // legacy pong cannot produce a sample
+        a.handle_keepalive(&reply).await;
+        assert!(a.observed_rtt_us() > 0);
+        let snapshot = table.peer_info_snapshot();
+        let measured = snapshot[0]
+            .links
+            .iter()
+            .find(|l| l.link_id == measured_id)
+            .unwrap();
+        assert_eq!(measured.rtt_us, a.observed_rtt_us());
+        assert!(Arc::ptr_eq(table.get(&peer).unwrap(), &active_before));
+        assert!(a.rtt.lock().unwrap().pending.is_empty());
+        let sample = a.rtt.lock().unwrap().sample;
+        a.handle_keepalive(&reply).await;
+        assert_eq!(a.rtt.lock().unwrap().sample, sample);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), other_b.recv_message())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), b.recv_message())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn crypto_roundtrip() {
@@ -2147,6 +2411,7 @@ mod tests {
     fn ping() -> Vec<u8> {
         crate::wire::KeepaliveMsg {
             ping_id: None,
+            probe_nonce: None,
             padding: Vec::new(),
         }
         .to_wire()

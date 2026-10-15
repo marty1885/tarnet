@@ -56,6 +56,9 @@ pub const METHOD_TNS_REMOVE_LABEL: u16 = 0x0013;
 pub const METHOD_TNS_LIST_LABELS: u16 = 0x0014;
 pub const METHOD_TNS_RESOLVE_NAME: u16 = 0x0015;
 
+/// Raw single-label TNS lookup without recursion.
+pub const METHOD_TNS_LOOKUP_LABEL: u16 = 0x002E;
+
 // Circuit connections
 pub const METHOD_DEFAULT_SERVICE_ID: u16 = 0x0016;
 pub const METHOD_CONNECT: u16 = 0x0017;

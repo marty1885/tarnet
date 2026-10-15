@@ -146,6 +146,8 @@ struct ReliableState {
     retries_since_ack: u32,
     /// When this channel was created (for death detection before first ACK).
     created_at: Instant,
+    last_diagnostics: Instant,
+    retransmits_since_diagnostics: usize,
     // Receiver — ordered mode: full reorder buffer
     recv_next: u32,
     recv_buf: BTreeMap<u32, Vec<u8>>,
@@ -175,6 +177,8 @@ impl ReliableState {
             last_ack_at: now,
             retries_since_ack: 0,
             created_at: now,
+            last_diagnostics: now,
+            retransmits_since_diagnostics: 0,
             recv_next: 0,
             recv_buf: BTreeMap::new(),
             recv_seen: HashSet::new(),
@@ -464,6 +468,7 @@ impl Channel {
     /// below the highest selectively acknowledged sequence are marked for
     /// immediate retransmission (see [`has_fast_retransmit`](Self::has_fast_retransmit)).
     pub fn process_ack(&mut self, ack_seq: u32, selective_acks: &[u32]) -> Vec<u32> {
+        let channel_id = self.channel_id;
         let state = match self.state.reliable_state_mut() {
             Some(s) => s,
             None => return vec![],
@@ -547,6 +552,22 @@ impl Channel {
             state.fast_due.extend(holes);
         }
 
+        if log::log_enabled!(log::Level::Debug)
+            && now.duration_since(state.last_diagnostics) >= Duration::from_secs(1)
+        {
+            log::debug!(
+                "channel {}: cwnd={:.1}/{} inflight={} srtt_ms={:?} rto_ms={} retransmits={}",
+                channel_id,
+                state.cwnd,
+                state.send_window,
+                state.send_buf.len(),
+                state.srtt.map(|rtt| rtt.as_millis()),
+                state.base_rto_ms(),
+                state.retransmits_since_diagnostics,
+            );
+            state.last_diagnostics = now;
+            state.retransmits_since_diagnostics = 0;
+        }
         acked
     }
 
@@ -628,6 +649,9 @@ impl Channel {
         }
         if !due.is_empty() {
             state.retries_since_ack = state.retries_since_ack.saturating_add(1);
+            state.retransmits_since_diagnostics = state
+                .retransmits_since_diagnostics
+                .saturating_add(due.len());
         }
         let backoff_cap = state
             .rto_with_queue_ms(state.send_buf.len())

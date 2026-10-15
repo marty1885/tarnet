@@ -321,8 +321,11 @@ impl RekeyMsg {
 /// carries random padding so size-based traffic analysis can't trivially tell
 /// heartbeats from real protocol messages.
 ///
-/// Format: flags(u8) || [ping_id(u64 BE) if flags & 1] || padding(rest)
+/// Format: flags(u8) || [ping_id(u64 BE) if flags & 1]
+///         || [probe_nonce(16 bytes) if flags & 2] || padding(rest)
 ///   - flags bit 0: 1 = ping (carries a random ping id), 0 = pong
+///   - flags bit 1: a 128-bit challenge follows the optional legacy ping id
+///     on requests, and is echoed on replies. Older peers ignore this extension.
 ///   - padding: random bytes, ignored on receive
 #[derive(Debug, Clone)]
 pub struct KeepaliveMsg {
@@ -330,17 +333,23 @@ pub struct KeepaliveMsg {
     /// which would fingerprint the sender). The receiver answers with a pong.
     /// If None, this is a pong.
     pub ping_id: Option<u64>,
+    /// Random challenge, never a timestamp. Replies echo it on the same link.
+    pub probe_nonce: Option<[u8; 16]>,
     /// Random padding bytes. Set by sender; receiver discards.
     pub padding: Vec<u8>,
 }
 
 impl KeepaliveMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(1 + 8 + self.padding.len());
-        let flags: u8 = if self.ping_id.is_some() { 1 } else { 0 };
+        let mut out = Vec::with_capacity(1 + 8 + 16 + self.padding.len());
+        let flags: u8 =
+            u8::from(self.ping_id.is_some()) | (u8::from(self.probe_nonce.is_some()) << 1);
         out.push(flags);
         if let Some(ts) = self.ping_id {
             out.extend_from_slice(&ts.to_be_bytes());
+        }
+        if let Some(nonce) = self.probe_nonce {
+            out.extend_from_slice(&nonce);
         }
         out.extend_from_slice(&self.padding);
         out
@@ -350,6 +359,7 @@ impl KeepaliveMsg {
         if data.is_empty() {
             return Ok(Self {
                 ping_id: None,
+                probe_nonce: None,
                 padding: Vec::new(),
             });
         }
@@ -360,8 +370,14 @@ impl KeepaliveMsg {
         } else {
             None
         };
+        let probe_nonce = if flags & 2 != 0 {
+            Some(r.read_bytes(16)?.try_into().unwrap())
+        } else {
+            None
+        };
         Ok(Self {
             ping_id,
+            probe_nonce,
             padding: Vec::new(),
         })
     }
@@ -2327,6 +2343,32 @@ mod tests {
         let end = at + 1 + 32 * old;
         bytes.splice(end..end, std::iter::repeat(0xAB).take(32 * (n - old)));
         bytes
+    }
+
+    #[test]
+    fn keepalive_challenges_are_optional_and_truncation_is_rejected() {
+        for ping_id in [None, Some(123)] {
+            for probe_nonce in [None, Some([42; 16])] {
+                let ka = KeepaliveMsg {
+                    ping_id,
+                    probe_nonce,
+                    padding: vec![99; 10],
+                };
+                let encoded = ka.to_bytes();
+                let decoded = KeepaliveMsg::from_bytes(&encoded).unwrap();
+                assert_eq!(decoded.ping_id, ping_id);
+                assert_eq!(decoded.probe_nonce, probe_nonce);
+                if probe_nonce.is_some() {
+                    let header = 1 + if ping_id.is_some() { 8 } else { 0 };
+                    for end in header..header + 16 {
+                        assert!(KeepaliveMsg::from_bytes(&encoded[..end]).is_err());
+                    }
+                    // Legacy readers inspect only bit 0 and ignore the rest.
+                    assert_eq!(encoded[0] & 1 != 0, ping_id.is_some());
+                }
+            }
+        }
+        assert!(KeepaliveMsg::from_bytes(&[]).unwrap().probe_nonce.is_none());
     }
 
     #[test]

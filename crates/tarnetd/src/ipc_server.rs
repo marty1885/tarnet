@@ -635,6 +635,17 @@ async fn dispatch_request(
             }
         }
 
+        METHOD_TNS_LOOKUP_LABEL => {
+            let (zone, name): (ServiceId, String) = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.tns_lookup_label(zone, &name).await {
+                Ok(result) => ok_response(request_id, &encode_payload(&result)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
         METHOD_TNS_RESOLVE_NAME => {
             let name: String = match decode_payload(payload) {
                 Ok(v) => v,

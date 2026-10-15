@@ -538,64 +538,24 @@ impl App {
     }
 
     async fn resolve(&mut self, name: &str) {
-        // The explicit-zone daemon API reads published records. A private label
-        // in a nondefault local zone is visible through the label API instead.
-        if self.identity_name() != "default" && !name.contains('.') {
-            if let Some((_, records, public)) =
-                self.labels.iter().find(|(label, _, _)| label == name)
-            {
-                self.lookup = Some((
-                    name.to_string(),
-                    format!(
-                        "Local {} label in {}:\n{}",
-                        if *public { "public" } else { "private" },
-                        self.identity_name(),
-                        records
-                            .iter()
-                            .map(short_record)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    ),
-                ));
-                self.tab = LOOKUP;
-                self.detail_scroll = 0;
-                return;
-            }
-        }
-        let result = match self.identities.get(self.identity) {
-            Some((zone, _)) if zone == "default" => self.client.tns_resolve_name(name).await,
-            Some((_, sid)) => self.client.tns_resolve(*sid, name).await,
-            None => self.client.tns_resolve_name(name).await,
+        let zone = match self.identities.get(self.identity) {
+            Some((_, sid)) => *sid,
+            None => self.client.default_service_id().await,
         };
-        let root = name.rsplit('.').next().unwrap_or(name);
-        let local = self
-            .labels
-            .iter()
-            .find(|(label, _, _)| label == root)
-            .map(|(_, records, public)| {
-                format!(
-                    "\nLocal root label '{root}' ({}): {}{}",
-                    if *public { "public" } else { "private" },
-                    records
-                        .iter()
-                        .map(short_record)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    if self.identity_name() != "default" && !*public {
-                        "\nNote: explicit-zone resolution cannot follow private local labels."
-                    } else {
-                        ""
-                    }
-                )
-            })
-            .unwrap_or_default();
-        self.lookup = Some((
-            name.to_string(),
-            match result {
-                Ok(r) => format!("{}{}", describe_resolution(&r), local),
-                Err(e) => format!("Lookup failed: {e}"),
-            },
-        ));
+        let client = self.client.as_ref();
+        let lookup =
+            |zone, label: String| async move { client.tns_lookup_label(zone, &label).await };
+        let mut steps = Vec::new();
+        let result = match tokio::time::timeout(
+            Duration::from_secs(30),
+            resolve_lookup(&lookup, zone, name, 0, &mut steps),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => TnsResolution::Error("total resolution timeout exceeded".into()),
+        };
+        self.lookup = Some((name.to_string(), describe_trace(&steps, &result)));
         self.tab = LOOKUP;
         self.detail_scroll = 0;
     }
@@ -736,6 +696,172 @@ fn short_record(record: &TnsRecord) -> String {
     }
 }
 
+struct LookupStep {
+    zone: ServiceId,
+    label: String,
+    records: Vec<TnsRecord>,
+    direct_zone: bool,
+}
+
+async fn resolve_lookup<F, Fut>(
+    lookup: &F,
+    zone: ServiceId,
+    name: &str,
+    depth: usize,
+    steps: &mut Vec<LookupStep>,
+) -> TnsResolution
+where
+    F: Fn(ServiceId, String) -> Fut,
+    Fut: std::future::Future<Output = tarnet_api::error::ApiResult<Vec<TnsRecord>>>,
+{
+    if depth >= 16 {
+        return TnsResolution::Error("max delegation/redirect depth exceeded".into());
+    }
+
+    let labels: Vec<&str> = name.split('.').rev().collect();
+    if labels.is_empty() || labels.iter().any(|l| l.is_empty()) {
+        return TnsResolution::Error("invalid name: empty label".into());
+    }
+
+    let mut current_zone = zone;
+    let mut current_depth = depth;
+    let mut label_idx = 0;
+
+    while label_idx < labels.len() {
+        if current_depth >= 16 {
+            return TnsResolution::Error("max delegation/redirect depth exceeded".into());
+        }
+        current_depth += 1;
+
+        let label = labels[label_idx];
+        let is_terminal = label_idx == labels.len() - 1;
+
+        if !is_terminal {
+            if let Some(zone_id) = tarnet_api::types::decode_base32(label)
+                .ok()
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .map(ServiceId)
+            {
+                steps.push(LookupStep {
+                    zone: current_zone,
+                    label: label.into(),
+                    records: vec![TnsRecord::Zone(zone_id)],
+                    direct_zone: true,
+                });
+                current_zone = zone_id;
+                label_idx += 1;
+                continue;
+            }
+        }
+
+        let step = steps.len();
+        steps.push(LookupStep {
+            zone: current_zone,
+            label: label.into(),
+            records: Vec::new(),
+            direct_zone: false,
+        });
+        let records = match lookup(current_zone, label.to_string()).await {
+            Ok(records) => records,
+            Err(e) => return TnsResolution::Error(e.to_string()),
+        };
+        steps[step].records = records.clone();
+
+        if records.is_empty() {
+            return TnsResolution::NotFound;
+        }
+
+        if let Some(alias_target) = records.iter().find_map(|r| match r {
+            TnsRecord::Alias(s) => Some(s.clone()),
+            _ => None,
+        }) {
+            let remaining: Vec<&str> = labels[label_idx + 1..].iter().rev().copied().collect();
+            let new_name = if remaining.is_empty() {
+                alias_target.clone()
+            } else {
+                format!("{}.{}", remaining.join("."), alias_target)
+            };
+
+            return Box::pin(resolve_lookup(
+                lookup,
+                current_zone,
+                &new_name,
+                current_depth,
+                steps,
+            ))
+            .await;
+        }
+
+        if is_terminal {
+            if let Some(serving) = records.iter().find_map(|r| match r {
+                TnsRecord::VHost(sid) => Some(*sid),
+                _ => None,
+            }) {
+                return TnsResolution::VHost {
+                    serving,
+                    canonical_label: label.to_string(),
+                };
+            }
+
+            if let Some(zone_sid) = records.iter().find_map(|r| match r {
+                TnsRecord::Zone(sid) => Some(*sid),
+                _ => None,
+            }) {
+                return match Box::pin(resolve_lookup(lookup, zone_sid, "@", current_depth, steps))
+                    .await
+                {
+                    TnsResolution::NotFound => TnsResolution::Records(records),
+                    apex => apex,
+                };
+            }
+            return TnsResolution::Records(records);
+        }
+
+        if let Some(next_zone) = records.iter().find_map(|r| match r {
+            TnsRecord::Zone(sid) => Some(*sid),
+            _ => None,
+        }) {
+            current_zone = next_zone;
+            label_idx += 1;
+        } else {
+            return TnsResolution::Error(format!(
+                "non-terminal label '{}' has no Zone or Alias",
+                label
+            ));
+        }
+    }
+
+    TnsResolution::NotFound
+}
+
+fn describe_trace(steps: &[LookupStep], result: &TnsResolution) -> String {
+    let mut lines = vec!["Recursive resolution (rightmost label first):".to_string()];
+    for (i, step) in steps.iter().enumerate() {
+        lines.push(format!(
+            "\n{}. {} in zone {}{}",
+            i + 1,
+            step.label,
+            step.zone,
+            if step.direct_zone {
+                " (direct zone)"
+            } else {
+                ""
+            }
+        ));
+        if step.records.is_empty() {
+            lines.push("   No records returned".into());
+        } else {
+            lines.extend(
+                step.records
+                    .iter()
+                    .map(|r| format!("   {}", short_record(r))),
+            );
+        }
+    }
+    lines.push(format!("\nResult:\n{}", describe_resolution(result)));
+    lines.join("\n")
+}
+
 fn describe_resolution(result: &TnsResolution) -> String {
     match result {
         TnsResolution::Records(records) if records.is_empty() => "No terminal records returned".into(),
@@ -799,6 +925,71 @@ fn input_text(input: &Input) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recursive_lookup_traces_delegation_alias_and_apex() {
+        let home = ServiceId([1; 32]);
+        let friend = ServiceId([2; 32]);
+        let target = ServiceId([3; 32]);
+        let lookup = |zone, label: String| {
+            std::future::ready(Ok(match (zone, label.as_str()) {
+                (z, "friend") if z == home => vec![TnsRecord::Zone(friend)],
+                (z, "site") if z == friend => vec![TnsRecord::Alias("@".into())],
+                (z, "@") if z == friend => vec![TnsRecord::VHost(target)],
+                _ => vec![],
+            }))
+        };
+        for (name, expected) in [
+            ("site.friend".to_string(), vec!["friend", "site", "@"]),
+            ("friend".to_string(), vec!["friend", "@"]),
+            (format!("site.{friend}"), vec!["direct", "site", "@"]),
+        ] {
+            let mut steps = Vec::new();
+            let result = resolve_lookup(&lookup, home, &name, 0, &mut steps).await;
+            assert!(
+                matches!(result, TnsResolution::VHost { serving, ref canonical_label } if serving == target && canonical_label == "@")
+            );
+            let labels: Vec<_> = steps
+                .iter()
+                .map(|s| {
+                    if s.direct_zone {
+                        "direct"
+                    } else {
+                        s.label.as_str()
+                    }
+                })
+                .collect();
+            assert_eq!(labels, expected);
+            assert_eq!(steps.last().unwrap().zone, friend);
+            let display = describe_trace(&steps, &result);
+            assert!(display.contains("1."));
+            assert!(display.contains("Result:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_lookup_bounds_cycles_and_reports_missing_labels() {
+        let zone = ServiceId([1; 32]);
+        let lookup = |_, label: String| {
+            std::future::ready(Ok(if label == "loop" {
+                vec![TnsRecord::Alias("loop".into())]
+            } else {
+                vec![]
+            }))
+        };
+        let mut steps = Vec::new();
+        let result = resolve_lookup(&lookup, zone, "loop", 0, &mut steps).await;
+        assert!(matches!(result, TnsResolution::Error(_)));
+        assert_eq!(steps.len(), 16);
+        steps.clear();
+        let result = resolve_lookup(&lookup, zone, "missing", 0, &mut steps).await;
+        assert!(matches!(result, TnsResolution::NotFound));
+        assert_eq!(steps.len(), 1);
+        steps.clear();
+        let result = resolve_lookup(&lookup, zone, "bad..name", 0, &mut steps).await;
+        assert!(matches!(result, TnsResolution::Error(_)));
+        assert!(steps.is_empty());
+    }
 
     #[test]
     fn handle_parsing_requires_128_hex_chars() {

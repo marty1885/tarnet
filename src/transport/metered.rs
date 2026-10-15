@@ -326,6 +326,7 @@ mod tests {
         assert!(handshake > 0);
         let msg = KeepaliveMsg {
             ping_id: None,
+            probe_nonce: None,
             padding: vec![4; 73],
         }
         .to_wire()

@@ -404,6 +404,7 @@ mod tests {
     fn keepalive() -> Vec<u8> {
         KeepaliveMsg {
             ping_id: None,
+            probe_nonce: None,
             padding: Vec::new(),
         }
         .to_wire()

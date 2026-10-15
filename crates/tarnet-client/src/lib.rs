@@ -569,6 +569,13 @@ impl ServiceApi for IpcServiceApi {
         decode_payload(&resp)
     }
 
+    async fn tns_lookup_label(&self, zone: ServiceId, name: &str) -> ApiResult<Vec<TnsRecord>> {
+        let payload = encode_payload(&(zone, name.to_string()));
+        let (status, resp) = self.request(METHOD_TNS_LOOKUP_LABEL, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution> {
         let payload = encode_payload(&name.to_string());
         let (status, resp) = self.request(METHOD_TNS_RESOLVE_NAME, &payload).await?;

@@ -474,6 +474,14 @@ pub trait ServiceApi: Send + Sync {
     /// Resolve a name relative to the local node's petnames/zone.
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution>;
 
+    /// Fetch one label's raw records in a zone, without following aliases or delegations.
+    async fn tns_lookup_label(&self, zone: ServiceId, label: &str) -> ApiResult<Vec<TnsRecord>> {
+        let _ = (zone, label);
+        Err(crate::error::ApiError::Service(
+            "raw TNS lookup is unsupported".into(),
+        ))
+    }
+
     /// Set a local label with associated records and publish flag.
     /// If `identity` is None, uses the default identity.
     async fn tns_set_label(

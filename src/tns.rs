@@ -747,6 +747,10 @@ async fn resolve_inner(node: &Node, zone: ServiceId, name: &str, depth: usize) -
 /// than what we sign, and waiting out the search is what made unknown names
 /// slow). Otherwise from the TNS cache, else from the zone's root found by a
 /// DHT search, cached with its TTL. Empty means not found.
+pub async fn lookup_label(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRecord> {
+    fetch_records(node, zone, label).await
+}
+
 async fn fetch_records(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRecord> {
     // 1. Our own zone: local labels (published or not) and live publishers.
     if node.owns_zone(zone).await {

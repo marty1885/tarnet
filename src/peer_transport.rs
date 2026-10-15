@@ -173,7 +173,8 @@ impl PeerTransport {
     }
 
     /// Update scoring metrics for a link after keepalive pong.
-    // Nothing measures link RTT or loss yet: only tests feed scores.
+    // Observed RTT is display-only: peer batching/delay must not drive selection.
+    // Only tests feed scores; loss measurement is not implemented.
     #[cfg(test)]
     fn update_score(&mut self, id: LinkId, rtt_us: u64, loss_rate: u8) {
         if let Some(sl) = self.links.get_mut(&id) {
@@ -320,6 +321,7 @@ pub struct LinkInfo {
     pub link_id: LinkId,
     pub state: &'static str,     // "active" | "standby"
     pub direction: &'static str, // "outbound" | "inbound"
+    /// Observed response time, including peer batching/delay; zero if unknown/stale.
     pub rtt_us: u64,
     pub loss_rate: u8,
     pub age_secs: u64,
@@ -543,7 +545,7 @@ impl LinkTable {
                         } else {
                             "inbound"
                         },
-                        rtt_us: sl.score.ewma_rtt_us,
+                        rtt_us: sl.link.observed_rtt_us(),
                         loss_rate: sl.score.loss_rate,
                         age_secs: sl.created_at.elapsed().as_secs(),
                         idle_secs: sl.last_recv.elapsed().as_secs(),
@@ -712,6 +714,7 @@ mod tests {
         // padded before encryption, so decode rather than compare raw bytes.)
         let frame = KeepaliveMsg {
             ping_id: None,
+            probe_nonce: None,
             padding: Vec::new(),
         }
         .to_wire()
@@ -733,6 +736,7 @@ mod tests {
         let (a, b) = make_test_link_pair().await; // a = initiator
         let frame = KeepaliveMsg {
             ping_id: None,
+            probe_nonce: None,
             padding: Vec::new(),
         }
         .to_wire()
@@ -813,7 +817,13 @@ mod tests {
         assert_eq!(pt.dead_links(timeout), vec![0]);
         budget.set_rates(0, 1);
         budget.acquire_download(1).await;
-        let msg = KeepaliveMsg { ping_id: None, padding: vec![0; 8] }.to_wire().encode();
+        let msg = KeepaliveMsg {
+            ping_id: None,
+            probe_nonce: None,
+            padding: vec![0; 8],
+        }
+        .to_wire()
+        .encode();
         a.send_message(&msg).await.unwrap();
         {
             let receive = b.recv_message();

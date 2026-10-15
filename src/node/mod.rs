@@ -1395,6 +1395,7 @@ impl Node {
                     rand::thread_rng().fill_bytes(&mut padding);
                     let ka_msg = KeepaliveMsg {
                         ping_id: Some(rand::random()),
+                        probe_nonce: Some(rand::random()),
                         padding,
                     };
                     let encoded = ka_msg.to_wire().encode();
@@ -2545,27 +2546,10 @@ impl Node {
             }
             MessageType::Keepalive => {
                 let ka = KeepaliveMsg::from_bytes(&msg.payload)?;
-                if ka.ping_id.is_some() {
-                    // This is a ping — echo it back as a pong (no timestamp = pong)
-                    // Pong: random padding so pongs aren't a distinguishable
-                    // fixed-size response either.
-                    use rand::RngCore;
-                    let pad_len = {
-                        use rand::Rng;
-                        rand::thread_rng().gen_range(0..=HEARTBEAT_MAX_PADDING)
-                    };
-                    let mut padding = vec![0u8; pad_len];
-                    rand::thread_rng().fill_bytes(&mut padding);
-                    let pong = KeepaliveMsg {
-                        ping_id: None,
-                        padding,
-                    };
-                    let _ = self
-                        .sender
-                        .to_peer(&from, &pong.to_wire().encode(), sender::Queue::Deferred)
-                        .await;
+                let link = self.links.lock().await.get_link(&from, msg_link_id);
+                if let Some(link) = link {
+                    link.handle_keepalive(&ka).await;
                 }
-                // Pong — activity is already tracked by touch_recv above.
             }
             MessageType::DhtWatch => self.handle_dht_watch(from, &msg.payload).await?,
             MessageType::DhtWatchNotify => self.handle_dht_watch_notify(from, &msg.payload).await?,

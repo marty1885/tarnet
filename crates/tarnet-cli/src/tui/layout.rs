@@ -1,7 +1,9 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use tarnet_api::types::{LinkStatus, PrivacyLevel};
 
@@ -42,6 +44,9 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     render_header(frame, app, sections[0]);
     render_body(frame, app, sections[1]);
     render_footer(frame, app, sections[2]);
+    if let Some(input) = &app.input {
+        render_input_popup(frame, input);
+    }
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
@@ -393,7 +398,10 @@ fn render_right(frame: &mut Frame, app: &App, area: Rect, title: &str) {
                     };
                     lines.push(Line::from(vec![
                         Span::styled("Out  ", Style::default().fg(MUTED)),
-                        Span::styled(out, Style::default().fg(if *hops == 0 { YELLOW } else { GREEN })),
+                        Span::styled(
+                            out,
+                            Style::default().fg(if *hops == 0 { YELLOW } else { GREEN }),
+                        ),
                     ]));
                 }
                 lines.push(Line::raw(""));
@@ -907,6 +915,70 @@ fn hint_line(items: &[(&str, &str)], width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+fn render_input_popup(frame: &mut Frame, input: &super::Input) {
+    let screen = frame.area();
+    let width = screen.width.saturating_sub(4).min(80);
+    let height = screen.height.min(8);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" Input ")
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(CYAN))
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let content = Rect::new(
+        inner.x + 1,
+        inner.y,
+        inner.width.saturating_sub(2),
+        inner.height,
+    );
+    frame.render_widget(
+        Paragraph::new(input.label())
+            .style(Style::default().fg(CYAN).add_modifier(Modifier::BOLD))
+            .wrap(Wrap { trim: false }),
+        Rect {
+            height: 2,
+            ..content
+        },
+    );
+    let field = Rect::new(content.x, content.y + 2, content.width, 1);
+    // Reserve a cell for the cursor and scroll long values by terminal columns.
+    let text = super::input_text(input);
+    let mut start = text.len();
+    let mut used = 0;
+    for (index, ch) in text.char_indices().rev() {
+        let width = Span::raw(ch.to_string()).width();
+        if used + width > field.width.saturating_sub(1) as usize {
+            break;
+        }
+        start = index;
+        used += width;
+    }
+    frame.render_widget(
+        Paragraph::new(&text[start..]).style(Style::default().fg(Color::White).bg(Color::DarkGray)),
+        field,
+    );
+    frame.set_cursor_position((field.x + used as u16, field.y));
+    frame.render_widget(
+        Paragraph::new("Enter: confirm · Esc: cancel")
+            .style(Style::default().fg(MUTED))
+            .wrap(Wrap { trim: false }),
+        Rect::new(
+            content.x,
+            content.y + 4,
+            content.width,
+            content.height.saturating_sub(4),
+        ),
+    );
+}
+
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let contextual: &[(&str, &str)] = match app.tab {
         NODE => &[("i", "zone")],
@@ -936,27 +1008,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         let all: Vec<_> = contextual.iter().chain(global).copied().collect();
         frame.render_widget(Paragraph::new(hint_line(&all, area.width)), row(0));
     }
-    let (message, style) = if let Some(input) = &app.input {
-        let prefix = format!(" {}: ", input.label());
-        let suffix = "█";
-        let help = "   enter confirm · esc cancel";
-        let text = super::input_text(input);
-        // Keep the cursor visible: show the tail of long input (e.g. a
-        // pasted 128-char handle) and drop the help text if it won't fit.
-        let room = (area.width as usize).saturating_sub(prefix.chars().count() + suffix.len() + 1);
-        let help = if room > text.chars().count() + help.chars().count() {
-            help
-        } else {
-            ""
-        };
-        let room = room.saturating_sub(help.chars().count());
-        let skip = text.chars().count().saturating_sub(room);
-        let shown: String = text.chars().skip(skip).collect();
-        (
-            format!("{prefix}{shown}{suffix}{help}"),
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
-        )
-    } else if app.message.is_empty() {
+    let (message, style) = if app.message.is_empty() {
         (" Ready".to_string(), Style::default().fg(MUTED))
     } else {
         let bad = app.message.contains("failed")
