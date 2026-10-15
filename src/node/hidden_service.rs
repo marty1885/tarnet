@@ -499,8 +499,7 @@ impl Node {
         // A Hidden identity has no peer record: drop it from the zone in case
         // the identity was Public before. The new root replaces the old one.
         self.zone_published_update(&service_id, "peer", None).await;
-        crate::tns::publish(self, &zone_keypair, "intro", &intro_records, HIDDEN_SERVICE_TTL)
-            .await?;
+        crate::tns::publish(self, &zone_keypair, "intro", &intro_records).await?;
 
         log::info!(
             "Hidden service published: {:?} with {} intro points",
@@ -601,7 +600,8 @@ impl Node {
 
         let peer_id = self.peer_id();
         let record = crate::tns::build_peer_record(&zone_keypair, &peer_id);
-        crate::tns::publish(self, &zone_keypair, "peer", &[record], 600).await?;
+        // Re-signs the zone root, with every label the zone publishes.
+        crate::tns::publish(self, &zone_keypair, "peer", &[record]).await?;
 
         log::info!("Published peer record for {:?} → {:?}", service_id, peer_id);
         Ok(())
@@ -639,89 +639,6 @@ impl Node {
                     log::warn!("Failed to publish peer record for {:?}: {}", sid, e);
                 }
             }
-        }
-    }
-
-    /// Re-publish every owned, published TNS zone label so names stay resolvable.
-    ///
-    /// TNS zones are published once by the operator (via `tns_set_label` /
-    /// `tns_publish`); the label DB (`publish = true`) is the durable source of
-    /// truth, while the DHT copy is soft state that now honours its TTL. Without
-    /// this loop a name would resolve only for one TTL and then vanish — the old
-    /// behaviour where it lived forever was an artifact of replication resetting
-    /// the record clock, not a design feature. Mirrors `maintain_peer_records`:
-    /// each round re-mints with a fresh sequence (so it supersedes the prior
-    /// copy) and a full TTL; stopping the daemon — or removing the label — lets
-    /// the name expire within one TTL.
-    pub(super) async fn maintain_tns_zones(&self) {
-        let Some(db) = self.db.clone() else { return };
-
-        if self.connected_peers().await.is_empty() {
-            log::debug!("maintain_tns_zones: no peers, skipping");
-            return;
-        }
-
-        // Snapshot (identity label, owned keypair) pairs up front so we hold the
-        // identity_store lock only briefly — not across the DB reads / async
-        // publishes below. The label DB is keyed by the identity's label, which
-        // is exactly what `identity_store.list()` yields.
-        //
-        // Hidden identities are skipped: republishing their zone in the same
-        // burst as a Public identity's (whose PeerId is published) links the
-        // two. `maintain_hidden_services` republishes a hidden zone root, with
-        // every label, on its own timer.
-        let identities: Vec<(String, crate::identity::Keypair)> = {
-            let is = self.identity_store.lock().await;
-            is.list()
-                .into_iter()
-                .filter_map(|(label, sid, privacy, ..)| {
-                    if matches!(privacy, tarnet_api::types::PrivacyLevel::Hidden { .. }) {
-                        return None;
-                    }
-                    is.keypair_for(&sid).map(|kp| {
-                        (
-                            label,
-                            crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes())
-                                .expect("round-trip of a stored keypair"),
-                        )
-                    })
-                })
-                .collect()
-        };
-
-        let mut republished = 0usize;
-        for (id_label, keypair) in &identities {
-            let labels = match db.label_list(id_label) {
-                Ok(labels) => labels,
-                Err(e) => {
-                    log::warn!("maintain_tns_zones: label_list({}) failed: {}", id_label, e);
-                    continue;
-                }
-            };
-            for (label, blobs, publish) in labels {
-                if !publish {
-                    continue;
-                }
-                let records: Vec<crate::tns::TnsRecord> = blobs
-                    .iter()
-                    .filter_map(|b| crate::tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
-                    .collect();
-                if records.is_empty() {
-                    continue;
-                }
-                match crate::tns::publish(self, keypair, &label, &records, TNS_REPUBLISH_TTL).await {
-                    Ok(()) => republished += 1,
-                    Err(e) => log::warn!(
-                        "maintain_tns_zones: republish {}/{} failed: {}",
-                        id_label,
-                        label,
-                        e
-                    ),
-                }
-            }
-        }
-        if republished > 0 {
-            log::debug!("Republished {} TNS label(s)", republished);
         }
     }
 
@@ -896,14 +813,7 @@ impl Node {
         };
 
         let digest = *blake3::hash(payload).as_bytes();
-        if self
-            .hidden
-            .introduce_seen
-            .lock()
-            .await
-            .insert(digest, Instant::now())
-            .is_some()
-        {
+        if self.hidden.introduce_seen.lock().await.contains_key(&digest) {
             log::debug!("Replayed INTRODUCE for {:?}, dropping", service_sid);
             return;
         }
@@ -915,6 +825,12 @@ impl Node {
                     return;
                 }
             };
+        // Remembered only once it decrypted, so junk can't fill the table;
+        // a racing copy loses here.
+        if self.hidden.introduce_seen.lock().await.try_insert(digest, ()).is_err() {
+            log::debug!("Replayed (or too many) INTRODUCE for {:?}, dropping", service_sid);
+            return;
+        }
         log::info!("Service received INTRODUCE: rendezvous={:?}", intro.rendezvous);
 
         // Answer the client's ephemeral key: the end-to-end key then needs
@@ -1109,16 +1025,16 @@ mod tests {
         for kp in [&hidden_kp, &public_kp] {
             let record =
                 crate::dht::VerifiedRecord::new_zone_root(kp, b"zone", 1, Duration::from_secs(600));
-            node.dht_publish(record).await;
+            node.dht_publish(record).await.unwrap();
         }
 
-        let signers: Vec<[u8; 32]> = node
+        let signers: Vec<PeerId> = node
             .own_records_to_republish()
             .await
             .iter()
             .map(|r| r.signer)
             .collect();
-        assert!(!signers.contains(hidden_kp.peer_id().as_bytes()));
-        assert!(signers.contains(public_kp.peer_id().as_bytes()));
+        assert!(!signers.contains(&hidden_kp.peer_id()));
+        assert!(signers.contains(&public_kp.peer_id()));
     }
 }

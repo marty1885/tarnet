@@ -90,8 +90,7 @@ impl Node {
         let channels = self.channel_state.channels.clone();
         let retransmit_notify = self.channel_state.retransmit_notify.clone();
         let tunnel_table = self.tunnel_table.clone();
-        let links = self.links.clone();
-        let routing_table = self.routing_table.clone();
+        let sender = self.sender.clone();
         let peer_id = self.peer_id();
 
         log::info!("WebRTC signaling listener registered");
@@ -105,8 +104,7 @@ impl Node {
                 let channels = channels.clone();
                 let retransmit_notify = retransmit_notify.clone();
                 let tunnel_table = tunnel_table.clone();
-                let links = links.clone();
-                let routing_table = routing_table.clone();
+                let sender = sender.clone();
 
                 log::debug!(
                     "WebRTC signaling session from {:?} on channel {}",
@@ -152,8 +150,7 @@ impl Node {
                                 if let Err(e) = send_on_channel(
                                     &channels,
                                     &tunnel_table,
-                                    &links,
-                                    &routing_table,
+                                    &sender,
                                     &retransmit_notify,
                                     peer_id,
                                     channel_id,
@@ -168,8 +165,7 @@ impl Node {
                                 // Spawn ICE trickle sender
                                 let channels2 = channels.clone();
                                 let tunnel_table2 = tunnel_table.clone();
-                                let links2 = links.clone();
-                                let routing_table2 = routing_table.clone();
+                                let sender2 = sender.clone();
                                 let retransmit_notify2 = retransmit_notify.clone();
                                 tokio::spawn(async move {
                                     while let Some(candidate) = ice_rx.recv().await {
@@ -179,8 +175,7 @@ impl Node {
                                         if send_on_channel(
                                             &channels2,
                                             &tunnel_table2,
-                                            &links2,
-                                            &routing_table2,
+                                            &sender2,
                                             &retransmit_notify2,
                                             peer_id,
                                             channel_id,
@@ -236,7 +231,7 @@ impl Node {
                                     }
                                     // Clean up channel handler
                                     channel_data_handlers.lock().await.remove(&channel_id);
-                                    channels3.lock().await.remove(&channel_id);
+                                    channels3.lock().await.remove(channel_id);
                                 });
                             }
                             TAG_ICE_CANDIDATE => {
@@ -304,8 +299,7 @@ impl Node {
         let channels = self.channel_state.channels.clone();
         let retransmit_notify = self.channel_state.retransmit_notify.clone();
         let tunnel_table = self.tunnel_table.clone();
-        let links = self.links.clone();
-        let routing_table = self.routing_table.clone();
+        let sender = self.sender.clone();
         let my_peer_id = self.peer_id();
         tokio::spawn(async move {
             while let Some(candidate) = ice_rx.recv().await {
@@ -315,8 +309,7 @@ impl Node {
                 if send_on_channel(
                     &channels,
                     &tunnel_table,
-                    &links,
-                    &routing_table,
+                    &sender,
                     &retransmit_notify,
                     my_peer_id,
                     channel_id,
@@ -395,7 +388,7 @@ impl Node {
             }
             // Clean up
             channel_data_handlers.lock().await.remove(&channel_id);
-            channels2.lock().await.remove(&channel_id);
+            channels2.lock().await.remove(channel_id);
         });
 
         Ok(())
@@ -405,35 +398,23 @@ impl Node {
 /// Send data on a channel using the tunnel, without holding a &Node reference.
 /// Used from spawned tasks that can't borrow the node.
 async fn send_on_channel(
-    channels: &Arc<Mutex<HashMap<u32, (PeerId, Channel)>>>,
+    channels: &Arc<Mutex<crate::channel::ChannelTable>>,
     tunnel_table: &Arc<Mutex<TunnelTable>>,
-    links: &Arc<Mutex<LinkTable>>,
-    routing_table: &Arc<Mutex<RoutingTable>>,
+    sender: &super::sender::Sender,
     retransmit_notify: &Arc<tokio::sync::Notify>,
     our_peer_id: PeerId,
     channel_id: u32,
     data: &[u8],
 ) -> Result<()> {
-    let (dest, sends, is_reliable) = {
-        let mut chs = channels.lock().await;
-        let (remote, ch) = chs
-            .get_mut(&channel_id)
-            .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
-        let dest = *remote;
-        let reliable = ch.reliable;
-        let sends = ch.prepare_send(data.to_vec());
-        (dest, sends, reliable)
-    };
+    let (dest, is_reliable, msgs) = channels
+        .lock()
+        .await
+        .prepare_send(channel_id, data)
+        .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
     if is_reliable {
         retransmit_notify.notify_one();
     }
-    for (seq, payload) in sends {
-        let msg = ChannelDataMsg {
-            channel_id,
-            sequence: seq,
-            data: payload,
-        };
-        let inner = msg.to_wire().encode();
+    for inner in msgs {
 
         // Encrypt via tunnel
         let (encrypted, hints) = {
@@ -447,13 +428,13 @@ async fn send_on_channel(
         let enc_msg = EncryptedDataMsg {
             origin: our_peer_id,
             destination: dest,
-            ttl: 64,
+            ttl: crate::wire::DATA_TTL,
             hints: hints.clone(),
             data: encrypted,
         };
         let encoded = enc_msg.to_wire_encrypted().encode();
 
-        super::tunnel::send_overlay(links, routing_table, &dest, &hints, &encoded).await?;
+        sender.routed(&dest, &hints, &encoded).await?;
     }
     Ok(())
 }

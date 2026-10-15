@@ -231,8 +231,8 @@ async fn route_propagation_three_nodes() {
     let mut table_a = RoutingTable::new(a);
     let mut table_b = RoutingTable::new(b);
     let mut table_c = RoutingTable::new(c);
-    let dump_a_to_b = table_a.neighbour_up(b, COST_FAST);
-    let dump_c_to_b = table_c.neighbour_up(b, COST_FAST);
+    let (dump_a_to_b, _) = table_a.neighbour_up(b, COST_FAST);
+    let (dump_c_to_b, _) = table_c.neighbour_up(b, COST_FAST);
     table_b.neighbour_up(a, COST_FAST);
     table_b.neighbour_up(c, COST_FAST);
     for m in dump_a_to_b {
@@ -266,7 +266,7 @@ async fn dht_content_addressed() {
     use tarnet::dht::*;
 
     let data = b"distributed hash table test data";
-    let (key, blob) = content_address_put(data);
+    let (key, blob, handle) = content_address_put(data);
 
     // Simulate storing and retrieving
     let peer = PeerId([1u8; 32]);
@@ -275,11 +275,11 @@ async fn dht_content_addressed() {
         key,
         record_type: tarnet::types::RecordType::Content,
         sequence: 0,
-        signer: [0u8; 32],
+        signer: tarnet::types::PeerId([0u8; 32]),
         signer_algo: 1,
         signer_pubkey: Vec::new(),
         value: blob.clone(),
-        ttl: Duration::from_secs(3600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(3600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0u8; 64],
     }));
@@ -289,9 +289,8 @@ async fn dht_content_addressed() {
     let record = records[0];
     assert_eq!(record.value, blob);
 
-    // Decrypt with content hash
-    let inner_hash: [u8; 64] = hash_64(data);
-    let decrypted = content_address_get(&inner_hash, &record.value).unwrap();
+    // Decrypt with the content handle
+    let decrypted = content_address_get(&handle, &record.value).unwrap();
     assert_eq!(decrypted, data);
 }
 
@@ -585,7 +584,7 @@ fn bloom_filter_dedup() {
     assert!(!empty.contains(salt, &peer_c));
 }
 
-/// Test handshake with anti-replay protection (timestamp + challenge).
+/// Test handshake anti-replay: fresh ephemerals and challenges on both sides, no clock.
 #[tokio::test]
 async fn handshake_anti_replay() {
     let kp_a = Keypair::generate();
@@ -686,7 +685,7 @@ async fn dht_put_and_get_walks_meet_across_a_line() {
 
     // Node A puts content; its walks end at some storing local minimum.
     let data = b"walk test data";
-    let inner_hash = node_a.dht_put_content(data).await;
+    let inner_hash = node_a.dht_put_content(data).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Node C's GET walks find it.
@@ -708,7 +707,7 @@ fn signature_validation_on_get_response() {
         key: [0xAA; 64],
         record_type: RecordType::Hello,
         sequence: 1,
-        signer: *kp.peer_id().as_bytes(),
+        signer: kp.peer_id(),
         ttl: 600,
         value: b"hello".to_vec(),
         signature: vec![0xFF; 64], // invalid signature
@@ -718,8 +717,9 @@ fn signature_validation_on_get_response() {
     };
 
     // Verify that signature check fails
-    let valid = identity::verify(
-        kp.identity.signing_algo(),
+    let valid = identity::verify_signed(
+        identity::SignedBy::AnyPeer,
+        Some(kp.identity.signing_algo() as u8),
         &pubkey,
         &put.signable_bytes(),
         &put.signature,
@@ -731,7 +731,7 @@ fn signature_validation_on_get_response() {
         key: [0xBB; 64],
         record_type: RecordType::Hello,
         sequence: 1,
-        signer: *kp.peer_id().as_bytes(),
+        signer: kp.peer_id(),
         ttl: 600,
         value: b"valid hello".to_vec(),
         signature: vec![0u8; 64],
@@ -740,8 +740,9 @@ fn signature_validation_on_get_response() {
         walk: Default::default(),
     };
     put_valid.signature = kp.sign(&put_valid.signable_bytes());
-    let valid = identity::verify(
-        kp.identity.signing_algo(),
+    let valid = identity::verify_signed(
+        identity::SignedBy::AnyPeer,
+        Some(kp.identity.signing_algo() as u8),
         &pubkey,
         &put_valid.signable_bytes(),
         &put_valid.signature,
@@ -820,8 +821,9 @@ fn rekey_msg_roundtrip() {
     assert_eq!(decoded.kem_algo, kp.identity.kem_algo() as u8);
 
     // Verify the signature
-    let valid = identity::verify(
-        kp.identity.signing_algo(),
+    let valid = identity::verify_signed(
+        identity::SignedBy::AnyPeer,
+        Some(kp.identity.signing_algo() as u8),
         &pubkey,
         &decoded.signable_bytes(),
         &decoded.signature,
@@ -875,8 +877,8 @@ async fn signed_content_multi_publisher() {
     let topic = b"my-group-secret||llama-70b";
 
     // Both providers publish signed content for the same topic
-    let inner_hash_a = provider_a.dht_put_signed_content(topic, 600).await;
-    let inner_hash_b = provider_b.dht_put_signed_content(topic, 600).await;
+    let inner_hash_a = provider_a.dht_put_signed_content(topic, 600).await.unwrap();
+    let inner_hash_b = provider_b.dht_put_signed_content(topic, 600).await.unwrap();
 
     // Inner hashes must be identical (same content)
     assert_eq!(inner_hash_a, inner_hash_b);
@@ -932,7 +934,7 @@ async fn signed_content_garbage_rejected() {
 
     // Publish real signed content
     let topic = b"secret||model-x";
-    let inner_hash = node.dht_put_signed_content(topic, 600).await;
+    let inner_hash = node.dht_put_signed_content(topic, 600).await.unwrap();
 
     // Retrieve with correct inner hash — should find the record
     let results = node.dht_get_signed_content(&inner_hash).await;
@@ -941,7 +943,7 @@ async fn signed_content_garbage_rejected() {
     assert_eq!(results[0].1, topic);
 
     // Retrieve with wrong inner hash — should find nothing (self-authentication)
-    let wrong_hash: [u8; 64] = hash_64(b"wrong-secret||model-x");
+    let wrong_hash = tarnet::types::ContentHandle(hash_64(b"wrong-secret||model-x"));
     let wrong_results = node.dht_get_signed_content(&wrong_hash).await;
     assert!(wrong_results.is_empty());
 }
@@ -958,7 +960,7 @@ async fn node_db_restores_sequences_and_records() {
     let original = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
 
     original.publish_hello().await;
-    let signed_hash = original.dht_put_signed_content(b"payload", 300).await;
+    let signed_hash = original.dht_put_signed_content(b"payload", 300).await.unwrap();
 
     // Read back persisted state through new Node
     let restored = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
@@ -1355,7 +1357,7 @@ async fn hidden_service_rendezvous() {
         kem_algo: default_kp_c.identity.kem_algo() as u8,
         kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*node_a, &default_kp_c, "intro", &intro_records, 600)
+    tarnet::tns::publish(&*node_a, &default_kp_c, "intro", &intro_records)
         .await
         .unwrap();
 

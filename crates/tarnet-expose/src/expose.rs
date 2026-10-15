@@ -496,7 +496,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
             };
             match state
                 .api
-                .tns_publish(identity_label, subdomain, vec![record], 3600)
+                .tns_publish(identity_label, subdomain, vec![record])
                 .await
             {
                 Ok(()) => info!(
@@ -545,7 +545,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
             let identity_record = TnsRecord::Identity(serving_sid);
             match state
                 .api
-                .tns_publish(identity_label, "@", vec![identity_record], 3600)
+                .tns_publish(identity_label, "@", vec![identity_record])
                 .await
             {
                 Ok(()) => {
@@ -913,16 +913,16 @@ mod tests {
             })
         }
 
-        async fn dht_put(&self, _: &[u8]) -> DhtId {
-            DhtId([0; 64])
+        async fn dht_put(&self, _: &[u8]) -> tarnet_api::error::ApiResult<tarnet_api::types::ContentHandle> {
+            Ok(tarnet_api::types::ContentHandle([0; 64]))
         }
-        async fn dht_get(&self, _: &DhtId, _: u32) -> Option<Vec<u8>> {
+        async fn dht_get(&self, _: &tarnet_api::types::ContentHandle, _: u32) -> Option<Vec<u8>> {
             None
         }
-        async fn dht_put_signed(&self, _: &[u8], _: u32) -> DhtId {
-            DhtId([0; 64])
+        async fn dht_put_signed(&self, _: &[u8], _: u32) -> tarnet_api::error::ApiResult<tarnet_api::types::ContentHandle> {
+            Ok(tarnet_api::types::ContentHandle([0; 64]))
         }
-        async fn dht_get_signed(&self, _: &DhtId, _: u32) -> Vec<DhtEntry> {
+        async fn dht_get_signed(&self, _: &tarnet_api::types::ContentHandle, _: u32) -> Vec<DhtEntry> {
             vec![]
         }
         async fn lookup_hello(&self, _: &PeerId, _: u32) -> Option<HelloInfo> {
@@ -976,7 +976,6 @@ mod tests {
             identity: Option<&str>,
             _label: &str,
             records: Vec<TnsRecord>,
-            _ttl_secs: u32,
         ) -> ApiResult<()> {
             self.tns_publish_called.store(true, Ordering::SeqCst);
             self.published

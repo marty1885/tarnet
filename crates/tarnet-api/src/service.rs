@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::error::{ApiError, ApiResult};
-use crate::types::{DhtId, PeerId, ServiceId};
+use crate::types::{ContentHandle, DhtId, PeerId, ServiceId};
 
 /// A single entry returned from a signed DHT get.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -397,21 +397,22 @@ pub trait ServiceApi: Send + Sync {
 
     // ── DHT: content-addressed (anonymous, self-authenticating) ──
 
-    /// Store content in the DHT. Returns the inner hash (BLAKE3 of value).
-    async fn dht_put(&self, value: &[u8]) -> DhtId;
+    /// Store content in the DHT. Returns its 64-byte content handle (the
+    /// decryption key and the hash of the stored blob; see the DHT spec).
+    async fn dht_put(&self, value: &[u8]) -> ApiResult<ContentHandle>;
 
-    /// Retrieve content by inner hash. Checks local store first, then queries
+    /// Retrieve content by its handle. Checks local store first, then queries
     /// the network if `timeout_secs > 0`. Returns None if not found.
-    async fn dht_get(&self, key: &DhtId, timeout_secs: u32) -> Option<Vec<u8>>;
+    async fn dht_get(&self, handle: &ContentHandle, timeout_secs: u32) -> Option<Vec<u8>>;
 
     // ── DHT: signed content (publisher-authenticated) ──
 
-    /// Store signed content. Returns inner hash.
-    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> DhtId;
+    /// Store signed content. Returns its content handle.
+    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle>;
 
-    /// Retrieve signed content by inner hash. Returns entries with signer and plaintext.
+    /// Retrieve signed content by its handle. Returns entries with signer and plaintext.
     /// Checks local store first, queries network if `timeout_secs > 0`.
-    async fn dht_get_signed(&self, key: &DhtId, timeout_secs: u32) -> Vec<DhtEntry>;
+    async fn dht_get_signed(&self, handle: &ContentHandle, timeout_secs: u32) -> Vec<DhtEntry>;
 
     // ── DHT: hello records (peer discovery) ──
 
@@ -449,12 +450,12 @@ pub trait ServiceApi: Send + Sync {
     /// Publish a TNS record set for a label in the given identity's zone.
     /// If `identity` is None, uses the default identity.
     /// The string may be an identity label or a base32-encoded ServiceId.
+    /// The node keeps it published (it refreshes the zone) until removed.
     async fn tns_publish(
         &self,
         identity: Option<&str>,
         label: &str,
         records: Vec<TnsRecord>,
-        ttl_secs: u32,
     ) -> ApiResult<()>;
 
     /// Resolve a dot-separated name starting from a zone.

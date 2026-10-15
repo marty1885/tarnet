@@ -28,6 +28,14 @@ const FD_GC: Duration = Duration::from_secs(180);
 
 /// Duplicate seqno requests are dropped for this long.
 const REQUEST_DEDUP: Duration = Duration::from_secs(10);
+/// Seqno requests remembered at once.
+const MAX_RECENT_REQUESTS: usize = 8192;
+
+/// A starving destination's seqno request is resent after this, doubling up
+/// to `STARVE_RETRY_MAX`, until a feasible route appears or its feasibility
+/// distance expires. Longer than `REQUEST_DEDUP`, so relays pass the retry.
+const STARVE_RETRY_MIN: Duration = Duration::from_secs(12);
+const STARVE_RETRY_MAX: Duration = Duration::from_secs(120);
 
 /// Landmark acceptance limits and flag rate limit (sybil defence).
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +99,10 @@ struct Neighbour {
     rib: BTreeMap<PeerId, RouteEntry>,
     /// A full dump in progress, replacing `rib` when it ends.
     staging: Option<BTreeMap<PeerId, RouteEntry>>,
+    /// No full dump from this neighbour has completed yet: its first dump
+    /// applies as it arrives (there is nothing stale to protect, and on a
+    /// slow link the whole dump takes a while).
+    first_dump: bool,
     /// Changes to our advertised set not yet sent to this neighbour.
     pending: BTreeMap<PeerId, RouteEntry>,
 }
@@ -115,7 +127,11 @@ pub struct RoutingTable {
     advertised: BTreeMap<PeerId, RouteEntry>,
     /// Feasibility distance `(seqno, metric)` and when it was last used.
     fd: HashMap<PeerId, (u16, u16, Instant)>,
-    recent_requests: HashMap<(PeerId, u16), Instant>,
+    recent_requests: crate::bounded::BoundedMap<(PeerId, u16), ()>,
+    /// Destinations with routes but none feasible: when to resend their seqno
+    /// request, and the current backoff. A lost request must not leave a
+    /// destination unreachable.
+    starving: HashMap<PeerId, (Instant, Duration)>,
     /// The last reselection had at least as many destinations as it keeps.
     evicting: bool,
     /// We are a landmark: our own route carries the flag.
@@ -144,7 +160,8 @@ impl RoutingTable {
             selected: HashMap::new(),
             advertised: BTreeMap::new(),
             fd: HashMap::new(),
-            recent_requests: HashMap::new(),
+            recent_requests: crate::bounded::BoundedMap::new(MAX_RECENT_REQUESTS, REQUEST_DEDUP),
+            starving: HashMap::new(),
             evicting: false,
             landmark: false,
             limits: LandmarkLimits::default(),
@@ -324,29 +341,39 @@ impl RoutingTable {
 
     // ── Link events ──
 
-    /// A neighbour came up. Returns the full dump to send it.
-    pub fn neighbour_up(&mut self, n: PeerId, cost: u16) -> Vec<RouteUpdateMsg> {
+    /// A neighbour came up (or another link to it did). Returns the full
+    /// dump to send it, and seqno requests if its cost changed.
+    pub fn neighbour_up(&mut self, n: PeerId, cost: u16) -> (Vec<RouteUpdateMsg>, Vec<SeqnoRequest>) {
+        let requests = if self.neighbours.contains_key(&n) {
+            self.neighbour_cost(&n, cost)
+        } else {
+            self.neighbours.insert(
+                n,
+                Neighbour {
+                    cost: cost.max(1),
+                    degree: 0,
+                    rib: BTreeMap::new(),
+                    staging: None,
+                    first_dump: true,
+                    pending: BTreeMap::new(),
+                },
+            );
+            Vec::new()
+        };
+        (self.full_dump(&n), requests)
+    }
+
+    /// The cost of the link to `n` changed (its active link failed over, or
+    /// was replaced by a faster or slower one).
+    pub fn neighbour_cost(&mut self, n: &PeerId, cost: u16) -> Vec<SeqnoRequest> {
         let cost = cost.max(1);
-        match self.neighbours.get_mut(&n) {
-            Some(nb) if nb.cost == cost => {}
-            Some(nb) => {
+        match self.neighbours.get_mut(n) {
+            Some(nb) if nb.cost != cost => {
                 nb.cost = cost;
-                self.decide();
+                self.decide()
             }
-            None => {
-                self.neighbours.insert(
-                    n,
-                    Neighbour {
-                        cost,
-                        degree: 0,
-                        rib: BTreeMap::new(),
-                        staging: None,
-                        pending: BTreeMap::new(),
-                    },
-                );
-            }
+            _ => Vec::new(),
         }
-        self.full_dump(&n)
     }
 
     /// A neighbour went down: its routes are gone. Returns seqno requests for
@@ -376,15 +403,32 @@ impl RoutingTable {
             return Vec::new();
         };
         nb.degree = msg.degree;
-        if msg.flags & crate::wire::ROUTE_FULL_START != 0 {
+        let full = msg.flags & crate::wire::ROUTE_FULL != 0;
+        let start = msg.flags & crate::wire::ROUTE_FULL_START != 0;
+        let end = msg.flags & crate::wire::ROUTE_FULL_END != 0;
+        if (start || end) && !full {
+            // Malformed: dump brackets only appear on dump messages.
+            return Vec::new();
+        }
+        if start {
             nb.staging = Some(BTreeMap::new());
         }
-        let full = msg.flags & crate::wire::ROUTE_FULL != 0;
-        // Entries for ourselves are kept too: the digest covers them. They
-        // are never selected.
+        if full && nb.staging.is_none() {
+            // Part of a dump whose start we missed: useless on its own. The
+            // next digest asks again.
+            return Vec::new();
+        }
+        // A dump fills only the staging copy and takes effect when it ends,
+        // so a dump whose end is lost changes nothing. Ordinary updates
+        // apply to what we hold now and to a dump in progress, which they
+        // are newer than.
+        let live = !full || nb.first_dump;
         for e in &msg.entries {
-            let mut targets = vec![&mut nb.rib];
-            if let (true, Some(staging)) = (full, nb.staging.as_mut()) {
+            let mut targets: Vec<&mut BTreeMap<PeerId, RouteEntry>> = Vec::with_capacity(2);
+            if live {
+                targets.push(&mut nb.rib);
+            }
+            if let Some(staging) = nb.staging.as_mut() {
                 targets.push(staging);
             }
             for rib in targets {
@@ -395,9 +439,10 @@ impl RoutingTable {
                 }
             }
         }
-        if msg.flags & crate::wire::ROUTE_FULL_END != 0 {
+        if end {
             if let Some(staging) = nb.staging.take() {
                 nb.rib = staging;
+                nb.first_dump = false;
             }
         }
         self.decide()
@@ -429,24 +474,21 @@ impl RoutingTable {
             }
             return None;
         }
-        let now = Instant::now();
-        if self
-            .recent_requests
-            .get(&(dest, seqno))
-            .is_some_and(|t| now.duration_since(*t) < REQUEST_DEDUP)
-        {
+        // Seen recently (or too many tracked): don't forward it again.
+        if self.recent_requests.try_insert((dest, seqno), ()).is_err() {
             return None;
         }
-        self.recent_requests.insert((dest, seqno), now);
         if let Some(best) = self.selected.get(&dest).and_then(|r| r.first()) {
             if !seqno_newer(seqno, best.seqno) {
                 self.resend(&dest, from);
                 return None;
             }
         }
-        if hops <= 1 {
+        // The hop budget comes from the wire: never more than we'd start with.
+        if hops.min(SEQNO_REQUEST_HOPS) <= 1 {
             return None;
         }
+        let hops = hops.min(SEQNO_REQUEST_HOPS);
         let next = self
             .selected
             .get(&dest)
@@ -531,14 +573,49 @@ impl RoutingTable {
         Some(RouteDigestMsg::of(self.advertised.values()))
     }
 
-    /// Forget old feasibility distances and request records.
-    pub fn gc(&mut self) {
+    /// Forget old feasibility distances and request records. A destination
+    /// whose feasibility distance expired may have become selectable, so this
+    /// reselects; returns the resulting seqno requests.
+    pub fn gc(&mut self) -> Vec<SeqnoRequest> {
         let now = Instant::now();
         let selected = &self.selected;
+        let before = self.fd.len();
         self.fd
             .retain(|d, (_, _, t)| selected.contains_key(d) || now.duration_since(*t) < FD_GC);
-        self.recent_requests
-            .retain(|_, t| now.duration_since(*t) < REQUEST_DEDUP);
+        self.recent_requests.expire(now);
+        if self.fd.len() < before {
+            self.decide()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Resend the seqno requests of destinations still starving whose retry
+    /// is due, with backoff.
+    pub fn retry_starving(&mut self) -> Vec<SeqnoRequest> {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        for (dest, (next, backoff)) in self.starving.iter_mut() {
+            if *next > now {
+                continue;
+            }
+            let Some(&(s, _, _)) = self.fd.get(dest) else {
+                continue;
+            };
+            *backoff = (*backoff * 2).min(STARVE_RETRY_MAX);
+            *next = now + *backoff;
+            for (n, nb) in &self.neighbours {
+                if nb.rib.contains_key(dest) {
+                    out.push(SeqnoRequest {
+                        to: *n,
+                        dest: *dest,
+                        seqno: s.wrapping_add(1),
+                        hops: SEQNO_REQUEST_HOPS,
+                    });
+                }
+            }
+        }
+        out
     }
 
     // ── Internals ──
@@ -691,6 +768,7 @@ impl RoutingTable {
                 });
             }
         }
+        let reachable: HashSet<PeerId> = candidates.keys().copied().collect();
 
         let mut ranked: Vec<(u32, PeerId, Vec<Route>)> = candidates
             .into_iter()
@@ -742,7 +820,6 @@ impl RoutingTable {
             self.set_advertised(e);
         }
 
-        let mut requests = Vec::new();
         for dest in old.keys() {
             if self.selected.contains_key(dest) {
                 continue;
@@ -753,17 +830,31 @@ impl RoutingTable {
                 metric: ROUTE_INFINITY,
                 eflags: 0,
             });
-            // Starvation: routes exist but none is feasible. Ask the
-            // destination for a newer seqno.
-            if let (Some(via), Some(&(s, _, _))) = (infeasible.get(dest), self.fd.get(dest)) {
-                for n in via {
-                    requests.push(SeqnoRequest {
-                        to: *n,
-                        dest: *dest,
-                        seqno: s.wrapping_add(1),
-                        hops: SEQNO_REQUEST_HOPS,
-                    });
-                }
+        }
+
+        // Starvation: routes exist but none is feasible. Ask the destination
+        // for a newer seqno now, and keep asking (`retry_starving`) until a
+        // feasible route appears or the feasibility distance expires.
+        let now = Instant::now();
+        let fd = &self.fd;
+        self.starving
+            .retain(|d, _| infeasible.contains_key(d) && !reachable.contains(d) && fd.contains_key(d));
+        let mut requests = Vec::new();
+        for (dest, via) in &infeasible {
+            if reachable.contains(dest) || self.starving.contains_key(dest) {
+                continue;
+            }
+            let Some(&(s, _, _)) = self.fd.get(dest) else {
+                continue;
+            };
+            self.starving.insert(*dest, (now + STARVE_RETRY_MIN, STARVE_RETRY_MIN));
+            for n in via {
+                requests.push(SeqnoRequest {
+                    to: *n,
+                    dest: *dest,
+                    seqno: s.wrapping_add(1),
+                    hops: SEQNO_REQUEST_HOPS,
+                });
             }
         }
         requests
@@ -825,7 +916,7 @@ mod tests {
 
     fn link(a: &mut RoutingTable, b: &mut RoutingTable) {
         let (pa, pb) = (a.local, b.local);
-        let (to_b, to_a) = (a.neighbour_up(pb, COST_FAST), b.neighbour_up(pa, COST_FAST));
+        let (to_b, to_a) = (a.neighbour_up(pb, COST_FAST).0, b.neighbour_up(pa, COST_FAST).0);
         for m in to_b {
             b.apply_update(&pa, &m);
         }
@@ -885,6 +976,119 @@ mod tests {
         a.apply_update(&pid(3), &update(vec![entry(9, 10, 2)]));
         a.apply_update(&pid(2), &update(vec![entry(9, 10, ROUTE_INFINITY)]));
         assert!(a.lookup(&pid(9)).is_none());
+    }
+
+    fn dump(flags: u8, entries: Vec<RouteEntry>) -> RouteUpdateMsg {
+        RouteUpdateMsg {
+            flags: ROUTE_FULL | flags,
+            degree: 1,
+            entries,
+        }
+    }
+
+    #[test]
+    fn a_dump_takes_effect_when_it_ends_and_keeps_newer_updates() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(&pid(2), &dump(ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
+        assert!(a.lookup(&pid(9)).is_some());
+
+        // A second dump: nothing changes while it is in progress.
+        a.apply_update(&pid(2), &dump(ROUTE_FULL_START, vec![entry(8, 1, 1)]));
+        assert!(a.lookup(&pid(8)).is_none(), "dump applied before its end");
+        assert!(a.lookup(&pid(9)).is_some());
+        // An ordinary update during the dump applies now and survives the end.
+        a.apply_update(&pid(2), &update(vec![entry(7, 1, 1)]));
+        assert!(a.lookup(&pid(7)).is_some());
+        a.apply_update(&pid(2), &dump(ROUTE_FULL_END, vec![]));
+        assert!(a.lookup(&pid(8)).is_some());
+        assert!(a.lookup(&pid(7)).is_some(), "update during the dump was lost");
+        assert!(a.lookup(&pid(9)).is_none(), "entry missing from the dump kept");
+    }
+
+    #[test]
+    fn a_dump_whose_end_is_lost_changes_nothing() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(&pid(2), &dump(ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
+        a.apply_update(&pid(2), &dump(ROUTE_FULL_START, vec![entry(8, 1, 1)]));
+        assert!(a.lookup(&pid(8)).is_none());
+        assert!(a.lookup(&pid(9)).is_some());
+        // Dump parts without a start, and brackets on ordinary updates, are
+        // ignored.
+        let mut b = RoutingTable::new(pid(1));
+        b.neighbour_up(pid(2), COST_FAST);
+        b.apply_update(&pid(2), &dump(0, vec![entry(6, 1, 1)]));
+        assert!(b.lookup(&pid(6)).is_none());
+        b.apply_update(
+            &pid(2),
+            &RouteUpdateMsg {
+                flags: ROUTE_FULL_START,
+                degree: 1,
+                entries: vec![entry(5, 1, 1)],
+            },
+        );
+        assert!(b.lookup(&pid(5)).is_none());
+    }
+
+    #[test]
+    fn a_first_dump_applies_as_it_arrives() {
+        // Nothing stale to protect from a new neighbour, and on a slow link
+        // its dump takes a while.
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(&pid(2), &dump(ROUTE_FULL_START, vec![entry(9, 1, 1)]));
+        assert!(a.lookup(&pid(9)).is_some());
+    }
+
+    #[test]
+    fn a_starving_destination_is_asked_again() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.neighbour_up(pid(3), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![entry(9, 10, 1)]));
+        a.apply_update(&pid(3), &update(vec![entry(9, 10, 5)]));
+        let first = a.apply_update(&pid(2), &update(vec![entry(9, 10, ROUTE_INFINITY)]));
+        assert_eq!(first.len(), 1);
+        // Not before the retry is due...
+        assert!(a.retry_starving().is_empty());
+        // ...then again, with backoff, since the first request may be lost.
+        a.starving.get_mut(&pid(9)).unwrap().0 = Instant::now();
+        let again = a.retry_starving();
+        assert_eq!(again, first);
+        assert_eq!(a.starving[&pid(9)].1, STARVE_RETRY_MIN * 2);
+        // A feasible route ends it.
+        a.apply_update(&pid(3), &update(vec![entry(9, 11, 5)]));
+        assert!(a.lookup(&pid(9)).is_some());
+        assert!(a.starving.is_empty());
+    }
+
+    #[test]
+    fn feasibility_expiry_reselects() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.neighbour_up(pid(3), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![entry(9, 10, 1)]));
+        a.apply_update(&pid(3), &update(vec![entry(9, 10, 5)]));
+        a.apply_update(&pid(2), &update(vec![entry(9, 10, ROUTE_INFINITY)]));
+        assert!(a.lookup(&pid(9)).is_none());
+        let Some(old) = Instant::now().checked_sub(FD_GC + Duration::from_secs(1)) else {
+            return;
+        };
+        a.fd.get_mut(&pid(9)).unwrap().2 = old;
+        a.gc();
+        assert_eq!(a.lookup(&pid(9)).map(|r| r.next_hop), Some(pid(3)));
+    }
+
+    #[test]
+    fn a_neighbour_cost_change_reprices_its_routes() {
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![entry(9, 1, 1)]));
+        assert_eq!(a.lookup(&pid(9)).unwrap().cost, 2);
+        a.neighbour_cost(&pid(2), COST_SLOW);
+        assert_eq!(a.lookup(&pid(9)).unwrap().cost, 17);
+        assert_eq!(a.lookup(&pid(2)).unwrap().cost, COST_SLOW as u32);
     }
 
     #[test]

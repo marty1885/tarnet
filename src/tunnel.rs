@@ -24,9 +24,26 @@ pub struct Tunnel {
     send_seq: u64,
     recv_highest: Option<u64>,
     recv_seen: BTreeSet<u64>,
+    /// Responder side: nonces of the key exchanges that created this tunnel
+    /// and replaced its predecessors, newest last, so a replay of any of them
+    /// can't swap the keys while the tunnel lives.
+    pub kex_nonces: Vec<[u8; 32]>,
+    /// Last time it carried data either way, for eviction.
+    last_used: std::time::Instant,
 }
 
+/// Key exchanges a tunnel remembers (see [`Tunnel::kex_nonces`]).
+const KEX_NONCES_MAX: usize = 64;
+
 impl Tunnel {
+    /// Remember the key exchange that (re)created this tunnel.
+    pub fn remember_kex(&mut self, nonce: [u8; 32]) {
+        if self.kex_nonces.len() >= KEX_NONCES_MAX {
+            self.kex_nonces.remove(0);
+        }
+        self.kex_nonces.push(nonce);
+    }
+
     /// Create a new tunnel from a completed key exchange.
     /// `is_initiator` determines which direction gets which keys.
     pub fn new(remote_peer: PeerId, shared_secret: &[u8; 32], is_initiator: bool) -> Self {
@@ -45,6 +62,8 @@ impl Tunnel {
             send_seq: 0,
             recv_highest: None,
             recv_seen: BTreeSet::new(),
+            kex_nonces: Vec::new(),
+            last_used: std::time::Instant::now(),
         }
     }
 
@@ -77,6 +96,7 @@ impl Tunnel {
         out.extend_from_slice(&sequence.to_be_bytes());
         out.extend_from_slice(&nonce);
         out.extend_from_slice(&ciphertext);
+        self.last_used = std::time::Instant::now();
         Ok(out)
     }
 
@@ -108,6 +128,7 @@ impl Tunnel {
         // Commit replay state only after authentication succeeds. A forged packet
         // with a high sequence number must not advance the window.
         self.record_sequence(sequence);
+        self.last_used = std::time::Instant::now();
         Ok(plaintext)
     }
 
@@ -134,9 +155,17 @@ impl Tunnel {
 
 /// Tunnel table: maps remote PeerId → Tunnel.
 /// No relay state — tunnels are pure e2e encryption keyed by peer.
+///
+/// Bounded: past [`MAX_TUNNELS`], a new tunnel evicts the one used least
+/// recently. Tunnels aren't expired by idleness, since the far end can't
+/// tell its peer forgot one; under a flood of new initiators, the tunnels
+/// in use survive.
 pub struct TunnelTable {
-    pub tunnels: HashMap<PeerId, Tunnel>,
+    tunnels: HashMap<PeerId, Tunnel>,
 }
+
+/// Tunnels held at once.
+pub const MAX_TUNNELS: usize = 4096;
 
 impl TunnelTable {
     pub fn new() -> Self {
@@ -147,7 +176,21 @@ impl TunnelTable {
 
     /// Register a tunnel to a remote peer.
     pub fn add(&mut self, tunnel: Tunnel) {
+        if !self.tunnels.contains_key(&tunnel.remote_peer) && self.tunnels.len() >= MAX_TUNNELS {
+            if let Some(stale) = self
+                .tunnels
+                .iter()
+                .min_by_key(|(_, t)| t.last_used)
+                .map(|(p, _)| *p)
+            {
+                self.tunnels.remove(&stale);
+            }
+        }
         self.tunnels.insert(tunnel.remote_peer, tunnel);
+    }
+
+    pub fn len(&self) -> usize {
+        self.tunnels.len()
     }
 
     /// Look up a tunnel by remote peer.
@@ -167,6 +210,23 @@ impl TunnelTable {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_table_is_bounded_and_keeps_tunnels_in_use() {
+        let mut table = TunnelTable::new();
+        for i in 0..MAX_TUNNELS as u32 {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&i.to_be_bytes());
+            table.add(Tunnel::new(PeerId(id), &[1; 32], false));
+        }
+        // The first is in use; adding one more evicts some other.
+        let first = PeerId([0; 32]);
+        table.get_mut(&first).unwrap().encrypt(b"x").unwrap();
+        table.add(Tunnel::new(PeerId([0xFF; 32]), &[1; 32], false));
+        assert_eq!(table.len(), MAX_TUNNELS);
+        assert!(table.get(&first).is_some());
+        assert!(table.get(&PeerId([0xFF; 32])).is_some());
+    }
+
     use super::*;
 
     #[test]

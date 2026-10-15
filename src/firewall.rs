@@ -3,13 +3,12 @@
 //! Evaluates inbound wire messages against an ordered chain of rules.
 //! First matching rule wins; if none match the chain's default policy applies.
 //!
-//! Connection tracking groups message types into protocol categories and
-//! records whether traffic has been seen in each direction.  A flow is
-//! `Established` once both inbound and outbound packets have been observed
-//! for the same `(PeerId, category)` pair.
+//! Connection tracking groups message types into protocol categories. A
+//! flow is `Established` when, on the link a message arrives on, this node
+//! has itself sent a message of the same category. The link records what it
+//! sent (every outgoing message passes through it); the firewall keeps no
+//! per-flow state of its own.
 
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 use rand::prelude::*;
 use rand::rngs::StdRng;
@@ -160,20 +159,9 @@ fn proto_category(mt: MessageType) -> ProtoCategory {
     }
 }
 
-struct ConnTrackEntry {
-    seen_inbound: bool,
-    seen_outbound: bool,
-    last_activity: Instant,
-}
-
-impl ConnTrackEntry {
-    fn state(&self) -> ConnState {
-        if self.seen_inbound && self.seen_outbound {
-            ConnState::Established
-        } else {
-            ConnState::New
-        }
-    }
+/// The bit `mt`'s protocol category has in a link's record of what it sent.
+pub(crate) fn category_bit(mt: MessageType) -> u8 {
+    1 << (proto_category(mt) as u8)
 }
 
 // ── Firewall ─────────────────────────────────────────────────────────
@@ -196,7 +184,6 @@ pub struct Firewall {
     rules: Vec<Rule>,
     default_policy: Action,
     next_id: u64,
-    conntrack: HashMap<(PeerId, u8), ConnTrackEntry>,
     rng: StdRng,
 }
 
@@ -206,7 +193,6 @@ impl Default for Firewall {
             rules: Vec::new(),
             default_policy: Action::Accept,
             next_id: 1,
-            conntrack: HashMap::new(),
             rng: StdRng::from_entropy(),
         }
     }
@@ -287,50 +273,18 @@ impl Firewall {
 
     // ── Connection tracking ──
 
-    /// Record outbound traffic for conntrack.
-    pub fn track_outbound(&mut self, peer: &PeerId, msg_type: MessageType) {
-        let cat = proto_category(msg_type) as u8;
-        let entry = self
-            .conntrack
-            .entry((*peer, cat))
-            .or_insert(ConnTrackEntry {
-                seen_inbound: false,
-                seen_outbound: false,
-                last_activity: Instant::now(),
-            });
-        entry.seen_outbound = true;
-        entry.last_activity = Instant::now();
-    }
-
-    /// Expire conntrack entries older than `max_age`.
-    pub fn gc_conntrack(&mut self, max_age: Duration) {
-        let cutoff = Instant::now() - max_age;
-        self.conntrack.retain(|_, e| e.last_activity > cutoff);
-    }
-
-    /// Number of active conntrack entries.
-    pub fn conntrack_len(&self) -> usize {
-        self.conntrack.len()
-    }
-
     // ── Evaluation ──
 
-    /// Evaluate an inbound message.  Updates conntrack, then walks the
-    /// rule chain.  First match wins; default policy if none match.
-    pub fn evaluate(&mut self, peer: &PeerId, msg: &WireMessage) -> Action {
-        // Update conntrack inbound
-        let cat = proto_category(msg.msg_type) as u8;
-        let entry = self
-            .conntrack
-            .entry((*peer, cat))
-            .or_insert(ConnTrackEntry {
-                seen_inbound: false,
-                seen_outbound: false,
-                last_activity: Instant::now(),
-            });
-        entry.seen_inbound = true;
-        entry.last_activity = Instant::now();
-        let state = entry.state();
+    /// Evaluate an inbound message, walking the rule chain: first match
+    /// wins, else the default policy. `replied` says whether the link it
+    /// arrived on has sent a message of its category (the flow is then
+    /// `Established`).
+    pub fn evaluate(&mut self, peer: &PeerId, msg: &WireMessage, replied: bool) -> Action {
+        let state = if replied {
+            ConnState::Established
+        } else {
+            ConnState::New
+        };
 
         // Walk rules
         for rule in &self.rules {
@@ -339,5 +293,27 @@ impl Firewall {
             }
         }
         self.default_policy
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn established_follows_what_the_link_sent() {
+        let mut fw = Firewall::default();
+        fw.add_rule(Match::State(ConnState::Established), Action::Accept);
+        fw.set_default_policy(Action::Drop);
+        let peer = PeerId([1; 32]);
+        let get = WireMessage::new(MessageType::DhtGet, vec![]);
+        assert_eq!(fw.evaluate(&peer, &get, false), Action::Drop);
+        assert_eq!(fw.evaluate(&peer, &get, true), Action::Accept);
+        // Request and response share a category.
+        assert_eq!(
+            category_bit(MessageType::DhtGet),
+            category_bit(MessageType::DhtGetResponse)
+        );
+        assert_ne!(category_bit(MessageType::DhtGet), category_bit(MessageType::CircuitRelay));
     }
 }

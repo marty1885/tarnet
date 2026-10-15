@@ -17,10 +17,7 @@ const POOL_WALKS_AT_ONCE: usize = 8;
 /// How long the walker waits for a result, and relays remember a walk.
 const WALK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Walks a relay remembers at once.
-const MAX_WALKS: usize = 4096;
-/// Walks accepted per second per neighbour, and the burst allowed.
-const WALK_RATE: f64 = 10.0;
-const WALK_BURST: f64 = 100.0;
+const MAX_FORWARDED_WALKS: usize = 4096;
 /// Rounds of walks a request for relays may wait for.
 const ON_DEMAND_ROUNDS: usize = 3;
 /// Most steps a walk may ask for.
@@ -42,7 +39,6 @@ struct Forwarded {
     prev_token: [u8; 32],
     /// Who we sent it to: only they may answer.
     next: PeerId,
-    at: Instant,
 }
 
 /// Our own walk in flight.
@@ -52,20 +48,17 @@ struct Waiter {
 }
 
 pub(super) struct SampleState {
-    forwarded: Mutex<HashMap<[u8; 32], Forwarded>>,
+    forwarded: Mutex<crate::bounded::BoundedMap<[u8; 32], Forwarded>>,
     waiters: Mutex<HashMap<[u8; 32], Waiter>>,
     pool: Mutex<Vec<SampledRelay>>,
-    /// Per neighbour: walk tokens left and when they were counted.
-    budget: Mutex<HashMap<PeerId, (f64, Instant)>>,
 }
 
 impl SampleState {
     pub(super) fn new() -> Self {
         Self {
-            forwarded: Mutex::new(HashMap::new()),
+            forwarded: Mutex::new(crate::bounded::BoundedMap::new(MAX_FORWARDED_WALKS, WALK_TIMEOUT)),
             waiters: Mutex::new(HashMap::new()),
             pool: Mutex::new(Vec::new()),
-            budget: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -105,24 +98,8 @@ impl Node {
         None
     }
 
-    async fn walk_allowed(&self, from: &PeerId) -> bool {
-        let mut budget = self.sampling.budget.lock().await;
-        let now = Instant::now();
-        let (tokens, at) = budget.entry(*from).or_insert((WALK_BURST, now));
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * WALK_RATE).min(WALK_BURST);
-        *at = now;
-        if *tokens < 1.0 {
-            return false;
-        }
-        *tokens -= 1.0;
-        true
-    }
-
     pub(super) async fn handle_sample_walk(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let msg = SampleWalkMsg::from_bytes(payload)?;
-        if !self.walk_allowed(&from).await {
-            return Ok(());
-        }
         let Some((next, steps)) = self.walk_from_here(msg.steps.min(MAX_STEPS)).await else {
             // The walk ends here. A client-only node is no relay.
             let sample = if self.is_client_only() {
@@ -144,22 +121,13 @@ impl Node {
         };
         // A fresh token per hop, so nodes on the walk can't match theirs.
         let token: [u8; 32] = rand::random();
-        {
-            let mut forwarded = self.sampling.forwarded.lock().await;
-            let now = Instant::now();
-            forwarded.retain(|_, f| now.duration_since(f.at) < WALK_TIMEOUT);
-            if forwarded.len() >= MAX_WALKS {
-                return Ok(());
-            }
-            forwarded.insert(
-                token,
-                Forwarded {
-                    prev: from,
-                    prev_token: msg.token,
-                    next,
-                    at: now,
-                },
-            );
+        let forwarded = Forwarded {
+            prev: from,
+            prev_token: msg.token,
+            next,
+        };
+        if self.sampling.forwarded.lock().await.try_insert(token, forwarded).is_err() {
+            return Ok(());
         }
         let walk = SampleWalkMsg { token, steps };
         self.send_to_peer_deferred(&next, &walk.to_wire().encode())
@@ -179,7 +147,10 @@ impl Node {
         let fwd = {
             let mut forwarded = self.sampling.forwarded.lock().await;
             match forwarded.get(&msg.token) {
-                Some(f) if f.next == from => forwarded.remove(&msg.token).expect("checked"),
+                Some(f) if f.next == from => match forwarded.remove(&msg.token) {
+                    Some(f) => f,
+                    None => return Ok(()),
+                },
                 _ => return Ok(()),
             }
         };
@@ -238,7 +209,7 @@ impl Node {
         }
         // Its address reaches it from anywhere; the walk's path only
         // from near where the walk ended.
-        if let Some(rec) = address.filter(|r| r.peer == peer && r.verify()) {
+        if let Some(rec) = address.and_then(|r| crate::directory::VerifiedAddress::verify_for(r, &peer)) {
             self.cache_address(rec).await;
         }
         // Drop our own neighbourhood from the hints: they are sent to
@@ -261,9 +232,10 @@ impl Node {
         let found = futures_util::future::join_all(walks).await;
         let mut pool = self.sampling.pool.lock().await;
         for s in found.into_iter().flatten() {
-            match pool.iter_mut().find(|p| p.peer == s.peer) {
-                Some(p) => *p = s,
-                None => pool.push(s),
+            if let Some(p) = pool.iter_mut().find(|p| p.peer == s.peer) {
+                *p = s;
+            } else if pool.len() < POOL_SIZE {
+                pool.push(s);
             }
         }
     }

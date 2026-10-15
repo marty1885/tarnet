@@ -14,14 +14,14 @@ const EXTEND_ATTEMPTS: usize = 3;
 /// Tries at getting TRUNCATED back from the last built hop.
 const TRUNCATE_ATTEMPTS: usize = 3;
 /// How long a hop keeps its CircuitCreated reply for answering resent CREATEs.
-const CREATED_REPLY_TTL: Duration = Duration::from_secs(30);
+pub(super) const CREATED_REPLY_TTL: Duration = Duration::from_secs(30);
+/// Legs a relay holds waiting for their CREATED (routed CREATEs, EXTENDs),
+/// and cached CREATED replies.
+pub(super) const MAX_PENDING_LEGS: usize = 16 * 1024;
 /// How long a CREATE's ephemeral key is remembered to catch loops.
-const CREATE_KEY_TTL: Duration = Duration::from_secs(30);
+pub(super) const CREATE_KEY_TTL: Duration = Duration::from_secs(30);
 /// Ephemeral keys remembered at once.
-const MAX_CREATE_KEYS: usize = 16 * 1024;
-/// CREATEs accepted per second per incoming link, and the burst allowed.
-const CREATE_RATE: f64 = 50.0;
-const CREATE_BURST: f64 = 200.0;
+pub(super) const MAX_CREATE_KEYS: usize = 16 * 1024;
 /// A routed CREATE not answered in this time is torn down.
 pub(super) const ROUTED_CREATE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A relay or endpoint entry that carries no cell for this long is torn
@@ -42,7 +42,7 @@ pub(super) struct CircuitAttemptGuard {
     circuits: CircuitState,
     endpoints: EndpointState,
     first_hop: Option<PeerId>,
-    links: Arc<Mutex<crate::peer_transport::LinkTable>>,
+    sender: super::sender::Sender,
     pub(super) armed: bool,
 }
 
@@ -431,7 +431,7 @@ impl Drop for CircuitAttemptGuard {
         let circuits = self.circuits.clone();
         let endpoints = self.endpoints.clone();
         let first_hop = self.first_hop;
-        let links = self.links.clone();
+        let sender = self.sender.clone();
         tokio::spawn(async move {
             circuits.pending_extends.lock().await.remove(&id);
             circuits.pending_create_peers.lock().await.remove(&id);
@@ -448,14 +448,10 @@ impl Drop for CircuitAttemptGuard {
             let removed = circuits.outbound.lock().await.remove(&id);
             if removed.is_none() {
                 if let Some(peer) = first_hop {
-                    let link = links.lock().await.get(&peer).cloned();
-                    if let Some(link) = link {
-                        let _ = link
-                            .send_message_critical(
-                                &CircuitDestroyMsg { circuit_id: id }.to_wire().encode(),
-                            )
-                            .await;
-                    }
+                    let destroy = CircuitDestroyMsg { circuit_id: id }.to_wire().encode();
+                    let _ = sender
+                        .to_peer(&peer, &destroy, super::sender::Queue::Critical, super::sender::Budget::Upkeep)
+                        .await;
                 }
             }
         });
@@ -480,7 +476,7 @@ impl Node {
             circuits: self.circuits.clone(),
             endpoints: self.endpoints.clone(),
             first_hop: None,
-            links: self.links.clone(),
+            sender: self.sender.clone(),
             armed: true,
         }
     }
@@ -900,41 +896,31 @@ impl Node {
             return Ok(());
         }
 
-        // Per-peer and global stream limits to prevent SYN flood.
-        {
-            let owners = self.endpoints.stream_owners.lock().await;
-            // Global limit.
-            if owners.len() >= super::MAX_STREAMS_GLOBAL {
-                drop(owners);
-                log::warn!("STREAM_BEGIN rejected: global stream limit reached");
-                self.send_endpoint_relay_cell(
-                    from,
-                    circuit_id,
-                    RelayCellCommand::StreamRefused,
-                    &[],
-                )
-                .await?;
-                return Ok(());
-            }
-            // Per-peer limit.
+        // Per-peer and global stream limits to prevent SYN flood, checked
+        // and claimed in one step so concurrent STREAM_BEGINs can't overrun
+        // them.
+        let refused = {
+            let mut owners = self.endpoints.stream_owners.lock().await;
             let peer_count = owners.values().filter(|p| **p == from).count();
-            if peer_count >= super::MAX_STREAMS_PER_PEER {
-                drop(owners);
-                log::warn!(
-                    "STREAM_BEGIN rejected: peer {:?} at stream limit ({}/{})",
+            if owners.len() >= super::MAX_STREAMS_GLOBAL {
+                Some("global stream limit reached".to_string())
+            } else if peer_count >= super::MAX_STREAMS_PER_PEER {
+                Some(format!(
+                    "peer {:?} at stream limit ({}/{})",
                     from,
                     peer_count,
-                    super::MAX_STREAMS_PER_PEER,
-                );
-                self.send_endpoint_relay_cell(
-                    from,
-                    circuit_id,
-                    RelayCellCommand::StreamRefused,
-                    &[],
-                )
-                .await?;
-                return Ok(());
+                    super::MAX_STREAMS_PER_PEER
+                ))
+            } else {
+                owners.insert(key, from);
+                None
             }
+        };
+        if let Some(reason) = refused {
+            log::warn!("STREAM_BEGIN rejected: {}", reason);
+            self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::StreamRefused, &[])
+                .await?;
+            return Ok(());
         }
 
         log::info!(
@@ -945,7 +931,6 @@ impl Node {
             circuit_id
         );
 
-        self.endpoints.stream_owners.lock().await.insert(key, from);
         let conn = self
             .stream_connection(service_id, mode, &port, key, false)
             .await;
@@ -982,11 +967,7 @@ impl Node {
     /// itself if linked, else the next hop of our route to it, else toward
     /// the last hint we can reach. Never back to `from`.
     pub(super) async fn next_hop_toward(&self, dest: &PeerId, hints: &[PeerId], from: &PeerId) -> Option<PeerId> {
-        let linked: HashSet<PeerId> = self.links.lock().await.keys().copied().collect();
-        self.routing_table
-            .lock()
-            .await
-            .next_hop_hinted(dest, hints, |p| linked.contains(p) && p != from)
+        self.sender.next_hop(dest, hints, Some(from)).await
     }
 
     /// Reserve a circuit id on our link to `next_hop`. Must be called with
@@ -1016,35 +997,17 @@ impl Node {
     async fn note_create_key(&self, eph_pk: &[u8], key: CircuitKey) -> bool {
         let id = *blake3::hash(eph_pk).as_bytes();
         let mut seen = self.circuits.create_keys.lock().await;
-        let now = Instant::now();
         match seen.get(&id) {
-            Some((k, at)) if now.duration_since(*at) < CREATE_KEY_TTL => *k == key,
-            _ => {
-                if seen.len() >= MAX_CREATE_KEYS {
-                    seen.retain(|_, (_, at)| now.duration_since(*at) < CREATE_KEY_TTL);
-                    if seen.len() >= MAX_CREATE_KEYS {
-                        return false;
-                    }
-                }
-                seen.insert(id, (key, now));
-                true
-            }
+            Some(k) => *k == key,
+            None => seen.try_insert(id, key).is_ok(),
         }
     }
 
-    /// Token bucket for CREATEs arriving on one link.
-    async fn allow_create(&self, from: &PeerId) -> bool {
-        let mut buckets = self.circuits.create_budget.lock().await;
-        let now = Instant::now();
-        let (tokens, at) = buckets.entry(*from).or_insert((CREATE_BURST, now));
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * CREATE_RATE).min(CREATE_BURST);
-        *at = now;
-        if *tokens >= 1.0 {
-            *tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+    /// Admit a new circuit leg on `from`'s behalf (a CREATE from it, or an
+    /// EXTEND it asked of us): its circuit cap and create rate.
+    async fn admit_circuit(&self, from: &PeerId) -> bool {
+        let circuits = self.circuits.table.lock().await.circuits_for_peer(from);
+        self.governor.lock().await.admit_circuit(from, circuits)
     }
 
     async fn refuse_create(&self, to: &PeerId, circuit_id: u32) {
@@ -1081,6 +1044,12 @@ impl Node {
             log::debug!("EXTEND: no route to {:?}", req.destination);
             return fail().await;
         };
+        // The legs installed here are work done for `from`: the same
+        // budget and circuit cap as a CREATE from it.
+        if !self.admit_circuit(&from).await {
+            log::debug!("EXTEND over budget for {:?}, refusing", from);
+            return fail().await;
+        }
         let we_initiated_next = self.we_initiated_link(&next_hop).await;
 
         let reserved = self.circuits.pending_create_peers.lock().await;
@@ -1102,6 +1071,18 @@ impl Node {
             circuit_id: outbound_id,
             from_peer: next_hop,
         };
+        // Claim the pending leg before installing anything.
+        if self
+            .circuits
+            .relay_extend_pending
+            .lock()
+            .await
+            .try_insert(out_key, (from, inbound_circuit_id))
+            .is_err()
+        {
+            drop((table, outbound, reserved));
+            return fail().await;
+        }
         // Cells from downstream gain our layer on their way to the initiator.
         let bwd_crypto = self
             .circuits
@@ -1132,11 +1113,6 @@ impl Node {
 
         // A loop that brings this CREATE back to us must be recognised.
         self.note_create_key(&req.eph_pk, out_key).await;
-        self.circuits
-            .relay_extend_pending
-            .lock()
-            .await
-            .insert(out_key, (from, inbound_circuit_id, Instant::now()));
         let create = CircuitCreateMsg {
             circuit_id: outbound_id,
             encrypted_payload: extend_data.to_vec(),
@@ -1198,8 +1174,8 @@ impl Node {
             .lock()
             .await
             .get(&key)
-            .filter(|(hash, _, _)| *hash == create_hash)
-            .map(|(_, reply, _)| reply.clone());
+            .filter(|(hash, _)| *hash == create_hash)
+            .map(|(_, reply)| reply.clone());
         if let Some(reply) = cached {
             if self.circuits.table.lock().await.lookup(&key).is_some() {
                 log::debug!("CircuitCreate {} resent by {:?}, replaying reply", msg.circuit_id, from);
@@ -1219,8 +1195,8 @@ impl Node {
             return self.send_to_peer_critical(&next_hop, &create).await;
         }
 
-        if !self.allow_create(&from).await {
-            log::debug!("CREATE rate limit for {:?}, refusing", from);
+        if !self.admit_circuit(&from).await {
+            log::debug!("CREATE over budget for {:?}, refusing", from);
             self.refuse_create(&from, msg.circuit_id).await;
             return Ok(());
         }
@@ -1287,15 +1263,19 @@ impl Node {
         }
         .to_wire()
         .encode();
-        self.circuits.routed_pending.lock().await.insert(
-            down,
-            RoutedCreate {
-                upstream: key,
-                hash: create_hash,
-                create: create.clone(),
-                at: Instant::now(),
-            },
-        );
+        let routed = RoutedCreate {
+            upstream: key,
+            hash: create_hash,
+            create: create.clone(),
+        };
+        if self.circuits.routed_pending.lock().await.try_insert(down, routed).is_err() {
+            let mut table = self.circuits.table.lock().await;
+            table.remove(&down);
+            table.remove(&key);
+            drop(table);
+            self.refuse_create(&from, msg.circuit_id).await;
+            return Ok(());
+        }
         self.send_to_peer_critical(&next_hop, &create).await
     }
 
@@ -1351,19 +1331,15 @@ impl Node {
     /// Tear down routed CREATEs older than [`ROUTED_CREATE_TIMEOUT`]: drop
     /// both keyless entries and tell both neighbours.
     pub(super) async fn expire_routed_creates(&self) {
-        let now = Instant::now();
-        let stale: Vec<(CircuitKey, CircuitKey)> = {
-            let mut pending = self.circuits.routed_pending.lock().await;
-            let stale = pending
-                .iter()
-                .filter(|(_, p)| now.duration_since(p.at) >= ROUTED_CREATE_TIMEOUT)
-                .map(|(down, p)| (*down, p.upstream))
-                .collect::<Vec<_>>();
-            for (down, _) in &stale {
-                pending.remove(down);
-            }
-            stale
-        };
+        let stale: Vec<(CircuitKey, CircuitKey)> = self
+            .circuits
+            .routed_pending
+            .lock()
+            .await
+            .drain_expired(Instant::now())
+            .into_iter()
+            .map(|(down, p)| (down, p.upstream))
+            .collect();
         for (down, up) in stale {
             {
                 let mut table = self.circuits.table.lock().await;
@@ -1404,10 +1380,13 @@ impl Node {
     }
 
     async fn cache_created_reply(&self, key: CircuitKey, create_hash: [u8; 32], reply: Vec<u8>) {
-        let mut cache = self.circuits.created_replies.lock().await;
-        let now = Instant::now();
-        cache.retain(|_, (_, _, at)| now.duration_since(*at) < CREATED_REPLY_TTL);
-        cache.insert(key, (create_hash, reply, now));
+        // Best effort: when full, a resend just gets no cached reply.
+        let _ = self
+            .circuits
+            .created_replies
+            .lock()
+            .await
+            .upsert(key, (create_hash, reply));
     }
 
     /// Handle CircuitCreated: pass it back along a routed CREATE, turn it
@@ -1434,7 +1413,7 @@ impl Node {
                 return self.send_to_peer_critical(&p.upstream.from_peer, &reply).await;
             }
             let extend = self.circuits.relay_extend_pending.lock().await.remove(&key);
-            if let Some((inbound_from, inbound_circuit_id, _)) = extend {
+            if let Some((inbound_from, inbound_circuit_id)) = extend {
                 return self
                     .send_endpoint_relay_cell(
                         inbound_from,
@@ -1584,9 +1563,7 @@ impl Node {
             .relay_extend_pending
             .lock()
             .await
-            .retain(|id, (peer, cid, _)| {
-                *id != key && !(*peer == from && *cid == msg.circuit_id)
-            });
+            .retain(|id, (peer, cid)| *id != key && !(*peer == from && *cid == msg.circuit_id));
         self.circuits
             .routed_pending
             .lock()
@@ -1738,7 +1715,19 @@ impl Node {
             service_from: None,
             created_at: Instant::now(),
         };
-        self.hidden.rendezvous.lock().await.insert(cookie, entry);
+        let mut table = self.hidden.rendezvous.lock().await;
+        let on_circuit = table
+            .iter()
+            .filter(|(_, e)| e.client_circuit_id == circuit_id && e.client_from == from)
+            .count();
+        if on_circuit >= super::MAX_RENDEZVOUS_PER_CIRCUIT {
+            log::debug!("RendezvousEstablish: too many cookies on circuit_id={}", circuit_id);
+            return Ok(());
+        }
+        // A cookie already in use is not taken over.
+        if let Err(e) = table.try_insert(cookie, entry) {
+            log::debug!("RendezvousEstablish refused: {:?}", e);
+        }
         Ok(())
     }
 

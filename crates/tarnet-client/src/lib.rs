@@ -31,7 +31,7 @@ use tarnet_api::service::{
     PoolKind, PoolRegisterOptions, PortMode, ServiceApi, TnsRecord, TnsResolution,
 };
 use tarnet_api::types::{
-    DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo,
+    ContentHandle, DhtId, IdentityScheme, KemAlgo, PeerId, PrivacyLevel, ServiceId, SigningAlgo,
 };
 
 /// Per-connection data channel: conn_id -> sender.
@@ -412,16 +412,14 @@ impl ServiceApi for IpcServiceApi {
 
     // ── DHT: content-addressed ──
 
-    async fn dht_put(&self, value: &[u8]) -> DhtId {
+    async fn dht_put(&self, value: &[u8]) -> ApiResult<ContentHandle> {
         let payload = encode_payload(&serde_bytes::ByteBuf::from(value.to_vec()));
-        let (_, resp) = self
-            .request(METHOD_DHT_PUT_CONTENT, &payload)
-            .await
-            .unwrap();
-        decode_payload(&resp).unwrap()
+        let (status, resp) = self.request(METHOD_DHT_PUT_CONTENT, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
     }
 
-    async fn dht_get(&self, key: &DhtId, timeout_secs: u32) -> Option<Vec<u8>> {
+    async fn dht_get(&self, key: &ContentHandle, timeout_secs: u32) -> Option<Vec<u8>> {
         let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
         let (status, resp) = self
@@ -437,17 +435,18 @@ impl ServiceApi for IpcServiceApi {
 
     // ── DHT: signed content ──
 
-    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> DhtId {
+    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
         let req = DhtPutSignedReq {
             ttl_secs,
             value: value.to_vec(),
         };
         let payload = encode_payload(&req);
-        let (_, resp) = self.request(METHOD_DHT_PUT_SIGNED, &payload).await.unwrap();
-        decode_payload(&resp).unwrap()
+        let (status, resp) = self.request(METHOD_DHT_PUT_SIGNED, &payload).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
     }
 
-    async fn dht_get_signed(&self, key: &DhtId, timeout_secs: u32) -> Vec<DhtEntry> {
+    async fn dht_get_signed(&self, key: &ContentHandle, timeout_secs: u32) -> Vec<DhtEntry> {
         let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
         let (status, resp) = match self
@@ -557,10 +556,9 @@ impl ServiceApi for IpcServiceApi {
         identity: Option<&str>,
         label: &str,
         records: Vec<TnsRecord>,
-        ttl_secs: u32,
     ) -> ApiResult<()> {
         let id_str: Option<String> = identity.map(|s| s.to_string());
-        let payload = encode_payload(&(id_str, label.to_string(), records, ttl_secs));
+        let payload = encode_payload(&(id_str, label.to_string(), records));
         let (status, resp) = self.request(METHOD_TNS_PUBLISH, &payload).await?;
         Self::check_status(status, &resp)
     }

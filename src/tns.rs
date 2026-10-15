@@ -571,7 +571,7 @@ pub(crate) fn open_bundle(
     if plaintext.len() < 4 || plaintext[0] != TNS_BUNDLE_VERSION {
         return None;
     }
-    let algo = tarnet_api::types::SigningAlgo::from_u8(plaintext[1]).ok()?;
+    let algo_byte = plaintext[1];
     let pk_len = u16::from_be_bytes([plaintext[2], plaintext[3]]) as usize;
     let mut off = 4;
     if plaintext.len() < off + pk_len + 8 + 4 {
@@ -596,7 +596,8 @@ pub(crate) fn open_bundle(
     let sig = &plaintext[off..off + sig_len];
 
     let signable = bundle_signable(namespace, label, sequence, records_ser);
-    if !crate::identity::verify(algo, pubkey, &signable, sig) {
+    // The author is whoever holds the key; owners are checked below.
+    if !crate::identity::verify_signed(crate::identity::SignedBy::AnyPeer, Some(algo_byte), pubkey, &signable, sig) {
         return None;
     }
     let author = ServiceId::from_signing_pubkey(pubkey);
@@ -914,7 +915,7 @@ async fn try_open_root_local(
             Ok(m) => m,
             Err(_) => continue,
         };
-        let remaining = record.ttl.saturating_sub(record.stored_at.elapsed());
+        let remaining = record.remaining_ttl();
         match &best {
             Some((_, best_seq, _)) if *best_seq >= record.sequence => {}
             _ => best = Some((map, record.sequence, remaining)),
@@ -1090,22 +1091,15 @@ pub fn verify_peer_record(record: &TnsRecord, expected_service_id: &ServiceId) -
         return Err(Error::Protocol("not a Peer record".into()));
     };
 
-    // 1. Verify the pubkey hashes to the expected ServiceId.
-    let derived = ServiceId::from_signing_pubkey(signing_pubkey);
-    if derived != *expected_service_id {
-        return Err(Error::Crypto(
-            "Peer record signing pubkey does not match expected ServiceId".into(),
-        ));
-    }
-
-    // 2. Verify the signature over the domain-separated message.
-    let algo = tarnet_api::types::SigningAlgo::from_u8(*signing_algo)
-        .map_err(|e| Error::Wire(format!("Peer record unknown signing algo: {}", e)))?;
     let msg = peer_record_signable(peer_id);
-    if !crate::identity::verify(algo, signing_pubkey, &msg, signature) {
-        return Err(Error::Crypto(
-            "Peer record signature verification failed".into(),
-        ));
+    if !crate::identity::verify_signed(
+        crate::identity::SignedBy::Service(expected_service_id),
+        Some(*signing_algo),
+        signing_pubkey,
+        &msg,
+        signature,
+    ) {
+        return Err(Error::Crypto("Peer record not signed by its service".into()));
     }
 
     Ok(*peer_id)
@@ -1215,16 +1209,20 @@ fn open_zone_root_value(sid: &ServiceId, blob: &[u8]) -> Result<HashMap<[u8; 32]
 /// sequence is allocated atomically with the map snapshot (see
 /// [`Node::zone_published_update`]) so a higher sequence always carries a
 /// same-or-newer snapshot — concurrent publishers can't clobber each other.
+/// How long a published zone root lives. A zone root is one signed object
+/// holding every label, so it has one lifetime; the node refreshes it well
+/// within this (see `maintain_peer_records` and `maintain_hidden_services`).
+pub const ZONE_ROOT_TTL: u32 = 600;
+
 async fn publish_zone_root(
     node: &Node,
     zone_keypair: &Keypair,
     sid: &ServiceId,
     map: &std::collections::BTreeMap<String, Vec<u8>>,
     sequence: u64,
-    ttl_secs: u32,
 ) -> Result<()> {
     let value = build_zone_root_value(sid, map);
-    node.dht_put_zone_root(zone_keypair, &value, sequence, ttl_secs).await
+    node.dht_put_zone_root(zone_keypair, &value, sequence, ZONE_ROOT_TTL).await
 }
 
 /// Publish a TNS record set for a label in the given zone.
@@ -1242,12 +1240,11 @@ pub async fn publish(
     zone_keypair: &Keypair,
     label: &str,
     records: &[TnsRecord],
-    ttl_secs: u32,
 ) -> Result<()> {
     let sid = zone_keypair.identity.service_id();
     let set_bytes = serialize_record_set(records);
     let (map, sequence) = node.zone_published_update(&sid, label, Some(set_bytes)).await;
-    publish_zone_root(node, zone_keypair, &sid, &map, sequence, ttl_secs).await
+    publish_zone_root(node, zone_keypair, &sid, &map, sequence).await
 }
 
 /// Remove a label from the zone and republish the root without it.
@@ -1255,11 +1252,10 @@ pub async fn unpublish(
     node: &Node,
     zone_keypair: &Keypair,
     label: &str,
-    ttl_secs: u32,
 ) -> Result<()> {
     let sid = zone_keypair.identity.service_id();
     let (map, sequence) = node.zone_published_update(&sid, label, None).await;
-    publish_zone_root(node, zone_keypair, &sid, &map, sequence, ttl_secs).await
+    publish_zone_root(node, zone_keypair, &sid, &map, sequence).await
 }
 
 #[cfg(test)]
@@ -1478,7 +1474,7 @@ mod tests {
             let label = "www";
 
             let good = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x11; 32]))];
-            publish(&node, &victim, label, &good, 600).await.unwrap();
+            publish(&node, &victim, label, &good).await.unwrap();
 
             // Attacker forges at the same location with their own key.
             let attacker = Keypair::generate();
@@ -1513,7 +1509,7 @@ mod tests {
             let zone_id = zone.identity.service_id();
             let target = ServiceId::from_signing_pubkey(&[0x11; 32]);
 
-            publish(&node, &zone, "www", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone, "www", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
 
@@ -1525,16 +1521,17 @@ mod tests {
                 let junk_kp = Keypair::generate();
                 let value = b"junk".to_vec();
                 let seq = node.next_dht_sequence().await;
+                let expires = crate::dht::expires_in(Duration::from_secs(600));
                 // Build a ZoneRoot record at the VICTIM's root key, signed by junk_kp.
                 let rec = crate::dht::DhtRecord {
                     key: root_key,
                     record_type: RecordType::ZoneRoot,
                     sequence: seq,
-                    signer: *junk_kp.peer_id().as_bytes(),
+                    signer: junk_kp.peer_id(),
                     signer_algo: junk_kp.identity.signing.algo() as u8,
                     signer_pubkey: junk_kp.identity.signing.signing_pubkey_bytes(),
                     value: value.clone(),
-                    ttl: Duration::from_secs(600),
+                    expires,
                     stored_at: Instant::now(),
                     signature: junk_kp.sign(&crate::dht::record_signable(
                         root_key.as_bytes(),
@@ -1568,10 +1565,10 @@ mod tests {
             let b = ServiceId::from_signing_pubkey(&[0xB2; 32]);
 
             // Two labels in one zone — both must resolve (exercises root accumulation).
-            publish(&node, &zone, "www", &[TnsRecord::Identity(a)], 600)
+            publish(&node, &zone, "www", &[TnsRecord::Identity(a)])
                 .await
                 .unwrap();
-            publish(&node, &zone, "mail", &[TnsRecord::Identity(b)], 600)
+            publish(&node, &zone, "mail", &[TnsRecord::Identity(b)])
                 .await
                 .unwrap();
             assert!(matches!(
@@ -1584,7 +1581,7 @@ mod tests {
             ));
 
             // Remove www; mail must survive, www must become NotFound.
-            unpublish(&node, &zone, "www", 600).await.unwrap();
+            unpublish(&node, &zone, "www").await.unwrap();
             node.tns_cache().lock().await.clear();
             match resolve(&node, zone_id, "www").await {
                 TnsResolution::NotFound => {}
@@ -1703,7 +1700,7 @@ mod tests {
                 TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x22; 32])),
             ];
 
-            publish(&node, &zone_kp, "www", &records, 600)
+            publish(&node, &zone_kp, "www", &records)
                 .await
                 .unwrap();
 
@@ -1733,14 +1730,13 @@ mod tests {
                 &zone_a,
                 "blog",
                 &[TnsRecord::Zone(zone_b.identity.service_id())],
-                600,
             )
             .await
             .unwrap();
 
             // Zone B has "www" pointing to an identity.
             let target = ServiceId::from_signing_pubkey(&[0xFF; 32]);
-            publish(&node, &zone_b, "www", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone_b, "www", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
 
@@ -1782,7 +1778,7 @@ mod tests {
                 TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x22; 32])),
                 TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x33; 32])),
             ];
-            publish(&node, &zone, "lb", &records, 600).await.unwrap();
+            publish(&node, &zone, "lb", &records).await.unwrap();
 
             let result = resolve(&node, zone.identity.service_id(), "lb").await;
             match result {
@@ -1810,7 +1806,6 @@ mod tests {
                 &default_kp,
                 "server",
                 &[TnsRecord::Identity(target)],
-                600,
             )
             .await
             .unwrap();
@@ -1843,13 +1838,12 @@ mod tests {
                 &default_kp,
                 "tom",
                 &[TnsRecord::Zone(zone.identity.service_id())],
-                600,
             )
             .await
             .unwrap();
 
             // Publish "www" in zone Z
-            publish(&node, &zone, "www", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone, "www", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
 
@@ -1882,7 +1876,6 @@ mod tests {
                 &default_kp,
                 "tom",
                 &[TnsRecord::Zone(zone_a.identity.service_id())],
-                600,
             )
             .await
             .unwrap();
@@ -1893,13 +1886,12 @@ mod tests {
                 &zone_a,
                 "app",
                 &[TnsRecord::Zone(zone_b.identity.service_id())],
-                600,
             )
             .await
             .unwrap();
 
             let target = TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0xBB; 32]));
-            publish(&node, &zone_b, "service", &[target.clone()], 600)
+            publish(&node, &zone_b, "service", &[target.clone()])
                 .await
                 .unwrap();
 
@@ -1927,7 +1919,6 @@ mod tests {
                 &zone,
                 "loop",
                 &[TnsRecord::Alias("final.loop".into())],
-                600,
             )
             .await
             .unwrap();
@@ -1939,7 +1930,6 @@ mod tests {
                 &[TnsRecord::Identity(ServiceId::from_signing_pubkey(
                     &[0xAA; 32],
                 ))],
-                600,
             )
             .await
             .unwrap();
@@ -1972,7 +1962,6 @@ mod tests {
                 &zone,
                 "x",
                 &[TnsRecord::Zone(zone.identity.service_id())],
-                600,
             )
             .await
             .unwrap();
@@ -1985,7 +1974,6 @@ mod tests {
                 &[TnsRecord::Identity(ServiceId::from_signing_pubkey(
                     &[0xBB; 32],
                 ))],
-                600,
             )
             .await
             .unwrap();
@@ -2051,7 +2039,7 @@ mod tests {
             let target = ServiceId::from_signing_pubkey(&[0xBB; 32]);
 
             // Publish "bob" in the foreign zone.
-            publish(&node, &zone, "bob", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone, "bob", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
 
@@ -2271,10 +2259,10 @@ mod tests {
             let node = Node::new(Keypair::generate());
             let target = ServiceId::from_signing_pubkey(&[0xAA; 32]);
 
-            publish(&node, &zone, "@", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone, "@", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
-            publish(&node, &zone, "blog", &[TnsRecord::Alias("@".into())], 600)
+            publish(&node, &zone, "blog", &[TnsRecord::Alias("@".into())])
                 .await
                 .unwrap();
 
@@ -2304,15 +2292,14 @@ mod tests {
                 &zone_a,
                 "friend",
                 &[TnsRecord::Zone(zone_b.identity.service_id())],
-                600,
             )
             .await
             .unwrap();
 
-            publish(&node, &zone_b, "@", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone_b, "@", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
-            publish(&node, &zone_b, "site", &[TnsRecord::Alias("@".into())], 600)
+            publish(&node, &zone_b, "site", &[TnsRecord::Alias("@".into())])
                 .await
                 .unwrap();
 
@@ -2344,12 +2331,11 @@ mod tests {
                 &zone_a,
                 "shortcut",
                 &[TnsRecord::Alias(alias_target)],
-                600,
             )
             .await
             .unwrap();
 
-            publish(&node, &zone_b, "www", &[TnsRecord::Identity(target)], 600)
+            publish(&node, &zone_b, "www", &[TnsRecord::Identity(target)])
                 .await
                 .unwrap();
 
@@ -2374,7 +2360,7 @@ mod tests {
             let zone_sid = zone.identity.service_id();
             let serving = ServiceId::from_signing_pubkey(&[0xEE; 32]);
 
-            publish(&node, &zone, "blog", &[TnsRecord::VHost(serving)], 600)
+            publish(&node, &zone, "blog", &[TnsRecord::VHost(serving)])
                 .await
                 .unwrap();
 
@@ -2422,11 +2408,10 @@ mod tests {
                 &zone_a,
                 "alice-blog",
                 &[TnsRecord::Alias(format!("blog.{}", alice_sid))],
-                600,
             )
             .await
             .unwrap();
-            publish(&node, &alice, "blog", &[TnsRecord::VHost(serving)], 600)
+            publish(&node, &alice, "blog", &[TnsRecord::VHost(serving)])
                 .await
                 .unwrap();
 

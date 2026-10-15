@@ -20,9 +20,13 @@ const KIND_FIN: u8 = 1;
 /// Part of an application message too large for one cell:
 /// `msg_id(u16) || index(u16) || count(u16) || bytes`.
 const KIND_FRAGMENT: u8 = 2;
-const FRAGMENT_HEADER: usize = 1 + 6;
+/// A fragment's fields after its kind byte: msg_id, index, count.
+const FRAGMENT_FIELDS: usize = 6;
+const FRAGMENT_HEADER: usize = 1 + FRAGMENT_FIELDS;
+/// A DATA cell: `seq(u32) || kind(u8) || body`.
+const SEQ_LEN: usize = 4;
 /// Channel packet bytes that fit one DATA cell after the channel sequence.
-const PACKET_MAX: usize = CELL_PAYLOAD_MAX - 4;
+const PACKET_MAX: usize = CELL_PAYLOAD_MAX - SEQ_LEN;
 /// Bounds on partially received application messages per stream. On a
 /// reliable stream every missing fragment is still on its way (it holds a
 /// channel window slot until acknowledged), so these only trip for a
@@ -92,13 +96,13 @@ impl FragmentAssembler {
 
     /// Add a fragment packet body; returns the message it completes.
     fn push(&mut self, body: &[u8]) -> Option<Vec<u8>> {
-        if body.len() < 6 {
+        if body.len() < FRAGMENT_FIELDS {
             return None;
         }
         let msg_id = u16::from_be_bytes([body[0], body[1]]);
         let index = u16::from_be_bytes([body[2], body[3]]);
         let count = u16::from_be_bytes([body[4], body[5]]);
-        let bytes = &body[6..];
+        let bytes = &body[FRAGMENT_FIELDS..];
         if count < 2 || index >= count {
             return None;
         }
@@ -143,7 +147,7 @@ impl EndpointState {
 /// Sequence numbers belong to the end-to-end channel; crypto nonces never repeat.
 async fn send_cell(
     circuits: &CircuitState,
-    links: &Arc<Mutex<crate::peer_transport::LinkTable>>,
+    sender: &super::sender::Sender,
     key: CircuitKey,
     outbound: bool,
     command: RelayCellCommand,
@@ -173,14 +177,10 @@ async fn send_cell(
             .ok_or_else(|| Error::Crypto("backward counter exhausted".into()))?;
         super::circuit::seal_backward_cell(&hop.keys, n, key.circuit_id, &body)
     };
-    let link = links
-        .lock()
-        .await
-        .get(&key.from_peer)
-        .cloned()
-        .ok_or_else(|| Error::Protocol("stream link gone".into()))?;
     // Loss here is safe: reliable channels retain the plaintext until its ACK.
-    link.send_message(&encoded).await
+    sender
+        .to_peer(&key.from_peer, &encoded, super::sender::Queue::Data, super::sender::Budget::Limited)
+        .await
 }
 
 impl Node {
@@ -233,7 +233,7 @@ impl Node {
             .insert(key, stream.clone());
         let circuits = self.circuits.clone();
         let endpoints = self.endpoints.clone();
-        let links = self.links.clone();
+        let sender = self.sender.clone();
         tokio::spawn(async move {
             let mut pending = VecDeque::<Vec<u8>>::new();
             let mut next_msg_id: u16 = 0;
@@ -298,7 +298,7 @@ impl Node {
                     data.extend_from_slice(&payload);
                     if send_cell(
                         &circuits,
-                        &links,
+                        &sender,
                         key,
                         outbound,
                         RelayCellCommand::Data,
@@ -331,7 +331,7 @@ impl Node {
                             log::trace!("stream {:?}: retransmit seq {}", key.circuit_id, sequence);
                             let mut data = sequence.to_be_bytes().to_vec();
                             data.extend_from_slice(&payload);
-                            if send_cell(&circuits, &links, key, outbound, RelayCellCommand::Data, &data).await.is_err() { break 'send; }
+                            if send_cell(&circuits, &sender, key, outbound, RelayCellCommand::Data, &data).await.is_err() { break 'send; }
                         }
                     }
                 }
@@ -339,7 +339,7 @@ impl Node {
             // Reliable FIN has been acknowledged, or the circuit is unusable.
             let _ = send_cell(
                 &circuits,
-                &links,
+                &sender,
                 key,
                 outbound,
                 RelayCellCommand::StreamEnd,
@@ -360,10 +360,11 @@ impl Node {
     }
 
     pub(super) async fn handle_stream_data(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
-        if data.len() < 5
-            || data[4] > KIND_FRAGMENT
-            || (data[4] == KIND_FIN && data.len() != 5)
-            || (data[4] == KIND_FRAGMENT && data.len() < 4 + FRAGMENT_HEADER)
+        let kind = SEQ_LEN;
+        if data.len() < SEQ_LEN + 1
+            || data[kind] > KIND_FRAGMENT
+            || (data[kind] == KIND_FIN && data.len() != SEQ_LEN + 1)
+            || (data[kind] == KIND_FRAGMENT && data.len() < SEQ_LEN + FRAGMENT_HEADER)
         {
             return Err(Error::Wire("invalid stream DATA".into()));
         }
@@ -371,13 +372,13 @@ impl Node {
         let Some(stream) = stream else {
             return Ok(());
         };
-        let sequence = u32::from_be_bytes(data[..4].try_into().unwrap());
+        let sequence = u32::from_be_bytes(data[..SEQ_LEN].try_into().unwrap());
         let (ready, ack) = {
             let mut channel = stream.channel.lock().await;
-            let ready = channel.receive_data(sequence, data[4..].to_vec());
+            let ready = channel.receive_data(sequence, data[SEQ_LEN..].to_vec());
             (ready, channel.generate_ack())
         };
-        if data[4] == KIND_FIN {
+        if data[kind] == KIND_FIN {
             *stream.remote_fin.lock().unwrap() = Some(sequence);
         }
         let messages: Vec<Vec<u8>> = ready
@@ -404,7 +405,7 @@ impl Node {
             .to_bytes();
             send_cell(
                 &self.circuits,
-                &self.links,
+                &self.sender,
                 key,
                 stream.outbound,
                 RelayCellCommand::StreamAck,
@@ -424,10 +425,8 @@ impl Node {
     }
 
     pub(super) async fn handle_stream_ack(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
+        // The decoder bounds the selective acks.
         let ack = ChannelAckMsg::from_bytes(data)?;
-        if ack.selective_acks.len() > 32 {
-            return Err(Error::Wire("too many stream ACKs".into()));
-        }
         let stream = self.endpoints.streams.lock().await.get(&key).cloned();
         if let Some(stream) = stream {
             log::trace!(

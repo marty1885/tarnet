@@ -754,10 +754,53 @@ pub fn signing_algo_of(pubkey: &[u8]) -> Option<SigningAlgo> {
     }
 }
 
+/// Who a signature must come from. Every signature check binds the key to
+/// an identity first: there is no way to check a signature against a key
+/// alone, so no object can forget the binding.
+#[derive(Debug, Clone, Copy)]
+pub enum SignedBy<'a> {
+    /// The key must be this peer's (hash to its peer id).
+    Peer(&'a PeerId),
+    /// The key must be this service's (hash to its service id).
+    Service(&'a ServiceId),
+    /// The key was bound to an identity already (a link's authenticated
+    /// peer key).
+    BoundKey,
+    /// Whoever holds the key: the caller derives the signer from it
+    /// afterwards (a handshake learning who the peer is).
+    AnyPeer,
+}
+
+/// The one signature check: bind the key as `signed_by` says, take the
+/// algorithm from the sender's `algo` byte when it sends one (it must match
+/// the key) or from the key, and verify.
+pub fn verify_signed(signed_by: SignedBy, algo: Option<u8>, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    let bound = match signed_by {
+        SignedBy::Peer(p) => peer_id_from_signing_pubkey(pubkey) == *p,
+        SignedBy::Service(s) => ServiceId::from_signing_pubkey(pubkey) == *s,
+        SignedBy::BoundKey | SignedBy::AnyPeer => true,
+    };
+    if !bound {
+        return false;
+    }
+    let algo = match algo {
+        Some(byte) => match SigningAlgo::from_u8(byte) {
+            Ok(a) => a,
+            Err(_) => return false,
+        },
+        None => match signing_algo_of(pubkey) {
+            Some(a) => a,
+            None => return false,
+        },
+    };
+    verify(algo, pubkey, msg, sig)
+}
+
 /// Verify a signature. The key must have exactly the length of `algo`'s keys:
 /// a peer id hashes the whole key, so checking a hybrid key as Ed25519 alone
-/// would let a broken Ed25519 impersonate a hybrid identity.
-pub fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+/// would let a broken Ed25519 impersonate a hybrid identity. Private: callers
+/// go through [`verify_signed`], which binds the key first.
+fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     if signing_algo_of(pubkey) != Some(algo) {
         return false;
     }
@@ -803,22 +846,9 @@ pub fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool 
     }
 }
 
-/// Verify using a PeerId and cached public key info.
-/// This is the main verification path — callers look up the pubkey from
-/// the pubkey cache or inline TLV, then call this.
-pub fn verify_with_pubkey(
-    algo: SigningAlgo,
-    pubkey: &[u8],
-    peer_id: &PeerId,
-    msg: &[u8],
-    sig: &[u8],
-) -> bool {
-    // Verify that the pubkey actually corresponds to this PeerId
-    let expected = peer_id_from_signing_pubkey(pubkey);
-    if expected != *peer_id {
-        return false;
-    }
-    verify(algo, pubkey, msg, sig)
+/// [`verify_signed`] for a peer's signature, with the sender's algo byte.
+pub fn verify_with_pubkey(algo: SigningAlgo, pubkey: &[u8], peer_id: &PeerId, msg: &[u8], sig: &[u8]) -> bool {
+    verify_signed(SignedBy::Peer(peer_id), Some(algo as u8), pubkey, msg, sig)
 }
 
 // ---------------------------------------------------------------------------

@@ -129,6 +129,37 @@ pub struct ServiceId(pub [u8; 32]);
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DhtId(pub [u8; 64]);
 
+/// A handle to content-addressed DHT data: `enc_key(32) || chk(32)`, the
+/// key that decrypts the content and the hash of the stored blob. Not a DHT
+/// location (that is a [`DhtId`], derived from the handle); its first half
+/// is a secret, so its `Debug` output shows only the blob hash.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentHandle(pub [u8; 64]);
+
+impl ContentHandle {
+    pub fn as_bytes(&self) -> &[u8; 64] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ContentHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ContentHandle(chk {})", hex(&self.0[32..40]))
+    }
+}
+
+impl Serialize for ContentHandle {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentHandle {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        DhtId::deserialize(d).map(|id| ContentHandle(id.0))
+    }
+}
+
 /// Privacy level for an identity. Strictly local configuration — never transmitted on the wire
 /// or stored in DHT. Relay nodes cannot distinguish privacy levels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

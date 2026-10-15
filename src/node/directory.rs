@@ -40,9 +40,6 @@ const TOKEN_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_TOKENS: usize = 8192;
 /// Records a landmark stores.
 const DIR_STORE_MAX: usize = 65536;
-/// Directory messages accepted per second per neighbour, and the burst.
-const DIR_RATE: f64 = 20.0;
-const DIR_BURST: f64 = 200.0;
 /// Resolved addresses kept at most this long (their TTL may be shorter).
 const CACHE_MAX_AGE: Duration = Duration::from_secs(3600);
 /// A landmark whose hello denies the role is checked again after this,
@@ -55,6 +52,10 @@ const HELLO_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// After every entry of an address failed, the directory is skipped for
 /// that peer this long in favour of route search.
 const EXHAUSTED_FOR: Duration = Duration::from_secs(60);
+/// Peers whose address, landmark verdict or failure we track, at once.
+const MAX_TRACKED_PEERS: usize = 4096;
+/// A landmark's hello is checked again after this long.
+const VERIFIED_FOR: Duration = Duration::from_secs(3600);
 
 /// Whether this node may be a landmark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,6 +150,16 @@ enum Verification {
     Rejected(Instant),
 }
 
+/// A lookup that passed us.
+struct LookupPath {
+    /// Where it came from: results go back there.
+    prev: PeerId,
+    /// It came through in the routed phase (not walking).
+    routed: bool,
+    /// Where we passed it on, last: results come only from there.
+    next: Option<PeerId>,
+}
+
 pub(super) struct DirectoryState {
     config: std::sync::Mutex<LandmarkConfig>,
     client_only: std::sync::atomic::AtomicBool,
@@ -156,17 +167,18 @@ pub(super) struct DirectoryState {
     store: Mutex<DirStore>,
     own: Mutex<OwnAddress>,
     /// Resolved addresses.
-    cache: Mutex<HashMap<PeerId, CachedAddress>>,
+    cache: Mutex<crate::bounded::BoundedMap<PeerId, CachedAddress>>,
     traces: Mutex<HashMap<[u8; 32], oneshot::Sender<Vec<PeerId>>>>,
     /// Lookup token → previous hop, whether it was routed (not walking)
     /// through us, and when.
-    reverse: Mutex<HashMap<[u8; 32], (PeerId, bool, Instant)>>,
-    waiters: Mutex<HashMap<[u8; 32], oneshot::Sender<Option<AddressRecord>>>>,
-    budget: Mutex<HashMap<PeerId, (f64, Instant)>>,
-    verified: Mutex<HashMap<PeerId, Verification>>,
+    reverse: Mutex<crate::bounded::BoundedMap<[u8; 32], LookupPath>>,
+    /// Our own lookups in flight: the answer, and the neighbour the lookup
+    /// left through (only it may answer).
+    waiters: Mutex<HashMap<[u8; 32], (oneshot::Sender<Option<AddressRecord>>, PeerId)>>,
+    verified: Mutex<crate::bounded::BoundedMap<PeerId, Verification>>,
     /// Peers every entry of whose address failed us: the record's seq, and
     /// when. Until a newer record turns up, attempts use route search.
-    exhausted: Mutex<HashMap<PeerId, (u32, Instant)>>,
+    exhausted: Mutex<crate::bounded::BoundedMap<PeerId, u32>>,
 }
 
 impl DirectoryState {
@@ -177,27 +189,19 @@ impl DirectoryState {
             role: Mutex::new(Role::default()),
             store: Mutex::new(DirStore::new(DIR_STORE_MAX)),
             own: Mutex::new(OwnAddress::default()),
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(crate::bounded::BoundedMap::new(MAX_TRACKED_PEERS, CACHE_MAX_AGE)),
             traces: Mutex::new(HashMap::new()),
-            reverse: Mutex::new(HashMap::new()),
+            reverse: Mutex::new(crate::bounded::BoundedMap::new(MAX_TOKENS, TOKEN_LIFETIME)),
             waiters: Mutex::new(HashMap::new()),
-            budget: Mutex::new(HashMap::new()),
-            verified: Mutex::new(HashMap::new()),
-            exhausted: Mutex::new(HashMap::new()),
+            // A landmark's verdict is checked again after this long.
+            verified: Mutex::new(crate::bounded::BoundedMap::new(MAX_TRACKED_PEERS, VERIFIED_FOR)),
+            exhausted: Mutex::new(crate::bounded::BoundedMap::new(MAX_TRACKED_PEERS, EXHAUSTED_FOR)),
         }
     }
 
     fn config(&self) -> LandmarkConfig {
         self.config.lock().expect("config lock").clone()
     }
-}
-
-fn unix_secs() -> u32 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(u32::MAX as u64) as u32
 }
 
 /// Two landmarks crowd each other: how long until we, promoted at `since`,
@@ -232,7 +236,7 @@ impl Node {
             .await
             .set_landmark_limits(config.limits);
         *self.directory.config.lock().expect("config lock") = config;
-        drop(requests);
+        self.send_seqno_requests(requests).await;
     }
 
     /// A client-only node publishes no address, is never a landmark, and is
@@ -410,15 +414,15 @@ impl Node {
         let mut to_check = Vec::new();
         {
             let mut verified = self.directory.verified.lock().await;
-            out.retain(|(l, _)| match verified.get(l) {
-                Some(Verification::Rejected(until)) if *until > now => false,
+            out.retain(|(l, _)| match verified.get(l).copied() {
+                Some(Verification::Rejected(until)) if until > now => false,
                 Some(Verification::Rejected(_)) | None => {
-                    verified.insert(*l, Verification::Checking);
+                    let _ = verified.upsert(*l, Verification::Checking);
                     to_check.push(*l);
                     true
                 }
-                Some(Verification::Unknown(retry)) if *retry <= now => {
-                    verified.insert(*l, Verification::Checking);
+                Some(Verification::Unknown(retry)) if retry <= now => {
+                    let _ = verified.upsert(*l, Verification::Checking);
                     to_check.push(*l);
                     true
                 }
@@ -473,7 +477,7 @@ impl Node {
                 Verification::Rejected(now + LANDMARK_REJECT_FOR)
             }
         };
-        self.directory.verified.lock().await.insert(landmark, state);
+        let _ = self.directory.verified.lock().await.upsert(landmark, state);
     }
 
     /// A peer's newest hello: searched for in the DHT first, so a stale
@@ -601,7 +605,18 @@ impl Node {
             if !changed && !stale {
                 return;
             }
-            own.seq = (own.seq + 1).max(unix_secs());
+            // Monotonic across restarts without a clock: persisted with the
+            // node's other sequences.
+            if own.seq == 0 {
+                own.seq = self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.get_metadata("address_sequence").ok().flatten())
+                    .unwrap_or(0)
+                    .min(u32::MAX as u64) as u32;
+            }
+            own.seq = own.seq.saturating_add(1);
+            self.db_set_metadata("address_sequence", own.seq as u64);
             let record = AddressRecord::sign(
                 &self.identity,
                 own.seq,
@@ -629,7 +644,7 @@ impl Node {
                         .store
                         .lock()
                         .await
-                        .put(record.clone(), Instant::now());
+                        .put(dir::VerifiedAddress::signed_here(record.clone()), Instant::now());
                     continue;
                 }
                 self.send_publish(landmark, replica, &record).await;
@@ -653,12 +668,7 @@ impl Node {
             replica,
             record: record.clone(),
         };
-        let next = self
-            .routing_table
-            .lock()
-            .await
-            .lookup(&landmark)
-            .map(|r| r.next_hop);
+        let next = self.sender.next_hop(&landmark, &[], None).await;
         if let Some(next) = next {
             let _ = self
                 .send_to_peer_deferred(&next, &msg.to_wire().encode())
@@ -690,7 +700,7 @@ impl Node {
             let found = futures_util::future::join_all(checks).await;
             let mut missing = Vec::new();
             for ((landmark, replica), found) in slots.into_iter().zip(found) {
-                if found.is_some_and(|r| r.seq >= record.seq) {
+                if found.is_some_and(|r| r.record().seq >= record.seq) {
                     continue;
                 }
                 log::debug!(
@@ -708,16 +718,11 @@ impl Node {
 
     /// Look `target` up at `landmark` directly, without a walk. For checking
     /// our own record, which names us anyway.
-    async fn lookup_at(&self, landmark: PeerId, target: PeerId, replica: u8) -> Option<AddressRecord> {
-        let next = self
-            .routing_table
-            .lock()
-            .await
-            .lookup(&landmark)
-            .map(|r| r.next_hop)?;
+    async fn lookup_at(&self, landmark: PeerId, target: PeerId, replica: u8) -> Option<dir::VerifiedAddress> {
+        let next = self.sender.next_hop(&landmark, &[], None).await?;
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
-        self.directory.waiters.lock().await.insert(token, tx);
+        self.directory.waiters.lock().await.insert(token, (tx, next));
         let msg = DirLookupMsg {
             walking: false,
             token,
@@ -733,19 +738,14 @@ impl Node {
         result
             .ok()?
             .ok()?
-            .filter(|r| r.peer == target && r.verify())
+            .and_then(|r| dir::VerifiedAddress::verify_for(r, &target))
     }
 
     /// The nodes from us to `target` along our routes: us first, `target`
     /// last. `None` if the trace got no answer.
     async fn trace_path(&self, target: PeerId) -> Option<Vec<PeerId>> {
         let me = self.peer_id();
-        let next = self
-            .routing_table
-            .lock()
-            .await
-            .lookup(&target)
-            .map(|r| r.next_hop)?;
+        let next = self.sender.next_hop(&target, &[], None).await?;
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
         self.directory.traces.lock().await.insert(token, tx);
@@ -763,24 +763,8 @@ impl Node {
         (path.len() >= 2 && path[0] == me && path.last() == Some(&target)).then_some(path)
     }
 
-    async fn dir_allowed(&self, from: &PeerId) -> bool {
-        let mut budget = self.directory.budget.lock().await;
-        let now = Instant::now();
-        let (tokens, at) = budget.entry(*from).or_insert((DIR_BURST, now));
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * DIR_RATE).min(DIR_BURST);
-        *at = now;
-        if *tokens < 1.0 {
-            return false;
-        }
-        *tokens -= 1.0;
-        true
-    }
-
     pub(super) async fn handle_path_trace(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let mut msg = PathTraceMsg::from_bytes(payload)?;
-        if !self.dir_allowed(&from).await {
-            return Ok(());
-        }
         let me = self.peer_id();
         if msg.path.last() != Some(&from) || msg.path.contains(&me) || msg.path.len() >= PATH_TRACE_MAX {
             return Ok(());
@@ -795,13 +779,7 @@ impl Node {
                 .send_to_peer_deferred(&from, &back.to_wire().encode())
                 .await;
         }
-        let next = self
-            .routing_table
-            .lock()
-            .await
-            .lookup(&msg.target)
-            .map(|r| r.next_hop)
-            .filter(|n| *n != from);
+        let next = self.sender.next_hop(&msg.target, &[], Some(&from)).await;
         match next {
             Some(next) => {
                 self.send_to_peer_deferred(&next, &msg.to_wire().encode())
@@ -839,28 +817,18 @@ impl Node {
 
     pub(super) async fn handle_dir_publish(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let msg = DirPublishMsg::from_bytes(payload)?;
-        if !self.dir_allowed(&from).await {
-            return Ok(());
-        }
         let me = self.peer_id();
         if msg.landmark == me {
-            if !self.routing_table.lock().await.is_landmark() || !msg.record.verify() {
+            if !self.routing_table.lock().await.is_landmark() {
                 return Ok(());
             }
-            self.directory
-                .store
-                .lock()
-                .await
-                .put(msg.record, Instant::now());
+            let Some(record) = dir::VerifiedAddress::verify(msg.record) else {
+                return Ok(());
+            };
+            self.directory.store.lock().await.put(record, Instant::now());
             return Ok(());
         }
-        let next = self
-            .routing_table
-            .lock()
-            .await
-            .lookup(&msg.landmark)
-            .map(|r| r.next_hop)
-            .filter(|n| *n != from);
+        let next = self.sender.next_hop(&msg.landmark, &[], Some(&from)).await;
         match next {
             Some(next) => {
                 self.send_to_peer_deferred(&next, &msg.to_wire().encode())
@@ -876,35 +844,44 @@ impl Node {
     /// through us in the routed phase (a loop).
     async fn remember_lookup(&self, token: [u8; 32], from: PeerId, routed: bool) -> bool {
         let mut reverse = self.directory.reverse.lock().await;
-        let now = Instant::now();
-        if reverse.len() >= MAX_TOKENS {
-            reverse.retain(|_, (_, _, t)| now.duration_since(*t) < TOKEN_LIFETIME);
-            if reverse.len() >= MAX_TOKENS {
-                return false;
-            }
-        }
         match reverse.get_mut(&token) {
             // A walk that passes us twice returns the first way it came,
             // which erases the loop.
-            Some((_, was_routed, _)) => {
+            Some(path) => {
                 if routed {
-                    if *was_routed {
+                    if path.routed {
                         return false;
                     }
-                    *was_routed = true;
+                    path.routed = true;
                 }
                 true
             }
-            None => {
-                reverse.insert(token, (from, routed, now));
-                true
-            }
+            None => reverse
+                .try_insert(
+                    token,
+                    LookupPath {
+                        prev: from,
+                        routed,
+                        next: None,
+                    },
+                )
+                .is_ok(),
         }
+    }
+
+    /// Pass a lookup on to `next`, remembering that its result comes from
+    /// there.
+    async fn pass_lookup(&self, next: PeerId, msg: &DirLookupMsg) -> Result<()> {
+        if let Some(path) = self.directory.reverse.lock().await.get_mut(&msg.token) {
+            path.next = Some(next);
+        }
+        self.send_to_peer_deferred(&next, &msg.to_wire().encode())
+            .await
     }
 
     async fn answer_lookup(&self, to: PeerId, token: [u8; 32], record: Option<AddressRecord>) -> Result<()> {
         // A node that is the origin answers itself.
-        if let Some(tx) = self.directory.waiters.lock().await.remove(&token) {
+        if let Some((tx, _)) = self.directory.waiters.lock().await.remove(&token) {
             let _ = tx.send(record);
             return Ok(());
         }
@@ -915,9 +892,6 @@ impl Node {
 
     pub(super) async fn handle_dir_lookup(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let mut msg = DirLookupMsg::from_bytes(payload)?;
-        if !self.dir_allowed(&from).await {
-            return Ok(());
-        }
         let me = self.peer_id();
         if msg.walking {
             self.remember_lookup(msg.token, from, false).await;
@@ -934,9 +908,7 @@ impl Node {
             let end = others.is_empty() || rand::thread_rng().gen_bool(crate::dht::WALK_END_PROBABILITY);
             if !end {
                 let next = *others.choose(&mut rand::thread_rng()).expect("non-empty");
-                return self
-                    .send_to_peer_deferred(&next, &msg.to_wire().encode())
-                    .await;
+                return self.pass_lookup(next, &msg).await;
             }
             // The walk ends here: route toward a responsible landmark.
             let placeable = self.placeable_landmarks().await;
@@ -971,35 +943,48 @@ impl Node {
                 return self.answer_lookup(from, msg.token, Some(record)).await;
             }
         }
-        let next = self
-            .routing_table
-            .lock()
-            .await
-            .lookup(&msg.landmark)
-            .map(|r| r.next_hop)
-            .filter(|n| *n != from);
+        let next = self.sender.next_hop(&msg.landmark, &[], Some(&from)).await;
         match next {
-            Some(next) => {
-                self.send_to_peer_deferred(&next, &msg.to_wire().encode())
-                    .await
-            }
+            Some(next) => self.pass_lookup(next, &msg).await,
             None => self.answer_lookup(from, msg.token, None).await,
         }
     }
 
-    pub(super) async fn handle_dir_result(&self, _from: PeerId, payload: &[u8]) -> Result<()> {
+    /// A lookup's result: taken only from where the lookup went, so a node
+    /// that saw the token can't answer in its place (or end the lookup with
+    /// a forged "not found").
+    pub(super) async fn handle_dir_result(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let msg = DirResultMsg::from_bytes(payload)?;
-        if let Some(tx) = self.directory.waiters.lock().await.remove(&msg.token) {
-            let _ = tx.send(msg.record);
-            return Ok(());
-        }
-        let prev = self
+        // The result comes from where we last passed the lookup: our own
+        // lookup's first hop, or, if its walk came back through us and we
+        // passed it on again, that later hop.
+        let passed_on = self
             .directory
             .reverse
             .lock()
             .await
-            .remove(&msg.token)
-            .map(|(p, _, _)| p);
+            .get(&msg.token)
+            .map(|path| (path.prev, path.next));
+        {
+            let mut waiters = self.directory.waiters.lock().await;
+            if let Some((_, first)) = waiters.get(&msg.token) {
+                let expected = passed_on.and_then(|(_, next)| next).unwrap_or(*first);
+                if expected == from {
+                    if let Some((tx, _)) = waiters.remove(&msg.token) {
+                        let _ = tx.send(msg.record);
+                    }
+                    self.directory.reverse.lock().await.remove(&msg.token);
+                }
+                return Ok(());
+            }
+        }
+        let prev = match passed_on {
+            Some((prev, Some(next))) if next == from => {
+                self.directory.reverse.lock().await.remove(&msg.token);
+                Some(prev)
+            }
+            _ => None,
+        };
         match prev {
             Some(prev) => {
                 self.send_to_peer_deferred(&prev, &msg.to_wire().encode())
@@ -1011,7 +996,7 @@ impl Node {
 
     /// One lookup of one replica: a walk from a random neighbour, then
     /// routed to a responsible landmark.
-    async fn lookup_once(&self, target: PeerId, replica: u8) -> Option<AddressRecord> {
+    async fn lookup_once(&self, target: PeerId, replica: u8) -> Option<dir::VerifiedAddress> {
         use rand::seq::SliceRandom;
         let first = {
             let links = self.links.lock().await;
@@ -1020,7 +1005,7 @@ impl Node {
         };
         let token: [u8; 32] = rand::random();
         let (tx, rx) = oneshot::channel();
-        self.directory.waiters.lock().await.insert(token, tx);
+        self.directory.waiters.lock().await.insert(token, (tx, first));
         let msg = DirLookupMsg {
             walking: true,
             token,
@@ -1036,7 +1021,7 @@ impl Node {
         result
             .ok()?
             .ok()?
-            .filter(|r| r.peer == target && r.verify())
+            .and_then(|r| dir::VerifiedAddress::verify_for(r, &target))
     }
 
     /// Resolve `target`'s address: from the cache, else by lookups of
@@ -1060,7 +1045,7 @@ impl Node {
         while let Some(found) = lookups.next().await {
             if let Some(rec) = found {
                 self.cache_address(rec.clone()).await;
-                return Some(rec);
+                return Some(rec.into_inner());
             }
         }
         None
@@ -1068,29 +1053,28 @@ impl Node {
 
     /// A cached address, without the entries that failed us.
     async fn cached_address(&self, peer: &PeerId) -> Option<AddressRecord> {
-        let mut cache = self.directory.cache.lock().await;
         let now = Instant::now();
-        match cache.get(peer) {
-            Some(c) if c.expires > now => Some(c.usable()),
-            Some(_) => {
-                cache.remove(peer);
-                None
-            }
-            None => None,
-        }
+        self.directory
+            .cache
+            .lock()
+            .await
+            .get(peer)
+            .filter(|c| c.expires > now)
+            .map(|c| c.usable())
     }
 
     /// Keep a verified address until it expires (at most `CACHE_MAX_AGE`).
-    /// A newer seq replaces an older one.
-    pub(super) async fn cache_address(&self, rec: AddressRecord) {
+    /// A newer seq replaces an older one; the same record again keeps the
+    /// expiry held (its TTL is relative, so a copy can't extend it).
+    pub(super) async fn cache_address(&self, rec: dir::VerifiedAddress) {
+        let rec = rec.into_inner();
         let expires = Instant::now()
             + Duration::from_secs(rec.ttl_secs as u64).min(CACHE_MAX_AGE);
         let mut cache = self.directory.cache.lock().await;
         match cache.get_mut(&rec.peer) {
-            Some(c) if c.record.seq > rec.seq => {}
-            Some(c) if c.record.seq == rec.seq => c.expires = c.expires.max(expires),
+            Some(c) if c.record.seq >= rec.seq => {}
             _ => {
-                cache.insert(
+                let _ = cache.upsert(
                     rec.peer,
                     CachedAddress {
                         record: rec,
@@ -1129,11 +1113,7 @@ impl Node {
             let seq = c.record.seq;
             cache.remove(peer);
             drop(cache);
-            self.directory
-                .exhausted
-                .lock()
-                .await
-                .insert(*peer, (seq, Instant::now()));
+            let _ = self.directory.exhausted.lock().await.upsert(*peer, seq);
         }
     }
 
@@ -1186,8 +1166,7 @@ impl Node {
             .lock()
             .await
             .get(peer)
-            .filter(|(_, t)| t.elapsed() < EXHAUSTED_FOR)
-            .map(|(seq, _)| *seq);
+            .copied();
         // With no landmark there is no directory to ask.
         let directory = self.routing_table.lock().await.is_landmark()
             || !self.routing_table.lock().await.landmarks().is_empty();
@@ -1226,21 +1205,10 @@ impl Node {
                 node.address_tick().await;
                 let now = Instant::now();
                 node.directory.store.lock().await.gc(now);
-                node.directory
-                    .reverse
-                    .lock()
-                    .await
-                    .retain(|_, (_, _, t)| now.duration_since(*t) < TOKEN_LIFETIME);
-                node.directory
-                    .cache
-                    .lock()
-                    .await
-                    .retain(|_, c| c.expires > now);
-                node.directory
-                    .exhausted
-                    .lock()
-                    .await
-                    .retain(|_, (_, t)| now.duration_since(*t) < EXHAUSTED_FOR);
+                node.directory.reverse.lock().await.expire(now);
+                node.directory.cache.lock().await.retain(|_, c| c.expires > now);
+                node.directory.exhausted.lock().await.expire(now);
+                node.directory.verified.lock().await.expire(now);
                 if !node.routing_table.lock().await.is_landmark() {
                     node.directory.store.lock().await.clear();
                 }

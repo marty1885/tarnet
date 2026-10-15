@@ -403,7 +403,7 @@ mod tests {
 
     fn keepalive() -> Vec<u8> {
         KeepaliveMsg {
-            timestamp_us: None,
+            ping_id: None,
             padding: Vec::new(),
         }
         .to_wire()

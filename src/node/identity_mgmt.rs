@@ -277,7 +277,10 @@ impl Node {
             sequence,
             Duration::from_secs(HELLO_TTL as u64),
         );
-        self.dht_publish(record).await;
+        if let Err(e) = self.dht_publish(record).await {
+            log::warn!("Hello record not published: {}", e);
+            return;
+        }
         log::info!(
             "Published hello record ({} global addrs, {} introducers)",
             hello.global_addresses.len(),
@@ -287,26 +290,7 @@ impl Node {
 
     /// Look up a peer's hello record from the local DHT store.
     pub async fn lookup_hello(&self, peer_id: &PeerId) -> Option<HelloRecord> {
-        let key = crate::dht::identity_address_key(peer_id);
-        let store = self.dht_store.lock().await;
-        let records = store.get(&key);
-        // Find a Hello record from the right signer
-        for record in records {
-            if record.record_type != RecordType::Hello {
-                continue;
-            }
-            if record.signer != *peer_id.as_bytes() {
-                continue;
-            }
-            let plaintext = match crate::dht::signed_record_decrypt(&key, &record.value) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if let Ok(hello) = HelloRecord::from_bytes(&plaintext) {
-                return Some(hello);
-            }
-        }
-        None
+        self.dht_store.lock().await.hello_of(peer_id)
     }
 
     /// A peer's hello record: from the local store, else searched for in the

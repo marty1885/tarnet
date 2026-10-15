@@ -25,25 +25,107 @@ pub const GOVERNOR_TICK_INTERVAL: Duration = Duration::from_secs(10);
 /// Strikes halve after this much time with no new strikes.
 const STRIKE_DECAY_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Sliding window for per-peer protocol work accounting.
-const RESOURCE_RATE_WINDOW: Duration = Duration::from_secs(60);
-
 // ── Configuration ───────────────────────────────────────────────────
+
+/// Per-peer work a link peer can make us do, each with its own budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resource {
+    /// A circuit leg installed here (CREATE, or EXTEND at a relay).
+    CircuitCreate,
+    /// DHT reverse-path state and forwarding (GET, WATCH).
+    DhtQuery,
+    /// DHT records to verify and maybe store (PUT, notify, GET response).
+    DhtRecords,
+    /// The bytes of those records.
+    DhtBytes,
+    /// Directory work: publishes, lookups, path traces and their answers.
+    Directory,
+    /// Sample walks and their results.
+    Sample,
+    /// Route-search floods and their answers.
+    RouteSearch,
+    /// Seqno requests (each allocates dedup state and may be forwarded).
+    RouteRequest,
+    /// Tunnel key exchanges: a signature check and a KEM each.
+    TunnelKex,
+}
+
+impl Resource {
+    const COUNT: usize = 9;
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What a message costs its link peer. Every message type has one (see
+/// [`message_cost`]), so a new type can't arrive unbudgeted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Cost {
+    /// Link upkeep, routing state bounded by its own caps, or forwarding
+    /// bounded by link bandwidth.
+    Free,
+    /// Charged before the handler runs.
+    Charge(&'static [Resource]),
+    /// DHT records: a count and their bytes.
+    Records { records: u32, bytes: usize },
+    /// Charged by the handler, which can tell new work from a resend: the
+    /// named resource, through [`Governor::admit_circuit`] or
+    /// [`Governor::charge`].
+    ByHandler(Resource),
+}
+
+/// The cost of every message type. Exhaustive on purpose: no wildcard.
+pub fn message_cost(mt: MessageType, payload: &[u8]) -> Cost {
+    use MessageType as M;
+    use Resource as R;
+    match mt {
+        M::HandshakeHello | M::HandshakeAuth | M::HandshakeConfirm | M::Rekey | M::Keepalive => Cost::Free,
+        // Bounded by the routing table's own caps, and rate-limited by the
+        // sender's batching; dropping them would break convergence.
+        M::RouteUpdate | M::RouteDigest => Cost::Free,
+        M::RouteRequest => Cost::Charge(&[R::RouteRequest]),
+        M::DirPublish | M::DirLookup | M::DirResult | M::PathTrace | M::PathTraceResult => {
+            Cost::Charge(&[R::Directory])
+        }
+        M::RouteSearch | M::RouteSearchFound => Cost::Charge(&[R::RouteSearch]),
+        M::SampleWalk | M::SampleResult => Cost::Charge(&[R::Sample]),
+        M::DhtGet | M::DhtWatch => Cost::Charge(&[R::DhtQuery]),
+        M::DhtPut | M::DhtWatchNotify => Cost::Records {
+            records: 1,
+            bytes: payload.len(),
+        },
+        M::DhtGetResponse => Cost::Records {
+            records: crate::wire::DhtGetResponseMsg::record_count(payload) as u32,
+            bytes: payload.len(),
+        },
+        M::DhtNeighbor => Cost::Free,
+        M::TunnelKeyExchange | M::TunnelKeyResponse => Cost::Charge(&[R::TunnelKex]),
+        // Only valid inside tunnels; dropped if they arrive on a link.
+        M::ChannelOpen | M::ChannelData | M::ChannelAck | M::ChannelClose => Cost::Free,
+        // Forwarding, bounded by link bandwidth. A key exchange carried
+        // inside is charged by its handler.
+        M::Data | M::EncryptedData => Cost::Free,
+        M::CircuitCreate => Cost::ByHandler(R::CircuitCreate),
+        M::CircuitCreated | M::CircuitRelay | M::CircuitDestroy => Cost::Free,
+    }
+}
 
 /// Governor tuning knobs.
 #[derive(Debug, Clone)]
 pub struct GovernorConfig {
     /// Hard cap on circuits involving any single link peer.
     pub max_circuits_per_peer: usize,
-    /// Max circuit creates per peer within [`RESOURCE_RATE_WINDOW`].
-    pub circuit_creates_per_window: u32,
-    /// Max new DHT query tokens accepted from one link peer per window.
-    pub dht_queries_per_window: u32,
-    /// Max DHT records (PUT, GET-response, watch-notify) accepted from one
-    /// link peer per window. Each costs a signature check and possibly storage.
-    pub dht_ingest_records_per_window: u32,
-    /// Max DHT record payload bytes accepted from one link peer per window.
-    pub dht_ingest_bytes_per_window: usize,
+    /// Refill rate (per second) and burst of each [`Resource`], per link peer.
+    pub circuit_creates: (f64, f64),
+    pub dht_queries: (f64, f64),
+    pub dht_records: (f64, f64),
+    pub dht_bytes: (f64, f64),
+    pub directory: (f64, f64),
+    pub sample: (f64, f64),
+    pub route_search: (f64, f64),
+    pub route_requests: (f64, f64),
+    pub tunnel_kex: (f64, f64),
     /// Total circuit capacity of this node (for pressure calculation).
     pub max_circuits: usize,
     /// Pressure level below which no enforcement happens (0.0–1.0).
@@ -56,20 +138,63 @@ pub struct GovernorConfig {
     pub block_duration: Duration,
 }
 
+impl GovernorConfig {
+    fn limit(&self, r: Resource) -> (f64, f64) {
+        match r {
+            Resource::CircuitCreate => self.circuit_creates,
+            Resource::DhtQuery => self.dht_queries,
+            Resource::DhtRecords => self.dht_records,
+            Resource::DhtBytes => self.dht_bytes,
+            Resource::Directory => self.directory,
+            Resource::Sample => self.sample,
+            Resource::RouteSearch => self.route_search,
+            Resource::RouteRequest => self.route_requests,
+            Resource::TunnelKex => self.tunnel_kex,
+        }
+    }
+}
+
 impl Default for GovernorConfig {
     fn default() -> Self {
         Self {
             max_circuits_per_peer: 100,
-            circuit_creates_per_window: 20,
-            dht_queries_per_window: 256,
-            dht_ingest_records_per_window: 2048,
-            dht_ingest_bytes_per_window: 8 * 1024 * 1024,
+            circuit_creates: (20.0 / 60.0, 20.0),
+            dht_queries: (256.0 / 60.0, 256.0),
+            dht_records: (2048.0 / 60.0, 2048.0),
+            dht_bytes: (8.0 * 1024.0 * 1024.0 / 60.0, 8.0 * 1024.0 * 1024.0),
+            directory: (20.0, 200.0),
+            sample: (10.0, 100.0),
+            route_search: (5.0, 20.0),
+            route_requests: (20.0, 100.0),
+            tunnel_kex: (5.0, 50.0),
             max_circuits: 10_000,
             pressure_threshold: 0.75,
             throttle_strikes: 3,
             block_strikes: 6,
             block_duration: Duration::from_secs(3600),
         }
+    }
+}
+
+/// A token bucket: `burst` tokens, refilled at `rate` per second.
+#[derive(Debug, Clone, Copy)]
+struct Bucket {
+    tokens: f64,
+    at: Instant,
+}
+
+impl Bucket {
+    fn full(burst: f64) -> Self {
+        Self {
+            tokens: burst,
+            at: Instant::now(),
+        }
+    }
+
+    fn refill(&mut self, (rate, burst): (f64, f64)) {
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * rate).min(burst);
+        self.at = now;
     }
 }
 
@@ -148,77 +273,42 @@ struct PeerBudget {
     strikes: u16,
     /// When the last strike was recorded (for decay).
     last_strike: Option<Instant>,
-    /// Circuit creation count in the current window.
-    circuit_creates: u32,
-    /// New DHT query tokens charged to this peer in the current window.
-    dht_queries: u32,
-    /// DHT records ingested from this peer in the current window.
-    dht_ingest_records: u32,
-    /// DHT record bytes ingested from this peer in the current window.
-    dht_ingest_bytes: usize,
-    /// Start of the current rate-limit window.
-    window_start: Instant,
+    buckets: [Bucket; Resource::COUNT],
 }
 
 impl PeerBudget {
-    fn new() -> Self {
+    fn new(config: &GovernorConfig) -> Self {
+        let r = |r| Bucket::full(config.limit(r).1);
+        use Resource::*;
         Self {
             standing: Standing::Normal,
             strikes: 0,
             last_strike: None,
-            circuit_creates: 0,
-            dht_queries: 0,
-            dht_ingest_records: 0,
-            dht_ingest_bytes: 0,
-            window_start: Instant::now(),
+            buckets: [
+                r(CircuitCreate),
+                r(DhtQuery),
+                r(DhtRecords),
+                r(DhtBytes),
+                r(Directory),
+                r(Sample),
+                r(RouteSearch),
+                r(RouteRequest),
+                r(TunnelKex),
+            ],
         }
     }
 
-    /// Reset the rate window if it has expired.
-    fn maybe_reset_window(&mut self) {
-        if self.window_start.elapsed() >= RESOURCE_RATE_WINDOW {
-            self.circuit_creates = 0;
-            self.dht_queries = 0;
-            self.dht_ingest_records = 0;
-            self.dht_ingest_bytes = 0;
-            self.window_start = Instant::now();
+    /// Take `amount` of each resource, all or none.
+    fn take(&mut self, config: &GovernorConfig, charges: &[(Resource, f64)]) -> bool {
+        for (r, _) in charges {
+            self.buckets[r.index()].refill(config.limit(*r));
         }
-    }
-
-    /// Try to consume a circuit-create token.  Returns false if rate exceeded.
-    fn try_circuit_create(&mut self, limit: u32) -> bool {
-        self.maybe_reset_window();
-        if self.circuit_creates >= limit {
+        if charges.iter().any(|(r, n)| self.buckets[r.index()].tokens < *n) {
             return false;
         }
-        self.circuit_creates += 1;
-        true
-    }
-
-    fn try_dht_query(&mut self, limit: u32) -> bool {
-        self.maybe_reset_window();
-        if self.dht_queries >= limit {
-            return false;
+        for (r, n) in charges {
+            self.buckets[r.index()].tokens -= n;
         }
-        self.dht_queries += 1;
-        true
-    }
-
-    fn try_dht_ingest(
-        &mut self,
-        records: u32,
-        bytes: usize,
-        record_limit: u32,
-        byte_limit: usize,
-    ) -> bool {
-        self.maybe_reset_window();
-        let records_after = self.dht_ingest_records.saturating_add(records);
-        let bytes_after = self.dht_ingest_bytes.saturating_add(bytes);
-        if records_after > record_limit || bytes_after > byte_limit {
-            return false;
-        }
-        self.dht_ingest_records = records_after;
-        self.dht_ingest_bytes = bytes_after;
         true
     }
 
@@ -304,7 +394,8 @@ impl Governor {
 
     /// Call when a new link peer connects (first link).
     pub fn peer_connected(&mut self, peer: PeerId) {
-        self.budgets.entry(peer).or_insert_with(PeerBudget::new);
+        let config = &self.config;
+        self.budgets.entry(peer).or_insert_with(|| PeerBudget::new(config));
     }
 
     /// Call when the last link to a peer drops.
@@ -319,22 +410,16 @@ impl Governor {
 
     // ── Hot path ──
 
-    /// Evaluate an inbound message.  Called for every message in the
-    /// event loop, so it must be fast.
-    ///
-    /// `circuits_for_peer`: how many circuit-table entries involve this peer.
-    pub fn evaluate(
-        &mut self,
-        from: &PeerId,
-        msg_type: MessageType,
-        circuits_for_peer: usize,
-    ) -> Verdict {
+    /// Evaluate an inbound message and charge its [`message_cost`]. Called
+    /// for every message in the event loop, so it must be fast. Every DHT,
+    /// directory, sampling, search, seqno and key-exchange message pays here,
+    /// before its handler allocates or forwards anything.
+    pub fn evaluate(&mut self, from: &PeerId, msg_type: MessageType, payload: &[u8]) -> Verdict {
         let config = &self.config;
-
-        let budget = match self.budgets.get_mut(from) {
-            Some(b) => b,
-            None => return Verdict::Allow,
-        };
+        let budget = self
+            .budgets
+            .entry(*from)
+            .or_insert_with(|| PeerBudget::new(config));
 
         // ── Hard block ──
         if let Standing::Blocked { until } = budget.standing {
@@ -345,32 +430,28 @@ impl Governor {
             budget.standing = Standing::Throttled;
         }
 
-        // ── Circuit creation checks ──
-        if msg_type == MessageType::CircuitCreate {
-            // Per-peer circuit count cap.
-            if circuits_for_peer >= config.max_circuits_per_peer {
-                budget.add_strike(
-                    config.throttle_strikes,
-                    config.block_strikes,
-                    config.block_duration,
-                );
-                return Verdict::Shed;
+        // ── Always-on budgets ──
+        // Over budget is shed without a strike: a link-up sync or a busy
+        // neighbour can legitimately burst.
+        let paid = match message_cost(msg_type, payload) {
+            Cost::Free | Cost::ByHandler(_) => true,
+            Cost::Charge(resources) => {
+                let charges: Vec<(Resource, f64)> = resources.iter().map(|r| (*r, 1.0)).collect();
+                budget.take(config, &charges)
             }
-            // Rate limit.
-            if !budget.try_circuit_create(config.circuit_creates_per_window) {
-                budget.add_strike(
-                    config.throttle_strikes,
-                    config.block_strikes,
-                    config.block_duration,
-                );
-                return Verdict::Shed;
-            }
+            Cost::Records { records, bytes } => budget.take(
+                config,
+                &[
+                    (Resource::DhtRecords, records as f64),
+                    (Resource::DhtBytes, bytes as f64),
+                ],
+            ),
+        };
+        if !paid {
+            return Verdict::Shed;
         }
 
         // ── Generous by default ──
-        // Below the pressure threshold, circuit admission limits above remain
-        // active because they bound attacker-controlled state. Other traffic
-        // skips pressure-driven shedding.
         if self.pressure.level < self.config.pressure_threshold {
             return Verdict::Allow;
         }
@@ -383,32 +464,34 @@ impl Governor {
         Verdict::Allow
     }
 
-    /// Charge allocation and forwarding state for a previously unseen DHT query.
-    /// This limit is always active; circuit pressure is unrelated to DHT memory
-    /// consumption and must not disable the admission check.
-    pub fn charge_dht_query(&mut self, from: &PeerId) -> bool {
-        let Some(budget) = self.budgets.get_mut(from) else {
+    /// Admit a new circuit leg from `from` (a CREATE, or an EXTEND at a
+    /// relay, which installs legs on its behalf): the per-peer circuit cap
+    /// and the create rate, with a strike when either is exceeded. Called by
+    /// the handlers after they have told a resend from new work, so a lossy
+    /// link's retransmits cost nothing.
+    pub fn admit_circuit(&mut self, from: &PeerId, circuits_for_peer: usize) -> bool {
+        let config = &self.config;
+        let budget = self
+            .budgets
+            .entry(*from)
+            .or_insert_with(|| PeerBudget::new(config));
+        if circuits_for_peer >= config.max_circuits_per_peer
+            || !budget.take(config, &[(Resource::CircuitCreate, 1.0)])
+        {
+            budget.add_strike(config.throttle_strikes, config.block_strikes, config.block_duration);
             return false;
-        };
-        budget.try_dht_query(self.config.dht_queries_per_window)
+        }
+        true
     }
 
-    /// Charge `records` DHT records totalling `bytes` delivered by `from`
-    /// (a PUT, a GET response, or a watch notification). Charged before any
-    /// signature is checked, so it bounds verification CPU as well as storage
-    /// churn. Always active, like [`charge_dht_query`](Self::charge_dht_query).
-    /// Over-budget traffic is dropped without a strike: a link-up store sync
-    /// can legitimately burst.
-    pub fn charge_dht_ingest(&mut self, from: &PeerId, records: u32, bytes: usize) -> bool {
-        let Some(budget) = self.budgets.get_mut(from) else {
-            return false;
-        };
-        budget.try_dht_ingest(
-            records,
-            bytes,
-            self.config.dht_ingest_records_per_window,
-            self.config.dht_ingest_bytes_per_window,
-        )
+    /// Charge work a handler found inside a message (e.g. a key exchange
+    /// carried in Data). No strike.
+    pub fn charge(&mut self, from: &PeerId, resource: Resource) -> bool {
+        let config = &self.config;
+        self.budgets
+            .entry(*from)
+            .or_insert_with(|| PeerBudget::new(config))
+            .take(config, &[(resource, 1.0)])
     }
 
     // ── Maintenance ──
@@ -444,7 +527,6 @@ impl Governor {
         // Decay strikes and standing for all peers.
         for budget in self.budgets.values_mut() {
             budget.decay_strikes();
-            budget.maybe_reset_window();
         }
     }
 }
@@ -478,130 +560,56 @@ mod tests {
     }
 
     #[test]
-    fn first_circuit_create_allowed_below_threshold() {
-        let mut gov = Governor::new(GovernorConfig::default());
-        let peer = test_peer(1);
-        gov.peer_connected(peer);
-        // Pressure is 0.0, but the first create is within its always-on budget.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::CircuitCreate, 0),
-            Verdict::Allow
-        );
-    }
-
-    #[test]
-    fn circuit_rate_limit_is_enforced_below_pressure_threshold() {
+    fn circuit_admission_caps_rate_and_count_with_strikes() {
         let mut config = GovernorConfig::default();
-        config.circuit_creates_per_window = 2;
-        let mut gov = Governor::new(config);
-        let peer = test_peer(1);
-        gov.peer_connected(peer);
-
-        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, 0), Verdict::Allow);
-        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, 0), Verdict::Allow);
-        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, 0), Verdict::Shed);
-    }
-
-    #[test]
-    fn circuit_rate_limit_under_pressure() {
-        let mut config = GovernorConfig::default();
-        config.circuit_creates_per_window = 3;
-        config.pressure_threshold = 0.0; // always enforce
-        let mut gov = Governor::new(config);
-        let peer = test_peer(1);
-        gov.peer_connected(peer);
-
-        // First 3 allowed.
-        for _ in 0..3 {
-            assert_eq!(
-                gov.evaluate(&peer, MessageType::CircuitCreate, 0),
-                Verdict::Allow,
-            );
-        }
-        // 4th shed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::CircuitCreate, 0),
-            Verdict::Shed,
-        );
-    }
-
-    #[test]
-    fn circuit_count_cap_under_pressure() {
-        let mut config = GovernorConfig::default();
+        config.circuit_creates = (0.0, 2.0);
         config.max_circuits_per_peer = 5;
-        config.pressure_threshold = 0.0;
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
-
-        // At the cap → shed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::CircuitCreate, 5),
-            Verdict::Shed,
-        );
-        // Below cap → allowed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::CircuitCreate, 4),
-            Verdict::Allow,
-        );
+        // At the circuit cap: refused, even with tokens left.
+        assert!(!gov.admit_circuit(&peer, 5));
+        assert!(gov.admit_circuit(&peer, 0));
+        assert!(gov.admit_circuit(&peer, 0));
+        // Rate spent.
+        assert!(!gov.admit_circuit(&peer, 0));
+        // A CREATE itself is charged by its handler, not at the gate.
+        assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, &[]), Verdict::Allow);
     }
 
     #[test]
     fn strikes_escalate_to_block() {
         let mut config = GovernorConfig::default();
-        config.circuit_creates_per_window = 1;
-        config.pressure_threshold = 0.0;
+        config.circuit_creates = (0.0, 1.0);
         config.throttle_strikes = 2;
         config.block_strikes = 4;
         config.block_duration = Duration::from_secs(3600);
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
-
-        // First create OK.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::CircuitCreate, 0),
-            Verdict::Allow,
-        );
-        // Subsequent creates in the same window get shed + strike.
+        assert!(gov.admit_circuit(&peer, 0));
         for _ in 0..5 {
-            assert_eq!(
-                gov.evaluate(&peer, MessageType::CircuitCreate, 0),
-                Verdict::Shed,
-            );
+            assert!(!gov.admit_circuit(&peer, 0));
         }
-        // Now blocked — even non-circuit messages are shed.
-        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, 0), Verdict::Shed,);
-        // But essential messages are still shed when blocked (block is hard).
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::Keepalive, 0),
-            Verdict::Shed,
-        );
+        // Now blocked: everything is shed, essential messages included.
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Shed);
+        assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Shed);
     }
 
     #[test]
     fn throttled_allows_essential() {
         let mut config = GovernorConfig::default();
-        config.circuit_creates_per_window = 1;
+        config.circuit_creates = (0.0, 1.0);
         config.pressure_threshold = 0.0;
         config.throttle_strikes = 1;
-        config.block_strikes = 100; // won't reach block
+        config.block_strikes = 100;
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
-
-        // Use up rate limit.
-        gov.evaluate(&peer, MessageType::CircuitCreate, 0);
-        // Next create → strike → throttled.
-        gov.evaluate(&peer, MessageType::CircuitCreate, 0);
-
-        // Non-essential shed.
-        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, 0), Verdict::Shed,);
-        // Essential allowed.
-        assert_eq!(
-            gov.evaluate(&peer, MessageType::Keepalive, 0),
-            Verdict::Allow,
-        );
+        gov.admit_circuit(&peer, 0);
+        gov.admit_circuit(&peer, 0); // strike → throttled
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Shed);
+        assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Allow);
     }
 
     #[test]
@@ -615,37 +623,66 @@ mod tests {
     }
 
     #[test]
-    fn dht_query_charge_is_always_enforced() {
+    fn every_charged_message_type_is_bounded_without_pressure() {
+        // Pressure stays zero: the budgets are always on.
         let mut config = GovernorConfig::default();
-        config.dht_queries_per_window = 2;
-        // Pressure remains zero: DHT admission must still be bounded.
+        for r in [
+            &mut config.dht_queries,
+            &mut config.directory,
+            &mut config.sample,
+            &mut config.route_search,
+            &mut config.route_requests,
+            &mut config.tunnel_kex,
+        ] {
+            *r = (0.0, 2.0);
+        }
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
-
-        assert!(gov.charge_dht_query(&peer));
-        assert!(gov.charge_dht_query(&peer));
-        assert!(!gov.charge_dht_query(&peer));
+        use MessageType as M;
+        for (a, b) in [
+            (M::DhtGet, M::DhtWatch),
+            (M::DirLookup, M::DirResult),
+            (M::SampleWalk, M::SampleResult),
+            (M::RouteSearch, M::RouteSearchFound),
+            (M::RouteRequest, M::RouteRequest),
+            (M::TunnelKeyExchange, M::TunnelKeyResponse),
+        ] {
+            assert_eq!(gov.evaluate(&peer, a, &[]), Verdict::Allow);
+            assert_eq!(gov.evaluate(&peer, b, &[]), Verdict::Allow);
+            assert_eq!(gov.evaluate(&peer, a, &[]), Verdict::Shed, "{:?} unbounded", a);
+        }
+        // Free traffic is never charged.
+        for _ in 0..100 {
+            assert_eq!(gov.evaluate(&peer, M::Keepalive, &[]), Verdict::Allow);
+        }
     }
 
     #[test]
-    fn dht_ingest_charge_bounds_records_and_bytes() {
+    fn dht_records_are_charged_by_count_and_bytes() {
         let mut config = GovernorConfig::default();
-        config.dht_ingest_records_per_window = 3;
-        config.dht_ingest_bytes_per_window = 100;
+        config.dht_records = (0.0, 3.0);
+        config.dht_bytes = (0.0, 100.0);
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtPut, &[0; 40]), Verdict::Allow);
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtPut, &[0; 70]), Verdict::Shed);
+        // A refused charge takes nothing.
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtPut, &[0; 50]), Verdict::Allow);
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtWatchNotify, &[0; 5]), Verdict::Allow);
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtPut, &[0; 1]), Verdict::Shed);
+    }
 
-        assert!(gov.charge_dht_ingest(&peer, 2, 40));
-        // Record budget: 2 + 2 > 3.
-        assert!(!gov.charge_dht_ingest(&peer, 2, 10));
-        // A refused charge consumes nothing.
-        assert!(gov.charge_dht_ingest(&peer, 1, 10));
-        // Byte budget: 50 + 60 > 100, even though records are exhausted anyway.
-        assert!(!gov.charge_dht_ingest(&peer, 0, 60));
-        // Unknown peers are refused.
-        assert!(!gov.charge_dht_ingest(&test_peer(2), 1, 1));
+    #[test]
+    fn handler_charges_share_the_budget() {
+        let mut config = GovernorConfig::default();
+        config.tunnel_kex = (0.0, 1.0);
+        let mut gov = Governor::new(config);
+        let peer = test_peer(1);
+        gov.peer_connected(peer);
+        assert!(gov.charge(&peer, Resource::TunnelKex));
+        assert_eq!(gov.evaluate(&peer, MessageType::TunnelKeyExchange, &[]), Verdict::Shed);
     }
 
     #[test]
@@ -657,20 +694,14 @@ mod tests {
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
-
-        // Send a report.
         gov.reporter()
             .send(Report {
                 link_peer: peer,
                 reason: ReportReason::ProtocolViolation,
             })
             .unwrap();
-
-        // Drain it.
         gov.drain_reports();
-
-        // Peer should be throttled now — non-essential shed.
-        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, 0), Verdict::Shed,);
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Shed);
     }
 
     #[test]

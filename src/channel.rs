@@ -5,8 +5,7 @@ use rand::Rng;
 
 use crate::wire;
 
-/// Maximum number of selective ACK entries to include in an ACK message.
-const MAX_SELECTIVE_ACKS: usize = 32;
+use crate::wire::MAX_SELECTIVE_ACKS;
 
 const DEFAULT_WINDOW_SIZE: u32 = 32;
 /// Congestion window at the start, in packets. The send window above is its cap.
@@ -696,6 +695,181 @@ impl Channel {
             Some(state) => state.recv_ready.drain(..).collect(),
             None => vec![],
         }
+    }
+}
+
+/// Inbound channels one peer may hold open at once, and all peers together.
+pub const MAX_CHANNELS_PER_PEER: usize = 256;
+pub const MAX_CHANNELS: usize = 16 * 1024;
+
+/// Every channel this node has, by local handle.
+///
+/// A channel's id on the wire is chosen by whichever side opened it, so ids
+/// are only unique per peer. The table keys channels by `(peer, wire id)`
+/// and hands out local handles: a channel we open uses its wire id as its
+/// handle; one a peer opens gets a fresh handle. A peer therefore can't
+/// claim ids another peer's channels need, and inbound channels are capped
+/// per peer and in total.
+#[derive(Default)]
+pub struct ChannelTable {
+    entries: std::collections::HashMap<u32, (crate::types::PeerId, Channel)>,
+    by_wire: std::collections::HashMap<(crate::types::PeerId, u32), u32>,
+    inbound_per_peer: std::collections::HashMap<crate::types::PeerId, usize>,
+    inbound: usize,
+}
+
+/// Why a peer's channel was not accepted.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChannelRefused {
+    /// The peer already has a channel with this id.
+    Duplicate,
+    /// The peer, or the node, has as many inbound channels as allowed.
+    Full,
+}
+
+impl ChannelTable {
+    fn free_handle(&self, peer: &crate::types::PeerId) -> u32 {
+        loop {
+            let h: u32 = rand::thread_rng().gen();
+            if !self.entries.contains_key(&h) && !self.by_wire.contains_key(&(*peer, h)) {
+                return h;
+            }
+        }
+    }
+
+    /// A channel we open to `peer`; its handle is its wire id.
+    pub fn open_local(&mut self, peer: crate::types::PeerId, port: [u8; 32], reliable: bool, ordered: bool) -> u32 {
+        let handle = self.free_handle(&peer);
+        let mut ch = Channel::new(handle, port, reliable, ordered);
+        ch.mark_opened_locally();
+        self.entries.insert(handle, (peer, ch));
+        self.by_wire.insert((peer, handle), handle);
+        handle
+    }
+
+    /// A channel `peer` opened with `wire_id`.
+    pub fn accept(
+        &mut self,
+        peer: crate::types::PeerId,
+        wire_id: u32,
+        port: [u8; 32],
+        reliable: bool,
+        ordered: bool,
+    ) -> Result<u32, ChannelRefused> {
+        if self.by_wire.contains_key(&(peer, wire_id)) {
+            return Err(ChannelRefused::Duplicate);
+        }
+        let per_peer = self.inbound_per_peer.get(&peer).copied().unwrap_or(0);
+        if per_peer >= MAX_CHANNELS_PER_PEER || self.inbound >= MAX_CHANNELS {
+            return Err(ChannelRefused::Full);
+        }
+        let handle = self.free_handle(&peer);
+        self.entries
+            .insert(handle, (peer, Channel::new(wire_id, port, reliable, ordered)));
+        self.by_wire.insert((peer, wire_id), handle);
+        *self.inbound_per_peer.entry(peer).or_insert(0) += 1;
+        self.inbound += 1;
+        Ok(handle)
+    }
+
+    /// The handle of `peer`'s channel `wire_id` (ours or theirs).
+    pub fn resolve(&self, peer: &crate::types::PeerId, wire_id: u32) -> Option<u32> {
+        self.by_wire.get(&(*peer, wire_id)).copied()
+    }
+
+    pub fn get(&self, handle: u32) -> Option<&(crate::types::PeerId, Channel)> {
+        self.entries.get(&handle)
+    }
+
+    pub fn get_mut(&mut self, handle: u32) -> Option<&mut (crate::types::PeerId, Channel)> {
+        self.entries.get_mut(&handle)
+    }
+
+    pub fn remove(&mut self, handle: u32) -> Option<(crate::types::PeerId, Channel)> {
+        let (peer, ch) = self.entries.remove(&handle)?;
+        self.by_wire.remove(&(peer, ch.channel_id));
+        if ch.channel_id != handle {
+            // Inbound.
+            self.inbound = self.inbound.saturating_sub(1);
+            if let Some(n) = self.inbound_per_peer.get_mut(&peer) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    self.inbound_per_peer.remove(&peer);
+                }
+            }
+        }
+        Some((peer, ch))
+    }
+
+    /// Queue `data` on channel `handle`: the peer, whether the channel is
+    /// reliable, and the encoded messages to send (with the channel's wire
+    /// id, which for a peer's channel is not its handle).
+    pub fn prepare_send(
+        &mut self,
+        handle: u32,
+        data: &[u8],
+    ) -> Option<(crate::types::PeerId, bool, Vec<Vec<u8>>)> {
+        let (peer, ch) = self.entries.get_mut(&handle)?;
+        let msgs = ch
+            .prepare_send(data.to_vec())
+            .into_iter()
+            .map(|(sequence, data)| {
+                wire::ChannelDataMsg {
+                    channel_id: ch.channel_id,
+                    sequence,
+                    data,
+                }
+                .to_wire()
+                .encode()
+            })
+            .collect();
+        Some((*peer, ch.reliable, msgs))
+    }
+
+    /// Every channel, by handle.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &crate::types::PeerId, &Channel)> {
+        self.entries.iter().map(|(h, (p, c))| (*h, p, c))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (u32, &crate::types::PeerId, &mut Channel)> {
+        self.entries.iter_mut().map(|(h, (p, c))| (*h, &*p, c))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::*;
+    use crate::types::PeerId;
+
+    #[test]
+    fn peers_have_their_own_ids_and_caps() {
+        let mut t = ChannelTable::default();
+        let (a, b) = (PeerId([1; 32]), PeerId([2; 32]));
+        let ha = t.accept(a, 7, [0; 32], true, true).unwrap();
+        // Another peer may use the same wire id.
+        let hb = t.accept(b, 7, [0; 32], true, true).unwrap();
+        assert_ne!(ha, hb);
+        assert_eq!(t.resolve(&a, 7), Some(ha));
+        assert_eq!(t.resolve(&b, 7), Some(hb));
+        assert_eq!(t.accept(a, 7, [0; 32], true, true), Err(ChannelRefused::Duplicate));
+        for i in 0..MAX_CHANNELS_PER_PEER as u32 - 1 {
+            t.accept(a, 100 + i, [0; 32], true, true).unwrap();
+        }
+        assert_eq!(t.accept(a, 99, [0; 32], true, true), Err(ChannelRefused::Full));
+        // Closing one makes room.
+        t.remove(ha);
+        assert!(t.accept(a, 99, [0; 32], true, true).is_ok());
+        // Our own channel to `a` is addressable by its wire id too.
+        let ours = t.open_local(a, [0; 32], true, true);
+        assert_eq!(t.resolve(&a, ours), Some(ours));
     }
 }
 

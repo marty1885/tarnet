@@ -893,44 +893,33 @@ pub struct CreateRequest {
 
 impl CreateRequest {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(5 + self.eph_pk.len() + 33 + 32 * self.hints.len());
+        let mut buf = Vec::new();
         buf.push(CELL_CRYPTO_VERSION);
         buf.push(0); // flags, none defined
         buf.push(self.kem_algo);
         buf.extend_from_slice(&(self.eph_pk.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.eph_pk);
         buf.extend_from_slice(self.destination.as_bytes());
-        buf.push(self.hints.len() as u8);
-        for hint in &self.hints {
-            buf.extend_from_slice(hint.as_bytes());
-        }
+        crate::codec::write_peers(&mut buf, &self.hints, crate::wire::MAX_HINTS);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let short = || Error::Wire("CREATE payload too short".into());
-        if data.len() < 5 {
-            return Err(short());
+        let mut r = crate::codec::Reader::new(data);
+        let version = r.read_u8()?;
+        if version != CELL_CRYPTO_VERSION {
+            return Err(Error::Wire(format!("unsupported cell crypto version {}", version)));
         }
-        if data[0] != CELL_CRYPTO_VERSION {
-            return Err(Error::Wire(format!("unsupported cell crypto version {}", data[0])));
+        let flags = r.read_u8()?;
+        if flags != 0 {
+            return Err(Error::Wire(format!("unknown CREATE flags {:#x}", flags)));
         }
-        let kem_algo = data[2];
-        let pk_len = u16::from_be_bytes([data[3], data[4]]) as usize;
-        let eph_pk = data.get(5..5 + pk_len).ok_or_else(short)?.to_vec();
-        let at = 5 + pk_len;
-        let destination = PeerId(data.get(at..at + 32).ok_or_else(short)?.try_into().unwrap());
-        let hint_count = *data.get(at + 32).ok_or_else(short)? as usize;
-        if hint_count > crate::wire::MAX_HINTS {
-            return Err(Error::Wire(format!("CREATE carries {} hints", hint_count)));
-        }
-        let hints_at = at + 33;
-        let hints = data
-            .get(hints_at..hints_at + 32 * hint_count)
-            .ok_or_else(short)?
-            .chunks_exact(32)
-            .map(|h| PeerId(h.try_into().unwrap()))
-            .collect();
+        let kem_algo = r.read_u8()?;
+        let pk_len = r.read_u16()? as usize;
+        let eph_pk = r.read_bytes(pk_len)?;
+        let destination = PeerId(r.read_array::<32>()?);
+        let hints = r.read_peers(crate::wire::MAX_HINTS, "CREATE hints")?;
+        r.finish()?;
         Ok(Self {
             kem_algo,
             eph_pk,
@@ -983,23 +972,17 @@ impl CreatedReply {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let mut at = 0;
+        let mut r = crate::codec::Reader::new(data);
         let mut field = || -> Result<Vec<u8>> {
-            let len = data
-                .get(at..at + 2)
-                .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
-                .ok_or_else(|| Error::Wire("CREATED payload too short".into()))?;
-            let bytes = data
-                .get(at + 2..at + 2 + len)
-                .ok_or_else(|| Error::Wire("CREATED payload too short".into()))?
-                .to_vec();
-            at += 2 + len;
-            Ok(bytes)
+            let len = r.read_u16()? as usize;
+            r.read_bytes(len)
         };
+        let (kem_ct, signing_pk, sig) = (field()?, field()?, field()?);
+        r.finish()?;
         Ok(Self {
-            kem_ct: field()?,
-            signing_pk: field()?,
-            sig: field()?,
+            kem_ct,
+            signing_pk,
+            sig,
         })
     }
 
@@ -1007,14 +990,15 @@ impl CreatedReply {
     /// hashes to the destination and signed this handshake. Returns the
     /// transcript hash for key derivation.
     pub fn verify(&self, request: &CreateRequest) -> Result<[u8; 32]> {
-        if crate::identity::peer_id_from_signing_pubkey(&self.signing_pk) != request.destination {
-            return Err(Error::Crypto("CREATED key is not the destination's".into()));
-        }
-        let algo = crate::identity::signing_algo_of(&self.signing_pk)
-            .ok_or_else(|| Error::Crypto("CREATED key has an unknown length".into()))?;
         let transcript = request.transcript(&self.kem_ct);
-        if !crate::identity::verify(algo, &self.signing_pk, &created_signed_message(&transcript), &self.sig) {
-            return Err(Error::Crypto("CREATED signature invalid".into()));
+        if !crate::identity::verify_signed(
+            crate::identity::SignedBy::Peer(&request.destination),
+            None,
+            &self.signing_pk,
+            &created_signed_message(&transcript),
+            &self.sig,
+        ) {
+            return Err(Error::Crypto("CREATED not signed by the destination".into()));
         }
         Ok(transcript)
     }
@@ -1097,16 +1081,13 @@ pub struct Introduction {
 impl Introduction {
     fn to_plaintext(&self) -> Vec<u8> {
         let port = self.port.as_bytes();
-        let mut out = Vec::with_capacity(72 + port.len() + 32 * self.rendezvous_hints.len() + 3 + self.client_eph_pk.len());
+        let mut out = Vec::new();
         out.extend_from_slice(self.rendezvous.as_bytes());
         out.extend_from_slice(&self.cookie);
         out.push(self.mode as u8);
         out.extend_from_slice(&(u16::try_from(port.len()).expect("port name too long")).to_be_bytes());
         out.extend_from_slice(port);
-        out.push(self.rendezvous_hints.len() as u8);
-        for hint in &self.rendezvous_hints {
-            out.extend_from_slice(hint.as_bytes());
-        }
+        crate::codec::write_peers(&mut out, &self.rendezvous_hints, crate::wire::MAX_HINTS);
         out.push(self.client_kem_algo);
         out.extend_from_slice(&(self.client_eph_pk.len() as u16).to_be_bytes());
         out.extend_from_slice(&self.client_eph_pk);
@@ -1114,32 +1095,23 @@ impl Introduction {
     }
 
     fn from_plaintext(p: &[u8]) -> Result<Self> {
-        let short = || Error::Wire("INTRODUCE plaintext truncated".into());
-        let take = |at: usize, n: usize| p.get(at..at + n).ok_or_else(short);
-        let rendezvous = PeerId(take(0, 32)?.try_into().unwrap());
-        let cookie: [u8; 32] = take(32, 32)?.try_into().unwrap();
-        let mode = match take(64, 1)?[0] {
+        let mut r = crate::codec::Reader::new(p);
+        let rendezvous = PeerId(r.read_array::<32>()?);
+        let cookie: [u8; 32] = r.read_array::<32>()?;
+        let mode = match r.read_u8()? {
             0 => tarnet_api::service::PortMode::ReliableOrdered,
             1 => tarnet_api::service::PortMode::ReliableUnordered,
             2 => tarnet_api::service::PortMode::UnreliableUnordered,
             other => return Err(Error::Wire(format!("unknown port mode {}", other))),
         };
-        let port_len = u16::from_be_bytes(take(65, 2)?.try_into().unwrap()) as usize;
-        let port = String::from_utf8(take(67, port_len)?.to_vec())
+        let port_len = r.read_u16()? as usize;
+        let port = String::from_utf8(r.read_bytes(port_len)?)
             .map_err(|_| Error::Wire("INTRODUCE port is not valid UTF-8".into()))?;
-        let mut at = 67 + port_len;
-        let hint_count = take(at, 1)?[0] as usize;
-        if hint_count > crate::wire::MAX_HINTS {
-            return Err(Error::Wire(format!("INTRODUCE carries {} hints", hint_count)));
-        }
-        let rendezvous_hints = take(at + 1, 32 * hint_count)?
-            .chunks_exact(32)
-            .map(|h| PeerId(h.try_into().unwrap()))
-            .collect();
-        at += 1 + 32 * hint_count;
-        let client_kem_algo = take(at, 1)?[0];
-        let pk_len = u16::from_be_bytes(take(at + 1, 2)?.try_into().unwrap()) as usize;
-        let client_eph_pk = take(at + 3, pk_len)?.to_vec();
+        let rendezvous_hints = r.read_peers(crate::wire::MAX_HINTS, "INTRODUCE hints")?;
+        let client_kem_algo = r.read_u8()?;
+        let pk_len = r.read_u16()? as usize;
+        let client_eph_pk = r.read_bytes(pk_len)?;
+        r.finish()?;
         Ok(Self {
             rendezvous,
             rendezvous_hints,
@@ -1276,14 +1248,16 @@ pub fn build_join(kem_ct: &[u8], confirm: &[u8; 16]) -> Vec<u8> {
 }
 
 pub fn parse_join(data: &[u8]) -> Result<(&[u8], [u8; 16])> {
-    let short = || Error::Wire("JOIN answer too short".into());
+    let short = || Error::Wire("JOIN answer malformed".into());
     let len = data
         .get(..2)
         .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
         .ok_or_else(short)?;
-    let kem_ct = data.get(2..2 + len).ok_or_else(short)?;
-    let confirm = data.get(2 + len..2 + len + 16).ok_or_else(short)?;
-    Ok((kem_ct, confirm.try_into().unwrap()))
+    // Exactly the ciphertext and the confirm tag, nothing after.
+    if data.len() != 2 + len + 16 {
+        return Err(short());
+    }
+    Ok((&data[2..2 + len], data[2 + len..].try_into().unwrap()))
 }
 
 /// Build a rendezvous cookie payload (used by both ESTABLISH and JOIN).
@@ -1309,6 +1283,9 @@ pub fn build_rendezvous_establish_payload(cookie: &[u8; 32]) -> Vec<u8> {
 
 /// Parse a RENDEZVOUS_ESTABLISH payload.
 pub fn parse_rendezvous_establish_payload(data: &[u8]) -> Result<[u8; 32]> {
+    if data.len() != 32 {
+        return Err(Error::Wire("RENDEZVOUS_ESTABLISH payload is not a cookie".into()));
+    }
     parse_rendezvous_cookie_payload(data, "RENDEZVOUS_ESTABLISH")
 }
 
@@ -1373,13 +1350,14 @@ pub fn verify_intro_register(
     let pk = field()?;
     let sig = field()?;
     let service_id = tarnet_api::types::ServiceId(sid);
-    if tarnet_api::types::ServiceId::from_signing_pubkey(pk) != service_id {
-        return Err(Error::Crypto("INTRO_REGISTER key is not the service's".into()));
-    }
-    let algo = crate::identity::signing_algo_of(pk)
-        .ok_or_else(|| Error::Crypto("INTRO_REGISTER key has an unknown length".into()))?;
-    if !crate::identity::verify(algo, pk, &intro_register_message(intro_point, transcript), sig) {
-        return Err(Error::Crypto("INTRO_REGISTER signature invalid".into()));
+    if !crate::identity::verify_signed(
+        crate::identity::SignedBy::Service(&service_id),
+        None,
+        pk,
+        &intro_register_message(intro_point, transcript),
+        sig,
+    ) {
+        return Err(Error::Crypto("INTRO_REGISTER not signed by the service".into()));
     }
     Ok(service_id)
 }

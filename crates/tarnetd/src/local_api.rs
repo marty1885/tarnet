@@ -2,12 +2,10 @@
 //! Used by the daemon's IPC server and by in-process services.
 //! Zero-copy, no serialization — just method calls.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 
 use tarnet::node::Node;
 use tarnet::state::StateDb;
@@ -17,19 +15,8 @@ use tarnet_api::service::{
     Connection, DhtEntry, HelloInfo, Listener, ListenerOptions, NodeEvent, PoolClaim, PoolEndpoint,
     PoolKind, PoolRegisterOptions, PortMode, ServiceApi, TnsRecord, TnsResolution, WatchEvent,
 };
-use tarnet_api::types::{DhtId, PeerId, ServiceId};
+use tarnet_api::types::{ContentHandle, DhtId, PeerId, ServiceId};
 
-/// How long successful TNS resolutions are cached.
-const TNS_CACHE_TTL_SUCCESS: std::time::Duration = std::time::Duration::from_secs(300);
-/// How long NotFound results are cached (negative caching).
-const TNS_CACHE_TTL_NOT_FOUND: std::time::Duration = std::time::Duration::from_secs(60);
-/// Maximum number of entries before we evict expired ones.
-const TNS_CACHE_MAX_ENTRIES: usize = 1024;
-
-struct TnsCacheEntry {
-    resolution: TnsResolution,
-    expires_at: Instant,
-}
 
 pub struct LocalServiceApi {
     node: Arc<Node>,
@@ -39,8 +26,6 @@ pub struct LocalServiceApi {
     db: Arc<StateDb>,
     /// SOCKS proxy bind addresses (empty if disabled).
     socks_addrs: Vec<std::net::SocketAddr>,
-    /// Cache for TNS resolution results. Key is (zone_hex, name).
-    tns_cache: Mutex<HashMap<String, TnsCacheEntry>>,
 }
 
 impl LocalServiceApi {
@@ -81,7 +66,7 @@ impl LocalServiceApi {
                 while let Some((key, record)) = watch_rx.recv().await {
                     let _ = tx.send(NodeEvent::Watch(WatchEvent {
                         key,
-                        signer: PeerId(record.signer),
+                        signer: record.signer,
                         value: record.value,
                     }));
                 }
@@ -107,48 +92,15 @@ impl LocalServiceApi {
             event_tx,
             db,
             socks_addrs,
-            tns_cache: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl LocalServiceApi {
-    /// Look up a cached TNS resolution result.
-    async fn tns_cache_get(&self, key: &str) -> Option<TnsResolution> {
-        let cache = self.tns_cache.lock().await;
-        if let Some(entry) = cache.get(key) {
-            if Instant::now() < entry.expires_at {
-                return Some(entry.resolution.clone());
-            }
-        }
-        None
-    }
-
-    /// Insert a TNS resolution result into the cache.
-    async fn tns_cache_put(&self, key: String, resolution: TnsResolution) {
-        let ttl = match &resolution {
-            TnsResolution::Records(_) | TnsResolution::VHost { .. } => TNS_CACHE_TTL_SUCCESS,
-            TnsResolution::NotFound => TNS_CACHE_TTL_NOT_FOUND,
-            TnsResolution::Error(_) => return, // don't cache errors
-        };
-        let mut cache = self.tns_cache.lock().await;
-        // Evict expired entries if we're at capacity.
-        if cache.len() >= TNS_CACHE_MAX_ENTRIES {
-            let now = Instant::now();
-            cache.retain(|_, v| v.expires_at > now);
-        }
-        cache.insert(
-            key,
-            TnsCacheEntry {
-                resolution,
-                expires_at: Instant::now() + ttl,
-            },
-        );
-    }
-
-    /// Invalidate all cache entries (used when local labels change).
+    /// Local labels changed: drop cached resolutions (the node's cache is
+    /// the only one).
     async fn tns_cache_clear(&self) {
-        self.tns_cache.lock().await.clear();
+        self.node.tns_cache().lock().await.clear();
     }
 
     /// Resolve an identity option to a DB key string.
@@ -388,12 +340,14 @@ impl ServiceApi for LocalServiceApi {
             .map_err(map_err)
     }
 
-    async fn dht_put(&self, value: &[u8]) -> DhtId {
-        DhtId(self.node.dht_put_content(value).await)
+    async fn dht_put(&self, value: &[u8]) -> ApiResult<ContentHandle> {
+        self.node
+            .dht_put_content(value)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
     }
 
-    async fn dht_get(&self, key: &DhtId, timeout_secs: u32) -> Option<Vec<u8>> {
-        let inner_hash = key.as_bytes();
+    async fn dht_get(&self, inner_hash: &ContentHandle, timeout_secs: u32) -> Option<Vec<u8>> {
 
         // Check local store first.
         if let Some(data) = self.node.dht_get_content(inner_hash).await {
@@ -418,12 +372,14 @@ impl ServiceApi for LocalServiceApi {
         }
     }
 
-    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> DhtId {
-        DhtId(self.node.dht_put_signed_content(value, ttl_secs).await)
+    async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
+        self.node
+            .dht_put_signed_content(value, ttl_secs)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
     }
 
-    async fn dht_get_signed(&self, key: &DhtId, timeout_secs: u32) -> Vec<DhtEntry> {
-        let inner_hash = key.as_bytes();
+    async fn dht_get_signed(&self, inner_hash: &ContentHandle, timeout_secs: u32) -> Vec<DhtEntry> {
 
         // Check local store first.
         let results = self.node.dht_get_signed_content(inner_hash).await;
@@ -532,14 +488,13 @@ impl ServiceApi for LocalServiceApi {
         identity: Option<&str>,
         label: &str,
         records: Vec<TnsRecord>,
-        ttl_secs: u32,
     ) -> ApiResult<()> {
         let id_key = self.identity_db_key(identity).await?;
         tns::validate_records(&records).map_err(map_err)?;
         tns::validate_published_aliases(&records, &self.db, &id_key).map_err(map_err)?;
 
         let zone_keypair = self.keypair_for_identity(identity).await?;
-        tns::publish(&self.node, &zone_keypair, label, &records, ttl_secs)
+        tns::publish(&self.node, &zone_keypair, label, &records)
             .await
             .map_err(map_err)?;
         self.tns_cache_clear().await;
@@ -547,28 +502,12 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn tns_resolve(&self, zone: ServiceId, name: &str) -> ApiResult<TnsResolution> {
-        let cache_key = format!(
-            "z:{}:{}",
-            tarnet_api::types::encode_base32(zone.as_bytes()),
-            name
-        );
-        if let Some(cached) = self.tns_cache_get(&cache_key).await {
-            return Ok(cached);
-        }
-        let result = tns::resolve(&self.node, zone, name).await;
-        self.tns_cache_put(cache_key, result.clone()).await;
-        Ok(result)
+        // Each step is cached by the node's TNS cache, with its record's TTL.
+        Ok(tns::resolve(&self.node, zone, name).await)
     }
 
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution> {
-        let cache_key = format!("n:{}", name);
-        if let Some(cached) = self.tns_cache_get(&cache_key).await {
-            return Ok(cached);
-        }
-
-        let result = self.tns_resolve_name_inner(name).await?;
-        self.tns_cache_put(cache_key, result.clone()).await;
-        Ok(result)
+        self.tns_resolve_name_inner(name).await
     }
 
     async fn tns_set_label(
@@ -594,7 +533,7 @@ impl ServiceApi for LocalServiceApi {
         // Auto-publish to DHT when marked public.
         if publish {
             let zone_keypair = self.keypair_for_identity(identity).await?;
-            tns::publish(&self.node, &zone_keypair, label, &records, 3600)
+            tns::publish(&self.node, &zone_keypair, label, &records)
                 .await
                 .map_err(map_err)?;
         }
@@ -628,7 +567,7 @@ impl ServiceApi for LocalServiceApi {
         // actually stops resolving (the root holds the zone's whole label set;
         // it would otherwise persist until the root's TTL lapses).
         let zone_keypair = self.keypair_for_identity(identity).await?;
-        tns::unpublish(&self.node, &zone_keypair, label, 3600)
+        tns::unpublish(&self.node, &zone_keypair, label)
             .await
             .map_err(map_err)?;
         self.tns_cache_clear().await;

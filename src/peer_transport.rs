@@ -670,7 +670,7 @@ mod tests {
         // Post-rekey: a→b and b→a both decrypt under the new keys. (Frames are
         // padded before encryption, so decode rather than compare raw bytes.)
         let frame = KeepaliveMsg {
-            timestamp_us: None,
+            ping_id: None,
             padding: Vec::new(),
         }
         .to_wire()
@@ -691,7 +691,7 @@ mod tests {
 
         let (a, b) = make_test_link_pair().await; // a = initiator
         let frame = KeepaliveMsg {
-            timestamp_us: None,
+            ping_id: None,
             padding: Vec::new(),
         }
         .to_wire()

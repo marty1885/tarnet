@@ -24,6 +24,28 @@ without a compatibility break. Open decisions are collected at the end.
 5. **Keep the privacy properties of v4** (listed under "Privacy"), and keep the
    design stances: unauthenticated relays, public by default, privacy opt-in via
    Hidden identities.
+6. **Clock-free.** Nothing depends on nodes' clocks agreeing; see below.
+
+## Clock-free
+
+Decision (2026-10): tarnet does not trust clocks. Relays include boards with no
+real-time clock on links that may never reach a time server, and serving time
+over the overlay was rejected as an extra dependency. So:
+
+* No message carries a wall-clock time that another node checks. The link
+  handshake and the tunnel key exchange carry no timestamps; their freshness
+  comes from both sides' fresh ephemeral keys and random challenges or nonces,
+  bound into what is signed. Keepalive pings carry a random id, not a time
+  (which would also fingerprint the sender's clock).
+* Lifetimes are relative: a record carries the TTL it has left and each node
+  counts it down on its own monotonic clock. Since a TTL can't be signed
+  meaningfully, stores never let a copy extend a record they hold, and never
+  store again a record that expired with them unless its owner signed a higher
+  sequence (DHT records and directory address records alike).
+* Sequences are counters persisted by their owner, never times.
+* A node's own wall clock is used only locally and fails safe: persisted DHT
+  records are dropped at start-up if the clock reads earlier than when they
+  were written.
 
 ## Use cases the design is checked against
 
@@ -255,11 +277,17 @@ An update `(D, s, m)` from neighbour n is **feasible** if `s` is newer than
 routes are selected. If the only remaining routes are infeasible (starvation),
 the node sends a `RouteRequest` with `SEQNO` toward D; D answers by incrementing
 its seqno and advertising. This removes count-to-infinity without hop limits.
+Requests are unacknowledged and can be lost, so a node resends them while D
+stays starving: after 12 s, doubling up to 120 s (longer than the 10 s within
+which relays drop a repeated request). An FD is forgotten 180 s after it was
+last used; the node then reselects, so D becomes reachable again even if every
+request was lost.
 
 ### Metric
 
 Additive per-link cost, chosen locally per link (a fast link costs 1, a slow
-link 16). `0xFFFF` is a retraction. A route whose metric would reach `0xFFFF`
+link 16). With several links to one neighbour, the cost is that of the link
+currently carrying its traffic, and follows it when that link fails over. `0xFFFF` is a retraction. A route whose metric would reach `0xFFFF`
 is unusable.
 
 ### Table budget
@@ -426,9 +454,10 @@ signature over "tarnet address v1" || every field before signer_algo
   `path_len ≤ PATH_MAX`. A node farther than that from every landmark is
   reachable only by route search.
 * The signer key must hash to `peer`. Directory nodes and resolvers verify.
-  Newest `seq` wins. Publishers use the current Unix time (or the last seq
-  plus one, if larger), so a restarted node's record is never older than the
-  one it left behind.
+  Newest `seq` wins. Publishers count `seq` up by one per publish and
+  persist it with their other sequences, so a restarted node's record is
+  never older than the one it left behind. No clock is involved (see
+  "Clock-free").
 * A landmark's own record lists itself first, with an empty path.
 
 Status: **implemented**.
@@ -471,8 +500,12 @@ tracing it:
 * It publishes when its address changes (nearest landmarks or paths), after a
   short delay and rate-limited, and otherwise every `DIR_REPUBLISH`.
 * A landmark stores bounded, verified records with TTL, newest seq per peer.
-  A repeat of the stored record refreshes it; a different record with the
-  same seq is refused. When full, the record expiring soonest makes room.
+  A repeat of the stored record is accepted but keeps the expiry already
+  held: `ttl_secs` is relative, so a replayed copy can't be told from a fresh
+  one, and only a higher seq brings a new lifetime. A record that expired at
+  this landmark is not stored again unless its seq is higher (remembered for
+  the 6 h TTL cap). A different record with the same seq is refused. When
+  full, the record expiring soonest makes room.
   A node that is not a landmark stores nothing. When the landmark set
   changes, owners republish. There is no handoff between landmarks.
 * `DirPublish` is not acknowledged and lossy links lose it, so the publisher
@@ -1047,7 +1080,53 @@ without a break. A future hierarchy layer above landmarks would go there.
 Hello record: `capabilities` gains bit 2 `LANDMARK_ELIGIBLE` and bit 3
 `LANDMARK`.
 
+### Encoding rules
+
+* **Exact decoding.** Every message, record and payload has exactly one
+  encoding: a decoder rejects anything left over after the last field
+  (keepalive padding excepted, which is defined as the rest of the message),
+  and the wire header's `LEN` must match the payload exactly. Several
+  mechanisms identify a message by a hash of its bytes (INTRODUCE replay,
+  CREATE resend detection); appending junk must not make a copy look new.
+* **Lists.** Every peer list (hints, paths, hops) is `count(u8) || count ×
+  peer(32)` with a per-list maximum, checked by the one shared reader; a
+  sender never builds a longer list.
+* **Status bytes** take only their defined values (0 or 1); others are
+  rejected. CREATE's flags byte must be 0.
+* **Signed bytes** start with a domain label naming the object and version
+  (`"tarnet dht record v1"`, `"tarnet link rekey v1"`, `"tarnet address v1"`,
+  …), and length-prefix every variable-length field, so no two objects an
+  identity signs can share signed bytes.
+* **TTLs** on overlay `Data` are clamped to the sender default (64) on
+  receipt; DHT TTLs to the type's cap; seqno-request hop budgets to 64.
+
 ## Local policy (not part of the wire contract)
+
+### Admission and per-node state
+
+* **One cost per message type.** Every message type has a declared cost
+  (free, a budget it charges, or "charged by its handler" for work only the
+  handler can tell from a resend, like CREATE and EXTEND), in one exhaustive
+  table. A link peer's message pays before any handler runs; a message
+  unwrapped from overlay `Data` pays the same as on a link. Budgets are
+  per link peer token buckets (circuit creates, DHT queries, DHT records and
+  bytes, directory, sampling, route search, seqno requests, key exchanges),
+  created and dropped with the peer.
+* **Bounded state.** Every table a peer can make a node grow is capped and
+  expires by itself (an entry past its lifetime is never returned, and a full
+  table refuses rather than grows): reverse paths, watches, tunnels and
+  channels (per peer and in total), rendezvous cookies, introduction and
+  key-exchange replay sets, pending circuit legs, search, sampling and
+  directory state.
+* **Replies come from where the request went.** A DHT response, watch
+  notification, directory result or route-search answer is taken only from
+  the neighbour the request was passed to; watches can be cancelled or
+  refreshed only by the neighbour that registered them.
+* **One send path.** Every message a node sends chooses its next hop by the
+  forwarding rule and is counted against the upload limit (link and routing
+  upkeep is counted but not held back), except keepalives, which belong to a
+  single physical link.
+
 
 | Parameter | Value |
 |---|---|

@@ -16,39 +16,36 @@ fn ring_wait(ttl: u8) -> Duration {
 const NONCE_LIFETIME: Duration = Duration::from_secs(30);
 /// Searches a relay remembers at once.
 const MAX_SEEN: usize = 8192;
-/// Searches accepted per second per neighbour, and the burst.
-const SEARCH_RATE: f64 = 5.0;
-const SEARCH_BURST: f64 = 20.0;
 /// At most one search per target this often.
 const SEARCH_PER_TARGET: Duration = Duration::from_secs(30);
 /// How long a search's answer is used.
 const FOUND_LIFETIME: Duration = Duration::from_secs(300);
+/// Targets with searched hints, or searched recently, remembered at once.
+const MAX_TARGETS: usize = 4096;
 
 /// A search that passed us.
 struct Seen {
     prev: PeerId,
     /// An answer already went back through us.
     answered: bool,
-    at: Instant,
 }
 
 pub(super) struct SearchState {
-    seen: Mutex<HashMap<[u8; 16], Seen>>,
+    seen: Mutex<crate::bounded::BoundedMap<[u8; 16], Seen>>,
     waiters: Mutex<HashMap<[u8; 16], oneshot::Sender<Vec<PeerId>>>>,
     /// Hints a search found, by target.
-    found: Mutex<HashMap<PeerId, (Vec<PeerId>, Instant)>>,
-    last_search: Mutex<HashMap<PeerId, Instant>>,
-    budget: Mutex<HashMap<PeerId, (f64, Instant)>>,
+    found: Mutex<crate::bounded::BoundedMap<PeerId, Vec<PeerId>>>,
+    /// Targets searched for recently: one search each per `SEARCH_PER_TARGET`.
+    last_search: Mutex<crate::bounded::BoundedMap<PeerId, ()>>,
 }
 
 impl SearchState {
     pub(super) fn new() -> Self {
         Self {
-            seen: Mutex::new(HashMap::new()),
+            seen: Mutex::new(crate::bounded::BoundedMap::new(MAX_SEEN, NONCE_LIFETIME)),
             waiters: Mutex::new(HashMap::new()),
-            found: Mutex::new(HashMap::new()),
-            last_search: Mutex::new(HashMap::new()),
-            budget: Mutex::new(HashMap::new()),
+            found: Mutex::new(crate::bounded::BoundedMap::new(MAX_TARGETS, FOUND_LIFETIME)),
+            last_search: Mutex::new(crate::bounded::BoundedMap::new(MAX_TARGETS, SEARCH_PER_TARGET)),
         }
     }
 }
@@ -65,39 +62,19 @@ fn hints_from_hops(hops: &[PeerId], reach: impl Fn(&PeerId) -> bool) -> Option<V
 }
 
 impl Node {
-    async fn search_allowed(&self, from: &PeerId) -> bool {
-        let mut budget = self.search.budget.lock().await;
-        let now = Instant::now();
-        let (tokens, at) = budget.entry(*from).or_insert((SEARCH_BURST, now));
-        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * SEARCH_RATE).min(SEARCH_BURST);
-        *at = now;
-        if *tokens < 1.0 {
-            return false;
-        }
-        *tokens -= 1.0;
-        true
-    }
-
     /// Remember a search. False if we have seen it already.
     async fn remember_search(&self, nonce: [u8; 16], prev: PeerId, answered: bool) -> bool {
-        let mut seen = self.search.seen.lock().await;
-        let now = Instant::now();
-        if seen.contains_key(&nonce) {
-            return false;
-        }
-        if seen.len() >= MAX_SEEN {
-            seen.retain(|_, s| now.duration_since(s.at) < NONCE_LIFETIME);
-            if seen.len() >= MAX_SEEN {
-                return false;
-            }
-        }
-        seen.insert(nonce, Seen { prev, answered, at: now });
-        true
+        self.search
+            .seen
+            .lock()
+            .await
+            .try_insert(nonce, Seen { prev, answered })
+            .is_ok()
     }
 
     pub(super) async fn handle_route_search(&self, from: PeerId, payload: &[u8]) -> Result<()> {
         let msg = RouteSearchMsg::from_bytes(payload)?;
-        if !self.search_allowed(&from).await || !self.remember_search(msg.nonce, from, false).await {
+        if !self.remember_search(msg.nonce, from, false).await {
             return Ok(());
         }
         let me = self.peer_id();
@@ -141,8 +118,10 @@ impl Node {
         let prev = {
             let mut seen = self.search.seen.lock().await;
             match seen.get_mut(&msg.nonce) {
-                // The first answer goes back; the rest add nothing.
-                Some(s) if !s.answered => {
+                // The first answer goes back; the rest add nothing. We sent
+                // the search to every neighbour but `prev`, so an answer
+                // can't come from it.
+                Some(s) if !s.answered && s.prev != from => {
                     s.answered = true;
                     s.prev
                 }
@@ -160,15 +139,7 @@ impl Node {
 
     /// Hints toward `target` from a recent search, if any.
     pub(super) async fn searched_hints(&self, target: &PeerId) -> Vec<PeerId> {
-        let mut found = self.search.found.lock().await;
-        match found.get(target) {
-            Some((hints, at)) if at.elapsed() < FOUND_LIFETIME => hints.clone(),
-            Some(_) => {
-                found.remove(target);
-                Vec::new()
-            }
-            None => Vec::new(),
-        }
+        self.search.found.lock().await.get(target).cloned().unwrap_or_default()
     }
 
     /// A build using the searched hints failed: search again next time.
@@ -180,14 +151,9 @@ impl Node {
     /// hints toward it, or `None` if no ring found it (or a search for it
     /// ran less than `SEARCH_PER_TARGET` ago).
     pub async fn route_search(&self, target: &PeerId) -> Option<Vec<PeerId>> {
-        {
-            let mut last = self.search.last_search.lock().await;
-            let now = Instant::now();
-            last.retain(|_, t| now.duration_since(*t) < SEARCH_PER_TARGET);
-            if last.contains_key(target) {
-                return None;
-            }
-            last.insert(*target, now);
+        // A search for this target ran recently (or too many are tracked).
+        if self.search.last_search.lock().await.try_insert(*target, ()).is_err() {
+            return None;
         }
         let me = self.peer_id();
         for ttl in RINGS {
@@ -221,11 +187,7 @@ impl Node {
             match hints {
                 Some(hints) => {
                     log::info!("Route search found {:?} within {} hops", target, ttl);
-                    self.search
-                        .found
-                        .lock()
-                        .await
-                        .insert(*target, (hints.clone(), Instant::now()));
+                    let _ = self.search.found.lock().await.upsert(*target, hints.clone());
                     return Some(hints);
                 }
                 None => {
@@ -244,21 +206,9 @@ impl Node {
             loop {
                 interval.tick().await;
                 let now = Instant::now();
-                node.search
-                    .seen
-                    .lock()
-                    .await
-                    .retain(|_, s| now.duration_since(s.at) < NONCE_LIFETIME);
-                node.search
-                    .found
-                    .lock()
-                    .await
-                    .retain(|_, (_, at)| now.duration_since(*at) < FOUND_LIFETIME);
-                node.search
-                    .budget
-                    .lock()
-                    .await
-                    .retain(|_, (_, at)| now.duration_since(*at) < NONCE_LIFETIME);
+                node.search.seen.lock().await.expire(now);
+                node.search.found.lock().await.expire(now);
+                node.search.last_search.lock().await.expire(now);
             }
         });
     }

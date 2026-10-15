@@ -4,27 +4,9 @@ use super::*;
 /// for as long as the pending exchange lives.
 const KEX_RETRY_INITIAL: Duration = Duration::from_millis(500);
 const KEX_RETRY_MAX: Duration = Duration::from_secs(1);
-const KEX_RETRY_WINDOW: Duration = Duration::from_secs(30);
-
-/// Send an overlay message toward `dest`: over the link if we have one,
-/// else by the forwarding rule with `hints`. For spawned tasks that hold the
-/// tables but not the node.
-pub(super) async fn send_overlay(
-    links: &Mutex<LinkTable>,
-    routing: &Mutex<RoutingTable>,
-    dest: &PeerId,
-    hints: &[PeerId],
-    data: &[u8],
-) -> Result<()> {
-    let links = links.lock().await;
-    let next = routing
-        .lock()
-        .await
-        .next_hop_hinted(dest, hints, |p| links.contains_key(p))
-        .ok_or(Error::NotFound)?;
-    let link = links.get(&next).ok_or(Error::NotFound)?;
-    link.send_message(data).await
-}
+pub(super) const KEX_RETRY_WINDOW: Duration = Duration::from_secs(30);
+/// Key exchanges this node has in flight at once.
+pub(super) const MAX_PENDING_KEX: usize = 4096;
 
 impl Node {
     /// Handle incoming TunnelKeyExchange — routed to us as destination.
@@ -62,56 +44,59 @@ impl Node {
             return Ok(());
         }
 
-        // Check timestamp drift
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let drift = if now > ke.timestamp {
-            now - ke.timestamp
-        } else {
-            ke.timestamp - now
-        };
-        if drift > KEY_EXCHANGE_MAX_DRIFT {
-            log::warn!(
-                "TunnelKeyExchange from {:?}: timestamp drift {}s, rejecting",
-                ke.initiator_peer_id,
-                drift
-            );
-            return Ok(());
-        }
-
         // Check nonce replay. A validly signed repeat of an exchange we
         // already answered is the initiator retrying after a lost response:
         // send the same response again rather than new keys.
         let cached = self
-            .kex_responses
+            .kex_seen
             .lock()
             .await
             .get(&ke.nonce)
-            .filter(|(initiator, _, _)| *initiator == ke.initiator_peer_id)
-            .map(|(_, msg, _)| msg.clone());
+            .filter(|(initiator, _)| *initiator == ke.initiator_peer_id)
+            .and_then(|(_, msg)| msg.clone());
         if let Some(msg) = cached {
             log::debug!("TunnelKeyExchange from {:?} retried, resending response", ke.initiator_peer_id);
             let hints = self.known_hints(&ke.initiator_peer_id).await;
             return self.route_message(&ke.initiator_peer_id, &hints, &msg).await;
         }
+        // A replay of an exchange that created or replaced our current tunnel
+        // with the initiator would swap in keys the initiator doesn't hold.
+        // The tunnel remembers those exchanges for as long as it lives, so no
+        // clock and no flushable global cache is needed; without a tunnel, a
+        // replay only builds one nobody can use.
+        let replayed = self
+            .tunnel_table
+            .lock()
+            .await
+            .get(&ke.initiator_peer_id)
+            .is_some_and(|t| t.kex_nonces.contains(&ke.nonce));
+        if replayed {
+            log::warn!(
+                "TunnelKeyExchange from {:?}: replayed nonce, rejecting",
+                ke.initiator_peer_id
+            );
+            return Ok(());
+        }
+        // Record the nonce; its response is added once sent.
+        match self
+            .kex_seen
+            .lock()
+            .await
+            .try_insert(ke.nonce, (ke.initiator_peer_id, None))
         {
-            let nonces = self.seen_nonces.lock().await;
-            if nonces.iter().any(|(n, _)| *n == ke.nonce) {
+            Ok(()) => {}
+            Err(crate::bounded::Refused::Duplicate) => {
                 log::warn!(
                     "TunnelKeyExchange from {:?}: replayed nonce, rejecting",
                     ke.initiator_peer_id
                 );
                 return Ok(());
             }
+            Err(crate::bounded::Refused::Full) => {
+                log::debug!("TunnelKeyExchange from {:?}: too many in progress", ke.initiator_peer_id);
+                return Ok(());
+            }
         }
-
-        // Record nonce as seen
-        self.seen_nonces
-            .lock()
-            .await
-            .push_back((ke.nonce, Instant::now()));
 
         // Complete key exchange using KEM
         let offer_algo = tarnet_api::types::KemAlgo::from_u8(ke.kem_algo)
@@ -122,7 +107,14 @@ impl Node {
         let hints = self.address_hints(&ke.initiator_peer_id).await;
         let mut tunnel = Tunnel::new(ke.initiator_peer_id, &shared_bytes, false);
         tunnel.hints = hints.clone();
-        self.tunnel_table.lock().await.add(tunnel);
+        {
+            let mut table = self.tunnel_table.lock().await;
+            if let Some(old) = table.get(&ke.initiator_peer_id) {
+                tunnel.kex_nonces = old.kex_nonces.clone();
+            }
+            tunnel.remember_kex(ke.nonce);
+            table.add(tunnel);
+        }
 
         // Generate our own nonce for the response
         let mut rng = rand::rngs::OsRng;
@@ -135,7 +127,6 @@ impl Node {
             responder_peer_id: self.peer_id(),
             nonce: resp_nonce,
             initiator_nonce: ke.nonce,
-            timestamp: now,
             signer_algo: self.identity.identity.signing_algo() as u8,
             signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
             signature: Vec::new(),
@@ -152,15 +143,14 @@ impl Node {
         let msg = DataMsg {
             origin: self.peer_id(),
             destination: ke.initiator_peer_id,
-            ttl: 64,
+            ttl: crate::wire::DATA_TTL,
             hints: hints.clone(),
             data: response.to_wire().encode(),
         };
         let encoded = msg.to_wire().encode();
-        self.kex_responses
-            .lock()
-            .await
-            .insert(ke.nonce, (ke.initiator_peer_id, encoded.clone(), Instant::now()));
+        if let Some(seen) = self.kex_seen.lock().await.get_mut(&ke.nonce) {
+            seen.1 = Some(encoded.clone());
+        }
         self.route_message(&ke.initiator_peer_id, &hints, &encoded).await?;
 
         log::info!(
@@ -184,7 +174,7 @@ impl Node {
         // an on-path peer can race a forged response; removing first would let
         // that invalid response cancel the legitimate exchange.
         let mut pending = self.pending_key_exchanges.lock().await;
-        if let Some((kex, _, dest, _created)) = pending.get(&kr.initiator_nonce) {
+        if let Some((kex, _, dest)) = pending.get(&kr.initiator_nonce) {
             let dest = *dest;
             // Verify the response is from the expected peer
             if kr.responder_peer_id != dest {
@@ -227,9 +217,10 @@ impl Node {
 
             // Authentication and decapsulation both succeeded.  Only now is it
             // safe to consume the one-shot state and notifier.
-            let (_, notifier, _, _) = pending
-                .remove(&kr.initiator_nonce)
-                .expect("pending tunnel exchange disappeared while locked");
+            // (It may have just expired, between the check above and now.)
+            let Some((_, notifier, _)) = pending.remove(&kr.initiator_nonce) else {
+                return Ok(());
+            };
             drop(pending);
 
             let mut tunnel = Tunnel::new(dest, &shared_bytes, true);
@@ -277,6 +268,8 @@ impl Node {
         }
 
         // Forward to next hop (same logic as handle_data)
+        // The TTL comes from the wire: never more than a sender starts with.
+        msg.ttl = msg.ttl.min(crate::wire::DATA_TTL);
         if msg.ttl == 0 {
             log::debug!(
                 "Dropping encrypted data with expired TTL for {:?}",
@@ -299,22 +292,16 @@ impl Node {
         match msg.msg_type {
             MessageType::ChannelOpen => {
                 let open = ChannelOpenMsg::from_bytes(&msg.payload)?;
-                if let Some((owner, _)) = channels.get(&open.channel_id) {
-                    if *owner == from {
-                        // The opener resends until it hears from us.
-                        log::trace!("Duplicate open for channel {}", open.channel_id);
+                let handle = match channels.accept(from, open.channel_id, open.port, open.reliable, open.ordered) {
+                    Ok(h) => h,
+                    // The opener resends until it hears from us.
+                    Err(crate::channel::ChannelRefused::Duplicate) => return Ok(()),
+                    Err(crate::channel::ChannelRefused::Full) => {
+                        log::debug!("Refusing channel {} from {:?}: too many open", open.channel_id, from);
                         return Ok(());
                     }
-                    log::warn!(
-                        "Rejecting channel {} from {:?}: already owned by {:?}",
-                        open.channel_id,
-                        from,
-                        owner
-                    );
-                    return Ok(());
-                }
-                let ch = Channel::new(open.channel_id, open.port, open.reliable, open.ordered);
-                channels.insert(open.channel_id, (from, ch));
+                };
+                drop(channels);
                 log::debug!("Channel {} opened from {:?}", open.channel_id, from);
 
                 // Check if a port listener is registered for this port
@@ -325,80 +312,54 @@ impl Node {
                         .data_handlers
                         .lock()
                         .await
-                        .insert(open.channel_id, data_tx);
-                    let _ = listener_tx.send((from, open.channel_id, data_rx));
+                        .insert(handle, data_tx);
+                    let _ = listener_tx.send((from, handle, data_rx));
                 }
             }
             MessageType::ChannelData => {
                 let data = ChannelDataMsg::from_bytes(&msg.payload)?;
-                if let Some((owner, ch)) = channels.get_mut(&data.channel_id) {
-                    if *owner != from {
-                        log::warn!(
-                            "Rejecting channel data for {} from non-owner {:?}",
-                            data.channel_id,
-                            from
-                        );
-                        return Ok(());
+                let Some(handle) = channels.resolve(&from, data.channel_id) else {
+                    return Ok(());
+                };
+                let Some((_, ch)) = channels.get_mut(handle) else {
+                    return Ok(());
+                };
+                ch.confirm_open();
+                let delivered = ch.receive_data(data.sequence, data.data);
+                let ack_bytes = ch.generate_ack().map(|(ack_seq, selective)| {
+                    ChannelAckMsg {
+                        channel_id: data.channel_id,
+                        ack_seq,
+                        selective_acks: selective,
                     }
-                    ch.confirm_open();
-                    let delivered = ch.receive_data(data.sequence, data.data);
-
-                    // Check if this channel has a data handler
-                    let handlers = self.channel_state.data_handlers.lock().await;
-                    if let Some(handler_tx) = handlers.get(&data.channel_id) {
+                    .to_wire()
+                    .encode()
+                });
+                drop(channels);
+                // A channel with a data handler delivers there, else to the app.
+                let handler = self.channel_state.data_handlers.lock().await.get(&handle).cloned();
+                match handler {
+                    Some(handler_tx) => {
                         for payload in delivered {
                             let _ = handler_tx.send(payload);
                         }
-                        // Generate ACK, collect data, release lock, then send
-                        let ack_bytes = ch.generate_ack().map(|(ack_seq, selective)| {
-                            ChannelAckMsg {
-                                channel_id: data.channel_id,
-                                ack_seq,
-                                selective_acks: selective,
-                            }
-                            .to_wire()
-                            .encode()
-                        });
-                        drop(handlers);
-                        drop(channels);
-                        if let Some(inner) = ack_bytes {
-                            let _ = self.send_tunnel_data(&from, &inner).await;
+                    }
+                    None => {
+                        for payload in delivered {
+                            let _ = self.app_tx.send((from, payload)).await;
                         }
-                        return Ok(());
                     }
-                    drop(handlers);
-
-                    for payload in delivered {
-                        let _ = self.app_tx.send((from, payload)).await;
-                    }
-                    // Generate ACK, collect data, release lock, then send
-                    let ack_bytes = ch.generate_ack().map(|(ack_seq, selective)| {
-                        ChannelAckMsg {
-                            channel_id: data.channel_id,
-                            ack_seq,
-                            selective_acks: selective,
-                        }
-                        .to_wire()
-                        .encode()
-                    });
-                    drop(channels);
-                    if let Some(inner) = ack_bytes {
-                        let _ = self.send_tunnel_data(&from, &inner).await;
-                    }
-                    return Ok(());
+                }
+                if let Some(inner) = ack_bytes {
+                    let _ = self.send_tunnel_data(&from, &inner).await;
                 }
             }
             MessageType::ChannelAck => {
                 let ack = ChannelAckMsg::from_bytes(&msg.payload)?;
-                if let Some((owner, ch)) = channels.get_mut(&ack.channel_id) {
-                    if *owner != from {
-                        log::warn!(
-                            "Rejecting channel ACK for {} from non-owner {:?}",
-                            ack.channel_id,
-                            from
-                        );
-                        return Ok(());
-                    }
+                let Some(handle) = channels.resolve(&from, ack.channel_id) else {
+                    return Ok(());
+                };
+                if let Some((_, ch)) = channels.get_mut(handle) {
                     ch.confirm_open();
                     ch.process_ack(ack.ack_seq, &ack.selective_acks);
                     // A SACK-revealed hole is due now; wake the retransmit task
@@ -410,23 +371,12 @@ impl Node {
             }
             MessageType::ChannelClose => {
                 let close = ChannelCloseMsg::from_bytes(&msg.payload)?;
-                if !channels
-                    .get(&close.channel_id)
-                    .is_some_and(|(owner, _)| *owner == from)
-                {
-                    log::warn!(
-                        "Rejecting channel close for {} from non-owner {:?}",
-                        close.channel_id,
-                        from
-                    );
+                let Some(handle) = channels.resolve(&from, close.channel_id) else {
                     return Ok(());
-                }
-                channels.remove(&close.channel_id);
-                self.channel_state
-                    .data_handlers
-                    .lock()
-                    .await
-                    .remove(&close.channel_id);
+                };
+                channels.remove(handle);
+                drop(channels);
+                self.channel_state.data_handlers.lock().await.remove(&handle);
                 log::debug!("Channel {} closed by {:?}", close.channel_id, from);
             }
             _ => {}
@@ -440,6 +390,20 @@ impl Node {
         if data.destination == self.peer_id() {
             // Check if this carries a tunnel key exchange/response inside
             if let Ok(inner) = WireMessage::decode(&data.data) {
+                // A message carried inside pays what it would cost arriving
+                // on the link, to the neighbour that delivered it.
+                if matches!(
+                    inner.msg_type,
+                    MessageType::TunnelKeyExchange | MessageType::TunnelKeyResponse
+                ) && self
+                    .governor
+                    .lock()
+                    .await
+                    .evaluate(&from, inner.msg_type, &inner.payload)
+                    == crate::governor::Verdict::Shed
+                {
+                    return Ok(());
+                }
                 match inner.msg_type {
                     MessageType::TunnelKeyExchange => {
                         return self.handle_tunnel_key_exchange(from, &inner.payload).await;
@@ -461,6 +425,8 @@ impl Node {
         }
 
         // Forward to next hop
+        // The TTL comes from the wire: never more than a sender starts with.
+        data.ttl = data.ttl.min(crate::wire::DATA_TTL);
         if data.ttl == 0 {
             log::debug!("Dropping data with expired TTL for {:?}", data.destination);
             return Ok(());
@@ -487,7 +453,7 @@ impl Node {
         let msg = DataMsg {
             origin: self.peer_id(),
             destination: *dest,
-            ttl: 64,
+            ttl: crate::wire::DATA_TTL,
             hints: hints.clone(),
             data: payload.to_vec(),
         };
@@ -504,18 +470,7 @@ impl Node {
     /// Route a message to a destination peer: directly, via our route, or
     /// toward the last of `hints` we can reach.
     pub(super) async fn route_message(&self, dest: &PeerId, hints: &[PeerId], data: &[u8]) -> Result<()> {
-        // Check if we have a direct link
-        {
-            let links = self.links.lock().await;
-            if let Some(link) = links.get(dest) {
-                return link.send_message(data).await;
-            }
-        }
-        let next_hop = self
-            .next_hop_toward(dest, hints, &self.peer_id())
-            .await
-            .ok_or(Error::NotFound)?;
-        self.send_to_peer(&next_hop, data).await
+        self.sender.routed(dest, hints, data).await
     }
 
     pub async fn create_tunnel(&self, dest: PeerId) -> Result<oneshot::Receiver<PeerId>> {
@@ -555,17 +510,11 @@ impl Node {
         let mut nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rng, &mut nonce);
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
         let mut ke = TunnelKeyExchangeMsg {
             kem_algo: kex.algo_byte(),
             ephemeral_pubkey: kex.pubkey_bytes(),
             initiator_peer_id: self.peer_id(),
             nonce,
-            timestamp,
             signer_algo: self.identity.identity.signing_algo() as u8,
             signer_pubkey: self.identity.identity.signing.signing_pubkey_bytes(),
             signature: Vec::new(),
@@ -580,17 +529,22 @@ impl Node {
         let msg = DataMsg {
             origin: self.peer_id(),
             destination: dest,
-            ttl: 64,
+            ttl: crate::wire::DATA_TTL,
             hints: hints.clone(),
             data: inner,
         };
 
         // Store pending state keyed by nonce
         let (tx, rx) = oneshot::channel();
-        self.pending_key_exchanges
+        if self
+            .pending_key_exchanges
             .lock()
             .await
-            .insert(nonce, (kex, tx, dest, Instant::now()));
+            .try_insert(nonce, (kex, tx, dest))
+            .is_err()
+        {
+            return Err(Error::Protocol("too many tunnel key exchanges in flight".into()));
+        }
 
         let encoded = msg.to_wire().encode();
         self.route_message(&dest, &hints, &encoded).await?;
@@ -599,8 +553,7 @@ impl Node {
         // (same nonce, same ephemeral key) until the response arrives. The
         // responder answers a repeat with its cached response.
         let pending = self.pending_key_exchanges.clone();
-        let links = self.links.clone();
-        let routing = self.routing_table.clone();
+        let sender = self.sender.clone();
         tokio::spawn(async move {
             let mut wait = KEX_RETRY_INITIAL;
             let give_up = Instant::now() + KEX_RETRY_WINDOW;
@@ -609,9 +562,7 @@ impl Node {
                 if Instant::now() >= give_up || !pending.lock().await.contains_key(&nonce) {
                     return;
                 }
-                if send_overlay(&links, &routing, &dest, &hints, &encoded)
-                    .await
-                    .is_ok()
+                if sender.routed(&dest, &hints, &encoded).await.is_ok()
                 {
                     log::debug!("Tunnel key exchange to {:?} resent", dest);
                 }
@@ -646,7 +597,7 @@ impl Node {
         let msg = EncryptedDataMsg {
             origin: self.peer_id(),
             destination: *dest,
-            ttl: 64,
+            ttl: crate::wire::DATA_TTL,
             hints: hints.clone(),
             data: encrypted,
         };
@@ -666,31 +617,8 @@ impl Node {
         reliable: bool,
         ordered: bool,
     ) -> Result<u32> {
-        use rand::Rng;
-        let port = crate::wire::hash_port_name(port_name);
-        let channel_id = {
-            let mut channels = self.channel_state.channels.lock().await;
-            loop {
-                let candidate: u32 = rand::thread_rng().gen();
-                if !channels.contains_key(&candidate) {
-                    let mut ch = Channel::new(candidate, port, reliable, ordered);
-                    ch.mark_opened_locally();
-                    channels.insert(candidate, (*dest, ch));
-                    break candidate;
-                }
-            }
-        };
-
-        // Send ChannelOpen through the tunnel
-        let open = ChannelOpenMsg {
-            channel_id,
-            port,
-            reliable,
-            ordered,
-        };
-        let inner = open.to_wire().encode();
-        self.send_tunnel_data(dest, &inner).await?;
-        Ok(channel_id)
+        self.channel_open_port(dest, crate::wire::hash_port_name(port_name), reliable, ordered)
+            .await
     }
 
     /// Open a channel using a pre-computed 32-byte port hash.
@@ -701,28 +629,19 @@ impl Node {
         reliable: bool,
         ordered: bool,
     ) -> Result<u32> {
-        use rand::Rng;
-        let channel_id = {
-            let mut channels = self.channel_state.channels.lock().await;
-            loop {
-                let candidate: u32 = rand::thread_rng().gen();
-                if !channels.contains_key(&candidate) {
-                    let mut ch = Channel::new(candidate, port, reliable, ordered);
-                    ch.mark_opened_locally();
-                    channels.insert(candidate, (*dest, ch));
-                    break candidate;
-                }
-            }
-        };
-
+        let channel_id = self
+            .channel_state
+            .channels
+            .lock()
+            .await
+            .open_local(*dest, port, reliable, ordered);
         let open = ChannelOpenMsg {
             channel_id,
             port,
             reliable,
             ordered,
         };
-        let inner = open.to_wire().encode();
-        self.send_tunnel_data(dest, &inner).await?;
+        self.send_tunnel_data(dest, &open.to_wire().encode()).await?;
         Ok(channel_id)
     }
 
@@ -771,26 +690,17 @@ impl Node {
     /// Send data through a reliable channel.  The channel handles
     /// sequencing, ACKs, and retransmission automatically.
     pub async fn channel_send(&self, channel_id: u32, data: &[u8]) -> Result<()> {
-        let (dest, sends, is_reliable) = {
-            let mut channels = self.channel_state.channels.lock().await;
-            let (remote, ch) = channels
-                .get_mut(&channel_id)
-                .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
-            let dest = *remote;
-            let reliable = ch.reliable;
-            let sends = ch.prepare_send(data.to_vec());
-            (dest, sends, reliable)
-        };
-        if is_reliable {
+        let (dest, reliable, msgs) = self
+            .channel_state
+            .channels
+            .lock()
+            .await
+            .prepare_send(channel_id, data)
+            .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
+        if reliable {
             self.channel_state.retransmit_notify.notify_one();
         }
-        for (seq, payload) in sends {
-            let msg = ChannelDataMsg {
-                channel_id,
-                sequence: seq,
-                data: payload,
-            };
-            let inner = msg.to_wire().encode();
+        for inner in msgs {
             self.send_tunnel_data(&dest, &inner).await?;
         }
         Ok(())
@@ -798,15 +708,17 @@ impl Node {
 
     /// Close a channel.
     pub async fn channel_close(&self, channel_id: u32) -> Result<()> {
-        let dest = {
-            let mut channels = self.channel_state.channels.lock().await;
-            let (remote, _) = channels
-                .remove(&channel_id)
-                .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
-            remote
+        let (dest, ch) = self
+            .channel_state
+            .channels
+            .lock()
+            .await
+            .remove(channel_id)
+            .ok_or_else(|| Error::Protocol(format!("no channel {}", channel_id)))?;
+        self.channel_state.data_handlers.lock().await.remove(&channel_id);
+        let close = ChannelCloseMsg {
+            channel_id: ch.channel_id,
         };
-        let close = ChannelCloseMsg { channel_id };
-        let inner = close.to_wire().encode();
-        self.send_tunnel_data(&dest, &inner).await
+        self.send_tunnel_data(&dest, &close.to_wire().encode()).await
     }
 }

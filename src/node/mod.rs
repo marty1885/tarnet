@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -52,6 +52,7 @@ mod pool;
 mod route;
 mod sample;
 mod search;
+pub(crate) mod sender;
 mod stream;
 mod tunnel;
 mod webrtc;
@@ -78,15 +79,13 @@ const WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Safety-net fallback for the retransmit task: maximum sleep when there are
 /// no unacked packets or when no notify arrives.  Replaces the old 250ms poll.
 const RETRANSMIT_SAFETY_INTERVAL: Duration = Duration::from_secs(5);
-/// How long query token → previous_hop mappings live.
-const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
-/// Maximum timestamp drift allowed for tunnel key exchange (seconds).
-const KEY_EXCHANGE_MAX_DRIFT: u64 = 60;
-/// How long seen nonces are cached for replay protection.
+/// How long seen key-exchange nonces are cached (local monotonic time): long
+/// enough to answer an initiator's retries; lasting replay protection is the
+/// tunnel's own memory (`Tunnel::kex_nonces`).
 const NONCE_CACHE_TTL: Duration = Duration::from_secs(120);
-/// Hard ceiling on anonymous reverse-path state. Per-peer admission in the
-/// governor is the primary control; this cap is the final global invariant.
-const MAX_QUERY_TOKENS: usize = 65_536;
+/// Most key exchanges remembered at once (see `kex_seen`).
+const MAX_KEX_SEEN: usize = 4096;
+
 /// How often the heartbeat / liveness scheduler wakes up. Fine enough that
 /// the Poisson heartbeat draws aren't quantised into visible buckets, and
 /// that a quiet link's liveness probes (every few seconds) go out on time.
@@ -201,8 +200,8 @@ impl Default for NodeConfig {
         Self {
             listen_addr: "127.0.0.1:0".into(),
             bootstrap_peers: Vec::new(),
-            max_inbound: 128,
-            max_outbound: 48,
+            max_inbound: DEFAULT_MAX_INBOUND,
+            max_outbound: DEFAULT_MAX_OUTBOUND,
         }
     }
 }
@@ -216,6 +215,18 @@ const HIDDEN_SERVICE_MAINTAIN_INTERVAL: Duration = Duration::from_secs(240);
 
 /// TTL of a hidden service's TNS intro records.
 const HIDDEN_SERVICE_TTL: u32 = 600;
+/// Default link limits (the daemon's config defaults use these too).
+pub const DEFAULT_MAX_INBOUND: usize = 128;
+pub const DEFAULT_MAX_OUTBOUND: usize = 48;
+/// Rendezvous cookies held at once, and per client circuit.
+const MAX_RENDEZVOUS: usize = 16 * 1024;
+const MAX_RENDEZVOUS_PER_CIRCUIT: usize = 4;
+/// A rendezvous lives this long once joined (its circuits may outlive it)...
+const RENDEZVOUS_LIFETIME: Duration = Duration::from_secs(300);
+/// ...and this long waiting for the service to join.
+const RENDEZVOUS_JOIN_WAIT: Duration = Duration::from_secs(60);
+/// INTRODUCE digests remembered at once, to drop replays.
+const MAX_INTRODUCE_SEEN: usize = 16 * 1024;
 /// INTRODUCEs a node's hidden services handle at once.
 const MAX_CONCURRENT_INTRODUCTIONS: usize = 8;
 
@@ -229,14 +240,6 @@ const HIDDEN_SERVICE_CHECK_INTERVAL: std::ops::Range<Duration> =
 /// while a crashed node's claims still expire promptly. See `project_resource_pool`.
 const POOL_CLAIM_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
-/// TTL for republished TNS zone labels, and how often we republish them. Owned
-/// published labels are soft state: the DHT now honours TTL (a record ages to a
-/// single deadline regardless of replication), so a name persists only while its
-/// owner keeps republishing. Refresh at half the TTL so one missed round still
-/// leaves the record live, mirroring hello/peer/intro maintenance; when the owner
-/// stops (or removes the label) the name expires within one TTL.
-const TNS_REPUBLISH_TTL: u32 = 3600;
-const TNS_REPUBLISH_INTERVAL: Duration = Duration::from_secs(1800);
 
 /// Rendezvous point state entry.
 pub(crate) struct RendezvousEntry {
@@ -263,18 +266,16 @@ pub struct CircuitState {
     /// Pending relay extends: outbound_circuit_id → (inbound_from, inbound_circuit_id).
     /// When a relay sends CircuitCreate on behalf of an EXTEND, this maps the outbound
     /// circuit_id to the inbound circuit so the CircuitCreated reply can be routed back.
-    pub relay_extend_pending: Arc<Mutex<HashMap<CircuitKey, (PeerId, u32, Instant)>>>,
+    pub relay_extend_pending: Arc<Mutex<crate::bounded::BoundedMap<CircuitKey, (PeerId, u32)>>>,
     /// Routed CREATEs we passed on, keyed by the downstream leg, until the
     /// destination's CREATED comes back.
-    pub routed_pending: Arc<Mutex<HashMap<CircuitKey, RoutedCreate>>>,
+    pub routed_pending: Arc<Mutex<crate::bounded::BoundedMap<CircuitKey, RoutedCreate>>>,
     /// Ephemeral keys of recent CREATEs (hashed) and the circuit that used
     /// each, to catch a CREATE that loops back.
-    pub create_keys: Arc<Mutex<HashMap<[u8; 32], (CircuitKey, Instant)>>>,
-    /// Per incoming link: CREATE tokens left and when they were counted.
-    pub create_budget: Arc<Mutex<HashMap<PeerId, (f64, Instant)>>>,
+    pub create_keys: Arc<Mutex<crate::bounded::BoundedMap<[u8; 32], CircuitKey>>>,
     /// CircuitCreated replies we sent, with a hash of the CREATE they answer,
     /// so a resent CREATE (the first reply was lost) gets the same reply.
-    pub created_replies: Arc<Mutex<HashMap<CircuitKey, ([u8; 32], Vec<u8>, Instant)>>>,
+    pub created_replies: Arc<Mutex<crate::bounded::BoundedMap<CircuitKey, ([u8; 32], Vec<u8>)>>>,
     /// Our backward layer keys for circuits we are a hop of, with the next
     /// counter for cells we seal ourselves.
     /// Key: (circuit_id, from_peer). Stored at CREATE time.
@@ -306,7 +307,6 @@ pub struct RoutedCreate {
     pub hash: [u8; 32],
     /// The CREATE as sent downstream, for resending.
     pub create: Vec<u8>,
-    pub at: Instant,
 }
 
 impl CircuitState {
@@ -316,11 +316,22 @@ impl CircuitState {
             outbound: Arc::new(Mutex::new(HashMap::new())),
             pending_extends: Arc::new(Mutex::new(HashMap::new())),
             pending_create_peers: Arc::new(Mutex::new(HashMap::new())),
-            relay_extend_pending: Arc::new(Mutex::new(HashMap::new())),
-            routed_pending: Arc::new(Mutex::new(HashMap::new())),
-            create_keys: Arc::new(Mutex::new(HashMap::new())),
-            create_budget: Arc::new(Mutex::new(HashMap::new())),
-            created_replies: Arc::new(Mutex::new(HashMap::new())),
+            relay_extend_pending: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                circuit::MAX_PENDING_LEGS,
+                circuit::ROUTED_CREATE_TIMEOUT,
+            ))),
+            routed_pending: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                circuit::MAX_PENDING_LEGS,
+                circuit::ROUTED_CREATE_TIMEOUT,
+            ))),
+            create_keys: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                circuit::MAX_CREATE_KEYS,
+                circuit::CREATE_KEY_TTL,
+            ))),
+            created_replies: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                circuit::MAX_PENDING_LEGS,
+                circuit::CREATED_REPLY_TTL,
+            ))),
             hop_backward_keys: Arc::new(Mutex::new(HashMap::new())),
             relay_queues: Arc::new(Mutex::new(HashMap::new())),
             groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
@@ -375,9 +386,9 @@ pub struct HiddenServiceState {
     pub intro_registrations:
         Arc<Mutex<HashMap<CircuitKey, (tarnet_api::types::ServiceId, PeerId)>>>,
     /// Rendezvous point state: cookie → RendezvousEntry
-    pub(crate) rendezvous: Arc<Mutex<HashMap<[u8; 32], RendezvousEntry>>>,
+    pub(crate) rendezvous: Arc<Mutex<crate::bounded::BoundedMap<[u8; 32], RendezvousEntry>>>,
     /// Hashes of INTRODUCEs our services answered, to drop replays.
-    pub(super) introduce_seen: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    pub(super) introduce_seen: Arc<Mutex<crate::bounded::BoundedMap<[u8; 32], ()>>>,
     /// INTRODUCEs handled at once; more are dropped.
     pub(super) introduce_slots: Arc<tokio::sync::Semaphore>,
 }
@@ -389,8 +400,13 @@ impl HiddenServiceState {
             last_publish: Arc::new(Mutex::new(HashMap::new())),
             maintained: Arc::new(Mutex::new(HashSet::new())),
             intro_registrations: Arc::new(Mutex::new(HashMap::new())),
-            rendezvous: Arc::new(Mutex::new(HashMap::new())),
-            introduce_seen: Arc::new(Mutex::new(HashMap::new())),
+            rendezvous: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(MAX_RENDEZVOUS, RENDEZVOUS_LIFETIME))),
+            // An INTRODUCE can't be replayed once the records naming its
+            // intro point have expired.
+            introduce_seen: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                MAX_INTRODUCE_SEEN,
+                Duration::from_secs(2 * HIDDEN_SERVICE_TTL as u64),
+            ))),
             introduce_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_INTRODUCTIONS)),
         }
     }
@@ -399,8 +415,8 @@ impl HiddenServiceState {
 /// Channel state grouped together.
 #[derive(Clone)]
 pub struct ChannelState {
-    /// Channels: channel_id → (remote_peer, channel)
-    pub channels: Arc<Mutex<HashMap<u32, (PeerId, Channel)>>>,
+    /// Channels by local handle (see [`crate::channel::ChannelTable`]).
+    pub channels: Arc<Mutex<crate::channel::ChannelTable>>,
     /// Per-channel data handlers: channel_id → sender for data on that channel.
     /// Channels with a handler deliver data here instead of app_tx.
     pub data_handlers: Arc<Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>>,
@@ -422,7 +438,7 @@ pub struct ChannelState {
 impl ChannelState {
     fn new() -> Self {
         Self {
-            channels: Arc::new(Mutex::new(HashMap::new())),
+            channels: Arc::new(Mutex::new(crate::channel::ChannelTable::default())),
             data_handlers: Arc::new(Mutex::new(HashMap::new())),
             port_listeners: Arc::new(Mutex::new(HashMap::new())),
             retransmit_notify: Arc::new(tokio::sync::Notify::new()),
@@ -470,20 +486,17 @@ pub struct Node {
     /// Monotonically increasing sequence number for hello records.
     hello_sequence: Arc<Mutex<u64>>,
     /// Pending key exchanges: initiator_nonce → (KEM offer, completion notifier, destination peer)
-    pending_key_exchanges:
-        Arc<Mutex<HashMap<[u8; 32], (KexOffer, oneshot::Sender<PeerId>, PeerId, Instant)>>>,
+    pending_key_exchanges: Arc<Mutex<crate::bounded::BoundedMap<[u8; 32], (KexOffer, oneshot::Sender<PeerId>, PeerId)>>>,
     /// Notifies app when an incoming tunnel is established (peer_id)
     tunnel_notify_tx: mpsc::Sender<PeerId>,
     tunnel_notify_rx: Mutex<Option<mpsc::Receiver<PeerId>>>,
     /// Channel for delivering channel lifecycle events (e.g. channel death) to the app.
     channel_event_tx: mpsc::Sender<ChannelEvent>,
     channel_event_rx: Mutex<Option<mpsc::Receiver<ChannelEvent>>>,
-    /// Seen nonces for replay protection (nonce, when_seen)
-    seen_nonces: Arc<Mutex<VecDeque<([u8; 32], Instant)>>>,
-    /// Responses we sent to tunnel key exchanges, by initiator nonce, so an
-    /// initiator retrying a lost exchange gets the same answer (and keys).
-    /// Expires with `seen_nonces`.
-    kex_responses: Arc<Mutex<HashMap<[u8; 32], (PeerId, Vec<u8>, Instant)>>>,
+    /// Tunnel key exchanges answered recently, by initiator nonce: the
+    /// initiator, and the response once sent, so a retry after a lost
+    /// response gets the same answer (and keys) and a repeat is refused.
+    kex_seen: Arc<Mutex<crate::bounded::BoundedMap<[u8; 32], (PeerId, Option<Vec<u8>>)>>>,
     /// Remote subscriptions: who wants notifications from us when a watched key changes.
     dht_watches: Arc<Mutex<DhtWatchTable>>,
     /// Keys we are watching locally.
@@ -495,7 +508,7 @@ pub struct Node {
     kbucket: Arc<Mutex<KBucketTable>>,
     /// Query token routing table: maps query_token → (previous_hop, created_at).
     /// Used for anonymous hop-by-hop reply routing for DHT GETs and watch notifications.
-    query_tokens: Arc<Mutex<HashMap<[u8; 32], (PeerId, Instant)>>>,
+    query_tokens: Arc<Mutex<dht::QueryTokens>>,
     /// Active local DHT searches: maps query_token → a sender that the
     /// DhtGetResponse handler feeds verified records into, waking the
     /// originating [`DhtSearch`] stream. A `std::sync::Mutex` so the stream's
@@ -560,6 +573,8 @@ pub struct Node {
     pub stats: Arc<crate::stats::StatsRegistry>,
     /// Global bandwidth limiter shared across all links.
     bandwidth: Arc<crate::bandwidth::BandwidthLimiter>,
+    /// Every send goes through this (see [`sender::Sender`]).
+    sender: sender::Sender,
     /// Node start time for uptime calculation.
     started_at: std::time::Instant,
     /// TNS resolution cache: avoids repeated DHT lookups for recently resolved names.
@@ -743,23 +758,38 @@ impl Node {
         let (channel_event_tx, channel_event_rx) = mpsc::channel(256);
         let (circuit_drop_tx, circuit_drop_rx) = mpsc::unbounded_channel();
         let mut dht_store = DhtStore::with_limits(&peer_id, storage_limits);
-        dht_store.import_records(dht_records);
+        let dropped = dht_store.import_records(dht_records);
+        if let Some(db) = &db {
+            for record in &dropped {
+                if let Err(e) = db.delete_dht_record(record.key.as_bytes(), record.signer.as_bytes()) {
+                    log::warn!("Failed to delete dropped DHT record: {}", e);
+                }
+            }
+        }
         let links = Arc::new(Mutex::new(LinkTable::new()));
         let routing_table = Arc::new(Mutex::new(RoutingTable::new(peer_id)));
-        let query_tokens = Arc::new(Mutex::new(HashMap::new()));
+        let stats = Arc::new(crate::stats::StatsRegistry::new());
+        let bandwidth = Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0));
+        let sender = sender::Sender::new(links.clone(), routing_table.clone(), bandwidth.clone(), stats.clone());
+        let query_tokens = Arc::new(Mutex::new(dht::QueryTokens::new(
+            dht::MAX_QUERY_TOKENS,
+            dht::QUERY_TOKEN_TTL,
+        )));
         let dht_walker = dht::DhtWalker {
             local: peer_id,
             links: links.clone(),
             routing_table: routing_table.clone(),
             neighbor_stores: Arc::new(Mutex::new(HashMap::new())),
             query_tokens: query_tokens.clone(),
+            sender: sender.clone(),
         };
         Self {
             identity: Arc::new(identity),
-            max_inbound: 128,
-            max_outbound: 48,
+            max_inbound: DEFAULT_MAX_INBOUND,
+            max_outbound: DEFAULT_MAX_OUTBOUND,
             links,
             routing_table,
+            sender,
             dht_store: Arc::new(Mutex::new(dht_store)),
             tunnel_table: Arc::new(Mutex::new(TunnelTable::new())),
             channel_state: ChannelState::new(),
@@ -772,13 +802,18 @@ impl Node {
             global_addrs: Arc::new(Mutex::new(Vec::new())),
             introducers: Arc::new(Mutex::new(Vec::new())),
             hello_sequence: Arc::new(Mutex::new(hello_seq)),
-            pending_key_exchanges: Arc::new(Mutex::new(HashMap::new())),
+            pending_key_exchanges: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                tunnel::MAX_PENDING_KEX,
+                tunnel::KEX_RETRY_WINDOW,
+            ))),
             tunnel_notify_tx,
             tunnel_notify_rx: Mutex::new(Some(tunnel_notify_rx)),
             channel_event_tx,
             channel_event_rx: Mutex::new(Some(channel_event_rx)),
-            seen_nonces: Arc::new(Mutex::new(VecDeque::new())),
-            kex_responses: Arc::new(Mutex::new(HashMap::new())),
+            kex_seen: Arc::new(Mutex::new(crate::bounded::BoundedMap::new(
+                MAX_KEX_SEEN,
+                NONCE_CACHE_TTL,
+            ))),
             dht_watches: Arc::new(Mutex::new(DhtWatchTable::new())),
             local_watches: Arc::new(Mutex::new(HashMap::new())),
             dht_watch_tx,
@@ -814,8 +849,8 @@ impl Node {
             firewall: Mutex::new(None),
             firewall_enabled: std::sync::atomic::AtomicBool::new(false),
             governor: Mutex::new(Governor::new(GovernorConfig::default())),
-            stats: Arc::new(crate::stats::StatsRegistry::new()),
-            bandwidth: Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0)),
+            stats,
+            bandwidth,
             started_at: std::time::Instant::now(),
             tns_cache: Arc::new(Mutex::new(crate::tns::TnsCache::new())),
             zone_published: Arc::new(Mutex::new(HashMap::new())),
@@ -827,14 +862,39 @@ impl Node {
     }
 
     /// Persist a DHT record to the database (if present).
-    fn db_upsert_dht_record(&self, record: &DhtRecord) {
+    fn db_upsert_dht_record(&self, record: &DhtRecord, source: RecordSource) {
         if let Some(db) = &self.db {
-            if let Some(pr) = PersistedRecord::from_live(record) {
+            if let Some(pr) = PersistedRecord::from_stored(record, source) {
                 if let Err(e) = db.upsert_dht_record(&pr) {
                     log::warn!("Failed to persist DHT record: {}", e);
                 }
             }
         }
+    }
+
+    /// Store a record and keep the database in step with the store: rows of
+    /// records the limits evicted are deleted, and the record is persisted
+    /// (when `persist`) only while the store holds it, as the store holds it.
+    pub(crate) async fn dht_store_record(
+        &self,
+        record: crate::dht::VerifiedRecord,
+        source: RecordSource,
+        persist: bool,
+    ) -> bool {
+        let outcome = self.dht_store.lock().await.put_record(record, source);
+        if let Some(db) = &self.db {
+            for evicted in &outcome.evicted {
+                if let Err(e) = db.delete_dht_record(evicted.key.as_bytes(), evicted.signer.as_bytes()) {
+                    log::warn!("Failed to delete evicted DHT record: {}", e);
+                }
+            }
+        }
+        if persist {
+            if let Some(stored) = &outcome.record {
+                self.db_upsert_dht_record(stored, outcome.source);
+            }
+        }
+        outcome.stored
     }
 
     /// Persist a metadata value to the database (if present).
@@ -1036,7 +1096,8 @@ impl Node {
         if self.webrtc_connector.is_some() {
             let node = self.clone();
             tokio::spawn(async move {
-                let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+                // Peers tried recently, not tried again for this long.
+                let mut cooldown = crate::bounded::BoundedMap::new(4096, Duration::from_secs(300));
                 let mut interval = jittered_interval(Duration::from_secs(30));
                 loop {
                     interval.tick().await;
@@ -1093,7 +1154,9 @@ impl Node {
             });
         }
 
-        // Peer record maintenance: periodically publish peer records for public identities.
+        // Zone maintenance for Public identities: publishing the peer record
+        // re-signs the whole zone root, every published label with it, so this
+        // one timer keeps names alive. (Hidden zones: `maintain_hidden_services`.)
         {
             let node = self.clone();
             tokio::spawn(async move {
@@ -1108,30 +1171,12 @@ impl Node {
             });
         }
 
-        // TNS zone maintenance: republish owned, published labels before their TTL
-        // so names persist while the owner runs and expire within one TTL after it
-        // stops (now that the DHT honours record TTL).
-        {
-            let node = self.clone();
-            tokio::spawn(async move {
-                // Wait for bootstrap to settle before first publish
-                tokio::time::sleep(Duration::from_secs(15)).await;
-                node.maintain_tns_zones().await;
-                let mut interval = jittered_interval(TNS_REPUBLISH_INTERVAL);
-                loop {
-                    interval.tick().await;
-                    node.maintain_tns_zones().await;
-                }
-            });
-        }
-
         // Run the event loop
         self.event_loop(self.clone()).await
     }
 
     /// Attempt WebRTC upgrades to peers reachable only via relay.
-    async fn try_webrtc_upgrades(&self, cooldown: &mut HashMap<PeerId, Instant>) {
-        let cooldown_duration = Duration::from_secs(300); // 5 minutes
+    async fn try_webrtc_upgrades(&self, cooldown: &mut crate::bounded::BoundedMap<PeerId, ()>) {
 
         // Don't try to upgrade if we already have enough outbound links.
         if self.max_outbound > 0 {
@@ -1160,18 +1205,15 @@ impl Node {
         drop(links);
 
         for peer_id in candidates {
-            // Respect cooldown
-            if let Some(last) = cooldown.get(&peer_id) {
-                if last.elapsed() < cooldown_duration {
-                    continue;
-                }
+            if cooldown.contains_key(&peer_id) {
+                continue;
             }
 
             // Check if peer's hello record advertises WebRTC
             if let Some(hello) = self.lookup_hello(&peer_id).await {
                 if hello.transports.contains(&TransportType::WebRtc) {
                     log::info!("Attempting WebRTC upgrade to {:?}", peer_id);
-                    cooldown.insert(peer_id, Instant::now());
+                    let _ = cooldown.try_insert(peer_id, ());
                     if let Err(e) = self.connect_webrtc(peer_id).await {
                         log::debug!("WebRTC upgrade to {:?} failed: {}", peer_id, e);
                     }
@@ -1180,7 +1222,7 @@ impl Node {
                 // No hello record locally — request it via DHT so the next
                 // cycle can check transport capabilities and attempt upgrade.
                 log::debug!("Requesting hello for relay-only peer {:?}", peer_id);
-                cooldown.insert(peer_id, Instant::now());
+                let _ = cooldown.try_insert(peer_id, ());
                 let _ = self.request_hello(&peer_id).await;
             }
         }
@@ -1335,10 +1377,6 @@ impl Node {
                     continue;
                 }
 
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64;
                 for (_peer, _link_id, link) in due {
                     use rand::RngCore;
                     let pad_len = {
@@ -1348,7 +1386,7 @@ impl Node {
                     let mut padding = vec![0u8; pad_len];
                     rand::thread_rng().fill_bytes(&mut padding);
                     let ka_msg = KeepaliveMsg {
-                        timestamp_us: Some(now_us),
+                        ping_id: Some(rand::random()),
                         padding,
                     };
                     let encoded = ka_msg.to_wire().encode();
@@ -1392,7 +1430,7 @@ impl Node {
 
         // Circuit drop cleanup task: handles async work triggered by the RAII
         // drop guard (CircuitDestroy message, connection teardown, multipath failover).
-        let cd_links = self.links.clone();
+        let cd_sender = self.sender.clone();
         let cd_groups = self.circuits.groups.clone();
         let cd_endpoints = self.endpoints.clone();
         let cd_stream_owners = self.endpoints.stream_owners.clone();
@@ -1409,12 +1447,14 @@ impl Node {
                 let destroy = CircuitDestroyMsg {
                     circuit_id: ev.first_hop_circuit_id,
                 };
-                let link = cd_links.lock().await.get(&ev.first_hop).cloned();
-                if let Some(link) = link {
-                    let _ = link
-                        .send_message_critical(&destroy.to_wire().encode())
-                        .await;
-                }
+                let _ = cd_sender
+                    .to_peer(
+                        &ev.first_hop,
+                        &destroy.to_wire().encode(),
+                        sender::Queue::Critical,
+                        sender::Budget::Upkeep,
+                    )
+                    .await;
 
                 // Clean up connection state
                 let stream_key = CircuitKey {
@@ -1456,7 +1496,7 @@ impl Node {
         // Actual cleanup (destroy message, failover, connection teardown) is handled
         // automatically by the CircuitDropGuard when circuits are removed from the map.
         let ck_circuits = self.circuits.outbound.clone();
-        let ck_links = self.links.clone();
+        let ck_sender = self.sender.clone();
         tokio::spawn(async move {
             let mut interval = jittered_interval(CIRCUIT_KEEPALIVE_INTERVAL);
             loop {
@@ -1503,10 +1543,10 @@ impl Node {
                         drop(circuits);
 
                         let encoded = encode_circuit_relay_cell(relay_cid, &cell);
-                        let links = ck_links.lock().await;
-                        if let Some(link) = links.get(&first_hop) {
-                            let _ = link.send_message(&encoded).await;
-                        }
+                        // Cover traffic: not held back by the upload limit.
+                        let _ = ck_sender
+                            .to_peer(&first_hop, &encoded, sender::Queue::Data, sender::Budget::Upkeep)
+                            .await;
                     }
                 }
             }
@@ -1550,8 +1590,7 @@ impl Node {
         let watches_ref = self.dht_watches.clone();
         let tokens_ref = self.query_tokens.clone();
         let db_ref = self.db.clone();
-        let nonces_ref = self.seen_nonces.clone();
-        let kex_resp_ref = self.kex_responses.clone();
+        let kex_seen_ref = self.kex_seen.clone();
         let relay_ext_ref = self.circuits.relay_extend_pending.clone();
         let pke_ref = self.pending_key_exchanges.clone();
         let rend_ref = self.hidden.rendezvous.clone();
@@ -1569,50 +1608,17 @@ impl Node {
                 watches_ref.lock().await.expire();
                 let now = Instant::now();
                 // Expire stale query token mappings
-                tokens_ref
-                    .lock()
-                    .await
-                    .retain(|_, (_, created)| now.duration_since(*created) < QUERY_TOKEN_TTL);
-                // Expire old seen nonces
-                let mut nonces = nonces_ref.lock().await;
-                while let Some((_, seen_at)) = nonces.front() {
-                    if now.duration_since(*seen_at) >= NONCE_CACHE_TTL {
-                        nonces.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                drop(nonces);
-                kex_resp_ref
-                    .lock()
-                    .await
-                    .retain(|_, (_, _, at)| now.duration_since(*at) < NONCE_CACHE_TTL);
-                // Expire stale relay extend pending entries (10s — well beyond
-                // the 1.5s circuit extend timeout at the initiator).
-                relay_ext_ref.lock().await.retain(|_, (_, _, created)| {
-                    now.duration_since(*created) < Duration::from_secs(10)
-                });
-                // Expire stale pending key exchanges (30s timeout).
-                pke_ref.lock().await.retain(|_, (_, _, _, created)| {
-                    now.duration_since(*created) < Duration::from_secs(30)
-                });
-                // Expire stale rendezvous entries (60s timeout for incomplete,
-                // 5 minutes for completed — circuits may outlive the rendezvous).
+                tokens_ref.lock().await.expire(now);
+                kex_seen_ref.lock().await.expire(now);
+                relay_ext_ref.lock().await.expire(now);
+                pke_ref.lock().await.expire(now);
+                // A completed rendezvous lives its full lifetime (circuits may
+                // outlive the rendezvous); one the service never joined, less.
                 rend_ref.lock().await.retain(|_, entry| {
-                    let age = now.duration_since(entry.created_at);
-                    if entry.service_from.is_none() {
-                        // Incomplete rendezvous — service never joined
-                        age < Duration::from_secs(60)
-                    } else {
-                        // Completed rendezvous — keep longer for circuit lifetime
-                        age < Duration::from_secs(300)
-                    }
+                    entry.service_from.is_some()
+                        || now.duration_since(entry.created_at) < RENDEZVOUS_JOIN_WAIT
                 });
-                // An INTRODUCE can't be replayed once the records naming its
-                // intro point have expired.
-                intro_seen_ref.lock().await.retain(|_, at| {
-                    now.duration_since(*at) < Duration::from_secs(2 * HIDDEN_SERVICE_TTL as u64)
-                });
+                intro_seen_ref.lock().await.expire(now);
             }
         });
 
@@ -1624,8 +1630,7 @@ impl Node {
         // adds a few seconds of delay, not infinite stall.
         let retransmit_channels = self.channel_state.channels.clone();
         let retransmit_tunnel_table = self.tunnel_table.clone();
-        let retransmit_links = self.links.clone();
-        let retransmit_routing = self.routing_table.clone();
+        let retransmit_sender = self.sender.clone();
         let retransmit_identity = self.identity.clone();
         let retransmit_event_tx = self.channel_event_tx.clone();
         let retransmit_notify = self.channel_state.retransmit_notify.clone();
@@ -1634,10 +1639,7 @@ impl Node {
                 // Compute the next deadline across all channels.
                 let deadline = {
                     let channels = retransmit_channels.lock().await;
-                    channels
-                        .values()
-                        .filter_map(|(_, ch)| ch.next_wakeup())
-                        .min()
+                    channels.iter().filter_map(|(_, _, ch)| ch.next_wakeup()).min()
                 };
 
                 // Sleep until deadline, notify, or safety-net fallback.
@@ -1667,14 +1669,14 @@ impl Node {
                     let mut reopens: Vec<(PeerId, Vec<u8>)> = Vec::new();
                     let now = Instant::now();
 
-                    for (&channel_id, (remote_peer, ch)) in channels.iter_mut() {
+                    for (channel_id, remote_peer, ch) in channels.iter_mut() {
                         if ch.is_dead() {
                             dead.push((channel_id, *remote_peer));
                             continue;
                         }
                         if ch.open_resend_due(now) {
                             let open = ChannelOpenMsg {
-                                channel_id,
+                                channel_id: ch.channel_id,
                                 port: ch.port,
                                 reliable: ch.reliable,
                                 ordered: ch.ordered,
@@ -1683,12 +1685,13 @@ impl Node {
                         }
                         let due = ch.retransmit_due();
                         if !due.is_empty() {
-                            retransmits.push((channel_id, *remote_peer, due));
+                            // On the wire, the channel's id, not our handle.
+                            retransmits.push((ch.channel_id, *remote_peer, due));
                         }
                     }
 
                     for &(channel_id, _) in &dead {
-                        channels.remove(&channel_id);
+                        channels.remove(channel_id);
                     }
 
                     (retransmits, dead, reopens)
@@ -1707,18 +1710,12 @@ impl Node {
                     let msg = EncryptedDataMsg {
                         origin: retransmit_identity.peer_id(),
                         destination: remote,
-                        ttl: 64,
+                        ttl: crate::wire::DATA_TTL,
                         hints: hints.clone(),
                         data: encrypted,
                     };
                     let encoded = msg.to_wire_encrypted().encode();
-                    let _ = tunnel::send_overlay(
-                        &retransmit_links,
-                        &retransmit_routing,
-                        &remote,
-                        &hints,
-                        &encoded,
-                    )
+                    let _ = retransmit_sender.routed(&remote, &hints, &encoded)
                     .await;
                 }
 
@@ -1763,7 +1760,7 @@ impl Node {
                         let msg = EncryptedDataMsg {
                             origin: retransmit_identity.peer_id(),
                             destination: remote,
-                            ttl: 64,
+                            ttl: crate::wire::DATA_TTL,
                             hints: hints.clone(),
                             data: encrypted,
                         };
@@ -1773,13 +1770,7 @@ impl Node {
 
                     // Route each retransmit
                     for (seq, encoded) in encoded_msgs {
-                        let result = tunnel::send_overlay(
-                            &retransmit_links,
-                            &retransmit_routing,
-                            &remote,
-                            &hints,
-                            &encoded,
-                        )
+                        let result = retransmit_sender.routed(&remote, &hints, &encoded)
                         .await;
                         if result.is_ok() {
                             log::trace!(
@@ -1849,24 +1840,8 @@ impl Node {
                     self.handle_link_down(peer_id, link_id).await;
                 }
                 NodeEvent::Message(from, msg_link_id, msg) => {
-                    // Stateful firewall: evaluate inbound message.
-                    // Skip lock entirely when no firewall is configured (common case).
-                    if self.firewall_enabled.load(Ordering::Relaxed) {
-                        let mut fw_guard = self.firewall.lock().await;
-                        if let Some(fw) = fw_guard.as_mut() {
-                            if matches!(fw.evaluate(&from, &msg), firewall::Action::Drop) {
-                                continue;
-                            }
-                        }
-                    }
-                    // Resource governor: per-link-peer budgeting.
-                    {
-                        let circuits_for_peer =
-                            self.circuits.table.lock().await.circuits_for_peer(&from);
-                        let mut gov = self.governor.lock().await;
-                        if gov.evaluate(&from, msg.msg_type, circuits_for_peer) == Verdict::Shed {
-                            continue;
-                        }
+                    if !self.admit_message(&from, msg_link_id, &msg).await {
+                        continue;
                     }
                     // Update link activity timestamp for keepalive tracking
                     self.links.lock().await.touch_recv(&from, msg_link_id);
@@ -2109,10 +2084,11 @@ impl Node {
         // detours to a storing node. Storing is the assumed default, so a
         // storing node sends nothing.
         if !self.dht_stores {
-            let msg = crate::wire::DhtNeighborMsg { flags: 0 };
-            if let Some(link) = self.links.lock().await.get(&peer_id) {
-                let _ = link.send_deferred(&msg.to_wire().encode()).await;
-            }
+            let msg = crate::wire::DhtNeighborMsg { flags: 0 }.to_wire().encode();
+            let _ = self
+                .sender
+                .to_peer(&peer_id, &msg, sender::Queue::Deferred, sender::Budget::Upkeep)
+                .await;
         }
     }
 
@@ -2195,6 +2171,9 @@ impl Node {
         // routed through it. Existing circuits on other links to this peer
         // are unaffected. If this was the last link, full peer cleanup runs.
         let peer_gone = self.links.lock().await.remove_link(&peer_id, link_id);
+        if !peer_gone {
+            self.routing_link_changed(&peer_id).await;
+        }
         if peer_gone {
             self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_link_down(&peer_id).await;
@@ -2212,6 +2191,9 @@ impl Node {
     async fn handle_link_down(&self, peer_id: PeerId, link_id: LinkId) {
         log::info!("Link down: {:?} (link_id={})", peer_id, link_id);
         let peer_gone = self.links.lock().await.remove_link(&peer_id, link_id);
+        if !peer_gone {
+            self.routing_link_changed(&peer_id).await;
+        }
         if peer_gone {
             self.governor.lock().await.peer_disconnected(&peer_id);
             self.routing_link_down(&peer_id).await;
@@ -2270,14 +2252,11 @@ impl Node {
             // Tell the surviving side of a relay pair that its path is gone.
             // Do not hold circuit state locks across link backpressure.
             if *from != peer_id {
-                let link = self.links.lock().await.get(from).cloned();
-                if let Some(link) = link {
-                    let _ = link
-                        .send_message_critical(
-                            &CircuitDestroyMsg { circuit_id: *cid }.to_wire().encode(),
-                        )
-                        .await;
-                }
+                let destroy = CircuitDestroyMsg { circuit_id: *cid }.to_wire().encode();
+                let _ = self
+                    .sender
+                    .to_peer(from, &destroy, sender::Queue::Critical, sender::Budget::Upkeep)
+                    .await;
             }
             let stream_key = CircuitKey {
                 circuit_id: *cid,
@@ -2313,13 +2292,12 @@ impl Node {
             .relay_extend_pending
             .lock()
             .await
-            .retain(|id, (from, _, _)| *from != peer_id && id.from_peer != peer_id);
+            .retain(|id, (from, _)| *from != peer_id && id.from_peer != peer_id);
         self.circuits
             .routed_pending
             .lock()
             .await
             .retain(|down, p| down.from_peer != peer_id && p.upstream.from_peer != peer_id);
-        self.circuits.create_budget.lock().await.remove(&peer_id);
         self.hidden
             .rendezvous
             .lock()
@@ -2407,26 +2385,13 @@ impl Node {
                     .collect();
 
                 for pid in &kb_peers {
-                    let key = crate::dht::identity_address_key(pid);
-                    let store = dht_store.lock().await;
-                    for record in store.get(&key) {
-                        if record.record_type != crate::types::RecordType::Hello {
-                            continue;
-                        }
-                        if record.signer != *pid.as_bytes() {
-                            continue;
-                        }
-                        if let Ok(plaintext) =
-                            crate::dht::signed_record_decrypt(&key, &record.value)
-                        {
-                            if let Ok(hello) = HelloRecord::from_bytes(&plaintext) {
-                                for addr in &hello.global_addresses {
-                                    if let Some(s) = addr.to_connect_string() {
-                                        if !seed_addrs.contains(&s) {
-                                            seed_addrs.push(s);
-                                        }
-                                    }
-                                }
+                    let Some(hello) = dht_store.lock().await.hello_of(pid) else {
+                        continue;
+                    };
+                    for addr in &hello.global_addresses {
+                        if let Some(s) = addr.to_connect_string() {
+                            if !seed_addrs.contains(&s) {
+                                seed_addrs.push(s);
                             }
                         }
                     }
@@ -2492,6 +2457,41 @@ impl Node {
         });
     }
 
+    /// We watch `key` ourselves (and the watch hasn't expired).
+    async fn watching_locally(&self, key: &[u8; 64]) -> bool {
+        self.local_watches
+            .lock()
+            .await
+            .get(key)
+            .is_some_and(|w| w.expires_at > Instant::now())
+    }
+
+    /// The one gate every inbound link message passes before dispatch: the
+    /// stateful firewall, then the governor, which charges the message's
+    /// cost (see `governor::message_cost`).
+    async fn admit_message(&self, from: &PeerId, link_id: LinkId, msg: &WireMessage) -> bool {
+        // Skip the firewall lock entirely when none is configured.
+        if self.firewall_enabled.load(Ordering::Relaxed) {
+            let replied = self
+                .links
+                .lock()
+                .await
+                .get_link(from, link_id)
+                .is_some_and(|l| l.has_sent_category_of(msg.msg_type));
+            let mut fw_guard = self.firewall.lock().await;
+            if let Some(fw) = fw_guard.as_mut() {
+                if matches!(fw.evaluate(from, msg, replied), firewall::Action::Drop) {
+                    return false;
+                }
+            }
+        }
+        self.governor
+            .lock()
+            .await
+            .evaluate(from, msg.msg_type, &msg.payload)
+            == Verdict::Allow
+    }
+
     async fn handle_message(
         &self,
         from: PeerId,
@@ -2543,17 +2543,6 @@ impl Node {
                 self.handle_route_search_found(from, &msg.payload).await?;
             }
             MessageType::DhtPut => {
-                // Charge before parsing further or verifying: the budget bounds
-                // signature-check CPU as well as store churn.
-                if !self
-                    .governor
-                    .lock()
-                    .await
-                    .charge_dht_ingest(&from, 1, msg.payload.len())
-                {
-                    log::debug!("DHT ingest budget exhausted for {:?}, dropping PUT", from);
-                    return Ok(());
-                }
                 let mut put = DhtPutMsg::from_bytes(&msg.payload)?;
                 let key = DhtId(put.key);
                 // `ttl` is unsigned: never store or forward more than the
@@ -2575,19 +2564,18 @@ impl Node {
                         self.notify_dht_watchers(&put, Some(&from)).await;
                         // We watch this key ourselves: verify, keep in memory
                         // (deduplicated against notifications) and tell the app.
-                        if self.local_watches.lock().await.contains_key(&put.key) {
+                        if self.watching_locally(&put.key).await {
                             if let Ok(verified) = crate::dht::VerifiedRecord::from_put_msg(&put) {
                                 let live = verified.record().clone();
-                                let is_new = !self.dht_store.lock().await.get(&key).iter().any(|r| {
-                                    r.signer == live.signer
-                                        && r.sequence == live.sequence
-                                        && r.record_type == live.record_type
-                                });
+                                let is_new = !self.dht_store.lock().await.holds(
+                                    &key,
+                                    live.record_type,
+                                    &live.signer,
+                                    live.sequence,
+                                );
                                 if is_new {
-                                    self.dht_store
-                                        .lock()
-                                        .await
-                                        .put_from(verified, RecordSource::Peer(from));
+                                    self.dht_store_record(verified, RecordSource::Peer(from), false)
+                                        .await;
                                     let _ = self.dht_watch_tx.send((key, live)).await;
                                 }
                             }
@@ -2604,28 +2592,21 @@ impl Node {
                                 return Ok(());
                             }
                         };
-                        let is_new = {
-                            let store = self.dht_store.lock().await;
-                            !store.get(&key).iter().any(|r| {
-                                r.signer == put.signer
-                                    && r.sequence == put.sequence
-                                    && r.record_type == put.record_type
-                            })
-                        };
+                        let is_new = !self.dht_store.lock().await.holds(
+                            &key,
+                            put.record_type,
+                            &put.signer,
+                            put.sequence,
+                        );
                         let live = record.record().clone();
                         let accepted = self
-                            .dht_store
-                            .lock()
-                            .await
-                            .put_from(record.clone(), RecordSource::Peer(from));
-                        if accepted {
-                            self.db_upsert_dht_record(record.record());
-                        }
+                            .dht_store_record(record, RecordSource::Peer(from), true)
+                            .await;
                         log::debug!("DHT PUT stored from {:?} (type={:?})", from, put.record_type);
                         // Several walks of one PUT can end here: notify once.
                         if is_new && accepted {
                             self.notify_dht_watchers(&put, Some(&from)).await;
-                            if self.local_watches.lock().await.contains_key(&put.key) {
+                            if self.watching_locally(&put.key).await {
                                 let _ = self.dht_watch_tx.send((key, live)).await;
                             }
                         }
@@ -2650,34 +2631,27 @@ impl Node {
                 // *after* it has received, it can never be its own forwarder's
                 // parent, so the parent graph is an acyclic tree rooted at the
                 // originator — replies walk it back without a loop bound.
-                let tokens = self.query_tokens.lock().await;
-                if tokens.contains_key(&get.query_token) {
-                    return Ok(());
-                }
-                if tokens.len() >= MAX_QUERY_TOKENS {
-                    log::debug!("Global DHT GET state limit reached");
-                    return Ok(());
-                }
-                drop(tokens);
-
-                if !self.governor.lock().await.charge_dht_query(&from) {
-                    log::debug!("DHT GET budget exhausted for {:?}", from);
-                    return Ok(());
-                }
-
-                // The main event loop serializes non-circuit messages, but use an
-                // entry check here as well so this remains correct if dispatch is
-                // parallelized later. A raced duplicate was already charged, which
-                // is conservative and still bounded.
-                let first_arrival = match self.query_tokens.lock().await.entry(get.query_token) {
-                    std::collections::hash_map::Entry::Occupied(_) => false,
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert((from, Instant::now()));
-                        true
+                // Checked and added in one step, so the cap holds however
+                // dispatch is scheduled.
+                match self
+                    .query_tokens
+                    .lock()
+                    .await
+                    .try_insert(
+                        get.query_token,
+                        dht::QueryToken {
+                            prev: from,
+                            key: get.key,
+                            next: None,
+                        },
+                    )
+                {
+                    Ok(()) => {}
+                    Err(crate::bounded::Refused::Duplicate) => return Ok(()),
+                    Err(crate::bounded::Refused::Full) => {
+                        log::debug!("Global DHT GET state limit reached");
+                        return Ok(());
                     }
-                };
-                if !first_arrival {
-                    return Ok(());
                 }
 
                 // Respond with local records, routed back via query_token.
@@ -2732,6 +2706,10 @@ impl Node {
                 if let WalkStep::Forward(next, walk) =
                     self.dht_walk_step(&key, &get.walk, &from).await
                 {
+                    // Responses relayed back come only from where it went.
+                    if let Some(t) = self.query_tokens.lock().await.get_mut(&get.query_token) {
+                        t.next = Some(next);
+                    }
                     get.walk = walk;
                     if let Err(e) = self
                         .send_to_peer_deferred(&next, &get.to_wire().encode())
@@ -2743,30 +2721,25 @@ impl Node {
             }
             MessageType::DhtGetResponse => {
                 let mut resp = DhtGetResponseMsg::from_bytes(&msg.payload)?;
-                if !self.governor.lock().await.charge_dht_ingest(
-                    &from,
-                    resp.records.len() as u32,
-                    msg.payload.len(),
-                ) {
-                    log::debug!("DHT ingest budget exhausted for {:?}, dropping response", from);
-                    return Ok(());
+
+                for rec in &mut resp.records {
+                    rec.ttl = crate::dht::clamp_ttl_secs(rec.record_type, rec.ttl);
                 }
 
-                // Only responses to a query we issued or relayed are accepted.
-                // An unsolicited response is a free write into our store.
+                // Only responses to a query we issued or relayed, for the key
+                // it asked, are accepted. An unsolicited response is a free
+                // write into our store.
                 let prev_hop = self
                     .query_tokens
                     .lock()
                     .await
                     .get(&resp.query_token)
-                    .map(|(peer, _)| *peer);
+                    .filter(|t| t.key == resp.key && t.next == Some(from))
+                    .map(|t| t.prev);
                 let Some(prev) = prev_hop else {
-                    log::debug!("DhtGetResponse with unknown query_token from {:?}, dropping", from);
+                    log::debug!("DhtGetResponse with unknown query_token, another key, or not from where the walk went, from {:?}, dropping", from);
                     return Ok(());
                 };
-                for rec in &mut resp.records {
-                    rec.ttl = crate::dht::clamp_ttl_secs(rec.record_type, rec.ttl);
-                }
 
                 if prev != self.peer_id() {
                     // Relay toward the originator, who verifies. Relays don't
@@ -2803,10 +2776,8 @@ impl Node {
                             let _ = tx.try_send(record.clone());
                         }
                     }
-                    self.dht_store
-                        .lock()
-                        .await
-                        .put_from(record, RecordSource::Peer(from));
+                    self.dht_store_record(record, RecordSource::Peer(from), false)
+                        .await;
                 }
             }
             MessageType::TunnelKeyExchange => {
@@ -2855,7 +2826,7 @@ impl Node {
             }
             MessageType::Keepalive => {
                 let ka = KeepaliveMsg::from_bytes(&msg.payload)?;
-                if let Some(ts) = ka.timestamp_us {
+                if ka.ping_id.is_some() {
                     // This is a ping — echo it back as a pong (no timestamp = pong)
                     // Pong: random padding so pongs aren't a distinguishable
                     // fixed-size response either.
@@ -2867,26 +2838,15 @@ impl Node {
                     let mut padding = vec![0u8; pad_len];
                     rand::thread_rng().fill_bytes(&mut padding);
                     let pong = KeepaliveMsg {
-                        timestamp_us: None,
+                        ping_id: None,
                         padding,
                     };
-                    if let Some(link) = self.links.lock().await.get(&from).cloned() {
-                        let _ = link.send_deferred(&pong.to_wire().encode()).await;
-                    }
-                    // Also compute RTT if we have a reasonable timestamp
-                    let now_us = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_micros() as u64;
-                    if now_us > ts {
-                        let _rtt_us = now_us - ts;
-                        // Note: this is one-way latency from their clock to ours,
-                        // not true RTT. RTT is measured from the pong response below.
-                    }
+                    let _ = self
+                        .sender
+                        .to_peer(&from, &pong.to_wire().encode(), sender::Queue::Deferred, sender::Budget::Upkeep)
+                        .await;
                 }
-                // Pong (no timestamp) — activity is already tracked by touch_recv above.
-                // RTT could be computed here if we stored the sent timestamp,
-                // but the link scoring already gets RTT from the pong round-trip.
+                // Pong — activity is already tracked by touch_recv above.
             }
             MessageType::DhtWatch => {
                 let mut watch = DhtWatchMsg::from_bytes(&msg.payload)?;
@@ -2909,6 +2869,11 @@ impl Node {
                 if let WalkStep::Forward(next, walk) =
                     self.dht_walk_step(&key, &watch.walk, &from).await
                 {
+                    // Notifications relayed back come only from where it went.
+                    self.dht_watches
+                        .lock()
+                        .await
+                        .set_next(&watch.key, &watch.query_token, next);
                     watch.walk = walk;
                     let _ = self
                         .send_to_peer_deferred(&next, &watch.to_wire().encode())
@@ -2916,15 +2881,6 @@ impl Node {
                 }
             }
             MessageType::DhtWatchNotify => {
-                if !self
-                    .governor
-                    .lock()
-                    .await
-                    .charge_dht_ingest(&from, 1, msg.payload.len())
-                {
-                    log::debug!("DHT ingest budget exhausted for {:?}, dropping notify", from);
-                    return Ok(());
-                }
                 let mut notify = DhtWatchNotifyMsg::from_bytes(&msg.payload)?;
                 notify.put.ttl = crate::dht::clamp_ttl_secs(notify.put.record_type, notify.put.ttl);
                 let key = DhtId(notify.put.key);
@@ -2934,7 +2890,7 @@ impl Node {
                     .lock()
                     .await
                     .get(&notify.put.key)
-                    .is_some_and(|w| w.tokens.contains(&notify.query_token));
+                    .is_some_and(|w| w.expires_at > Instant::now() && w.tokens.contains(&(notify.query_token, from)));
                 if ours {
                     // Run through the shared trust gate (pubkey present + bound
                     // to signer + valid signature) — same invariants as DhtPut /
@@ -2947,21 +2903,20 @@ impl Node {
                         }
                     };
                     // Several watch walks can report the same record: deliver once.
-                    let is_new = !self.dht_store.lock().await.get(&key).iter().any(|r| {
-                        r.signer == notify.put.signer
-                            && r.sequence == notify.put.sequence
-                            && r.record_type == notify.put.record_type
-                    });
+                    let is_new = !self.dht_store.lock().await.holds(
+                        &key,
+                        notify.put.record_type,
+                        &notify.put.signer,
+                        notify.put.sequence,
+                    );
                     if !is_new {
                         return Ok(());
                     }
                     // Keep it in memory for readers; like GET results, a
                     // watched record is fetched, not ours to persist.
                     let live = record.record().clone();
-                    self.dht_store
-                        .lock()
-                        .await
-                        .put_from(record, RecordSource::Peer(from));
+                    self.dht_store_record(record, RecordSource::Peer(from), false)
+                        .await;
                     let _ = self.dht_watch_tx.send((key, live)).await;
                 } else {
                     // Relay back along the watch walk without verifying; the
@@ -2970,14 +2925,15 @@ impl Node {
                         .dht_watches
                         .lock()
                         .await
-                        .via_for_token(&notify.put.key, &notify.query_token);
-                    if let Some(prev) = prev_hop {
-                        if prev != from {
+                        .relay_for(&notify.put.key, &notify.query_token, &from);
+                    match prev_hop {
+                        Some(prev) => {
                             self.send_to_peer_deferred(&prev, &notify.to_wire().encode())
                                 .await?;
                         }
-                    } else {
-                        log::debug!("DhtWatchNotify with unknown query_token, dropping");
+                        None => log::debug!(
+                            "DhtWatchNotify with unknown query_token, or not from where the watch went, dropping"
+                        ),
                     }
                 }
             }
@@ -3008,13 +2964,7 @@ impl Node {
     }
 
     async fn send_to_peer(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
-        self.bandwidth.acquire_upload(data.len()).await;
-        let links = self.links.lock().await;
-        let link = links
-            .get(peer)
-            .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
-        self.stats.record_send(peer, data.len() as u64);
-        link.send_message(data).await
+        self.sender.to_peer(peer, data, sender::Queue::Data, sender::Budget::Limited).await
     }
 
     /// Send a circuit-control message, awaiting link queue capacity instead
@@ -3026,29 +2976,14 @@ impl Node {
     /// The link Arc is cloned out of the table before the awaited send so the
     /// global links lock is never held while waiting for queue space.
     async fn send_to_peer_critical(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
-        self.bandwidth.acquire_upload(data.len()).await;
-        let link = self
-            .links
-            .lock()
-            .await
-            .get(peer)
-            .cloned()
-            .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
-        self.stats.record_send(peer, data.len() as u64);
-        link.send_message_critical(data).await
+        self.sender.to_peer(peer, data, sender::Queue::Critical, sender::Budget::Limited).await
     }
 
     /// Send a non-critical message via the deferred (coalescing) queue.
     /// The link drain task holds these briefly and flushes them alongside
     /// the next high-priority send.
     async fn send_to_peer_deferred(&self, peer: &PeerId, data: &[u8]) -> Result<()> {
-        self.bandwidth.acquire_upload(data.len()).await;
-        let links = self.links.lock().await;
-        let link = links
-            .get(peer)
-            .ok_or_else(|| Error::Protocol(format!("no link to {:?}", peer)))?;
-        self.stats.record_send(peer, data.len() as u64);
-        link.send_deferred(data).await
+        self.sender.to_peer(peer, data, sender::Queue::Deferred, sender::Budget::Limited).await
     }
 
     /// Rekey every link this node initiated on the next sweep (testing).
@@ -3223,6 +3158,12 @@ impl Node {
             upload_rate,
             download_rate,
         ));
+        self.sender = sender::Sender::new(
+            self.links.clone(),
+            self.routing_table.clone(),
+            self.bandwidth.clone(),
+            self.stats.clone(),
+        );
     }
 
     /// Update bandwidth rates on an already-running node (e.g. config reload).
@@ -3535,6 +3476,281 @@ fn resolve_mainline_addr(addr: &str) -> Option<String> {
 mod tests {
     use super::*;
     use tarnet_api::types::{IdentityScheme, KemAlgo, SigningAlgo};
+
+    fn temp_db(name: &str) -> (Arc<crate::state::StateDb>, std::path::PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("tarnet-{}-{}.sqlite3", name, nanos));
+        (Arc::new(crate::state::StateDb::open(&path).unwrap()), path)
+    }
+
+    fn signed(kp: &Keypair, key: DhtId, sequence: u64, value: Vec<u8>) -> crate::dht::VerifiedRecord {
+        let expires = crate::dht::expires_in(Duration::from_secs(86_400));
+        let signature = kp.sign(&crate::dht::record_signable(
+            key.as_bytes(),
+            RecordType::SignedContent,
+            sequence,
+            &value,
+        ));
+        crate::dht::VerifiedRecord::verify_incoming(DhtRecord {
+            key,
+            record_type: RecordType::SignedContent,
+            sequence,
+            signer: kp.peer_id(),
+            signer_algo: kp.identity.signing.algo() as u8,
+            signer_pubkey: kp.identity.signing.signing_pubkey_bytes(),
+            value,
+            expires,
+            stored_at: Instant::now(),
+            signature,
+        })
+        .unwrap()
+    }
+
+    /// A peer sending unique records can't grow the database past the
+    /// store's limits: evicted records lose their rows, and a record evicted
+    /// on arrival is never written.
+    #[tokio::test]
+    async fn persisted_records_stay_within_the_store_limits() {
+        let (db, path) = temp_db("dht-bound");
+        let limits = StorageLimits {
+            max_records: 4,
+            ..StorageLimits::default()
+        };
+        let node = Node::with_db(Keypair::generate(), db.clone(), limits);
+        let attacker = Keypair::generate();
+        let from = PeerId([7; 32]);
+        for i in 0..50u8 {
+            let rec = signed(&attacker, DhtId([i; 64]), 1, vec![i; 100]);
+            node.dht_store_record(rec, RecordSource::Peer(from), true).await;
+        }
+        let rows = db.load_dht_records().unwrap();
+        assert_eq!(rows.len(), node.dht_store.lock().await.record_count());
+        assert!(rows.len() <= 4, "{} rows persisted", rows.len());
+
+        // A database already over the limits is trimmed on load.
+        for i in 100..120u8 {
+            let rec = signed(&attacker, DhtId([i; 64]), 1, vec![i; 100]);
+            let pr = crate::state::PersistedRecord::from_stored(rec.record(), RecordSource::Peer(from)).unwrap();
+            db.upsert_dht_record(&pr).unwrap();
+        }
+        let restored = Node::with_db(Keypair::generate(), db.clone(), limits);
+        let rows = db.load_dht_records().unwrap();
+        assert_eq!(rows.len(), restored.dht_store.lock().await.record_count());
+        assert!(rows.len() <= 4, "{} rows after load", rows.len());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A replayed tunnel key exchange can't swap a live tunnel's keys, even
+    /// after the time-bounded nonce cache has forgotten it: the tunnel itself
+    /// remembers the exchanges that made it.
+    #[tokio::test]
+    async fn replayed_key_exchange_cannot_replace_a_tunnel() {
+        let responder = Node::new(Keypair::generate());
+        let initiator = Keypair::generate();
+        let offer = |nonce: [u8; 32]| {
+            let kex = crate::key_exchange::KexOffer::new(initiator.identity.kem_algo());
+            let mut ke = TunnelKeyExchangeMsg {
+                kem_algo: kex.algo_byte(),
+                ephemeral_pubkey: kex.pubkey_bytes(),
+                initiator_peer_id: initiator.peer_id(),
+                nonce,
+                signer_algo: initiator.identity.signing_algo() as u8,
+                signer_pubkey: initiator.identity.signing.signing_pubkey_bytes(),
+                signature: Vec::new(),
+            };
+            ke.signature = initiator.sign(&ke.signed_bytes(&responder.peer_id()));
+            ke.to_bytes()
+        };
+        let first = offer([1; 32]);
+        let from = PeerId([7; 32]);
+        // Sending the response fails (no route); the tunnel is made first.
+        let _ = responder.handle_tunnel_key_exchange(from, &first).await;
+        let _ = responder.handle_tunnel_key_exchange(from, &offer([2; 32])).await;
+        let peer = initiator.peer_id();
+        let nonces = || async {
+            responder.tunnel_table.lock().await.get(&peer).unwrap().kex_nonces.clone()
+        };
+        assert_eq!(nonces().await, vec![[1; 32], [2; 32]]);
+
+        // Long after: the nonce cache and cached responses are gone.
+        responder.kex_seen.lock().await.clear();
+        let _ = responder.handle_tunnel_key_exchange(from, &first).await;
+        assert_eq!(nonces().await, vec![[1; 32], [2; 32]], "replay replaced the tunnel");
+    }
+
+    /// A relay verifies a PUT before telling watchers, so a forged record
+    /// claiming a victim's signer and the highest sequence can't mark the
+    /// victim's news as already told.
+    #[tokio::test]
+    async fn a_forged_put_does_not_suppress_watch_news() {
+        let node = Node::new(Keypair::generate());
+        let victim = Keypair::generate();
+        let key = DhtId([0x31; 64]);
+        node.dht_watches.lock().await.set_watch(*key.as_bytes(), [9; 32], PeerId([4; 32]), 60);
+        let mut forged = signed(&victim, key, 1, b"real".to_vec()).record().to_put_msg();
+        forged.sequence = u64::MAX;
+        node.notify_dht_watchers(&forged, None).await;
+        let news = node
+            .dht_watches
+            .lock()
+            .await
+            .watchers_for_news(key.as_bytes(), victim.peer_id().as_bytes(), 2);
+        assert_eq!(news.len(), 1, "forged PUT suppressed the victim's news");
+    }
+
+    /// A search yields every record delivered while it runs, even ones that
+    /// found its channel full: they are in the store.
+    #[tokio::test]
+    async fn a_search_loses_nothing_to_a_full_channel() {
+        let node = Node::new(Keypair::generate());
+        let key = DhtId([0x32; 64]);
+        let mut search = node.dht_search(key, Instant::now() + Duration::from_secs(1)).await;
+        // Responses that found the channel full went only to the store (as
+        // the response handler does): the search still yields them.
+        for _ in 0..10 {
+            let rec = signed(&Keypair::generate(), key, 1, b"v".to_vec());
+            node.dht_store_record(rec, RecordSource::Peer(PeerId([7; 32])), false).await;
+        }
+        let mut got = 0;
+        while search.next().await.is_some() {
+            got += 1;
+        }
+        assert_eq!(got, 10);
+    }
+
+    /// After a restart, a node republishes only the records it published
+    /// itself; replicas peers handed it stay theirs.
+    #[tokio::test]
+    async fn a_restarted_node_republishes_only_its_own_records() {
+        let (db, path) = temp_db("dht-origin");
+        let node = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
+        node.dht_put_signed_content(b"mine", 600).await.unwrap();
+        let replica = signed(&Keypair::generate(), DhtId([0x41; 64]), 1, b"theirs".to_vec());
+        node.dht_store_record(replica, RecordSource::Peer(PeerId([7; 32])), true).await;
+        assert_eq!(node.own_records_to_republish().await.len(), 1);
+
+        let restarted = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
+        assert_eq!(restarted.dht_store.lock().await.record_count(), 2);
+        let own = restarted.own_records_to_republish().await;
+        assert_eq!(own.len(), 1, "a peer's replica became ours on restart");
+        assert_ne!(own[0].key, DhtId([0x41; 64]));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Every DHT message type pays the DHT budget, WATCH included: a peer
+    /// churning watch/cancel pairs runs out like one flooding GETs.
+    #[tokio::test]
+    async fn watch_churn_is_charged_to_the_dht_budget() {
+        let node = Node::new(Keypair::generate());
+        let from = PeerId([7; 32]);
+        node.governor.lock().await.peer_connected(from);
+        let watch = |token: u8, secs: u32| {
+            crate::wire::DhtWatchMsg {
+                walk: crate::wire::WalkHeader::origin(),
+                key: [0x51; 64],
+                query_token: [token; 32],
+                expiration_secs: secs,
+            }
+            .to_wire()
+        };
+        let deliver = |msg: WireMessage| {
+            let node = &node;
+            async move {
+                if node.admit_message(&from, 0, &msg).await {
+                    node.handle_message(from, 0, msg).await.unwrap();
+                }
+            }
+        };
+        for i in 0..200u8 {
+            deliver(watch(i, 60)).await;
+            deliver(watch(i, 0)).await;
+        }
+        deliver(watch(250, 60)).await;
+        assert!(
+            !node.dht_watches.lock().await.is_watched(&[0x51; 64]),
+            "watch admitted past the budget"
+        );
+    }
+
+    /// The reverse-path cap holds for GETs this node launches as well as
+    /// GETs it relays: with the table full, a lookup launches no walks.
+    #[tokio::test]
+    async fn local_lookups_respect_the_reverse_path_cap() {
+        let node = Node::new(Keypair::generate());
+        {
+            let mut qt = node.query_tokens.lock().await;
+            let mut i = 0u64;
+            let entry = || dht::QueryToken {
+                prev: PeerId([1; 32]),
+                key: [0; 64],
+                next: None,
+            };
+            while qt.try_insert(blake3::hash(&i.to_be_bytes()).into(), entry()).is_ok() {
+                i += 1;
+            }
+            assert_eq!(qt.len(), 65_536);
+        }
+        let launched = node.dht_walker.launch_get(&[0x71; 64], None).await;
+        assert!(launched.is_empty());
+        assert_eq!(node.query_tokens.lock().await.len(), 65_536);
+        // A relayed GET is refused the same way.
+        let from = PeerId([7; 32]);
+        node.governor.lock().await.peer_connected(from);
+        let get = DhtGetMsg {
+            walk: crate::wire::WalkHeader::origin(),
+            key: [0x72; 64],
+            query_token: [0x73; 32],
+        };
+        node.handle_message(from, 0, get.to_wire()).await.unwrap();
+        assert!(node.query_tokens.lock().await.get(&[0x73; 32]).is_none());
+    }
+
+    /// A GET response is accepted only for the key its token asked for.
+    #[tokio::test]
+    async fn get_response_for_another_key_is_dropped() {
+        let node = Node::new(Keypair::generate());
+        let from = PeerId([7; 32]);
+        node.governor.lock().await.peer_connected(from);
+        let asked = DhtId([0x10; 64]);
+        let other = DhtId([0x20; 64]);
+        let token = [0x55; 32];
+        node.query_tokens
+            .lock()
+            .await
+            .try_insert(
+                token,
+                dht::QueryToken {
+                    prev: node.peer_id(),
+                    key: *asked.as_bytes(),
+                    next: Some(from),
+                },
+            )
+            .unwrap();
+        let signer = Keypair::generate();
+        let respond = |key: DhtId| {
+            let rec = signed(&signer, key, 1, b"value".to_vec());
+            DhtGetResponseMsg {
+                query_token: token,
+                key: *key.as_bytes(),
+                records: vec![rec.record().to_response_record()],
+            }
+            .to_wire()
+        };
+
+        node.handle_message(from, 0, respond(other)).await.unwrap();
+        assert!(node.dht_store.lock().await.get(&other).is_empty());
+        // The right key, but not from where the walk went.
+        let stranger = PeerId([8; 32]);
+        node.governor.lock().await.peer_connected(stranger);
+        node.handle_message(stranger, 0, respond(asked)).await.unwrap();
+        assert!(node.dht_store.lock().await.get(&asked).is_empty());
+
+        node.handle_message(from, 0, respond(asked)).await.unwrap();
+        assert_eq!(node.dht_store.lock().await.get(&asked).len(), 1);
+    }
 
     #[tokio::test]
     async fn db_restores_pq_default_identity() {

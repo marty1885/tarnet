@@ -172,8 +172,8 @@ pub struct CoreConfig {
 impl Default for CoreConfig {
     fn default() -> Self {
         Self {
-            max_inbound: 128,
-            max_outbound: 48,
+            max_inbound: tarnet::node::DEFAULT_MAX_INBOUND,
+            max_outbound: tarnet::node::DEFAULT_MAX_OUTBOUND,
             upload_limit: String::new(),
             download_limit: String::new(),
             dht_store: true,

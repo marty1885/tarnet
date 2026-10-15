@@ -9,81 +9,7 @@ pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
 pub const MAX_PAYLOAD: usize = 65535;
 
-struct Reader<'a> {
-    data: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
-    }
-
-    fn remaining(&self) -> usize {
-        self.data.len() - self.pos
-    }
-
-    fn read_u8(&mut self) -> Result<u8> {
-        if self.pos >= self.data.len() {
-            return Err(Error::Protocol("unexpected end of data".into()));
-        }
-        let v = self.data[self.pos];
-        self.pos += 1;
-        Ok(v)
-    }
-
-    fn read_u16(&mut self) -> Result<u16> {
-        if self.pos + 2 > self.data.len() {
-            return Err(Error::Protocol("unexpected end of data".into()));
-        }
-        let v = u16::from_be_bytes(self.data[self.pos..self.pos + 2].try_into().unwrap());
-        self.pos += 2;
-        Ok(v)
-    }
-
-    fn read_u32(&mut self) -> Result<u32> {
-        if self.pos + 4 > self.data.len() {
-            return Err(Error::Protocol("unexpected end of data".into()));
-        }
-        let v = u32::from_be_bytes(self.data[self.pos..self.pos + 4].try_into().unwrap());
-        self.pos += 4;
-        Ok(v)
-    }
-
-    fn read_u64(&mut self) -> Result<u64> {
-        if self.pos + 8 > self.data.len() {
-            return Err(Error::Protocol("unexpected end of data".into()));
-        }
-        let v = u64::from_be_bytes(self.data[self.pos..self.pos + 8].try_into().unwrap());
-        self.pos += 8;
-        Ok(v)
-    }
-
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        if self.pos + N > self.data.len() {
-            return Err(Error::Protocol("unexpected end of data".into()));
-        }
-        let mut arr = [0u8; N];
-        arr.copy_from_slice(&self.data[self.pos..self.pos + N]);
-        self.pos += N;
-        Ok(arr)
-    }
-
-    fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>> {
-        if self.pos + n > self.data.len() {
-            return Err(Error::Protocol("unexpected end of data".into()));
-        }
-        let v = self.data[self.pos..self.pos + n].to_vec();
-        self.pos += n;
-        Ok(v)
-    }
-
-    fn read_rest(&mut self) -> Vec<u8> {
-        let v = self.data[self.pos..].to_vec();
-        self.pos = self.data.len();
-        v
-    }
-}
+use crate::codec::Reader;
 
 macro_rules! enum_with_u16 {
     ($(#[$meta:meta])* $vis:vis enum $name:ident { $($variant:ident = $val:expr),* $(,)? }) => {
@@ -180,6 +106,12 @@ impl WireMessage {
         buf
     }
 
+    /// The type of an encoded message, from its header alone.
+    pub fn peek_type(data: &[u8]) -> Option<MessageType> {
+        let raw = data.get(1..3)?;
+        MessageType::from_u16(u16::from_be_bytes([raw[0], raw[1]]))
+    }
+
     /// Decode from wire format bytes.
     pub fn decode(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_SIZE {
@@ -194,11 +126,11 @@ impl WireMessage {
         }
         let msg_type_raw = u16::from_be_bytes([data[1], data[2]]);
         let len = u16::from_be_bytes([data[3], data[4]]) as usize;
-        if data.len() < HEADER_SIZE + len {
+        if data.len() != HEADER_SIZE + len {
             return Err(Error::Wire(format!(
-                "payload too short: expected {} got {}",
-                len,
-                data.len() - HEADER_SIZE
+                "payload length {} does not match its header ({})",
+                data.len() - HEADER_SIZE,
+                len
             )));
         }
         let msg_type = MessageType::from_u16(msg_type_raw)
@@ -210,7 +142,7 @@ impl WireMessage {
 
 // ── Specific message payload structs ──
 
-/// HandshakeHello: ephemeral(32) || signing_algo(u8) || signing_pk_len(u16 BE) || signing_pk || kem_algo(u8) || kem_pk_len(u16 BE) || kem_pk || timestamp(u64 BE) || challenge(32) || eph_kem_pk_len(u16 BE) || eph_kem_pk || min_version(u8) || max_version(u8)
+/// HandshakeHello: ephemeral(32) || signing_algo(u8) || signing_pk_len(u16 BE) || signing_pk || kem_algo(u8) || kem_pk_len(u16 BE) || kem_pk || challenge(32) || eph_kem_pk_len(u16 BE) || eph_kem_pk || min_version(u8) || max_version(u8)
 #[derive(Debug, Clone)]
 pub struct HandshakeHello {
     pub ephemeral_pubkey: [u8; 32],
@@ -218,7 +150,6 @@ pub struct HandshakeHello {
     pub signing_pubkey: Vec<u8>,
     pub kem_algo: u8,
     pub kem_pubkey: Vec<u8>,
-    pub timestamp: u64,
     pub challenge: [u8; 32],
     /// Ephemeral KEM public key for per-session PQ forward secrecy.
     pub eph_kem_pubkey: Vec<u8>,
@@ -237,7 +168,6 @@ impl HandshakeHello {
             + 1
             + 2
             + self.kem_pubkey.len()
-            + 8
             + 32
             + 2
             + self.eph_kem_pubkey.len()
@@ -250,7 +180,6 @@ impl HandshakeHello {
         buf.push(self.kem_algo);
         buf.extend_from_slice(&(self.kem_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.kem_pubkey);
-        buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.extend_from_slice(&self.challenge);
         buf.extend_from_slice(&(self.eph_kem_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.eph_kem_pubkey);
@@ -260,10 +189,7 @@ impl HandshakeHello {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        // Minimum: 32 + 1 + 2 + 0 + 1 + 2 + 0 + 8 + 32 + 2 + 0 = 80
-        if data.len() < 80 {
-            return Err(Error::Wire("HandshakeHello too short".into()));
-        }
+        // Minimum: 32 + 1 + 2 + 0 + 1 + 2 + 0 + 32 + 2 + 0 = 72
         let mut r = Reader::new(data);
         let ephemeral_pubkey = r.read_array::<32>()?;
         let signing_algo = r.read_u8()?;
@@ -272,23 +198,17 @@ impl HandshakeHello {
         let kem_algo = r.read_u8()?;
         let kem_pk_len = r.read_u16()? as usize;
         let kem_pubkey = r.read_bytes(kem_pk_len)?;
-        let timestamp = r.read_u64()?;
         let challenge = r.read_array::<32>()?;
         let eph_kem_pk_len = r.read_u16()? as usize;
         let eph_kem_pubkey = r.read_bytes(eph_kem_pk_len)?;
-        // Backward compat: old peers don't send version fields
-        let (min_version, max_version) = if r.remaining() >= 2 {
-            (r.read_u8()?, r.read_u8()?)
-        } else {
-            (2u8, 2u8)
-        };
+        let (min_version, max_version) = (r.read_u8()?, r.read_u8()?);
+        r.finish()?;
         Ok(Self {
             ephemeral_pubkey,
             signing_algo,
             signing_pubkey,
             kem_algo,
             kem_pubkey,
-            timestamp,
             challenge,
             eph_kem_pubkey,
             min_version,
@@ -313,11 +233,9 @@ impl HandshakeConfirmMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 32 {
-            return Err(Error::Wire("HandshakeConfirm too short".into()));
-        }
         let mut r = Reader::new(data);
         let confirm_hash = r.read_array::<32>()?;
+        r.finish()?;
         Ok(Self { confirm_hash })
     }
 
@@ -343,12 +261,16 @@ pub struct RekeyMsg {
 }
 
 impl RekeyMsg {
-    /// Bytes covered by the signature: kem_algo + KEM pubkey + KEM ciphertext.
+    /// Bytes covered by the signature: a domain label, then kem_algo and the
+    /// KEM pubkey and ciphertext, each length-prefixed (a request's key and
+    /// a response's ciphertext with the same bytes sign differently).
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + self.kem_pubkey.len() + self.kem_ciphertext.len());
+        let mut buf = b"tarnet link rekey v1".to_vec();
         buf.push(self.kem_algo);
-        buf.extend_from_slice(&self.kem_pubkey);
-        buf.extend_from_slice(&self.kem_ciphertext);
+        for field in [&self.kem_pubkey, &self.kem_ciphertext] {
+            buf.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            buf.extend_from_slice(field);
+        }
         buf
     }
 
@@ -373,9 +295,6 @@ impl RekeyMsg {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         // Minimum: 1 + 2 + 0 + 2 + 0 + 2 + 0 = 7
-        if data.len() < 7 {
-            return Err(Error::Wire("RekeyMsg too short".into()));
-        }
         let mut r = Reader::new(data);
         let kem_algo = r.read_u8()?;
         let kem_pk_len = r.read_u16()? as usize;
@@ -384,6 +303,7 @@ impl RekeyMsg {
         let kem_ciphertext = r.read_bytes(kem_ct_len)?;
         let sig_len = r.read_u16()? as usize;
         let signature = r.read_bytes(sig_len)?;
+        r.finish()?;
         Ok(Self {
             kem_algo,
             kem_pubkey,
@@ -401,14 +321,15 @@ impl RekeyMsg {
 /// carries random padding so size-based traffic analysis can't trivially tell
 /// heartbeats from real protocol messages.
 ///
-/// Format: flags(u8) || [timestamp_us(u64 BE) if flags & 1] || padding(rest)
-///   - flags bit 0: 1 = has timestamp (ping), 0 = no timestamp (pong)
+/// Format: flags(u8) || [ping_id(u64 BE) if flags & 1] || padding(rest)
+///   - flags bit 0: 1 = ping (carries a random ping id), 0 = pong
 ///   - padding: random bytes, ignored on receive
 #[derive(Debug, Clone)]
 pub struct KeepaliveMsg {
-    /// If Some, this is a ping with a timestamp. The receiver should echo it back.
-    /// If None, this is a pong (echo response).
-    pub timestamp_us: Option<u64>,
+    /// If Some, this is a ping: an opaque random id (never a clock reading,
+    /// which would fingerprint the sender). The receiver answers with a pong.
+    /// If None, this is a pong.
+    pub ping_id: Option<u64>,
     /// Random padding bytes. Set by sender; receiver discards.
     pub padding: Vec<u8>,
 }
@@ -416,9 +337,9 @@ pub struct KeepaliveMsg {
 impl KeepaliveMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + 8 + self.padding.len());
-        let flags: u8 = if self.timestamp_us.is_some() { 1 } else { 0 };
+        let flags: u8 = if self.ping_id.is_some() { 1 } else { 0 };
         out.push(flags);
-        if let Some(ts) = self.timestamp_us {
+        if let Some(ts) = self.ping_id {
             out.extend_from_slice(&ts.to_be_bytes());
         }
         out.extend_from_slice(&self.padding);
@@ -428,19 +349,19 @@ impl KeepaliveMsg {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         if data.is_empty() {
             return Ok(Self {
-                timestamp_us: None,
+                ping_id: None,
                 padding: Vec::new(),
             });
         }
         let mut r = Reader::new(data);
         let flags = r.read_u8()?;
-        let timestamp_us = if flags & 1 != 0 {
+        let ping_id = if flags & 1 != 0 {
             Some(r.read_u64()?)
         } else {
             None
         };
         Ok(Self {
-            timestamp_us,
+            ping_id,
             padding: Vec::new(),
         })
     }
@@ -481,32 +402,15 @@ impl HandshakeAuth {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 2 {
-            return Err(Error::Wire("HandshakeAuth too short".into()));
-        }
         let mut r = Reader::new(data);
         let sig_len = r.read_u16()? as usize;
         let signature = r.read_bytes(sig_len)?;
-        let kem_ciphertext = if r.remaining() >= 2 {
-            let ct_len = r.read_u16()? as usize;
-            if ct_len > 0 {
-                r.read_bytes(ct_len)?
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        let eph_kem_ciphertext = if r.remaining() >= 2 {
-            let ct_len = r.read_u16()? as usize;
-            if ct_len > 0 {
-                r.read_bytes(ct_len)?
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
+        // Both ciphertexts are always encoded (possibly empty).
+        let ct_len = r.read_u16()? as usize;
+        let kem_ciphertext = r.read_bytes(ct_len)?;
+        let ct_len = r.read_u16()? as usize;
+        let eph_kem_ciphertext = r.read_bytes(ct_len)?;
+        r.finish()?;
         Ok(Self {
             signature,
             kem_ciphertext,
@@ -594,6 +498,7 @@ impl RouteUpdateMsg {
                 eflags: r.read_u8()?,
             });
         }
+        r.finish()?;
         Ok(Self {
             flags,
             degree,
@@ -638,10 +543,12 @@ impl RouteDigestMsg {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        Ok(Self {
+        let msg = Self {
             digest: r.read_array::<16>()?,
             count: r.read_u16()?,
-        })
+        };
+        r.finish()?;
+        Ok(msg)
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -683,6 +590,7 @@ impl RouteRequestMsg {
         } else {
             None
         };
+        r.finish()?;
         Ok(Self {
             full_dump: flags & ROUTE_REQ_FULL_DUMP != 0,
             seqno,
@@ -714,10 +622,12 @@ impl SampleWalkMsg {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        Ok(Self {
+        let msg = Self {
             token: r.read_array::<32>()?,
             steps: r.read_u8()?,
-        })
+        };
+        r.finish()?;
+        Ok(msg)
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -755,10 +665,7 @@ impl SampleResultMsg {
             Some(s) => {
                 buf.push(0);
                 buf.extend_from_slice(s.peer.as_bytes());
-                buf.push(s.path.len() as u8);
-                for p in &s.path {
-                    buf.extend_from_slice(p.as_bytes());
-                }
+                write_peers(&mut buf, &s.path, SAMPLE_PATH_MAX);
                 let addr = s.address.as_ref().map(|a| a.to_bytes()).unwrap_or_default();
                 buf.extend_from_slice(&(addr.len() as u16).to_be_bytes());
                 buf.extend_from_slice(&addr);
@@ -773,13 +680,7 @@ impl SampleResultMsg {
         let sample = match r.read_u8()? {
             0 => {
                 let peer = PeerId(r.read_array::<32>()?);
-                let count = r.read_u8()? as usize;
-                if count > SAMPLE_PATH_MAX {
-                    return Err(Error::Wire(format!("SampleResult carries {} path entries", count)));
-                }
-                let path = (0..count)
-                    .map(|_| r.read_array::<32>().map(PeerId))
-                    .collect::<Result<Vec<_>>>()?;
+                let path = r.read_peers(SAMPLE_PATH_MAX, "SampleResult path")?;
                 let addr_len = r.read_u16()? as usize;
                 let address = if addr_len == 0 {
                     None
@@ -788,8 +689,10 @@ impl SampleResultMsg {
                 };
                 Some(Sample { peer, path, address })
             }
-            _ => None,
+            1 => None,
+            s => return Err(Error::Wire(format!("SampleResult status {}", s))),
         };
+        r.finish()?;
         Ok(Self { token, sample })
     }
 
@@ -808,19 +711,7 @@ pub const PATH_MAX: usize = 8;
 /// target.
 pub const PATH_TRACE_MAX: usize = PATH_MAX + 2;
 
-fn read_peers(r: &mut Reader, count: usize, max: usize, what: &str) -> Result<Vec<PeerId>> {
-    if count > max {
-        return Err(Error::Wire(format!("{} lists {} peers", what, count)));
-    }
-    (0..count).map(|_| r.read_array::<32>().map(PeerId)).collect()
-}
-
-fn write_peers(buf: &mut Vec<u8>, peers: &[PeerId]) {
-    buf.push(peers.len() as u8);
-    for p in peers {
-        buf.extend_from_slice(p.as_bytes());
-    }
-}
+use crate::codec::write_peers;
 
 /// One way to reach a node: a landmark, and the nodes after it up to, but
 /// excluding, the node.
@@ -855,7 +746,7 @@ impl AddressRecord {
         buf.push(self.entries.len() as u8);
         for e in &self.entries {
             buf.extend_from_slice(e.landmark.as_bytes());
-            write_peers(&mut buf, &e.path);
+            write_peers(&mut buf, &e.path, PATH_MAX);
         }
         buf
     }
@@ -922,8 +813,7 @@ impl AddressRecord {
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let landmark = PeerId(r.read_array::<32>()?);
-            let n = r.read_u8()? as usize;
-            let path = read_peers(r, n, PATH_MAX, "address path")?;
+            let path = r.read_peers(PATH_MAX, "address path")?;
             entries.push(AddressEntry { landmark, path });
         }
         let signer_algo = r.read_u8()?;
@@ -948,6 +838,7 @@ impl AddressRecord {
         if r.remaining() != 0 {
             return Err(Error::Wire("trailing bytes after address record".into()));
         }
+        r.finish()?;
         Ok(rec)
     }
 }
@@ -976,11 +867,13 @@ impl RouteSearchMsg {
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        Ok(Self {
+        let msg = Self {
             nonce: r.read_array::<16>()?,
             target: PeerId(r.read_array::<32>()?),
             ttl: r.read_u8()?,
-        })
+        };
+        r.finish()?;
+        Ok(msg)
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -1002,7 +895,7 @@ impl RouteSearchFoundMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = self.nonce.to_vec();
         buf.extend_from_slice(self.target.as_bytes());
-        write_peers(&mut buf, &self.hops);
+        write_peers(&mut buf, &self.hops, ROUTE_SEARCH_PATH_MAX);
         buf
     }
 
@@ -1010,8 +903,8 @@ impl RouteSearchFoundMsg {
         let mut r = Reader::new(data);
         let nonce = r.read_array::<16>()?;
         let target = PeerId(r.read_array::<32>()?);
-        let n = r.read_u8()? as usize;
-        let hops = read_peers(&mut r, n, ROUTE_SEARCH_PATH_MAX, "RouteSearchFound")?;
+        let hops = r.read_peers(ROUTE_SEARCH_PATH_MAX, "RouteSearchFound")?;
+        r.finish()?;
         Ok(Self { nonce, target, hops })
     }
 
@@ -1042,6 +935,7 @@ impl DirPublishMsg {
         let landmark = PeerId(r.read_array::<32>()?);
         let replica = r.read_u8()?;
         let record = AddressRecord::from_bytes(&r.read_rest())?;
+        r.finish()?;
         Ok(Self {
             landmark,
             replica,
@@ -1083,13 +977,15 @@ impl DirLookupMsg {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
         let flags = r.read_u8()?;
-        Ok(Self {
+        let msg = Self {
             walking: flags & DIR_LOOKUP_WALKING != 0,
             token: r.read_array::<32>()?,
             target: PeerId(r.read_array::<32>()?),
             replica: r.read_u8()?,
             landmark: PeerId(r.read_array::<32>()?),
-        })
+        };
+        r.finish()?;
+        Ok(msg)
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -1123,8 +1019,10 @@ impl DirResultMsg {
         let token = r.read_array::<32>()?;
         let record = match r.read_u8()? {
             0 => Some(AddressRecord::from_bytes(&r.read_rest())?),
-            _ => None,
+            1 => None,
+            s => return Err(Error::Wire(format!("DirResult status {}", s))),
         };
+        r.finish()?;
         Ok(Self { token, record })
     }
 
@@ -1147,7 +1045,7 @@ impl PathTraceMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = self.token.to_vec();
         buf.extend_from_slice(self.target.as_bytes());
-        write_peers(&mut buf, &self.path);
+        write_peers(&mut buf, &self.path, PATH_TRACE_MAX);
         buf
     }
 
@@ -1155,8 +1053,8 @@ impl PathTraceMsg {
         let mut r = Reader::new(data);
         let token = r.read_array::<32>()?;
         let target = PeerId(r.read_array::<32>()?);
-        let n = r.read_u8()? as usize;
-        let path = read_peers(&mut r, n, PATH_TRACE_MAX, "PathTrace")?;
+        let path = r.read_peers(PATH_TRACE_MAX, "PathTrace")?;
+        r.finish()?;
         Ok(Self {
             token,
             target,
@@ -1180,15 +1078,15 @@ pub struct PathTraceResultMsg {
 impl PathTraceResultMsg {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = self.token.to_vec();
-        write_peers(&mut buf, &self.path);
+        write_peers(&mut buf, &self.path, PATH_TRACE_MAX);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
         let token = r.read_array::<32>()?;
-        let n = r.read_u8()? as usize;
-        let path = read_peers(&mut r, n, PATH_TRACE_MAX, "PathTraceResult")?;
+        let path = r.read_peers(PATH_TRACE_MAX, "PathTraceResult")?;
+        r.finish()?;
         Ok(Self { token, path })
     }
 
@@ -1293,7 +1191,8 @@ pub struct DhtPutMsg {
     pub key: [u8; 64],
     pub record_type: RecordType,
     pub sequence: u64,
-    pub signer: [u8; 32],
+    pub signer: PeerId,
+    /// Remaining lifetime in seconds; unsigned, clamped per type by every node.
     pub ttl: u32,
     pub value: Vec<u8>,
     pub signature: Vec<u8>,
@@ -1309,7 +1208,7 @@ impl DhtPutMsg {
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(WalkHeader::LEN + self.record_len());
+        let mut buf = Vec::new();
         self.walk.write(&mut buf);
         self.write_record(&mut buf);
         buf
@@ -1318,18 +1217,15 @@ impl DhtPutMsg {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
         let walk = WalkHeader::read(&mut r)?;
-        Self::read_record(&mut r, walk)
-    }
-
-    fn record_len(&self) -> usize {
-        64 + 1 + 8 + 32 + 4 + 2 + self.value.len() + 2 + self.signature.len() + 1 + 2
-            + self.signer_pubkey.len()
+        let put = Self::read_record(&mut r, walk)?;
+        r.finish()?;
+        Ok(put)
     }
 
     /// Encode only the signed record (no walk header), as carried by
     /// `DhtWatchNotify`.
     pub fn record_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(self.record_len());
+        let mut buf = Vec::new();
         self.write_record(&mut buf);
         buf
     }
@@ -1337,52 +1233,41 @@ impl DhtPutMsg {
     /// Decode a bare record (no walk header); the walk header is set to
     /// [`WalkHeader::origin`].
     pub fn from_record_bytes(data: &[u8]) -> Result<Self> {
-        Self::read_record(&mut Reader::new(data), WalkHeader::origin())
+        let mut r = Reader::new(data);
+        let put = Self::read_record(&mut r, WalkHeader::origin())?;
+        r.finish()?;
+        Ok(put)
     }
 
     fn write_record(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.key);
-        buf.push(self.record_type.as_u8());
-        buf.extend_from_slice(&self.sequence.to_be_bytes());
-        buf.extend_from_slice(&self.signer);
-        buf.extend_from_slice(&self.ttl.to_be_bytes());
-        buf.extend_from_slice(&(self.value.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.value);
-        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signature);
-        buf.push(self.signer_algo);
-        buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signer_pubkey);
+        write_record_body(
+            buf,
+            self.record_type,
+            self.sequence,
+            self.signer.as_bytes(),
+            self.ttl,
+            &self.value,
+            &self.signature,
+            self.signer_algo,
+            &self.signer_pubkey,
+        );
     }
 
     fn read_record(r: &mut Reader, walk: WalkHeader) -> Result<Self> {
-        // Minimum: 64 + 1 + 8 + 32 + 4 + 2 + 0 + 2 + 0 + 1 + 2 + 0 = 116
-        if r.remaining() < 116 {
-            return Err(Error::Wire("DhtPut too short".into()));
-        }
         let key = r.read_array::<64>()?;
-        let record_type = RecordType::from_u8(r.read_u8()?);
-        let sequence = r.read_u64()?;
-        let signer = r.read_array::<32>()?;
-        let ttl = r.read_u32()?;
-        let value_len = r.read_u16()? as usize;
-        let value = r.read_bytes(value_len)?;
-        let sig_len = r.read_u16()? as usize;
-        let signature = r.read_bytes(sig_len)?;
-        let signer_algo = r.read_u8()?;
-        let signer_pk_len = r.read_u16()? as usize;
-        let signer_pubkey = r.read_bytes(signer_pk_len)?;
+        let body = DhtResponseRecord::read(r)?;
         Ok(Self {
             walk,
             key,
-            record_type,
-            sequence,
-            signer,
-            ttl,
-            value,
-            signature,
-            signer_algo,
-            signer_pubkey,
+            record_type: body.record_type,
+            sequence: body.sequence,
+            signer: body.signer,
+            ttl: body.ttl,
+            value: body.value,
+            signature: body.signature,
+            signer_algo: body.signer_algo,
+            signer_pubkey: body.signer_pubkey,
         })
     }
 
@@ -1416,6 +1301,7 @@ impl DhtGetMsg {
         let walk = WalkHeader::read(&mut r)?;
         let key = r.read_array::<64>()?;
         let query_token = r.read_array::<32>()?;
+        r.finish()?;
         Ok(Self {
             walk,
             key,
@@ -1433,7 +1319,8 @@ impl DhtGetMsg {
 pub struct DhtResponseRecord {
     pub record_type: RecordType,
     pub sequence: u64,
-    pub signer: [u8; 32],
+    pub signer: PeerId,
+    /// Remaining lifetime in seconds; unsigned, clamped per type by every node.
     pub ttl: u32,
     pub value: Vec<u8>,
     pub signature: Vec<u8>,
@@ -1444,42 +1331,27 @@ pub struct DhtResponseRecord {
 impl DhtResponseRecord {
     /// Encode: record_type(u8) || sequence(u64 BE) || signer(32) || ttl(u32 BE) || value_len(u16 BE) || value || sig_len(u16 BE) || signature || signer_algo(u8) || signer_pk_len(u16 BE) || signer_pubkey
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            1 + 8
-                + 32
-                + 4
-                + 2
-                + self.value.len()
-                + 2
-                + self.signature.len()
-                + 1
-                + 2
-                + self.signer_pubkey.len(),
+        let mut buf = Vec::new();
+        write_record_body(
+            &mut buf,
+            self.record_type,
+            self.sequence,
+            self.signer.as_bytes(),
+            self.ttl,
+            &self.value,
+            &self.signature,
+            self.signer_algo,
+            &self.signer_pubkey,
         );
-        buf.push(self.record_type.as_u8());
-        buf.extend_from_slice(&self.sequence.to_be_bytes());
-        buf.extend_from_slice(&self.signer);
-        buf.extend_from_slice(&self.ttl.to_be_bytes());
-        buf.extend_from_slice(&(self.value.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.value);
-        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signature);
-        buf.push(self.signer_algo);
-        buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signer_pubkey);
         buf
     }
 
-    /// Decode from bytes, returning (record, bytes_consumed).
-    pub fn from_bytes(data: &[u8]) -> Result<(Self, usize)> {
-        // Minimum: 1 + 8 + 32 + 4 + 2 + 0 + 2 + 0 + 1 + 2 + 0 = 52
-        if data.len() < 52 {
-            return Err(Error::Wire("DhtResponseRecord too short".into()));
-        }
-        let mut r = Reader::new(data);
+    /// Read one record body (a GET response's record, or a PUT's after
+    /// its key).
+    fn read(r: &mut Reader) -> Result<Self> {
         let record_type = RecordType::from_u8(r.read_u8()?);
         let sequence = r.read_u64()?;
-        let signer = r.read_array::<32>()?;
+        let signer = PeerId(r.read_array::<32>()?);
         let ttl = r.read_u32()?;
         let value_len = r.read_u16()? as usize;
         let value = r.read_bytes(value_len)?;
@@ -1488,21 +1360,44 @@ impl DhtResponseRecord {
         let signer_algo = r.read_u8()?;
         let signer_pk_len = r.read_u16()? as usize;
         let signer_pubkey = r.read_bytes(signer_pk_len)?;
-        let consumed = r.pos;
-        Ok((
-            Self {
-                record_type,
-                sequence,
-                signer,
-                ttl,
-                value,
-                signature,
-                signer_algo,
-                signer_pubkey,
-            },
-            consumed,
-        ))
+        Ok(Self {
+            record_type,
+            sequence,
+            signer,
+            ttl,
+            value,
+            signature,
+            signer_algo,
+            signer_pubkey,
+        })
     }
+}
+
+/// The one encoding of a DHT record's body, for PUTs (after the key) and GET
+/// responses alike. Read back by [`DhtResponseRecord::read`].
+#[allow(clippy::too_many_arguments)]
+fn write_record_body(
+    buf: &mut Vec<u8>,
+    record_type: RecordType,
+    sequence: u64,
+    signer: &[u8; 32],
+    ttl: u32,
+    value: &[u8],
+    signature: &[u8],
+    signer_algo: u8,
+    signer_pubkey: &[u8],
+) {
+    buf.push(record_type.as_u8());
+    buf.extend_from_slice(&sequence.to_be_bytes());
+    buf.extend_from_slice(signer);
+    buf.extend_from_slice(&ttl.to_be_bytes());
+    buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    buf.extend_from_slice(value);
+    buf.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    buf.extend_from_slice(signature);
+    buf.push(signer_algo);
+    buf.extend_from_slice(&(signer_pubkey.len() as u16).to_be_bytes());
+    buf.extend_from_slice(signer_pubkey);
 }
 
 /// DhtGetResponse: query_token(32) || key(64) || record_count(u16) || records...
@@ -1516,6 +1411,15 @@ pub struct DhtGetResponseMsg {
 }
 
 impl DhtGetResponseMsg {
+    /// The record count a response claims, read from its header alone (0 if
+    /// the header is short), for charging before it is parsed.
+    pub fn record_count(payload: &[u8]) -> u16 {
+        // query_token(32) || key(64) || count(u16)
+        payload
+            .get(96..98)
+            .map_or(0, |c| u16::from_be_bytes([c[0], c[1]]))
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&self.query_token);
@@ -1528,9 +1432,6 @@ impl DhtGetResponseMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 98 {
-            return Err(Error::Wire("DhtGetResponse too short".into()));
-        }
         let mut r = Reader::new(data);
         let query_token = r.read_array::<32>()?;
         let key = r.read_array::<64>()?;
@@ -1539,10 +1440,9 @@ impl DhtGetResponseMsg {
         // the minimum encoded record), not by the attacker-supplied count.
         let mut records = Vec::with_capacity(record_count.min(r.remaining() / 52));
         for _ in 0..record_count {
-            let (record, consumed) = DhtResponseRecord::from_bytes(&data[r.pos..])?;
-            records.push(record);
-            r.pos += consumed;
+            records.push(DhtResponseRecord::read(&mut r)?);
         }
+        r.finish()?;
         Ok(Self {
             query_token,
             key,
@@ -1555,7 +1455,7 @@ impl DhtGetResponseMsg {
     }
 }
 
-/// TunnelKeyExchange: kem_algo(1) || eph_pk_len(2 BE) || eph_pk(variable) || initiator_peer_id(32) || nonce(32) || timestamp(u64 BE)
+/// TunnelKeyExchange: kem_algo(1) || eph_pk_len(2 BE) || eph_pk(variable) || initiator_peer_id(32) || nonce(32)
 ///   || signer_algo(1) || signer_pk_len(2 BE) || signer_pubkey(variable) || sig_len(2 BE) || signature(variable)
 /// Routed via DataMsg envelope (origin, destination, TTL).
 ///
@@ -1569,7 +1469,6 @@ pub struct TunnelKeyExchangeMsg {
     pub ephemeral_pubkey: Vec<u8>,
     pub initiator_peer_id: PeerId,
     pub nonce: [u8; 32],
-    pub timestamp: u64,
     pub signer_algo: u8,
     pub signer_pubkey: Vec<u8>,
     pub signature: Vec<u8>,
@@ -1586,19 +1485,17 @@ impl TunnelKeyExchangeMsg {
             &self.ephemeral_pubkey,
             &self.initiator_peer_id,
             &self.nonce,
-            self.timestamp,
         )
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let pk_len = self.ephemeral_pubkey.len() as u16;
-        let mut buf = Vec::with_capacity(3 + self.ephemeral_pubkey.len() + 72);
+        let mut buf = Vec::new();
         buf.push(self.kem_algo);
         buf.extend_from_slice(&pk_len.to_be_bytes());
         buf.extend_from_slice(&self.ephemeral_pubkey);
         buf.extend_from_slice(self.initiator_peer_id.as_bytes());
         buf.extend_from_slice(&self.nonce);
-        buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.push(self.signer_algo);
         buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.signer_pubkey);
@@ -1608,30 +1505,23 @@ impl TunnelKeyExchangeMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 3 {
-            return Err(Error::Wire("TunnelKeyExchange too short".into()));
-        }
         let mut r = Reader::new(data);
         let kem_algo = r.read_u8()?;
         let pk_len = r.read_u16()? as usize;
-        if r.remaining() < pk_len + 72 {
-            return Err(Error::Wire("TunnelKeyExchange truncated".into()));
-        }
         let ephemeral_pubkey = r.read_bytes(pk_len)?.to_vec();
         let initiator = r.read_array::<32>()?;
         let nonce = r.read_array::<32>()?;
-        let timestamp = r.read_u64()?;
         let signer_algo = r.read_u8()?;
         let signer_pk_len = r.read_u16()? as usize;
         let signer_pubkey = r.read_bytes(signer_pk_len)?.to_vec();
         let sig_len = r.read_u16()? as usize;
         let signature = r.read_bytes(sig_len)?.to_vec();
+        r.finish()?;
         Ok(Self {
             kem_algo,
             ephemeral_pubkey,
             initiator_peer_id: PeerId(initiator),
             nonce,
-            timestamp,
             signer_algo,
             signer_pubkey,
             signature,
@@ -1654,9 +1544,8 @@ pub fn tunnel_kex_signed_bytes(
     ephemeral_pubkey: &[u8],
     initiator_peer_id: &PeerId,
     nonce: &[u8; 32],
-    timestamp: u64,
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(20 + 32 + 1 + 2 + ephemeral_pubkey.len() + 32 + 32 + 8);
+    let mut buf = Vec::with_capacity(20 + 32 + 1 + 2 + ephemeral_pubkey.len() + 32 + 32);
     buf.extend_from_slice(b"tarnet tunnel kex v1");
     buf.extend_from_slice(destination.as_bytes());
     buf.push(kem_algo);
@@ -1664,11 +1553,10 @@ pub fn tunnel_kex_signed_bytes(
     buf.extend_from_slice(ephemeral_pubkey);
     buf.extend_from_slice(initiator_peer_id.as_bytes());
     buf.extend_from_slice(nonce);
-    buf.extend_from_slice(&timestamp.to_be_bytes());
     buf
 }
 
-/// TunnelKeyResponse: kem_algo(1) || ct_len(2 BE) || ciphertext(variable) || responder_peer_id(32) || nonce(32) || initiator_nonce(32) || timestamp(u64 BE)
+/// TunnelKeyResponse: kem_algo(1) || ct_len(2 BE) || ciphertext(variable) || responder_peer_id(32) || nonce(32) || initiator_nonce(32)
 ///   || signer_algo(1) || signer_pk_len(2 BE) || signer_pubkey(variable) || sig_len(2 BE) || signature(variable)
 /// Echoes back the initiator's nonce to bind the exchange.
 ///
@@ -1683,7 +1571,6 @@ pub struct TunnelKeyResponseMsg {
     pub responder_peer_id: PeerId,
     pub nonce: [u8; 32],
     pub initiator_nonce: [u8; 32],
-    pub timestamp: u64,
     pub signer_algo: u8,
     pub signer_pubkey: Vec<u8>,
     pub signature: Vec<u8>,
@@ -1703,20 +1590,18 @@ impl TunnelKeyResponseMsg {
             &self.ciphertext,
             &self.initiator_nonce,
             &self.nonce,
-            self.timestamp,
         )
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let ct_len = self.ciphertext.len() as u16;
-        let mut buf = Vec::with_capacity(3 + self.ciphertext.len() + 104);
+        let mut buf = Vec::new();
         buf.push(self.kem_algo);
         buf.extend_from_slice(&ct_len.to_be_bytes());
         buf.extend_from_slice(&self.ciphertext);
         buf.extend_from_slice(self.responder_peer_id.as_bytes());
         buf.extend_from_slice(&self.nonce);
         buf.extend_from_slice(&self.initiator_nonce);
-        buf.extend_from_slice(&self.timestamp.to_be_bytes());
         buf.push(self.signer_algo);
         buf.extend_from_slice(&(self.signer_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.signer_pubkey);
@@ -1726,32 +1611,25 @@ impl TunnelKeyResponseMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 3 {
-            return Err(Error::Wire("TunnelKeyResponse too short".into()));
-        }
         let mut r = Reader::new(data);
         let kem_algo = r.read_u8()?;
         let ct_len = r.read_u16()? as usize;
-        if r.remaining() < ct_len + 104 {
-            return Err(Error::Wire("TunnelKeyResponse truncated".into()));
-        }
         let ciphertext = r.read_bytes(ct_len)?.to_vec();
         let responder = r.read_array::<32>()?;
         let nonce = r.read_array::<32>()?;
         let initiator_nonce = r.read_array::<32>()?;
-        let timestamp = r.read_u64()?;
         let signer_algo = r.read_u8()?;
         let signer_pk_len = r.read_u16()? as usize;
         let signer_pubkey = r.read_bytes(signer_pk_len)?.to_vec();
         let sig_len = r.read_u16()? as usize;
         let signature = r.read_bytes(sig_len)?.to_vec();
+        r.finish()?;
         Ok(Self {
             kem_algo,
             ciphertext,
             responder_peer_id: PeerId(responder),
             nonce,
             initiator_nonce,
-            timestamp,
             signer_algo,
             signer_pubkey,
             signature,
@@ -1777,10 +1655,9 @@ pub fn tunnel_kex_resp_signed_bytes(
     ciphertext: &[u8],
     initiator_nonce: &[u8; 32],
     responder_nonce: &[u8; 32],
-    timestamp: u64,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(
-        25 + 32 + 32 + 1 + 2 + ephemeral_pubkey.len() + 2 + ciphertext.len() + 32 + 32 + 8,
+        25 + 32 + 32 + 1 + 2 + ephemeral_pubkey.len() + 2 + ciphertext.len() + 32 + 32,
     );
     buf.extend_from_slice(b"tarnet tunnel kex-resp v1");
     buf.extend_from_slice(initiator_peer_id.as_bytes());
@@ -1792,7 +1669,6 @@ pub fn tunnel_kex_resp_signed_bytes(
     buf.extend_from_slice(ciphertext);
     buf.extend_from_slice(initiator_nonce);
     buf.extend_from_slice(responder_nonce);
-    buf.extend_from_slice(&timestamp.to_be_bytes());
     buf
 }
 
@@ -1806,8 +1682,8 @@ pub struct DataMsg {
     pub origin: PeerId,
     pub destination: PeerId,
     pub ttl: u8,
-    /// Forwarding hints toward the destination (its landmark and path).
-    /// Reserved: always sent empty, carried unchanged when forwarding.
+    /// Forwarding hints toward the destination (its landmark and path),
+    /// for relays with no route to it; carried unchanged when forwarding.
     pub hints: Vec<PeerId>,
     pub data: Vec<u8>,
 }
@@ -1815,6 +1691,13 @@ pub struct DataMsg {
 /// Most forwarding hints a Data message or EXTEND may carry: a landmark plus
 /// a path of up to `PATH_MAX` (8) peers.
 pub const MAX_HINTS: usize = 9;
+
+/// Most selective acks a channel or stream ACK carries.
+pub const MAX_SELECTIVE_ACKS: usize = 32;
+
+/// Hops an overlay-routed `Data` / `EncryptedData` may take: what every
+/// sender starts with, and what a receiver clamps a larger TTL to.
+pub const DATA_TTL: u8 = 64;
 
 /// Type alias preserving the old name for callers that used EncryptedDataMsg.
 pub type EncryptedDataMsg = DataMsg;
@@ -1825,30 +1708,19 @@ impl DataMsg {
         buf.extend_from_slice(self.origin.as_bytes());
         buf.extend_from_slice(self.destination.as_bytes());
         buf.push(self.ttl);
-        buf.push(self.hints.len() as u8);
-        for hint in &self.hints {
-            buf.extend_from_slice(hint.as_bytes());
-        }
+        write_peers(&mut buf, &self.hints, MAX_HINTS);
         buf.extend_from_slice(&self.data);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 66 {
-            return Err(Error::Wire("Data too short".into()));
-        }
         let mut r = Reader::new(data);
         let origin = r.read_array::<32>()?;
         let destination = r.read_array::<32>()?;
         let ttl = r.read_u8()?;
-        let hint_count = r.read_u8()? as usize;
-        if hint_count > MAX_HINTS {
-            return Err(Error::Wire(format!("Data carries {} hints", hint_count)));
-        }
-        let hints = (0..hint_count)
-            .map(|_| r.read_array::<32>().map(PeerId))
-            .collect::<Result<Vec<_>>>()?;
+        let hints = r.read_peers(MAX_HINTS, "Data hints")?;
         let rest = r.read_rest();
+        r.finish()?;
         Ok(Self {
             origin: PeerId(origin),
             destination: PeerId(destination),
@@ -1898,15 +1770,13 @@ impl ChannelOpenMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 37 {
-            return Err(Error::Wire("ChannelOpen too short".into()));
-        }
         let mut r = Reader::new(data);
         let channel_id = r.read_u32()?;
         let port = r.read_array::<32>()?;
         let flags = r.read_u8()?;
         let reliable = flags & 0x01 != 0;
         let ordered = flags & 0x02 != 0;
+        r.finish()?;
         Ok(Self {
             channel_id,
             port,
@@ -1938,13 +1808,11 @@ impl ChannelDataMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 8 {
-            return Err(Error::Wire("ChannelData too short".into()));
-        }
         let mut r = Reader::new(data);
         let channel_id = r.read_u32()?;
         let sequence = r.read_u32()?;
         let rest = r.read_rest();
+        r.finish()?;
         Ok(Self {
             channel_id,
             sequence,
@@ -1978,13 +1846,13 @@ impl ChannelAckMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 10 {
-            return Err(Error::Wire("ChannelAck too short".into()));
-        }
         let mut r = Reader::new(data);
         let channel_id = r.read_u32()?;
         let ack_seq = r.read_u32()?;
         let count = r.read_u16()? as usize;
+        if count > MAX_SELECTIVE_ACKS {
+            return Err(Error::Wire(format!("ChannelAck with {} selective acks", count)));
+        }
         if r.remaining() < count * 4 {
             return Err(Error::Wire("ChannelAck truncated".into()));
         }
@@ -1992,6 +1860,7 @@ impl ChannelAckMsg {
         for _ in 0..count {
             selective_acks.push(r.read_u32()?);
         }
+        r.finish()?;
         Ok(Self {
             channel_id,
             ack_seq,
@@ -2016,11 +1885,9 @@ impl ChannelCloseMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(Error::Wire("ChannelClose too short".into()));
-        }
         let mut r = Reader::new(data);
         let channel_id = r.read_u32()?;
+        r.finish()?;
         Ok(Self { channel_id })
     }
 
@@ -2127,9 +1994,6 @@ impl HelloRecord {
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         // Minimum: peer_id(32) + capabilities(4) + signaling_secret(16) +
         //          transport_count(2) + introducer_count(2) + addr_count(2) = 58
-        if data.len() < 58 {
-            return Err(Error::Wire("HelloRecord too short".into()));
-        }
         let mut r = Reader::new(data);
         let peer_id = r.read_array::<32>()?;
         let capabilities = r.read_u32()?;
@@ -2161,6 +2025,7 @@ impl HelloRecord {
             r.pos += consumed;
         }
 
+        r.finish()?;
         Ok(Self {
             peer_id: PeerId(peer_id),
             capabilities,
@@ -2200,6 +2065,7 @@ impl DhtWatchMsg {
         let key = r.read_array::<64>()?;
         let query_token = r.read_array::<32>()?;
         let expiration_secs = r.read_u32()?;
+        r.finish()?;
         Ok(Self {
             walk,
             key,
@@ -2231,11 +2097,9 @@ impl DhtWatchNotifyMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 32 {
-            return Err(Error::Wire("DhtWatchNotify too short".into()));
-        }
         let mut r = Reader::new(data);
         let query_token = r.read_array::<32>()?;
+        // The record runs to the end (its decoder checks nothing follows).
         let put = DhtPutMsg::from_record_bytes(&data[r.pos..])?;
         Ok(Self { query_token, put })
     }
@@ -2274,6 +2138,7 @@ impl DhtNeighborMsg {
             return Err(Error::Wire(format!("unsupported DHT version {}", version)));
         }
         let flags = r.read_u8()? & dht_neighbor_flags::STORES;
+        r.finish()?;
         Ok(Self { flags })
     }
 
@@ -2301,12 +2166,10 @@ impl CircuitRelayMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(Error::Wire("CircuitRelay too short".into()));
-        }
         let mut r = Reader::new(data);
         let circuit_id = r.read_u32()?;
         let rest = r.read_rest();
+        r.finish()?;
         Ok(Self {
             circuit_id,
             data: rest,
@@ -2351,12 +2214,10 @@ impl CircuitCreateMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(Error::Wire("CircuitCreate too short".into()));
-        }
         let mut r = Reader::new(data);
         let circuit_id = r.read_u32()?;
         let encrypted_payload = r.read_rest();
+        r.finish()?;
         Ok(Self {
             circuit_id,
             encrypted_payload,
@@ -2385,12 +2246,10 @@ impl CircuitCreatedMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(Error::Wire("CircuitCreated too short".into()));
-        }
         let mut r = Reader::new(data);
         let circuit_id = r.read_u32()?;
         let encrypted_reply = r.read_rest();
+        r.finish()?;
         Ok(Self {
             circuit_id,
             encrypted_reply,
@@ -2415,11 +2274,9 @@ impl CircuitDestroyMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 4 {
-            return Err(Error::Wire("CircuitDestroy too short".into()));
-        }
         let mut r = Reader::new(data);
         let circuit_id = r.read_u32()?;
+        r.finish()?;
         Ok(Self { circuit_id })
     }
 
@@ -2436,6 +2293,17 @@ pub fn hash_port_name(name: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bytes` with the peer list whose count byte is at `at` grown to `n`
+    /// entries: what a sender could put on the wire, though our encoders
+    /// never would.
+    fn grow_list(mut bytes: Vec<u8>, at: usize, n: usize) -> Vec<u8> {
+        let old = bytes[at] as usize;
+        bytes[at] = n as u8;
+        let end = at + 1 + 32 * old;
+        bytes.splice(end..end, std::iter::repeat(0xAB).take(32 * (n - old)));
+        bytes
+    }
 
     #[test]
     fn sample_messages_round_trip() {
@@ -2456,15 +2324,17 @@ mod tests {
         }
         let none = SampleResultMsg { token: [4; 32], sample: None };
         assert_eq!(SampleResultMsg::from_bytes(&none.to_bytes()).unwrap(), none);
-        let long = SampleResultMsg {
+        let ok = SampleResultMsg {
             token: [4; 32],
             sample: Some(Sample {
                 peer: PeerId([5; 32]),
-                path: vec![PeerId([6; 32]); SAMPLE_PATH_MAX + 1],
+                path: vec![PeerId([6; 32])],
                 address: None,
             }),
         };
-        assert!(SampleResultMsg::from_bytes(&long.to_bytes()).is_err());
+        // token(32) status(1) peer(32) count
+        let long = grow_list(ok.to_bytes(), 65, SAMPLE_PATH_MAX + 1);
+        assert!(SampleResultMsg::from_bytes(&long).is_err());
     }
 
     fn address_entries() -> Vec<AddressEntry> {
@@ -2509,10 +2379,10 @@ mod tests {
     #[test]
     fn address_record_bounds() {
         let kp = crate::identity::Keypair::generate_ed25519();
-        let mut entries = address_entries();
-        entries[0].path = vec![PeerId([9; 32]); PATH_MAX + 1];
-        let rec = AddressRecord::sign(&kp, 1, 60, entries);
-        assert!(AddressRecord::from_bytes(&rec.to_bytes()).is_err());
+        // The first entry's path: peer(32) seq(4) ttl(4) count(1) landmark(32).
+        let rec = AddressRecord::sign(&kp, 1, 60, address_entries());
+        let long = grow_list(rec.to_bytes(), 73, PATH_MAX + 1);
+        assert!(AddressRecord::from_bytes(&long).is_err());
         let rec = AddressRecord::sign(
             &kp,
             1,
@@ -2539,11 +2409,9 @@ mod tests {
             hops: vec![PeerId([3; 32]), PeerId([4; 32])],
         };
         assert_eq!(RouteSearchFoundMsg::from_bytes(&found.to_bytes()).unwrap(), found);
-        let long = RouteSearchFoundMsg {
-            hops: vec![PeerId([3; 32]); ROUTE_SEARCH_PATH_MAX + 1],
-            ..found
-        };
-        assert!(RouteSearchFoundMsg::from_bytes(&long.to_bytes()).is_err());
+        // nonce(16) target(32) count
+        let long = grow_list(found.to_bytes(), 48, ROUTE_SEARCH_PATH_MAX + 1);
+        assert!(RouteSearchFoundMsg::from_bytes(&long).is_err());
     }
 
     #[test]
@@ -2581,11 +2449,9 @@ mod tests {
             path: trace.path.clone(),
         };
         assert_eq!(PathTraceResultMsg::from_bytes(&back.to_bytes()).unwrap(), back);
-        let long = PathTraceMsg {
-            path: vec![PeerId([1; 32]); PATH_TRACE_MAX + 1],
-            ..trace
-        };
-        assert!(PathTraceMsg::from_bytes(&long.to_bytes()).is_err());
+        // token(32) target(32) count
+        let long = grow_list(trace.to_bytes(), 64, PATH_TRACE_MAX + 1);
+        assert!(PathTraceMsg::from_bytes(&long).is_err());
     }
 
     #[test]
@@ -2605,7 +2471,6 @@ mod tests {
             signing_pubkey: vec![99u8; 32],
             kem_algo: 2,
             kem_pubkey: vec![88u8; 1184],
-            timestamp: 1234567890,
             challenge: [0xAB; 32],
             eph_kem_pubkey: vec![77u8; 1216],
             min_version: 2,
@@ -2618,7 +2483,6 @@ mod tests {
         assert_eq!(decoded.signing_pubkey, vec![99u8; 32]);
         assert_eq!(decoded.kem_algo, 2);
         assert_eq!(decoded.kem_pubkey, vec![88u8; 1184]);
-        assert_eq!(decoded.timestamp, 1234567890);
         assert_eq!(decoded.challenge, [0xAB; 32]);
         assert_eq!(decoded.eph_kem_pubkey, vec![77u8; 1216]);
         assert_eq!(decoded.min_version, 2);
@@ -2626,26 +2490,28 @@ mod tests {
     }
 
     #[test]
-    fn handshake_hello_backward_compat() {
-        // Simulate old-format hello without version fields
+    fn handshake_hello_is_exact() {
         let hello = HandshakeHello {
             ephemeral_pubkey: [42u8; 32],
             signing_algo: 1,
             signing_pubkey: vec![99u8; 32],
             kem_algo: 2,
             kem_pubkey: vec![88u8; 32],
-            timestamp: 1234567890,
             challenge: [0xAB; 32],
             eph_kem_pubkey: vec![77u8; 32],
             min_version: 2,
             max_version: 2,
         };
         let mut bytes = hello.to_bytes();
-        // Strip the trailing version bytes to simulate old format
+        assert_eq!(HandshakeHello::from_bytes(&bytes).unwrap().max_version, 2);
+        // The version fields are required (the fallback for peers without
+        // them could never negotiate a supported version anyway)...
         bytes.truncate(bytes.len() - 2);
-        let decoded = HandshakeHello::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.min_version, 2);
-        assert_eq!(decoded.max_version, 2);
+        assert!(HandshakeHello::from_bytes(&bytes).is_err());
+        // ...and nothing may follow them.
+        let mut long = hello.to_bytes();
+        long.push(0);
+        assert!(HandshakeHello::from_bytes(&long).is_err());
     }
 
     #[test]
@@ -2677,7 +2543,7 @@ mod tests {
             key: [0xAA; 64],
             record_type: RecordType::Hello,
             sequence: 42,
-            signer: [0xBB; 32],
+            signer: PeerId([0xBB; 32]),
             ttl: 600,
             value: b"hello world".to_vec(),
             signature: vec![0xCC; 64],
@@ -2696,7 +2562,7 @@ mod tests {
         assert_eq!(decoded.record_type, RecordType::Hello);
         assert_eq!(decoded.sequence, 42);
         assert_eq!(decoded.signer, put.signer);
-        assert_eq!(decoded.ttl, 600);
+        assert_eq!(decoded.ttl, put.ttl);
         assert_eq!(decoded.value, b"hello world");
         assert_eq!(decoded.signature, put.signature);
         assert_eq!(decoded.signer_algo, 1);
@@ -2710,7 +2576,7 @@ mod tests {
             key: [1; 64],
             record_type: RecordType::SignedContent,
             sequence: 7,
-            signer: [2; 32],
+            signer: PeerId([2; 32]),
             ttl: 100,
             value: b"data".to_vec(),
             signature: vec![0; 64],
@@ -2719,11 +2585,13 @@ mod tests {
             walk: Default::default(),
         };
         let signable = put.signable_bytes();
-        // signable = key(64) || record_type(1) || sequence(8) || value(4) = 77 bytes
-        assert_eq!(signable.len(), 64 + 1 + 8 + 4);
-        assert_eq!(&signable[..64], &[1u8; 64]);
-        assert_eq!(signable[64], RecordType::SignedContent.as_u8());
-        assert_eq!(&signable[73..], b"data");
+        // The TTL changes per hop and is not signed:
+        // label(20) || key(64) || record_type(1) || sequence(8) || value(4)
+        assert_eq!(signable.len(), 20 + 64 + 1 + 8 + 4);
+        assert_eq!(&signable[..20], b"tarnet dht record v1");
+        assert_eq!(&signable[20..84], &[1u8; 64]);
+        assert_eq!(signable[84], RecordType::SignedContent.as_u8());
+        assert_eq!(&signable[93..], b"data");
 
         // The signing side (this wire helper) and the verifying side
         // (`dht::record_signable`, used by `verify_incoming_record`) must produce
@@ -2757,7 +2625,7 @@ mod tests {
                 DhtResponseRecord {
                     record_type: RecordType::SignedContent,
                     sequence: 0,
-                    signer: [0xAA; 32],
+                    signer: PeerId([0xAA; 32]),
                     ttl: 3600,
                     value: b"first".to_vec(),
                     signature: vec![0x11; 64],
@@ -2767,7 +2635,7 @@ mod tests {
                 DhtResponseRecord {
                     record_type: RecordType::SignedContent,
                     sequence: 0,
-                    signer: [0xBB; 32],
+                    signer: PeerId([0xBB; 32]),
                     ttl: 1800,
                     value: b"second record".to_vec(),
                     signature: vec![0x22; 64],
@@ -2781,11 +2649,11 @@ mod tests {
         assert_eq!(decoded.key, resp.key);
         assert_eq!(decoded.query_token, [0xEE; 32]);
         assert_eq!(decoded.records.len(), 2);
-        assert_eq!(decoded.records[0].signer, [0xAA; 32]);
+        assert_eq!(decoded.records[0].signer, PeerId([0xAA; 32]));
         assert_eq!(decoded.records[0].value, b"first");
-        assert_eq!(decoded.records[1].signer, [0xBB; 32]);
+        assert_eq!(decoded.records[1].signer, PeerId([0xBB; 32]));
         assert_eq!(decoded.records[1].value, b"second record");
-        assert_eq!(decoded.records[1].ttl, 1800);
+        assert_eq!(decoded.records[1].ttl, resp.records[1].ttl);
     }
 
     #[test]
@@ -2885,7 +2753,7 @@ mod tests {
             key: [0xAA; 64],
             record_type: RecordType::Unknown(42),
             sequence: 1,
-            signer: [0xBB; 32],
+            signer: PeerId([0xBB; 32]),
             ttl: 600,
             value: b"unknown data".to_vec(),
             signature: vec![0xCC; 64],
@@ -2975,7 +2843,7 @@ mod tests {
                 key: [0xCC; 64],
                 record_type: RecordType::Hello,
                 sequence: 5,
-                signer: [0xDD; 32],
+                signer: PeerId([0xDD; 32]),
                 ttl: 600,
                 value: b"notify data".to_vec(),
                 signature: vec![0xEE; 64],
@@ -3044,7 +2912,6 @@ mod tests {
             ephemeral_pubkey: vec![0x11; 1216],
             initiator_peer_id: PeerId([0x22; 32]),
             nonce: [0x33; 32],
-            timestamp: 1234567890,
             signer_algo: 0x01,
             signer_pubkey: vec![0x44; 32],
             signature: vec![0x55; 64],
@@ -3055,7 +2922,6 @@ mod tests {
         assert_eq!(decoded.ephemeral_pubkey, vec![0x11; 1216]);
         assert_eq!(decoded.initiator_peer_id, PeerId([0x22; 32]));
         assert_eq!(decoded.nonce, [0x33; 32]);
-        assert_eq!(decoded.timestamp, 1234567890);
         assert_eq!(decoded.signer_algo, 0x01);
         assert_eq!(decoded.signer_pubkey, vec![0x44; 32]);
         assert_eq!(decoded.signature, vec![0x55; 64]);
@@ -3069,7 +2935,6 @@ mod tests {
             responder_peer_id: PeerId([0xBB; 32]),
             nonce: [0xCC; 32],
             initiator_nonce: [0xDD; 32],
-            timestamp: 9876543210,
             signer_algo: 0x01,
             signer_pubkey: vec![0xEE; 32],
             signature: vec![0xFF; 64],
@@ -3081,7 +2946,6 @@ mod tests {
         assert_eq!(decoded.responder_peer_id, PeerId([0xBB; 32]));
         assert_eq!(decoded.nonce, [0xCC; 32]);
         assert_eq!(decoded.initiator_nonce, [0xDD; 32]);
-        assert_eq!(decoded.timestamp, 9876543210);
         assert_eq!(decoded.signer_algo, 0x01);
         assert_eq!(decoded.signer_pubkey, vec![0xEE; 32]);
         assert_eq!(decoded.signature, vec![0xFF; 64]);
@@ -3103,7 +2967,6 @@ mod tests {
             ephemeral_pubkey: eph_alice.clone(),
             initiator_peer_id: alice.peer_id(),
             nonce: [0x33; 32],
-            timestamp: 1_000,
             signer_algo: alice_algo as u8,
             signer_pubkey: alice.identity.signing.signing_pubkey_bytes(),
             signature: Vec::new(),
@@ -3173,7 +3036,6 @@ mod tests {
             responder_peer_id: bob.peer_id(),
             nonce: [0xCC; 32],
             initiator_nonce: ke.nonce,
-            timestamp: 1_001,
             signer_algo: alice_algo as u8,
             signer_pubkey: bob.identity.signing.signing_pubkey_bytes(),
             signature: Vec::new(),
@@ -3227,7 +3089,7 @@ mod tests {
 
     #[test]
     fn data_msg_hints_roundtrip_and_bound() {
-        let mut msg = DataMsg {
+        let msg = DataMsg {
             origin: PeerId([1; 32]),
             destination: PeerId([2; 32]),
             ttl: 7,
@@ -3237,8 +3099,9 @@ mod tests {
         let decoded = DataMsg::from_bytes(&msg.to_bytes()).unwrap();
         assert_eq!(decoded.hints, msg.hints);
         assert_eq!(decoded.data, msg.data);
-        msg.hints = vec![PeerId([5; 32]); MAX_HINTS + 1];
-        assert!(DataMsg::from_bytes(&msg.to_bytes()).is_err());
+        // origin(32) destination(32) ttl(1) count
+        let long = grow_list(msg.to_bytes(), 65, MAX_HINTS + 1);
+        assert!(DataMsg::from_bytes(&long).is_err());
     }
 
 

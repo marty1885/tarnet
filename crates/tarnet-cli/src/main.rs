@@ -113,9 +113,6 @@ enum Command {
         /// Pool service label (default: the tunnel name)
         #[arg(long)]
         service: Option<String>,
-        /// TNS record TTL in seconds; tunnel republishes every ttl/2
-        #[arg(long, default_value_t = 300)]
-        ttl: u32,
     },
     /// Resource pools (virtual clusters)
     #[command(subcommand_required = true, arg_required_else_help = true)]
@@ -187,10 +184,10 @@ enum DhtCommand {
         /// Value to store
         value: String,
     },
-    /// Retrieve a value from the DHT by inner hash
+    /// Retrieve a value from the DHT by its content handle
     #[command(arg_required_else_help = true)]
     Get {
-        /// Inner hash (128 hex chars)
+        /// Content handle (128 hex chars)
         hash: String,
     },
     /// Store signed content in the DHT (publisher-authenticated)
@@ -205,7 +202,7 @@ enum DhtCommand {
     /// Retrieve signed content from the DHT
     #[command(arg_required_else_help = true)]
     GetSigned {
-        /// Inner hash (128 hex chars)
+        /// Content handle (128 hex chars)
         hash: String,
     },
     /// Look up a peer's hello record
@@ -408,7 +405,6 @@ async fn main() {
             identity,
             pool,
             service,
-            ttl,
         } => {
             cmd_tunnel(
                 &cli,
@@ -419,7 +415,6 @@ async fn main() {
                 identity.as_deref(),
                 pool.as_deref(),
                 service.as_deref(),
-                *ttl,
             )
             .await
         }
@@ -712,12 +707,17 @@ async fn cmd_dht(cli: &Cli, cmd: &DhtCommand) {
 
     match cmd {
         DhtCommand::Put { value } => {
-            let hash = client.dht_put(value.as_bytes()).await;
-            println!("{}", hex_encode(hash.as_bytes()));
+            match client.dht_put(value.as_bytes()).await {
+                Ok(hash) => println!("{}", hex_encode(hash.as_bytes())),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         DhtCommand::Get { hash } => {
             let inner_hash = parse_dht_hash(hash);
-            let key = tarnet_api::types::DhtId(inner_hash);
+            let key = tarnet_api::types::ContentHandle(inner_hash);
 
             match client.dht_get(&key, 30).await {
                 Some(data) => match String::from_utf8(data.clone()) {
@@ -734,12 +734,17 @@ async fn cmd_dht(cli: &Cli, cmd: &DhtCommand) {
             }
         }
         DhtCommand::PutSigned { value, ttl } => {
-            let hash = client.dht_put_signed(value.as_bytes(), *ttl).await;
-            println!("{}", hex_encode(hash.as_bytes()));
+            match client.dht_put_signed(value.as_bytes(), *ttl).await {
+                Ok(hash) => println!("{}", hex_encode(hash.as_bytes())),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         DhtCommand::GetSigned { hash } => {
             let inner_hash = parse_dht_hash(hash);
-            let key = tarnet_api::types::DhtId(inner_hash);
+            let key = tarnet_api::types::ContentHandle(inner_hash);
 
             let results = client.dht_get_signed(&key, 30).await;
             if results.is_empty() {
@@ -1472,7 +1477,6 @@ async fn cmd_tunnel(
     identity: Option<&str>,
     pool: Option<&str>,
     service: Option<&str>,
-    ttl: u32,
 ) {
     let client = connect_daemon(cli).await;
 
@@ -1536,9 +1540,9 @@ async fn cmd_tunnel(
         exit_err(&format!("Failed to set local label '{}': {}", label, e));
     }
 
-    // Publish to DHT with the configured TTL.
+    // Publish to DHT; the daemon keeps it published while the label exists.
     if let Err(e) = client
-        .tns_publish(identity, &label, records.clone(), ttl)
+        .tns_publish(identity, &label, records.clone())
         .await
     {
         let _ = client.tns_remove_label(identity, &label).await;
@@ -1583,12 +1587,6 @@ async fn cmd_tunnel(
         let svc = service.unwrap_or(&label);
         println!("  {} {} / {}", dim("pool"), p, svc);
     }
-    println!(
-        "  {} {}s (republish every {}s)",
-        dim("ttl"),
-        ttl,
-        ttl / 2
-    );
     println!();
     println!("  {}", dim("# connect from the tarnet CLI:"));
     println!("  tarnet connect {} --port {}", public_name, port_name);
@@ -1605,31 +1603,6 @@ async fn cmd_tunnel(
     println!();
     println!("  {}", dim("Ctrl-C to stop."));
     println!();
-
-    // Republish loop.
-    let republish_client = client.clone();
-    let republish_identity = identity.map(|s| s.to_string());
-    let republish_label = label.clone();
-    let republish_records = records.clone();
-    let republish_handle = tokio::spawn(async move {
-        let interval = std::cmp::max(ttl / 2, 1) as u64;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
-        ticker.tick().await; // skip immediate tick (already published)
-        loop {
-            ticker.tick().await;
-            if let Err(e) = republish_client
-                .tns_publish(
-                    republish_identity.as_deref(),
-                    &republish_label,
-                    republish_records.clone(),
-                    ttl,
-                )
-                .await
-            {
-                eprintln!("[!] republish failed: {}", e);
-            }
-        }
-    });
 
     // Accept loop.
     let accept_client = client.clone();
@@ -1682,7 +1655,6 @@ async fn cmd_tunnel(
     eprintln!();
     eprintln!("{}", dim("Shutting down..."));
 
-    republish_handle.abort();
     accept_handle.abort();
 
     if let Some(claim) = pool_claim {

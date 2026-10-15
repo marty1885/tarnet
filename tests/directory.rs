@@ -120,12 +120,21 @@ async fn wait_directory(nodes: &[Arc<Node>], timeout: Duration) {
 /// A node of `from` and a node of `to` it has no route to (neither is a
 /// landmark, which everyone keeps a route to).
 async fn far_pair(from: &[Arc<Node>], to: &[Arc<Node>]) -> (Arc<Node>, Arc<Node>) {
-    for a in from.iter().rev() {
-        for z in to.iter().rev() {
-            if a.peer_id() != z.peer_id() && a.route_cost(&z.peer_id()).await.is_none() {
-                return (a.clone(), z.clone());
+    // Nodes elected at about the same moment are all landmarks, which every
+    // table keeps, until the crowded ones step down: wait for that.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        for a in from.iter().rev() {
+            for z in to.iter().rev() {
+                if a.peer_id() != z.peer_id() && a.route_cost(&z.peer_id()).await.is_none() {
+                    return (a.clone(), z.clone());
+                }
             }
         }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
     let mut landmarks = 0;
     for n in from.iter().chain(to) {
@@ -211,10 +220,21 @@ async fn tunnel_round_trip(a: &Arc<Node>, b: &Arc<Node>) {
 
 /// Spawn a chain, each node bootstrapping to the one before.
 async fn chain(count: usize, budget: usize) -> Vec<Arc<Node>> {
+    // Short tenure and hysteresis: landmarks elected at once crowd a short
+    // chain, and the extra ones should step down within the test.
+    let config = LandmarkConfig {
+        min_tenure: Duration::from_secs(5),
+        hysteresis: Duration::from_secs(10),
+        ..fast_landmarks()
+    };
     let mut nodes: Vec<Spawned> = Vec::new();
     for i in 0..count {
         let bootstrap = if i == 0 { vec![] } else { vec![nodes[i - 1].addr.clone()] };
-        nodes.push(spawn(budget, bootstrap, Opts::default()).await);
+        let opts = Opts {
+            landmarks: Some(config.clone()),
+            ..Opts::default()
+        };
+        nodes.push(spawn(budget, bootstrap, opts).await);
     }
     nodes.into_iter().map(|s| s.node).collect()
 }

@@ -4,6 +4,7 @@
 use super::*;
 use crate::routing::{SeqnoRequest, COST_FAST, COST_SLOW};
 use crate::wire::{RouteDigestMsg, RouteRequestMsg, RouteUpdateMsg};
+use super::sender::{Budget, Queue};
 
 /// Changes are batched for this long before they are sent.
 const UPDATE_BATCH: Duration = Duration::from_millis(250);
@@ -28,16 +29,32 @@ impl Node {
         let Some(link) = self.links.lock().await.get(peer).cloned() else {
             return;
         };
-        let dump = self
+        let (dump, requests) = self
             .routing_table
             .lock()
             .await
             .neighbour_up(*peer, link_cost(&link));
         for m in dump {
-            if let Err(e) = link.send_deferred(&m.to_wire().encode()).await {
+            let bytes = m.to_wire().encode();
+            if let Err(e) = self.sender.to_peer(peer, &bytes, Queue::Deferred, Budget::Upkeep).await {
                 log::warn!("Failed to send route dump to {:?}: {}", peer, e);
             }
         }
+        self.send_seqno_requests(requests).await;
+    }
+
+    /// One of several links to `peer` went away: its cost is now that of
+    /// whichever link is active.
+    pub(super) async fn routing_link_changed(&self, peer: &PeerId) {
+        let Some(link) = self.links.lock().await.get(peer).cloned() else {
+            return;
+        };
+        let requests = self
+            .routing_table
+            .lock()
+            .await
+            .neighbour_cost(peer, link_cost(&link));
+        self.send_seqno_requests(requests).await;
     }
 
     pub(super) async fn routing_link_down(&self, peer: &PeerId) {
@@ -109,7 +126,7 @@ impl Node {
         Ok(())
     }
 
-    async fn send_seqno_requests(&self, requests: Vec<SeqnoRequest>) {
+    pub(super) async fn send_seqno_requests(&self, requests: Vec<SeqnoRequest>) {
         for r in requests {
             let msg = RouteRequestMsg {
                 full_dump: false,
@@ -124,6 +141,7 @@ impl Node {
     /// Send batched route changes and periodic digests to every neighbour.
     pub(super) fn spawn_routing_task(&self) {
         let links = self.links.clone();
+        let sender = self.sender.clone();
         let routing = self.routing_table.clone();
         tokio::spawn(async move {
             // Per neighbour: last update sent, next digest due.
@@ -144,9 +162,26 @@ impl Node {
                 let mut to_send: Vec<(PeerId, Arc<PeerLink>, Vec<u8>)> = Vec::new();
                 {
                     let mut rt = routing.lock().await;
+                    let mut requests = Vec::new();
                     if now >= next_gc {
-                        rt.gc();
+                        requests.extend(rt.gc());
                         next_gc = now + Duration::from_secs(30);
+                    }
+                    // The active link to a peer can change under us (failover,
+                    // score-driven promotion): keep each neighbour's cost in
+                    // step with the link actually carrying its traffic.
+                    for (peer, link) in &peers {
+                        requests.extend(rt.neighbour_cost(peer, link_cost(link)));
+                    }
+                    requests.extend(rt.retry_starving());
+                    for r in requests {
+                        if let Some((_, link)) = peers.iter().find(|(p, _)| *p == r.to) {
+                            let msg = RouteRequestMsg {
+                                full_dump: false,
+                                seqno: Some((r.dest, r.seqno, r.hops)),
+                            };
+                            to_send.push((r.to, link.clone(), msg.to_wire().encode()));
+                        }
                     }
                     for (peer, link) in &peers {
                         let slow = link.is_slow();
@@ -180,8 +215,8 @@ impl Node {
                         }
                     }
                 }
-                for (peer, link, msg) in to_send {
-                    if let Err(e) = link.send_deferred(&msg).await {
+                for (peer, _link, msg) in to_send {
+                    if let Err(e) = sender.to_peer(&peer, &msg, Queue::Deferred, Budget::Upkeep).await {
                         log::warn!("Failed to send routing message to {:?}: {}", peer, e);
                     }
                 }

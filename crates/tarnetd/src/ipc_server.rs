@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tarnet_api::error::ApiResult;
 use tarnet_api::ipc::*;
 use tarnet_api::service::{Connection, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi};
-use tarnet_api::types::{DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
+use tarnet_api::types::{ContentHandle, DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
 
 /// A registered IPC connection plus the abort handle of its recv-relay task.
 /// Holding the relay handle lets `METHOD_CONN_CLOSE` stop the relay so the last
@@ -441,12 +441,14 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            let hash = api.dht_put(&value).await;
-            ok_response(request_id, &encode_payload(&hash))
+            match api.dht_put(&value).await {
+                Ok(hash) => ok_response(request_id, &encode_payload(&hash)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
         }
 
         METHOD_DHT_GET_CONTENT => {
-            let (hash, timeout_secs): (DhtId, u32) = match decode_payload(payload) {
+            let (hash, timeout_secs): (ContentHandle, u32) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
@@ -464,12 +466,14 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            let hash = api.dht_put_signed(&req.value, req.ttl_secs).await;
-            ok_response(request_id, &encode_payload(&hash))
+            match api.dht_put_signed(&req.value, req.ttl_secs).await {
+                Ok(hash) => ok_response(request_id, &encode_payload(&hash)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
         }
 
         METHOD_DHT_GET_SIGNED => {
-            let (hash, timeout_secs): (DhtId, u32) = match decode_payload(payload) {
+            let (hash, timeout_secs): (ContentHandle, u32) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
@@ -529,17 +533,16 @@ async fn dispatch_request(
         }
 
         METHOD_TNS_PUBLISH => {
-            let (identity, label, records, ttl): (
+            let (identity, label, records): (
                 Option<String>,
                 String,
                 Vec<tarnet_api::service::TnsRecord>,
-                u32,
             ) = match decode_payload(payload) {
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
             match api
-                .tns_publish(identity.as_deref(), &label, records, ttl)
+                .tns_publish(identity.as_deref(), &label, records)
                 .await
             {
                 Ok(()) => ok_response(request_id, &[]),

@@ -3,6 +3,7 @@
 //! Tests cover identity-based connections, DHT cross-node retrieval,
 //! TNS resolution, link break + cleanup, and DHT validation.
 
+use tarnet::types::ContentHandle;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,7 +103,7 @@ where
 }
 
 /// Search the DHT for content until found or `timeout`.
-async fn search_content(node: &Node, inner_hash: &[u8; 64], timeout: Duration) -> bool {
+async fn search_content(node: &Node, inner_hash: &ContentHandle, timeout: Duration) -> bool {
     let mut search = node
         .dht_search_content(inner_hash, std::time::Instant::now() + timeout)
         .await;
@@ -118,7 +119,7 @@ async fn search_content(node: &Node, inner_hash: &[u8; 64], timeout: Duration) -
 
 /// Search the DHT for signed content until at least one valid record is found
 /// or `timeout`.
-async fn search_signed_content(node: &Node, inner_hash: &[u8; 64], timeout: Duration) -> bool {
+async fn search_signed_content(node: &Node, inner_hash: &ContentHandle, timeout: Duration) -> bool {
     let mut search = node
         .dht_search_content(inner_hash, std::time::Instant::now() + timeout)
         .await;
@@ -640,7 +641,7 @@ async fn dht_get_from_remote_node() {
     let (a, _b, c) = (&nodes[0].node, &nodes[1].node, &nodes[2].node);
 
     let data = b"cross-node DHT test data";
-    let inner_hash = a.dht_put_content(data).await;
+    let inner_hash = a.dht_put_content(data).await.unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -659,7 +660,7 @@ async fn signed_content_cross_node() {
     let (a, _b, c) = (&nodes[0].node, &nodes[1].node, &nodes[2].node);
 
     let topic = b"signed-cross-node-test";
-    let inner_hash = a.dht_put_signed_content(topic, 600).await;
+    let inner_hash = a.dht_put_signed_content(topic, 600).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let found = search_signed_content(c, &inner_hash, Duration::from_secs(6)).await;
@@ -687,7 +688,7 @@ async fn tns_resolve_cross_node() {
 
     // A publishes an Identity record under "server" label
     let record = tarnet::tns::TnsRecord::Identity(zone_sid);
-    tarnet::tns::publish(a, &a.identity, "server", &[record.clone()], 3600)
+    tarnet::tns::publish(a, &a.identity, "server", &[record.clone()])
         .await
         .unwrap();
 
@@ -733,12 +734,12 @@ async fn tns_delegation_chain() {
     let zone_b = b.identity.identity.service_id();
 
     let deleg = tarnet::tns::TnsRecord::Zone(zone_b);
-    tarnet::tns::publish(a, &a.identity, "blog", &[deleg], 3600)
+    tarnet::tns::publish(a, &a.identity, "blog", &[deleg])
         .await
         .unwrap();
 
     let text = tarnet::tns::TnsRecord::Text("Welcome to my blog".into());
-    tarnet::tns::publish(b, &b.identity, "home", &[text.clone()], 3600)
+    tarnet::tns::publish(b, &b.identity, "home", &[text.clone()])
         .await
         .unwrap();
 
@@ -788,7 +789,7 @@ async fn repro_vhost_resolve_cross_node() {
     let serving = tarnet_api::types::ServiceId::from_signing_pubkey(&[0xEE; 32]);
 
     let record = tarnet::tns::TnsRecord::VHost(serving);
-    tarnet::tns::publish(a, &a.identity, "blog", &[record.clone()], 3600)
+    tarnet::tns::publish(a, &a.identity, "blog", &[record.clone()])
         .await
         .unwrap();
 
@@ -834,7 +835,6 @@ async fn repro_dht_pull_carries_pubkey() {
         &publisher.node.identity,
         "blog",
         &[tarnet::tns::TnsRecord::VHost(serving)],
-        3600,
     )
     .await
     .unwrap();
@@ -932,7 +932,7 @@ fn dht_signature_validation() {
         key: [0xBB; 64],
         record_type: RecordType::Hello,
         sequence: 1,
-        signer: *kp.peer_id().as_bytes(),
+        signer: kp.peer_id(),
         ttl: 600,
         value: b"test hello".to_vec(),
         signature: vec![0xFF; 64], // garbage
@@ -943,8 +943,9 @@ fn dht_signature_validation() {
 
     // Bad signature fails verification
     assert!(
-        !identity::verify(
-            kp.identity.signing_algo(),
+        !identity::verify_signed(
+            identity::SignedBy::AnyPeer,
+            Some(kp.identity.signing_algo() as u8),
             &pubkey,
             &put.signable_bytes(),
             &put.signature
@@ -955,8 +956,9 @@ fn dht_signature_validation() {
     // Valid signature passes
     put.signature = kp.sign(&put.signable_bytes());
     assert!(
-        identity::verify(
-            kp.identity.signing_algo(),
+        identity::verify_signed(
+            identity::SignedBy::AnyPeer,
+            Some(kp.identity.signing_algo() as u8),
             &pubkey,
             &put.signable_bytes(),
             &put.signature
@@ -976,7 +978,7 @@ fn dht_wrong_signer_rejected() {
         key: [0xCC; 64],
         record_type: RecordType::SignedContent,
         sequence: 1,
-        signer: *fake_kp.peer_id().as_bytes(), // Claims to be fake_kp
+        signer: fake_kp.peer_id(), // Claims to be fake_kp
         ttl: 600,
         value: b"misattributed".to_vec(),
         signature: Vec::new(),
@@ -988,8 +990,9 @@ fn dht_wrong_signer_rejected() {
 
     // Verify against claimed signer (fake_kp) → should fail
     assert!(
-        !identity::verify(
-            fake_kp.identity.signing_algo(),
+        !identity::verify_signed(
+            identity::SignedBy::AnyPeer,
+            Some(fake_kp.identity.signing_algo() as u8),
             &fake_pubkey,
             &put.signable_bytes(),
             &put.signature
@@ -1015,11 +1018,11 @@ fn dht_hello_sequence_ordering() {
         key,
         record_type: RecordType::Hello,
         sequence: 5,
-        signer: *peer.as_bytes(),
+        signer: peer,
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"seq5".to_vec(),
-        ttl: Duration::from_secs(600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0; 64],
     });
@@ -1033,11 +1036,11 @@ fn dht_hello_sequence_ordering() {
         key,
         record_type: RecordType::Hello,
         sequence: 3,
-        signer: *peer.as_bytes(),
+        signer: peer,
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"seq3".to_vec(),
-        ttl: Duration::from_secs(600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0; 64],
     });
@@ -1051,11 +1054,11 @@ fn dht_hello_sequence_ordering() {
         key,
         record_type: RecordType::Hello,
         sequence: 7,
-        signer: *peer.as_bytes(),
+        signer: peer,
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"seq7".to_vec(),
-        ttl: Duration::from_secs(600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0; 64],
     });
@@ -1073,14 +1076,14 @@ async fn dht_content_self_authenticating() {
     let (a, b) = (&nodes[0].node, &nodes[1].node);
 
     let data = b"self-auth test payload";
-    let inner_hash = a.dht_put_content(data).await;
+    let inner_hash = a.dht_put_content(data).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let found = search_content(b, &inner_hash, Duration::from_secs(6)).await;
     assert!(found);
     assert_eq!(b.dht_get_content(&inner_hash).await.unwrap(), data);
 
-    let wrong_hash = [0xAA; 64];
+    let wrong_hash = ContentHandle([0xAA; 64]);
     assert!(
         b.dht_get_content(&wrong_hash).await.is_none(),
         "Wrong inner hash should not decrypt content"
@@ -1105,11 +1108,11 @@ fn dht_signed_content_multi_signer() {
         key,
         record_type: RecordType::SignedContent,
         sequence: 1,
-        signer: *kp_a.peer_id().as_bytes(),
+        signer: kp_a.peer_id(),
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"from A".to_vec(),
-        ttl: Duration::from_secs(600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0; 64],
     });
@@ -1119,11 +1122,11 @@ fn dht_signed_content_multi_signer() {
         key,
         record_type: RecordType::SignedContent,
         sequence: 1,
-        signer: *kp_b.peer_id().as_bytes(),
+        signer: kp_b.peer_id(),
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"from B".to_vec(),
-        ttl: Duration::from_secs(600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0; 64],
     });
@@ -1136,11 +1139,11 @@ fn dht_signed_content_multi_signer() {
         key,
         record_type: RecordType::SignedContent,
         sequence: 2,
-        signer: *kp_a.peer_id().as_bytes(),
+        signer: kp_a.peer_id(),
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"from A v2".to_vec(),
-        ttl: Duration::from_secs(600),
+        expires: tarnet::dht::expires_in(Duration::from_secs(600)),
         stored_at: std::time::Instant::now(),
         signature: vec![0; 64],
     });
@@ -1149,7 +1152,7 @@ fn dht_signed_content_multi_signer() {
     assert_eq!(records.len(), 2, "Still two signers");
     let a_record = records
         .iter()
-        .find(|r| r.signer == *kp_a.peer_id().as_bytes())
+        .find(|r| r.signer == kp_a.peer_id())
         .unwrap();
     assert_eq!(a_record.sequence, 2, "Signer A's record should be updated");
 }
@@ -1170,11 +1173,11 @@ fn dht_record_expiry() {
         key,
         record_type: RecordType::Content,
         sequence: 0,
-        signer: [0; 32],
+        signer: tarnet::types::PeerId([0; 32]),
         signer_algo: 1,
         signer_pubkey: vec![],
         value: b"ephemeral".to_vec(),
-        ttl: Duration::from_secs(0),
+        expires: tarnet::dht::expires_in(Duration::from_secs(0)),
         stored_at: std::time::Instant::now() - Duration::from_secs(1),
         signature: vec![0; 64],
     });
@@ -1615,7 +1618,7 @@ async fn cross_algo_connect_pq_to_classic() {
         kem_algo: default_kp_c.identity.kem_algo() as u8,
         kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records, 600)
+    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records)
         .await
         .unwrap();
 
@@ -1710,7 +1713,7 @@ async fn cross_algo_connect_classic_to_pq() {
         kem_algo: default_kp_c.identity.kem_algo() as u8,
         kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
     }];
-    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records, 600)
+    tarnet::tns::publish(&*a.node, &default_kp_c, "intro", &intro_records)
         .await
         .unwrap();
 
@@ -1785,7 +1788,7 @@ async fn cross_algo_dht_signed_records() {
 
     // A (ed25519) publishes signed content
     let value = b"signed by classic ed25519";
-    let hash = a.node.dht_put_signed_content(value, 600).await;
+    let hash = a.node.dht_put_signed_content(value, 600).await.unwrap();
 
     // B (falcon_ed25519) should be able to retrieve and verify it
     let result = search_signed_content(&b.node, &hash, Duration::from_secs(6)).await;
@@ -1796,7 +1799,7 @@ async fn cross_algo_dht_signed_records() {
 
     // B (falcon_ed25519) publishes signed content
     let value2 = b"signed by PQ falcon_ed25519";
-    let hash2 = b.node.dht_put_signed_content(value2, 600).await;
+    let hash2 = b.node.dht_put_signed_content(value2, 600).await.unwrap();
 
     // A (ed25519) should be able to retrieve and verify it
     let result2 = search_signed_content(&a.node, &hash2, Duration::from_secs(6)).await;
@@ -1825,7 +1828,7 @@ async fn cross_algo_tns_resolution() {
     // A (ed25519) publishes TNS record
     let zone_a_sid = a.node.identity.identity.service_id();
     let record_a = tarnet::tns::TnsRecord::Identity(zone_a_sid);
-    tarnet::tns::publish(&*a.node, &a.node.identity, "www", &[record_a.clone()], 600)
+    tarnet::tns::publish(&*a.node, &a.node.identity, "www", &[record_a.clone()])
         .await
         .unwrap();
 
@@ -1854,7 +1857,7 @@ async fn cross_algo_tns_resolution() {
     // B (falcon_ed25519) publishes TNS record
     let zone_b_sid = b.node.identity.identity.service_id();
     let record_b = tarnet::tns::TnsRecord::Identity(zone_b_sid);
-    tarnet::tns::publish(&*b.node, &b.node.identity, "api", &[record_b.clone()], 600)
+    tarnet::tns::publish(&*b.node, &b.node.identity, "api", &[record_b.clone()])
         .await
         .unwrap();
 

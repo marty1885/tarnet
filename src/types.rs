@@ -10,7 +10,7 @@ pub fn jittered(d: std::time::Duration) -> std::time::Duration {
 
 // Re-export from tarnet-api — these are the canonical definitions.
 // Everything in this crate and downstream uses the same types.
-pub use tarnet_api::types::{DhtId, PeerId, PrivacyLevel};
+pub use tarnet_api::types::{ContentHandle, DhtId, PeerId, PrivacyLevel};
 
 /// Monotonic link identifier, never reused. Distinguishes multiple links to the same peer.
 pub type LinkId = u64;
@@ -67,9 +67,12 @@ impl RecordType {
         }
     }
 
-    /// Whether this record type requires signature verification.
+    /// Whether this record type requires signature verification. Unknown
+    /// types are checked generically (signer key bound to the signer, signature
+    /// over the canonical signable), so a future type relayed by this node
+    /// can't carry a forged signer or sequence.
     pub fn is_signed(&self) -> bool {
-        matches!(self, Self::Hello | Self::SignedContent | Self::ZoneRoot)
+        !matches!(self, Self::Content)
     }
 
     /// Whether this record type supports mutable updates via sequence numbers.
@@ -554,7 +557,7 @@ mod tests {
         let rt = RecordType::from_u8(99);
         assert_eq!(rt, RecordType::Unknown(99));
         assert_eq!(rt.as_u8(), 99);
-        assert!(!rt.is_signed());
+        assert!(rt.is_signed());
         assert!(!rt.is_mutable());
     }
 

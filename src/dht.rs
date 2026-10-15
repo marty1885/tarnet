@@ -7,7 +7,7 @@ use rand::{Rng, RngCore};
 
 use crate::identity::{dht_id_from_peer_id, Keypair};
 use crate::state::{PersistedRecord, StorageLimits};
-use crate::types::{DhtId, PeerId, RecordType, Result};
+use crate::types::{ContentHandle, DhtId, PeerId, RecordType, Result};
 use crate::wire::{walk_flags, WalkHeader};
 use tarnet_api::types::ServiceId;
 
@@ -175,18 +175,26 @@ pub struct DhtRecord {
     pub key: DhtId,
     pub record_type: RecordType,
     pub sequence: u64,
-    pub signer: [u8; 32],
+    pub signer: PeerId,
     pub signer_algo: u8,
     pub signer_pubkey: Vec<u8>,
     pub value: Vec<u8>,
-    pub ttl: Duration,
+    /// When the record expires here, on this node's monotonic clock. Nodes
+    /// share no clock: the wire carries the remaining `ttl` instead.
+    pub expires: Instant,
+    /// When this node stored it (eviction order only).
     pub stored_at: Instant,
     pub signature: Vec<u8>,
 }
 
+/// The `expires` of a record that has `ttl` left from now.
+pub fn expires_in(ttl: Duration) -> Instant {
+    Instant::now() + ttl
+}
+
 impl DhtRecord {
     pub fn is_expired(&self) -> bool {
-        self.stored_at.elapsed() > self.ttl
+        Instant::now() >= self.expires
     }
 
     /// Build the wire `DhtResponseRecord` for this stored record. Copies *every*
@@ -198,7 +206,7 @@ impl DhtRecord {
             record_type: self.record_type,
             sequence: self.sequence,
             signer: self.signer,
-            ttl: self.remaining_ttl().as_secs() as u32,
+            ttl: self.wire_ttl(),
             value: self.value.clone(),
             signature: self.signature.clone(),
             signer_algo: self.signer_algo,
@@ -211,24 +219,10 @@ impl DhtRecord {
     /// [`to_response_record`](Self::to_response_record): all signed fields are
     /// copied, never re-derived or omitted.
     ///
-    /// Carries the *remaining* TTL, not the full original — exactly like
-    /// [`to_response_record`](Self::to_response_record). Propagating the full
-    /// TTL let replication resurrect a record's clock on every hop: each
-    /// `SignedContent` round (which replaces on equal sequence) reset
-    /// `stored_at`, so k-closest holders mutually refreshed a record to full
-    /// life every replication interval and it never expired — outliving the
-    /// publisher. With remaining TTL, a record ages toward a single fixed
-    /// deadline (publish time + TTL) no matter how many times it is replicated.
-    ///
-    /// Note the TTL carried here is NOT authenticated — it is deliberately not
-    /// part of the signed bytes (`record_signable`) because it is rewritten on
-    /// every hop. Lifetime integrity therefore does not rest on the signature; it
-    /// rests on two things: `upsert_by_signer` never lets an equal-sequence
-    /// replace shorten a record's life (so a replayed `ttl=0` cannot force-expire
-    /// it), and storage is ultimately capacity-bound (evicted oldest-first under
-    /// pressure regardless of TTL). The record reaches its deadline and expires
-    /// unless the owner republishes with a higher sequence (pool lease refresh,
-    /// hello/peer/intro maintenance, TNS republish).
+    /// Carries the *remaining* TTL, so however often a record is relayed or
+    /// republished it ages toward one deadline. The TTL is not signed (nodes
+    /// share no clock, so nothing absolute could be); see [`DhtStore`] for what
+    /// stops a replay from extending a record.
     pub fn to_put_msg(&self) -> crate::wire::DhtPutMsg {
         crate::wire::DhtPutMsg {
             walk: WalkHeader::origin(),
@@ -236,7 +230,7 @@ impl DhtRecord {
             record_type: self.record_type,
             sequence: self.sequence,
             signer: self.signer,
-            ttl: self.remaining_ttl().as_secs() as u32,
+            ttl: self.wire_ttl(),
             value: self.value.clone(),
             signature: self.signature.clone(),
             signer_algo: self.signer_algo,
@@ -244,8 +238,14 @@ impl DhtRecord {
         }
     }
 
-    fn remaining_ttl(&self) -> Duration {
-        self.ttl.saturating_sub(self.stored_at.elapsed())
+    /// Time left until `expires`.
+    pub fn remaining_ttl(&self) -> Duration {
+        self.expires.saturating_duration_since(Instant::now())
+    }
+
+    /// Remaining whole seconds, as carried on the wire.
+    fn wire_ttl(&self) -> u32 {
+        self.remaining_ttl().as_secs().min(u32::MAX as u64) as u32
     }
 }
 
@@ -256,15 +256,13 @@ impl DhtRecord {
 /// [`verify_incoming_record`] both build the signable through this, so the signed
 /// layout can never drift between the signing side and the verifying side.
 ///
-/// `ttl` is intentionally NOT covered. Each forward ships the *remaining* TTL
-/// (see [`DhtRecord::to_put_msg`]), so the field is mutated per hop and cannot be
-/// signed. The consequence is that an incoming `ttl` is attacker-influenced; the
-/// store must therefore never trust it to shorten a record. That invariant lives
-/// in [`upsert_by_signer`] (equal-sequence replace keeps the later deadline), not
-/// here. Do not "fix" this by adding `ttl` to the signable — it would break
-/// remaining-ttl replication. The model is capacity-bound, not ttl-trusting.
+/// The TTL is not covered: each hop carries the *remaining* TTL, so it changes
+/// in transit. Nodes clamp it to the type's cap, and the store never lets a
+/// copy extend a record it holds or bring back one that expired here.
 pub fn record_signable(key: &[u8; 64], record_type: RecordType, sequence: u64, value: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64 + 1 + 8 + value.len());
+    let mut buf = Vec::with_capacity(20 + 64 + 1 + 8 + value.len());
+    // Domain-separated from everything else the same identity key signs.
+    buf.extend_from_slice(b"tarnet dht record v1");
     buf.extend_from_slice(key);
     buf.push(record_type.as_u8());
     buf.extend_from_slice(&sequence.to_be_bytes());
@@ -284,16 +282,17 @@ fn sign_record(
     value: Vec<u8>,
     ttl: Duration,
 ) -> DhtRecord {
+    let expires = expires_in(ttl.min(max_ttl(record_type)));
     let signature = kp.sign(&record_signable(key.as_bytes(), record_type, sequence, &value));
     DhtRecord {
         key,
         record_type,
         sequence,
-        signer: *kp.peer_id().as_bytes(),
+        signer: kp.peer_id(),
         signer_algo: kp.identity.signing.algo() as u8,
         signer_pubkey: kp.identity.signing.signing_pubkey_bytes(),
         value,
-        ttl,
+        expires,
         stored_at: Instant::now(),
         signature,
     }
@@ -314,21 +313,20 @@ pub fn verify_incoming_record(
     record_type: RecordType,
     sequence: u64,
     value: &[u8],
-    signer: &[u8; 32],
+    signer: &PeerId,
     signer_algo: u8,
     signer_pubkey: &[u8],
     signature: &[u8],
 ) -> std::result::Result<(), &'static str> {
-    if !record_type.is_signed() {
+    if record_type == RecordType::Content {
+        // Unsigned but self-certifying: the blob's hash fixes its key.
+        if content_key_of_blob(value).as_bytes() != key {
+            return Err("content not stored at its own key");
+        }
         return Ok(());
     }
-    let algo =
-        tarnet_api::types::SigningAlgo::from_u8(signer_algo).map_err(|_| "unknown signer algo")?;
     if signer_pubkey.is_empty() {
         return Err("missing signer pubkey");
-    }
-    if crate::identity::peer_id_from_signing_pubkey(signer_pubkey) != PeerId(*signer) {
-        return Err("signer pubkey does not match signer PeerId");
     }
     // Self-addressed records (zone roots) must live at the hash of their own
     // signer's ServiceId. This is the anti-flood / anti-squat invariant: a
@@ -346,13 +344,19 @@ pub fn verify_incoming_record(
     // stops anyone stacking hellos at another peer's key to crowd its real one
     // out (the store also never evicts a hello for other records at its key).
     if record_type == RecordType::Hello
-        && identity_address_key(&PeerId(*signer)).as_bytes() != key
+        && identity_address_key(signer).as_bytes() != key
     {
         return Err("hello not stored at its signer's identity key");
     }
     let signable = record_signable(key, record_type, sequence, value);
-    if !crate::identity::verify(algo, signer_pubkey, &signable, signature) {
-        return Err("invalid signature");
+    if !crate::identity::verify_signed(
+        crate::identity::SignedBy::Peer(signer),
+        Some(signer_algo),
+        signer_pubkey,
+        &signable,
+        signature,
+    ) {
+        return Err("not signed by its signer");
     }
     Ok(())
 }
@@ -415,22 +419,21 @@ impl VerifiedRecord {
     // a publish path physically cannot store a record that skipped encryption or
     // signing. This is the publish-side mirror of [`verify_incoming`].
 
-    /// Mint an unsigned, content-addressed record. The value is content-addressed
-    /// (key = `H(H(v))`, enc-key = `H(v)`), so storage nodes hold only an opaque
-    /// blob. Returns the record and the inner hash a reader needs to fetch and
+    /// Mint an unsigned, content-addressed record (a content-hash key, see
+    /// [`content_address_put`]): storage nodes hold only an opaque blob, and
+    /// can check it belongs at its key. Returns the record and the content handle a reader needs to fetch and
     /// decrypt it.
-    pub fn new_content(plaintext: &[u8], ttl: Duration) -> (Self, [u8; 64]) {
-        let inner_hash = hash_64(plaintext);
-        let (key, blob) = content_address_put(plaintext);
+    pub fn new_content(plaintext: &[u8], ttl: Duration) -> (Self, ContentHandle) {
+        let (key, blob, inner_hash) = content_address_put(plaintext);
         let record = DhtRecord {
             key,
             record_type: RecordType::Content,
             sequence: 0,
-            signer: [0u8; 32],
+            signer: PeerId([0u8; 32]),
             signer_algo: 0,
             signer_pubkey: Vec::new(),
             value: blob,
-            ttl,
+            expires: expires_in(ttl.min(MAX_RECORD_TTL)),
             stored_at: Instant::now(),
             signature: Vec::new(),
         };
@@ -440,15 +443,14 @@ impl VerifiedRecord {
     /// Mint a signed, content-addressed record. The value is content-addressed
     /// and then wrapped with [`signed_record_encrypt`] under the lookup key, so
     /// storage nodes see only a blob; the record is signed by `signer`. Returns
-    /// the record and the inner hash a reader needs to fetch and decrypt it.
+    /// the record and the content handle a reader needs to fetch and decrypt it.
     pub fn new_signed_content(
         signer: &Keypair,
         plaintext: &[u8],
         sequence: u64,
         ttl: Duration,
-    ) -> (Self, [u8; 64]) {
-        let inner_hash = hash_64(plaintext);
-        let (key, blob) = content_address_put(plaintext);
+    ) -> (Self, ContentHandle) {
+        let (key, blob, inner_hash) = content_address_put(plaintext);
         let value = signed_record_encrypt(&key, &blob);
         let record = sign_record(signer, key, RecordType::SignedContent, sequence, value, ttl);
         (Self(record), inner_hash)
@@ -535,7 +537,7 @@ impl VerifiedRecord {
             signer_algo: put.signer_algo,
             signer_pubkey: put.signer_pubkey.clone(),
             value: put.value.clone(),
-            ttl: Duration::from_secs(put.ttl as u64),
+            expires: expires_in(clamp_ttl(put.record_type, put.ttl)),
             stored_at: Instant::now(),
             signature: put.signature.clone(),
         })
@@ -555,7 +557,7 @@ impl VerifiedRecord {
             signer_algo: rec.signer_algo,
             signer_pubkey: rec.signer_pubkey.clone(),
             value: rec.value.clone(),
-            ttl: Duration::from_secs(rec.ttl as u64),
+            expires: expires_in(clamp_ttl(rec.record_type, rec.ttl)),
             stored_at: Instant::now(),
             signature: rec.signature.clone(),
         })
@@ -588,12 +590,26 @@ pub enum RecordSource {
 struct StoredRecord {
     record: DhtRecord,
     source: RecordSource,
+    /// What it counts against the byte limits, fixed when stored.
+    cost: usize,
 }
 
-/// Longest lifetime any record may hold in the store. `ttl` is not covered by
-/// the signature (see [`record_signable`]), so an inbound value is
-/// attacker-chosen; without a ceiling a replayed old record could be pinned for
-/// up to `u32::MAX` seconds.
+/// Bookkeeping per stored record beyond its encoding: map slot, times,
+/// source, vector headers.
+const STORED_OVERHEAD: usize = 128;
+
+impl StoredRecord {
+    /// The cost is the record's own wire encoding (every field, signer key
+    /// included, whatever fields records gain later) plus bookkeeping, so the
+    /// byte limits can't drift from what a record actually holds.
+    fn new(record: DhtRecord, source: RecordSource) -> Self {
+        let cost = record.to_put_msg().record_bytes().len() + STORED_OVERHEAD;
+        Self { record, source, cost }
+    }
+}
+
+/// Longest lifetime any record may hold in the store. The TTL is unsigned, so
+/// every node clamps whatever a sender claims to this.
 pub const MAX_RECORD_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// Ceiling for hello records, which are republished every few minutes and
@@ -608,20 +624,47 @@ pub fn max_ttl(record_type: RecordType) -> Duration {
     }
 }
 
-/// Clamp a wire `ttl` (seconds) to the ceiling for its record type, so a
-/// forwarded message never carries a longer lifetime than we would store.
-pub fn clamp_ttl_secs(record_type: RecordType, ttl: u32) -> u32 {
-    ttl.min(max_ttl(record_type).as_secs() as u32)
+/// A wire TTL, clamped to the ceiling for its record type.
+pub fn clamp_ttl(record_type: RecordType, ttl: u32) -> Duration {
+    Duration::from_secs(ttl as u64).min(max_ttl(record_type))
 }
 
-/// Content candidates kept per key. Storage cannot tell the authentic blob
-/// from junk (only a reader holding the inner hash can), so it keeps several.
-const MAX_CONTENT_CANDIDATES: usize = 5;
+/// [`clamp_ttl`] in wire seconds, for a message forwarded on.
+pub fn clamp_ttl_secs(record_type: RecordType, ttl: u32) -> u32 {
+    clamp_ttl(record_type, ttl).as_secs() as u32
+}
+
+/// What [`DhtStore::put_record`] did.
+#[derive(Debug)]
+pub struct PutOutcome {
+    /// The record is in the store now (new, newer, or an equal copy already
+    /// held) and survived the storage limits.
+    pub stored: bool,
+    /// The stored copy, when `stored`: what to persist. An equal copy keeps
+    /// the deadline already held, not the one it arrived with.
+    pub record: Option<DhtRecord>,
+    /// Who handed us the stored copy (persisted with it).
+    pub source: RecordSource,
+    /// Records the limits evicted, possibly the new one itself.
+    pub evicted: Vec<DhtRecord>,
+}
 
 pub struct DhtStore {
     records: HashMap<[u8; 64], Vec<StoredRecord>>,
     local_id: DhtId,
     limits: StorageLimits,
+    /// Records that expired here, by (key, signer): the highest dead
+    /// sequence, and when to forget it.
+    /// TTLs are unsigned and nodes share no clock, so a copy arriving later
+    /// (a replay, or a slow relay) can't be told apart from a fresh one by its
+    /// TTL; instead, a record that died here is never stored here again,
+    /// unless its owner signs a higher sequence. Remembered for the type's
+    /// TTL cap, the longest any copy could claim to live.
+    dead: crate::bounded::BoundedMap<([u8; 64], [u8; 32]), u64>,
+}
+
+fn dead_id(record: &DhtRecord) -> [u8; 32] {
+    *record.signer.as_bytes()
 }
 
 impl DhtStore {
@@ -634,6 +677,7 @@ impl DhtStore {
             records: HashMap::new(),
             local_id: dht_id_from_peer_id(local_peer),
             limits,
+            dead: crate::bounded::BoundedMap::new(limits.max_records.saturating_mul(2), MAX_RECORD_TTL),
         }
     }
 
@@ -642,73 +686,89 @@ impl DhtStore {
         self.put_from(record, RecordSource::Local)
     }
 
+    /// [`put_record`](Self::put_record), reporting only whether the record is
+    /// now stored.
+    pub fn put_from(&mut self, record: VerifiedRecord, source: RecordSource) -> bool {
+        self.put_record(record, source).stored
+    }
+
     /// Store a record with type-aware replacement policy, attributing it to
     /// `source` for fair-share eviction.
-    /// - Hello / ZoneRoot / Unknown: same signer + higher sequence replaces.
-    /// - SignedContent: add if new signer (supplemental), same signer replaces.
-    /// - Content: up to [`MAX_CONTENT_CANDIDATES`] distinct blobs; when full, a
-    ///   random candidate makes room, so whoever fills the slots first cannot
-    ///   lock the authentic blob out.
+    /// One version per signer at a key; a higher sequence replaces it.
+    /// `SignedContent` and `Content` accept a repeat of the version held
+    /// without extending it. Unsigned content is self-certifying (the ingest
+    /// gate checks its key), so it has one valid version per key.
     ///
     /// The stored TTL is clamped to [`max_ttl`] for the record type.
-    pub fn put_from(&mut self, record: VerifiedRecord, source: RecordSource) -> bool {
-        let mut record = record.into_inner();
+    ///
+    /// Whoever mirrors the store (the node's database) must drop the
+    /// [`evicted`](PutOutcome::evicted) records too, and keep the new one only
+    /// if [`stored`](PutOutcome::stored): the limits may evict it at once.
+    pub fn put_record(&mut self, record: VerifiedRecord, source: RecordSource) -> PutOutcome {
+        let record = record.into_inner();
         self.expire();
+        let mut out = PutOutcome {
+            stored: false,
+            record: None,
+            source,
+            evicted: Vec::new(),
+        };
         if record.value.len() > self.limits.max_value_bytes {
-            return false;
+            return out;
         }
-        record.ttl = record.ttl.min(max_ttl(record.record_type));
+        if record.is_expired() || self.died_here(&record) {
+            return out;
+        }
 
         let key = *record.key.as_bytes();
+        let (signer, sequence, record_type) = (record.signer, record.sequence, record.record_type);
         let entries = self.records.entry(key).or_default();
+        // Every type holds one version per signer at a key; a higher sequence
+        // replaces it. Unsigned content has a zero signer and is
+        // self-certifying, so its one valid blob is the only version.
+        // `SignedContent` and `Content` also accept a repeat of the version
+        // held (it keeps the deadline held).
+        let allow_equal = matches!(record_type, RecordType::SignedContent | RecordType::Content);
+        let stored = upsert_by_signer(entries, record, source, allow_equal);
 
-        let stored = match record.record_type {
-            RecordType::Hello => {
-                // Same signer + strictly higher sequence replaces
-                upsert_by_signer(entries, record, source, false)
-            }
-            RecordType::SignedContent => {
-                // Different signers are supplemental; same signer replaces if >= sequence
-                upsert_by_signer(entries, record, source, true)
-            }
-            RecordType::ZoneRoot => {
-                // Self-addressed: the ingest gate guarantees the signer's ServiceId
-                // hashes to this key, so every record here shares one signer — the
-                // zone owner. Same signer + strictly higher sequence replaces.
-                upsert_by_signer(entries, record, source, false)
-            }
-            RecordType::Content => {
-                let candidates: Vec<usize> = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.record.record_type == RecordType::Content)
-                    .map(|(i, _)| i)
-                    .collect();
-                if candidates
-                    .iter()
-                    .any(|&i| entries[i].record.value == record.value)
-                {
-                    false
-                } else {
-                    if candidates.len() >= MAX_CONTENT_CANDIDATES {
-                        let victim = candidates[rand::thread_rng().gen_range(0..candidates.len())];
-                        entries.remove(victim);
-                    }
-                    entries.push(StoredRecord { record, source });
-                    true
-                }
-            }
-            RecordType::Unknown(_) => {
-                // Best-effort store-and-relay: same signer + strictly higher sequence replaces
-                upsert_by_signer(entries, record, source, false)
-            }
-        };
-
-        if stored {
-            self.enforce_key_limits(&key);
-            self.enforce_global_limits();
+        if !stored {
+            self.records.retain(|_, v| !v.is_empty());
+            return out;
         }
-        stored
+        self.enforce_key_limits(&key, &mut out.evicted);
+        self.enforce_global_limits(&mut out.evicted);
+        if let Some(e) = self.records.get(&key).and_then(|entries| {
+            entries.iter().find(|e| {
+                e.record.signer == signer && e.record.sequence == sequence && e.record.record_type == record_type
+            })
+        }) {
+            out.record = Some(e.record.clone());
+            out.source = e.source;
+            out.stored = true;
+        }
+        out
+    }
+
+    /// Whether the store already holds this version of this record: one
+    /// version per signer at a key (unsigned content included, being
+    /// self-certifying).
+    pub fn holds(&self, key: &DhtId, record_type: RecordType, signer: &PeerId, sequence: u64) -> bool {
+        self.get(key)
+            .iter()
+            .any(|r| r.record_type == record_type && r.sequence == sequence && r.signer == *signer)
+    }
+
+    /// `peer`'s hello, from its newest hello record here: signed by `peer`
+    /// (the store only holds verified records), and naming `peer` itself.
+    pub fn hello_of(&self, peer: &PeerId) -> Option<crate::wire::HelloRecord> {
+        let key = identity_address_key(peer);
+        self.get(&key)
+            .into_iter()
+            .filter(|r| r.record_type == RecordType::Hello && r.signer == *peer)
+            .max_by_key(|r| r.sequence)
+            .and_then(|r| signed_record_decrypt(&key, &r.value).ok())
+            .and_then(|p| crate::wire::HelloRecord::from_bytes(&p).ok())
+            .filter(|h| h.peer_id == *peer)
     }
 
     /// Retrieve all non-expired records at a key.
@@ -725,10 +785,34 @@ impl DhtStore {
 
     /// Remove expired records.
     pub fn expire(&mut self) {
+        let now = Instant::now();
+        let dead = &mut self.dead;
         for entries in self.records.values_mut() {
-            entries.retain(|e| !e.record.is_expired());
+            entries.retain(|e| {
+                if !e.record.is_expired() {
+                    return true;
+                }
+                let r = &e.record;
+                let k = (*r.key.as_bytes(), dead_id(r));
+                match dead.get_mut(&k) {
+                    Some(seq) => *seq = (*seq).max(r.sequence),
+                    // Full: a replay of this one may be stored again.
+                    None => {
+                        let _ = dead.try_insert(k, r.sequence);
+                    }
+                }
+                false
+            });
         }
         self.records.retain(|_, v| !v.is_empty());
+        self.dead.expire(now);
+    }
+
+    /// The record (or an older sequence of it) expired here.
+    fn died_here(&self, record: &DhtRecord) -> bool {
+        self.dead
+            .get(&(*record.key.as_bytes(), dead_id(record)))
+            .is_some_and(|seq| record.sequence <= *seq)
     }
 
     /// Our DHT ID.
@@ -786,9 +870,10 @@ impl DhtStore {
     }
 
     pub fn export_records(&self) -> Vec<PersistedRecord> {
-        self.all_records()
-            .into_iter()
-            .filter_map(PersistedRecord::from_live)
+        self.records
+            .values()
+            .flat_map(|entries| entries.iter())
+            .filter_map(|e| PersistedRecord::from_stored(&e.record, e.source))
             .collect()
     }
 
@@ -796,20 +881,33 @@ impl DhtStore {
     /// longer pass the trust gate (DB corruption or tampering). Records that
     /// passed verification when first accepted re-verify here, since their signed
     /// fields round-trip faithfully through persistence.
-    pub fn import_records(&mut self, records: Vec<PersistedRecord>) {
+    /// Load persisted records. Returns the ones that are no longer stored
+    /// (expired, failing verification, or over the limits), whose rows the
+    /// caller deletes so the database stays within the store's limits.
+    pub fn import_records(&mut self, records: Vec<PersistedRecord>) -> Vec<DhtRecord> {
+        let mut dropped = Vec::new();
         for record in records {
-            let Some(live) = record.into_live() else {
+            // Each record comes back with who handed it to us: a replica a
+            // peer delivered stays a peer's after a restart, and is never
+            // republished as ours.
+            let Some((live, source)) = record.into_stored() else {
                 continue;
             };
-            match VerifiedRecord::verify_incoming(live) {
+            match VerifiedRecord::verify_incoming(live.clone()) {
                 Ok(verified) => {
-                    let _ = self.put(verified);
+                    let outcome = self.put_record(verified, source);
+                    if !outcome.stored {
+                        dropped.push(live);
+                    }
+                    dropped.extend(outcome.evicted);
                 }
                 Err(reason) => {
-                    log::warn!("dropping persisted DHT record on load: {}", reason)
+                    log::warn!("dropping persisted DHT record on load: {}", reason);
+                    dropped.push(live);
                 }
             }
         }
+        dropped
     }
 
     fn total_record_count(&self) -> usize {
@@ -820,7 +918,7 @@ impl DhtStore {
         self.records
             .values()
             .flat_map(|entries| entries.iter())
-            .map(|e| record_cost(&e.record))
+            .map(|e| e.cost)
             .sum()
     }
 
@@ -829,12 +927,12 @@ impl DhtStore {
     /// types can be stored) are never evicted to make room for other records at
     /// the same key: they are the reason the key exists, and foreign records
     /// piling onto it must not be able to push them out.
-    fn enforce_key_limits(&mut self, key: &[u8; 64]) {
+    fn enforce_key_limits(&mut self, key: &[u8; 64], evicted: &mut Vec<DhtRecord>) {
         let max_records_per_key = self.limits.max_records_per_key;
         let max_bytes_per_key = self.limits.max_bytes_per_key;
 
         if let Some(entries) = self.records.get_mut(key) {
-            let mut byte_total: usize = entries.iter().map(|e| record_cost(&e.record)).sum();
+            let mut byte_total: usize = entries.iter().map(|e| e.cost).sum();
             while entries.len() > max_records_per_key || byte_total > max_bytes_per_key {
                 let victim = fair_share_victim(
                     entries
@@ -845,15 +943,15 @@ impl DhtStore {
                 let Some(idx) = victim else {
                     break;
                 };
-                byte_total -= record_cost(&entries[idx].record);
-                entries.remove(idx);
+                byte_total -= entries[idx].cost;
+                evicted.push(entries.remove(idx).record);
             }
         }
 
         self.records.retain(|_, v| !v.is_empty());
     }
 
-    fn enforce_global_limits(&mut self) {
+    fn enforce_global_limits(&mut self, evicted: &mut Vec<DhtRecord>) {
         let mut record_count = self.total_record_count();
         let mut byte_count = self.total_bytes();
 
@@ -865,8 +963,8 @@ impl DhtStore {
                 break;
             };
             if let Some(entries) = self.records.get_mut(&key) {
-                byte_count -= record_cost(&entries[idx].record);
-                entries.remove(idx);
+                byte_count -= entries[idx].cost;
+                evicted.push(entries.remove(idx).record);
                 record_count -= 1;
                 if entries.is_empty() {
                     self.records.remove(&key);
@@ -913,36 +1011,21 @@ fn upsert_by_signer(
         // A strictly higher sequence is a genuinely newer record (sequence is
         // signed, so only the owner can produce one) — take it wholesale.
         if record.sequence > existing.record.sequence {
-            *existing = StoredRecord { record, source };
+            *existing = StoredRecord::new(record, source);
             return true;
         }
-        // Equal-sequence replace exists ONLY to refresh `stored_at` for
-        // replication — it must never SHORTEN a record's life. `ttl` is not in
-        // the signed bytes (it is rewritten per hop as remaining-ttl, see
-        // `to_put_msg`), so a replayed equal-sequence record can carry an
-        // attacker-chosen `ttl` — `ttl=0` would otherwise force-expire a healthy
-        // copy. Keep the later deadline: a refresh may extend (bounded by
-        // [`max_ttl`], which `put_from` applies before we get here) but can never
-        // cut life short. The source is kept: a refresh does not transfer
-        // ownership of the slot.
+        // An equal sequence is the same signed record again (a republish, or
+        // a replay by anyone who saw it). `ttl` is not signed, so the copy
+        // gains nothing: the record keeps its absolute deadline, which only a
+        // higher sequence (signed, so only the owner's) can renew.
         if allow_equal && record.sequence == existing.record.sequence {
-            let existing_remaining = existing.record.remaining_ttl();
-            existing.record = record;
-            if existing_remaining > existing.record.ttl {
-                existing.record.ttl = existing_remaining;
-            }
             return true;
         }
         false
     } else {
-        entries.push(StoredRecord { record, source });
+        entries.push(StoredRecord::new(record, source));
         true
     }
-}
-
-fn record_cost(record: &DhtRecord) -> usize {
-    // key(64) + record_type(1) + sequence(8) + signer(32) + signer_algo(1) + ttl(8) + stored_at(8) + signature + value
-    64 + 1 + 8 + 32 + 1 + 8 + 8 + record.signature.len() + record.value.len()
 }
 
 /// A remote watch on a DHT key, identified by query_token for anonymous
@@ -953,6 +1036,9 @@ pub struct DhtWatch {
     pub query_token: [u8; 32],
     /// Direct neighbor that forwarded this watch (for sending notifications).
     pub via_peer: PeerId,
+    /// Where we passed the watch on: notifications relayed back must come
+    /// from it. `None` if the walk ended here.
+    pub next: Option<PeerId>,
     pub expires_at: Instant,
     /// Newest sequence notified per signer, so a re-PUT of a record the
     /// watcher already has (a republish) notifies nothing.
@@ -1014,17 +1100,21 @@ impl DhtWatchTable {
         via_peer: PeerId,
         expiration_secs: u32,
     ) -> bool {
+        // A watch belongs to the neighbour that registered it: only that
+        // neighbour can cancel or refresh it, so a node that saw a token
+        // can't cancel someone's watch or point its notifications elsewhere.
+        let ours = |w: &DhtWatch| w.query_token == query_token && w.via_peer == via_peer;
         if expiration_secs == 0 {
-            // Cancel by token. Collect the via_peers of the entries being dropped
-            // first, then decrement the per-peer/total counters — avoids holding a
-            // mutable borrow on `self.watches` while touching `self.per_peer_count`.
+            // Collect the via_peers of the entries being dropped first, then
+            // decrement the per-peer/total counters — avoids holding a mutable
+            // borrow on `self.watches` while touching `self.per_peer_count`.
             if let Some(entries) = self.watches.get_mut(&key) {
                 let dropped: Vec<PeerId> = entries
                     .iter()
-                    .filter(|w| w.query_token == query_token)
+                    .filter(|w| ours(w))
                     .map(|w| w.via_peer)
                     .collect();
-                entries.retain(|w| w.query_token != query_token);
+                entries.retain(|w| !ours(w));
                 let empty = entries.is_empty();
                 for peer in &dropped {
                     self.decr_peer(peer);
@@ -1042,33 +1132,36 @@ impl DhtWatchTable {
         // clamp a cancel up into a live watch.
         let expiration_secs = expiration_secs.min(MAX_WATCH_EXPIRATION_SECS);
         let expires_at = Instant::now() + Duration::from_secs(expiration_secs as u64);
-        let entries = self.watches.entry(key).or_default();
-        // Refresh if same token already watching (must always succeed so legit
-        // periodic refresh isn't broken once a peer is at its cap). The watch may
-        // have re-arrived via a different neighbor; note the old via_peer so we
-        // can fix the per-peer counters after the borrow ends.
-        if let Some(existing) = entries.iter_mut().find(|w| w.query_token == query_token) {
-            let prev_peer = existing.via_peer;
-            existing.expires_at = expires_at;
-            existing.via_peer = via_peer;
-            if prev_peer != via_peer {
-                self.decr_peer(&prev_peer);
-                *self.per_peer_count.entry(via_peer).or_insert(0) += 1;
+        if let Some(entries) = self.watches.get_mut(&key) {
+            // Refresh (must always succeed, so a legit periodic refresh isn't
+            // broken once a peer is at its cap).
+            if let Some(existing) = entries.iter_mut().find(|w| ours(w)) {
+                existing.expires_at = expires_at;
+                return true;
             }
-            return true;
+            // The token is someone else's.
+            if entries.iter().any(|w| w.query_token == query_token) {
+                return false;
+            }
         }
 
-        // New entry: enforce the per-peer and global caps before inserting.
-        let peer_count = self.per_peer_count.get(&via_peer).copied().unwrap_or(0);
-        if peer_count >= MAX_WATCHES_PER_PEER || self.total_count >= MAX_WATCHES_TOTAL {
-            if entries.is_empty() {
-                self.watches.remove(&key);
+        // New entry: enforce the per-peer and global caps, counting only
+        // live watches.
+        let full = |t: &Self| {
+            t.per_peer_count.get(&via_peer).copied().unwrap_or(0) >= MAX_WATCHES_PER_PEER
+                || t.total_count >= MAX_WATCHES_TOTAL
+        };
+        if full(self) {
+            self.expire();
+            if full(self) {
+                return false;
             }
-            return false;
         }
+        let entries = self.watches.entry(key).or_default();
         entries.push(DhtWatch {
             query_token,
             via_peer,
+            next: None,
             expires_at,
             notified: HashMap::new(),
         });
@@ -1102,6 +1195,27 @@ impl DhtWatchTable {
         })
     }
 
+    /// Where to relay a notification under `query_token` that `from` sent:
+    /// the watch's previous hop, if `from` is where the watch went next.
+    pub fn relay_for(&self, key: &[u8; 64], query_token: &[u8; 32], from: &PeerId) -> Option<PeerId> {
+        let now = Instant::now();
+        self.watches.get(key)?.iter().find_map(|w| {
+            (w.query_token == *query_token && w.expires_at > now && w.next == Some(*from))
+                .then_some(w.via_peer)
+        })
+    }
+
+    /// Record where a watch walk went next.
+    pub fn set_next(&mut self, key: &[u8; 64], query_token: &[u8; 32], next: PeerId) {
+        if let Some(w) = self
+            .watches
+            .get_mut(key)
+            .and_then(|e| e.iter_mut().find(|w| w.query_token == *query_token))
+        {
+            w.next = Some(next);
+        }
+    }
+
     /// Get all non-expired watchers for a key: returns (query_token, via_peer).
     pub fn get_watchers(&self, key: &[u8; 64]) -> Vec<([u8; 32], PeerId)> {
         let now = Instant::now();
@@ -1118,6 +1232,9 @@ impl DhtWatchTable {
     /// Watchers of `key` to notify about a PUT of `(signer, sequence)`: those
     /// not yet notified of that sequence or a newer one from that signer.
     /// Marks them notified.
+    /// Watchers of `key` that haven't been told of this version (`signer`'s
+    /// record at `sequence`, or newer); marks them told. Call only with a
+    /// verified record: whatever is passed here suppresses later news.
     pub fn watchers_for_news(
         &mut self,
         key: &[u8; 64],
@@ -1142,6 +1259,14 @@ impl DhtWatchTable {
             out.push((w.query_token, w.via_peer));
         }
         out
+    }
+
+    /// Someone is watching `key`.
+    pub fn is_watched(&self, key: &[u8; 64]) -> bool {
+        let now = Instant::now();
+        self.watches
+            .get(key)
+            .is_some_and(|entries| entries.iter().any(|w| w.expires_at > now))
     }
 
     /// Remove expired watches.
@@ -1356,32 +1481,23 @@ impl Default for BloomFilter {
     }
 }
 
-/// Content-addressed PUT: key = BLAKE3(BLAKE3(value)), stored value = XChaCha20-Poly1305(value, key=BLAKE3(value))
-/// Self-authenticating: you need the content hash to look up AND decrypt.
-pub fn content_address_put(value: &[u8]) -> (DhtId, Vec<u8>) {
-    // Inner hash = BLAKE3(value) — used as encryption key
-    let inner_hash: [u8; 64] = hash_64(value);
-    // Outer hash = BLAKE3(inner_hash) — used as DHT key
-    let outer_hash: [u8; 64] = hash_64(&inner_hash);
-    let key = DhtId(outer_hash);
-
-    // Derive 32-byte encryption key from inner hash
-    let enc_key: [u8; 32] = *blake3::hash(&inner_hash).as_bytes();
-
-    // Encrypt value with XChaCha20-Poly1305 under a nonce derived from the
-    // content. The key is itself derived from the plaintext, so it only ever
-    // seals this one plaintext and a fixed nonce leaks nothing. Making the blob a
-    // pure function of the content means honest copies from every publisher are
-    // byte-identical, so storage dedupes them into one candidate slot instead of
-    // letting each fresh nonce consume another.
-    let mut nonce_seed = Vec::with_capacity(32 + 64);
-    nonce_seed.extend_from_slice(b"tarnet content-address nonce v1");
-    nonce_seed.extend_from_slice(&inner_hash);
+/// Content-hash keys (CHK), as in Freenet. A content **handle** is
+/// `enc_key(32) || chk(32)`: the key that decrypts the blob, and the hash of
+/// the blob itself. The DHT key is derived from `chk` alone, so a storing
+/// node, which sees only the opaque blob, can check that the blob belongs at
+/// its key ([`content_key_of_blob`]) and refuses anything else: exactly one
+/// blob is valid per key, and junk can't compete with it. Convergent: the
+/// same plaintext always gives the same handle, blob and key, so honest
+/// copies from every publisher are identical.
+///
+/// Returns the DHT key, the blob to store, and the handle a reader needs.
+pub fn content_address_put(value: &[u8]) -> (DhtId, Vec<u8>, ContentHandle) {
+    // The key only ever seals this one plaintext, so a fixed nonce derived
+    // from it leaks nothing, and makes the blob a pure function of the content.
+    let enc_key = blake3::derive_key("tarnet content v2 encryption key", value);
     let mut nonce = [0u8; 24];
-    nonce.copy_from_slice(&hash_64(&nonce_seed)[..24]);
-
-    let cipher = XChaCha20Poly1305::new((&enc_key).into());
-    let ciphertext = cipher
+    nonce.copy_from_slice(&blake3::derive_key("tarnet content v2 nonce", &enc_key)[..24]);
+    let ciphertext = XChaCha20Poly1305::new((&enc_key).into())
         .encrypt(
             (&nonce).into(),
             Payload {
@@ -1390,44 +1506,59 @@ pub fn content_address_put(value: &[u8]) -> (DhtId, Vec<u8>) {
             },
         )
         .expect("AEAD encryption should not fail");
-
     // Stored blob: nonce || ciphertext+tag
     let mut blob = Vec::with_capacity(24 + ciphertext.len());
     blob.extend_from_slice(&nonce);
     blob.extend_from_slice(&ciphertext);
 
-    (key, blob)
+    let chk = *blake3::hash(&blob).as_bytes();
+    let mut handle = [0u8; 64];
+    handle[..32].copy_from_slice(&enc_key);
+    handle[32..].copy_from_slice(&chk);
+    let handle = ContentHandle(handle);
+    (content_key(&handle), blob, handle)
 }
 
-/// Content-addressed GET: decrypt using the content hash.
-/// `content_hash` is BLAKE3(value) (the inner hash you must know a priori).
-pub fn content_address_get(content_hash: &[u8; 64], blob: &[u8]) -> Result<Vec<u8>> {
+/// The DHT key of the content a handle names.
+pub fn content_key(handle: &ContentHandle) -> DhtId {
+    content_key_of_chk(&handle.0[32..])
+}
+
+/// The only DHT key `blob` may be stored at as content.
+pub fn content_key_of_blob(blob: &[u8]) -> DhtId {
+    content_key_of_chk(blake3::hash(blob).as_bytes())
+}
+
+fn content_key_of_chk(chk: &[u8]) -> DhtId {
+    let mut input = Vec::with_capacity(21 + 32);
+    input.extend_from_slice(b"tarnet content key v2");
+    input.extend_from_slice(chk);
+    DhtId(hash_64(&input))
+}
+
+/// Content-addressed GET: check the blob against the handle and decrypt it.
+pub fn content_address_get(handle: &ContentHandle, blob: &[u8]) -> Result<Vec<u8>> {
+    let handle = handle.as_bytes();
+    if blake3::hash(blob).as_bytes()[..] != handle[32..] {
+        return Err(crate::types::Error::Crypto("content blob does not match its handle".into()));
+    }
     if blob.len() < 24 + 16 {
         return Err(crate::types::Error::Wire("content blob too short".into()));
     }
-    let nonce = &blob[..24];
-    let ciphertext_with_tag = &blob[24..];
-
-    let enc_key: [u8; 32] = *blake3::hash(content_hash).as_bytes();
-    let cipher = XChaCha20Poly1305::new((&enc_key).into());
-    let plaintext = cipher
+    let mut enc_key = [0u8; 32];
+    enc_key.copy_from_slice(&handle[..32]);
+    let plaintext = XChaCha20Poly1305::new((&enc_key).into())
         .decrypt(
-            nonce.into(),
+            blob[..24].into(),
             Payload {
-                msg: ciphertext_with_tag,
+                msg: &blob[24..],
                 aad: b"",
             },
         )
         .map_err(|_| crate::types::Error::Crypto("content AEAD decryption failed".into()))?;
-
-    // Verify: BLAKE3(plaintext) should equal content_hash
-    let check: [u8; 64] = hash_64(&plaintext);
-    if check != *content_hash {
-        return Err(crate::types::Error::Crypto(
-            "content hash mismatch after decryption".into(),
-        ));
+    if blake3::derive_key("tarnet content v2 encryption key", &plaintext) != enc_key {
+        return Err(crate::types::Error::Crypto("content handle does not match its plaintext".into()));
     }
-
     Ok(plaintext)
 }
 
@@ -1531,16 +1662,27 @@ mod tests {
         sequence: u64,
         value: Vec<u8>,
     ) -> DhtRecord {
+        signed_record_expiring(kp, key, record_type, sequence, value, expires_in(Duration::from_secs(600)))
+    }
+
+    fn signed_record_expiring(
+        kp: &Keypair,
+        key: DhtId,
+        record_type: RecordType,
+        sequence: u64,
+        value: Vec<u8>,
+        expires: Instant,
+    ) -> DhtRecord {
         let signature = kp.sign(&record_signable(key.as_bytes(), record_type, sequence, &value));
         DhtRecord {
             key,
             record_type,
             sequence,
-            signer: *kp.peer_id().as_bytes(),
+            signer: kp.peer_id(),
             signer_algo: kp.identity.signing.algo() as u8,
             signer_pubkey: kp.identity.signing.signing_pubkey_bytes(),
             value,
-            ttl: Duration::from_secs(600),
+            expires,
             stored_at: Instant::now(),
             signature,
         }
@@ -1575,10 +1717,10 @@ mod tests {
         let attacker = Keypair::generate();
         let victim = Keypair::generate();
         let mut rec = signed_record(&attacker, DhtId([0x03; 64]), RecordType::SignedContent, 1, b"x".to_vec());
-        rec.signer = *victim.peer_id().as_bytes();
+        rec.signer = victim.peer_id();
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
-            Some("signer pubkey does not match signer PeerId")
+            Some("not signed by its signer")
         );
     }
 
@@ -1664,11 +1806,11 @@ mod tests {
             key: DhtId([i; 64]),
             record_type: RecordType::Unknown(9),
             sequence: 1,
-            signer: [i; 32],
+            signer: PeerId([i; 32]),
             signer_algo: 1,
             signer_pubkey: vec![],
             value: vec![i; 8],
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signature: vec![0u8; 64],
         };
@@ -1686,50 +1828,69 @@ mod tests {
     }
 
     #[test]
-    fn full_content_slots_still_admit_a_new_candidate() {
-        let mut store = DhtStore::new(&PeerId([1; 32]));
-        let (genuine, _) = VerifiedRecord::new_content(b"the real thing", Duration::from_secs(600));
-        let key = genuine.record().key;
-        for i in 0..MAX_CONTENT_CANDIDATES as u8 {
-            put(&mut store, DhtRecord {
-                key,
-                record_type: RecordType::Content,
-                sequence: 0,
-                signer: [0; 32],
-                signer_algo: 0,
-                signer_pubkey: vec![],
-                value: vec![i; 48],
-                ttl: Duration::from_secs(600),
-                stored_at: Instant::now(),
-                signature: vec![],
-            });
+    fn byte_limits_count_the_whole_record() {
+        // Everything a record holds counts, signer key included (a hybrid
+        // post-quantum key is most of a small record).
+        let kp = Keypair::generate();
+        let rec = signed_record(&kp, DhtId([0x61; 64]), RecordType::SignedContent, 1, b"v".to_vec());
+        let pk = rec.signer_pubkey.len();
+        let stored = StoredRecord::new(rec.clone(), RecordSource::Local);
+        assert!(stored.cost >= pk + rec.signature.len() + rec.value.len() + 64);
+
+        let limits = StorageLimits {
+            max_total_bytes: stored.cost * 3,
+            ..StorageLimits::default()
+        };
+        let mut store = DhtStore::with_limits(&PeerId([0; 32]), limits);
+        for i in 0..10u8 {
+            let r = signed_record(&kp, DhtId([i; 64]), RecordType::SignedContent, 1, b"v".to_vec());
+            store.put(VerifiedRecord::verify_incoming(r).unwrap());
         }
+        // Falcon signatures vary in length: two or three fit.
+        assert!((2..=3).contains(&store.record_count()), "{} records", store.record_count());
+        assert!(store.total_bytes() <= limits.max_total_bytes);
+    }
+
+    #[test]
+    fn content_is_accepted_only_at_its_own_key() {
+        // Self-certifying content: a storing node checks the blob against
+        // the key, so junk can't sit at someone's content key and compete.
+        let (genuine, handle) = VerifiedRecord::new_content(b"the real thing", Duration::from_secs(600));
+        let key = genuine.record().key;
+        assert_eq!(key, content_key(&handle));
+        assert!(VerifiedRecord::verify_incoming(genuine.record().clone()).is_ok());
+        let mut junk = genuine.record().clone();
+        junk.value = vec![7; 48];
+        assert!(VerifiedRecord::verify_incoming(junk).is_err());
+
+        let mut store = DhtStore::new(&PeerId([1; 32]));
         assert!(store.put(genuine.clone()));
-        let at_key = store.get(&key);
-        assert_eq!(at_key.len(), MAX_CONTENT_CANDIDATES);
-        assert!(at_key.iter().any(|r| r.value == genuine.record().value));
+        assert!(store.put(genuine.clone()), "repeat of the one valid blob refused");
+        assert_eq!(store.get(&key).len(), 1);
     }
 
     #[test]
     fn content_blob_is_deterministic() {
-        let (k1, b1) = content_address_put(b"same bytes");
-        let (k2, b2) = content_address_put(b"same bytes");
-        assert_eq!(k1, k2);
-        assert_eq!(b1, b2);
-        assert_eq!(content_address_get(&hash_64(b"same bytes"), &b1).unwrap(), b"same bytes");
+        let (k1, b1, h1) = content_address_put(b"same bytes");
+        let (k2, b2, h2) = content_address_put(b"same bytes");
+        assert_eq!((k1, &b1, h1), (k2, &b2, h2));
+        assert_eq!(content_address_get(&h1, &b1).unwrap(), b"same bytes");
     }
 
     #[test]
-    fn stored_ttl_is_clamped_per_type() {
-        let mut store = DhtStore::new(&PeerId([1; 32]));
+    fn wire_ttl_is_clamped_per_type() {
+        // The TTL is unsigned: whatever a sender claims, a hello lives at most
+        // MAX_HELLO_TTL here, and minting clamps too.
         let kp = Keypair::generate();
-        let mut hello = signed_record(&kp, identity_address_key(&kp.peer_id()), RecordType::Hello, 1, b"h".to_vec());
-        hello.ttl = Duration::from_secs(u32::MAX as u64);
-        store.put(VerifiedRecord::verify_incoming(hello).unwrap());
-        let stored = store.all_records()[0].ttl;
-        assert_eq!(stored, MAX_HELLO_TTL);
+        let key = identity_address_key(&kp.peer_id());
+        let rec = signed_record(&kp, key, RecordType::Hello, 1, b"h".to_vec());
+        let mut put = rec.to_put_msg();
+        put.ttl = u32::MAX;
+        let got = VerifiedRecord::from_put_msg(&put).unwrap();
+        assert!(got.record().remaining_ttl() <= MAX_HELLO_TTL);
         assert_eq!(clamp_ttl_secs(RecordType::ZoneRoot, u32::MAX), MAX_RECORD_TTL.as_secs() as u32);
-        assert_eq!(clamp_ttl_secs(RecordType::Hello, 600), 600);
+        let minted = VerifiedRecord::new_hello(&kp, b"h", 2, Duration::from_secs(u32::MAX as u64));
+        assert!(minted.record().remaining_ttl() <= MAX_HELLO_TTL);
     }
 
     #[test]
@@ -1752,7 +1913,7 @@ mod tests {
         rec.value = b"tampered".to_vec(); // signature no longer covers the value
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
-            Some("invalid signature")
+            Some("not signed by its signer")
         );
     }
 
@@ -1763,7 +1924,7 @@ mod tests {
         rec.sequence = 999; // signable includes the sequence, so the sig breaks
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
-            Some("invalid signature")
+            Some("not signed by its signer")
         );
     }
 
@@ -1774,27 +1935,19 @@ mod tests {
         rec.signer_algo = 0xFF;
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
-            Some("unknown signer algo")
+            Some("not signed by its signer")
         );
     }
 
     #[test]
-    fn verify_incoming_skips_unsigned_content() {
-        // Content is not a signed type — an empty pubkey / signature is expected
-        // and the gate must let it through unchanged.
-        let rec = DhtRecord {
-            key: DhtId([0x07; 64]),
-            record_type: RecordType::Content,
-            sequence: 0,
-            signer: [0u8; 32],
-            signer_algo: 0,
-            signer_pubkey: Vec::new(),
-            value: b"blob".to_vec(),
-            ttl: Duration::from_secs(60),
-            stored_at: Instant::now(),
-            signature: Vec::new(),
-        };
-        assert!(VerifiedRecord::verify_incoming(rec).is_ok());
+    fn unsigned_content_needs_no_signature_but_its_own_key() {
+        let (rec, _) = VerifiedRecord::new_content(b"blob", Duration::from_secs(60));
+        let rec = rec.into_inner();
+        assert!(rec.signature.is_empty() && rec.signer_pubkey.is_empty());
+        assert!(VerifiedRecord::verify_incoming(rec.clone()).is_ok());
+        let mut elsewhere = rec;
+        elsewhere.key = DhtId([0x07; 64]);
+        assert!(VerifiedRecord::verify_incoming(elsewhere).is_err());
     }
 
     // ── DB reload re-verification: import_records ──
@@ -1852,7 +2005,7 @@ mod tests {
             signer_algo: resp.signer_algo,
             signer_pubkey: resp.signer_pubkey.clone(),
             value: resp.value.clone(),
-            ttl: Duration::from_secs(resp.ttl as u64),
+            expires: expires_in(clamp_ttl(resp.record_type, resp.ttl)),
             stored_at: Instant::now(),
             signature: resp.signature.clone(),
         };
@@ -1875,51 +2028,84 @@ mod tests {
     }
 
     #[test]
-    fn to_put_msg_carries_remaining_not_full_ttl() {
-        // Immortality guard: replication propagates a record via to_put_msg, and
-        // the receiver stores it with stored_at = now. If the PUT carried the
-        // *full* original TTL, every replication round would reset the record's
-        // clock and (for SignedContent, which replaces on equal sequence) it
-        // would never expire — outliving its publisher. The PUT must carry the
-        // remaining TTL so the record ages toward one fixed deadline regardless
-        // of how many times it is replicated.
+    fn to_put_msg_carries_the_remaining_ttl() {
+        // Relays and republishes carry what is left, so a record ages toward
+        // one deadline however often it is passed on.
         let kp = Keypair::generate();
-        let mut rec = signed_record(&kp, DhtId([0x0C; 64]), RecordType::SignedContent, 1, b"v".to_vec());
-        rec.ttl = Duration::from_secs(100);
-        rec.stored_at = Instant::now() - Duration::from_secs(60);
-
-        let put = rec.to_put_msg();
-        // ~40s remaining, never the full 100s. Allow a second of slack for the
-        // elapsed() call between construction and measurement.
-        assert!(
-            (38..=41).contains(&put.ttl),
-            "expected ~40s remaining TTL, got {}",
-            put.ttl
+        let rec = signed_record_expiring(
+            &kp,
+            DhtId([0x0C; 64]),
+            RecordType::SignedContent,
+            1,
+            b"v".to_vec(),
+            expires_in(Duration::from_secs(40)),
         );
+        let put = rec.to_put_msg();
+        assert!((38..=40).contains(&put.ttl), "carried {}s", put.ttl);
+    }
+
+    #[test]
+    fn a_record_that_expired_here_is_not_stored_again() {
+        // A replay (or a slow relay) of a record that died here carries a TTL
+        // nobody can check; the store refuses it unless the owner signed a
+        // higher sequence.
+        let kp = Keypair::generate();
+        let key = DhtId([0x0D; 64]);
+        let mut store = DhtStore::new(&PeerId([0u8; 32]));
+        let short = signed_record_expiring(
+            &kp,
+            key,
+            RecordType::SignedContent,
+            3,
+            b"v".to_vec(),
+            expires_in(Duration::from_millis(20)),
+        );
+        assert!(store.put(VerifiedRecord::locally_trusted(short)));
+        std::thread::sleep(Duration::from_millis(30));
+        store.expire();
+        assert!(store.get(&key).is_empty());
+
+        let replay = signed_record(&kp, key, RecordType::SignedContent, 3, b"v".to_vec());
+        assert!(!store.put(VerifiedRecord::verify_incoming(replay).unwrap()));
+        let older = signed_record(&kp, key, RecordType::SignedContent, 2, b"v".to_vec());
+        assert!(!store.put(VerifiedRecord::verify_incoming(older).unwrap()));
+        let newer = signed_record(&kp, key, RecordType::SignedContent, 4, b"v'".to_vec());
+        assert!(store.put(VerifiedRecord::verify_incoming(newer).unwrap()));
+
+        // Unsigned content: the same blob stays dead; another blob at the key
+        // is someone else's candidate.
+        let (content, _) = VerifiedRecord::new_content(b"blob", Duration::from_millis(20));
+        let ckey = content.record().key;
+        assert!(store.put(content));
+        std::thread::sleep(Duration::from_millis(30));
+        store.expire();
+        let (again, _) = VerifiedRecord::new_content(b"blob", Duration::from_secs(600));
+        assert!(!store.put(again));
+        assert!(store.get(&ckey).is_empty());
     }
 
     #[test]
     fn content_address_roundtrip() {
         let data = b"hello content-addressed DHT";
-        let (key, blob) = content_address_put(data);
-
-        // To retrieve, we need the inner hash of original data
-        let inner_hash: [u8; 64] = hash_64(data);
-
-        // Verify the key is hash(inner_hash)
-        let expected_key: [u8; 64] = hash_64(&inner_hash);
-        assert_eq!(*key.as_bytes(), expected_key);
-
-        let decrypted = content_address_get(&inner_hash, &blob).unwrap();
-        assert_eq!(decrypted, data);
+        let (key, blob, handle) = content_address_put(data);
+        // The key follows from the blob alone (what a storing node checks)
+        // and from the handle (what a reader has).
+        assert_eq!(key, content_key_of_blob(&blob));
+        assert_eq!(key, content_key(&handle));
+        assert_eq!(content_address_get(&handle, &blob).unwrap(), data);
     }
 
     #[test]
-    fn content_address_wrong_hash() {
-        let data = b"secret data";
-        let (_key, blob) = content_address_put(data);
-        let wrong_hash = [0u8; 64];
-        assert!(content_address_get(&wrong_hash, &blob).is_err());
+    fn content_address_wrong_handle() {
+        let (_key, blob, handle) = content_address_put(b"secret data");
+        assert!(content_address_get(&ContentHandle([0u8; 64]), &blob).is_err());
+        // Right blob hash, wrong decryption key.
+        let mut wrong = handle;
+        wrong.0[0] ^= 1;
+        assert!(content_address_get(&wrong, &blob).is_err());
+        // A blob that isn't the one the handle names.
+        let (_, other, _) = content_address_put(b"other data");
+        assert!(content_address_get(&handle, &other).is_err());
     }
 
     #[test]
@@ -1931,9 +2117,9 @@ mod tests {
             key,
             record_type: RecordType::Content,
             sequence: 0,
-            signer: [0u8; 32],
+            signer: PeerId([0u8; 32]),
             value: vec![1, 2, 3],
-            ttl: Duration::from_secs(0), // already expired
+            expires: expires_in(Duration::from_secs(0)), // already expired
             stored_at: Instant::now() - Duration::from_secs(1),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -1950,7 +2136,7 @@ mod tests {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xAA; 64]);
-        let signer = [0x11; 32];
+        let signer = PeerId([0x11; 32]);
 
         put(&mut store, DhtRecord {
             key,
@@ -1958,7 +2144,7 @@ mod tests {
             sequence: 1,
             signer,
             value: b"old hello".to_vec(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -1974,7 +2160,7 @@ mod tests {
             sequence: 5,
             signer,
             value: b"new hello".to_vec(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -1990,7 +2176,7 @@ mod tests {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xBB; 64]);
-        let signer = [0x22; 32];
+        let signer = PeerId([0x22; 32]);
 
         put(&mut store, DhtRecord {
             key,
@@ -1998,7 +2184,7 @@ mod tests {
             sequence: 10,
             signer,
             value: b"current".to_vec(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2012,7 +2198,7 @@ mod tests {
             sequence: 3,
             signer,
             value: b"stale".to_vec(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2034,9 +2220,9 @@ mod tests {
             key,
             record_type: RecordType::SignedContent,
             sequence: 0,
-            signer: [0x11; 32],
+            signer: PeerId([0x11; 32]),
             value: b"from signer A".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2046,9 +2232,9 @@ mod tests {
             key,
             record_type: RecordType::SignedContent,
             sequence: 0,
-            signer: [0x22; 32],
+            signer: PeerId([0x22; 32]),
             value: b"from signer B".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2058,11 +2244,11 @@ mod tests {
     }
 
     #[test]
-    fn signed_content_same_signer_replaces() {
+    fn signed_content_same_signer_replaced_only_by_higher_sequence() {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xDD; 64]);
-        let signer = [0x33; 32];
+        let signer = PeerId([0x33; 32]);
 
         put(&mut store, DhtRecord {
             key,
@@ -2070,7 +2256,7 @@ mod tests {
             sequence: 0,
             signer,
             value: b"version 1".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2082,14 +2268,29 @@ mod tests {
             sequence: 0,
             signer,
             value: b"version 2".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
+            stored_at: Instant::now(),
+            signer_algo: 1,
+            signer_pubkey: vec![],
+            signature: vec![0u8; 64],
+        });
+        // Equal sequence: the copy held is kept.
+        assert_eq!(store.get(&key).len(), 1);
+        assert_eq!(store.get(&key)[0].value, b"version 1");
+        put(&mut store, DhtRecord {
+            key,
+            record_type: RecordType::SignedContent,
+            sequence: 1,
+            signer,
+            value: b"version 3".to_vec(),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
             signature: vec![0u8; 64],
         });
         assert_eq!(store.get(&key).len(), 1);
-        assert_eq!(store.get(&key)[0].value, b"version 2");
+        assert_eq!(store.get(&key)[0].value, b"version 3");
     }
 
     #[test]
@@ -2097,7 +2298,7 @@ mod tests {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xDD; 64]);
-        let signer = [0x44; 32];
+        let signer = PeerId([0x44; 32]);
 
         put(&mut store, DhtRecord {
             key,
@@ -2105,7 +2306,7 @@ mod tests {
             sequence: 10,
             signer,
             value: b"current".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2118,7 +2319,7 @@ mod tests {
             sequence: 3,
             signer,
             value: b"stale".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2134,7 +2335,7 @@ mod tests {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xDD; 64]);
-        let signer = [0x55; 32];
+        let signer = PeerId([0x55; 32]);
 
         put(&mut store, DhtRecord {
             key,
@@ -2142,7 +2343,7 @@ mod tests {
             sequence: 1,
             signer,
             value: b"old".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2154,7 +2355,7 @@ mod tests {
             sequence: 5,
             signer,
             value: b"new".to_vec(),
-            ttl: Duration::from_secs(3600),
+            expires: expires_in(Duration::from_secs(3600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2171,8 +2372,8 @@ mod tests {
         let topic = b"secret-group-key||llama-70b";
 
         // Two providers encrypt the same topic
-        let (key1, blob1) = content_address_put(topic);
-        let (key2, blob2) = content_address_put(topic);
+        let (key1, blob1, _) = content_address_put(topic);
+        let (key2, blob2, _) = content_address_put(topic);
 
         // Keys must be identical (same content)
         assert_eq!(key1, key2);
@@ -2185,9 +2386,9 @@ mod tests {
             key: key1,
             record_type: RecordType::SignedContent,
             sequence: 1,
-            signer: [0x11; 32],
+            signer: PeerId([0x11; 32]),
             value: blob1.clone(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2197,9 +2398,9 @@ mod tests {
             key: key1,
             record_type: RecordType::SignedContent,
             sequence: 1,
-            signer: [0x22; 32],
+            signer: PeerId([0x22; 32]),
             value: blob2.clone(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2210,65 +2411,16 @@ mod tests {
         let records = store.get(&key1);
         assert_eq!(records.len(), 2);
 
-        // Both decrypt correctly with the inner hash
-        let inner_hash: [u8; 64] = hash_64(topic);
+        // Both decrypt correctly with the handle
+        let (_, _, handle) = content_address_put(topic);
         for record in records {
-            let plaintext = content_address_get(&inner_hash, &record.value).unwrap();
+            let plaintext = content_address_get(&handle, &record.value).unwrap();
             assert_eq!(plaintext, topic);
         }
 
-        // Garbage blob at same key fails decryption
+        // Garbage blob at same key fails
         let garbage = vec![0xDEu8; 100];
-        assert!(content_address_get(&inner_hash, &garbage).is_err());
-    }
-
-    #[test]
-    fn content_keeps_multiple_candidates() {
-        let peer = PeerId([1u8; 32]);
-        let mut store = DhtStore::new(&peer);
-        let key = DhtId([0xEE; 64]);
-
-        put(&mut store, DhtRecord {
-            key,
-            record_type: RecordType::Content,
-            sequence: 0,
-            signer: [0u8; 32],
-            value: b"first".to_vec(),
-            ttl: Duration::from_secs(3600),
-            stored_at: Instant::now(),
-            signer_algo: 1,
-            signer_pubkey: vec![],
-            signature: vec![0u8; 64],
-        });
-        put(&mut store, DhtRecord {
-            key,
-            record_type: RecordType::Content,
-            sequence: 0,
-            signer: [0u8; 32],
-            value: b"second".to_vec(),
-            ttl: Duration::from_secs(3600),
-            stored_at: Instant::now(),
-            signer_algo: 1,
-            signer_pubkey: vec![],
-            signature: vec![0u8; 64],
-        });
-        // Both candidates kept (anti-poisoning)
-        assert_eq!(store.get(&key).len(), 2);
-
-        // Duplicate values are deduplicated
-        put(&mut store, DhtRecord {
-            key,
-            record_type: RecordType::Content,
-            sequence: 0,
-            signer: [0u8; 32],
-            value: b"first".to_vec(),
-            ttl: Duration::from_secs(3600),
-            stored_at: Instant::now(),
-            signer_algo: 1,
-            signer_pubkey: vec![],
-            signature: vec![0u8; 64],
-        });
-        assert_eq!(store.get(&key).len(), 2);
+        assert!(content_address_get(&handle, &garbage).is_err());
     }
 
     #[test]
@@ -2284,7 +2436,7 @@ mod tests {
         let peer = PeerId([1u8; 32]);
         let mut store = DhtStore::new(&peer);
         let key = DhtId([0xAA; 64]);
-        let signer = [0x11; 32];
+        let signer = PeerId([0x11; 32]);
 
         put(&mut store, DhtRecord {
             key,
@@ -2292,7 +2444,7 @@ mod tests {
             sequence: 1,
             signer,
             value: b"unknown v1".to_vec(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2308,7 +2460,7 @@ mod tests {
             sequence: 5,
             signer,
             value: b"unknown v2".to_vec(),
-            ttl: Duration::from_secs(600),
+            expires: expires_in(Duration::from_secs(600)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2375,6 +2527,7 @@ mod tests {
         entries.push(DhtWatch {
             query_token: [0x33; 32],
             via_peer: peer,
+            next: None,
             expires_at: Instant::now() - Duration::from_secs(1),
             notified: HashMap::new(),
         });
@@ -2571,6 +2724,105 @@ mod tests {
     }
 
     #[test]
+    fn equal_seq_copy_changes_nothing() {
+        // The same signed record again (republish or replay) leaves the copy
+        // held as it is; a higher sequence brings the owner's new deadline.
+        let kp = Keypair::generate();
+        let key = DhtId([0x72; 64]);
+        let mut store = DhtStore::new(&PeerId([0u8; 32]));
+        let first = signed_record_expiring(&kp, key, RecordType::SignedContent, 4, b"v4".to_vec(), expires_in(Duration::from_secs(60)));
+        store.put(VerifiedRecord::verify_incoming(first.clone()).unwrap());
+        let outcome = store.put_record(VerifiedRecord::verify_incoming(first.clone()).unwrap(), RecordSource::Local);
+        assert!(outcome.stored);
+        assert_eq!(outcome.record.unwrap().expires, first.expires);
+
+        let newer = signed_record_expiring(&kp, key, RecordType::SignedContent, 5, b"v5".to_vec(), expires_in(Duration::from_secs(3600)));
+        store.put(VerifiedRecord::verify_incoming(newer.clone()).unwrap());
+        assert_eq!(store.get(&key)[0].expires, newer.expires);
+    }
+
+    #[test]
+    fn unknown_record_types_are_signature_checked() {
+        let kp = Keypair::generate();
+        let key = DhtId([0x73; 64]);
+        let genuine = signed_record(&kp, key, RecordType::Unknown(42), 1, b"future".to_vec());
+        assert!(VerifiedRecord::verify_incoming(genuine.clone()).is_ok());
+
+        // Forged sequence: the signature no longer covers it.
+        let mut forged = genuine.clone();
+        forged.sequence = u64::MAX;
+        assert!(VerifiedRecord::verify_incoming(forged).is_err());
+        // Spoofed signer: the pubkey doesn't hash to it.
+        let mut spoofed = genuine.clone();
+        spoofed.signer = PeerId([0x99; 32]);
+        assert!(VerifiedRecord::verify_incoming(spoofed).is_err());
+        // No signature material at all.
+        let mut bare = genuine;
+        bare.signer_pubkey.clear();
+        bare.signature.clear();
+        assert!(VerifiedRecord::verify_incoming(bare).is_err());
+    }
+
+    #[test]
+    fn put_record_reports_what_the_limits_evicted() {
+        let limits = StorageLimits {
+            max_records: 3,
+            ..StorageLimits::default()
+        };
+        let mut store = DhtStore::with_limits(&PeerId([0u8; 32]), limits);
+        let kp = Keypair::generate();
+        let mut held: Vec<DhtRecord> = Vec::new();
+        let mut evicted: Vec<DhtRecord> = Vec::new();
+        for i in 0..10u8 {
+            let rec = signed_record(&kp, DhtId([i; 64]), RecordType::SignedContent, 1, vec![i]);
+            let outcome = store.put_record(
+                VerifiedRecord::verify_incoming(rec).unwrap(),
+                RecordSource::Peer(PeerId([7; 32])),
+            );
+            if let Some(r) = outcome.record {
+                held.push(r);
+            }
+            evicted.extend(outcome.evicted);
+        }
+        // Mirroring the outcomes (keep what's stored, drop what's evicted)
+        // leaves exactly what the store holds.
+        held.retain(|r| !evicted.iter().any(|e| e.key == r.key && e.signer == r.signer));
+        assert_eq!(store.record_count(), 3);
+        assert_eq!(held.len(), 3);
+        for r in &held {
+            assert_eq!(store.get(&r.key).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_record_evicted_on_arrival_is_not_stored() {
+        // A key holding its owner's hello, one record per key: the hello is
+        // never evicted for other records, so a newcomer is evicted at once
+        // and must not count as stored (nor be persisted).
+        let limits = StorageLimits {
+            max_records_per_key: 1,
+            ..StorageLimits::default()
+        };
+        let mut store = DhtStore::with_limits(&PeerId([0u8; 32]), limits);
+        let owner = Keypair::generate();
+        let key = identity_address_key(&owner.peer_id());
+        let hello = signed_record(&owner, key, RecordType::Hello, 1, b"hello".to_vec());
+        assert!(store.put(VerifiedRecord::verify_incoming(hello).unwrap()));
+
+        let other = Keypair::generate();
+        let rec = signed_record(&other, key, RecordType::SignedContent, 1, b"junk".to_vec());
+        let outcome = store.put_record(
+            VerifiedRecord::verify_incoming(rec).unwrap(),
+            RecordSource::Peer(PeerId([7; 32])),
+        );
+        assert!(!outcome.stored);
+        assert!(outcome.record.is_none());
+        assert_eq!(outcome.evicted.len(), 1);
+        assert_eq!(outcome.evicted[0].signer, other.peer_id());
+        assert_eq!(store.get(&key).len(), 1);
+    }
+
+    #[test]
     fn dht_store_rejects_oversized_values() {
         let peer = PeerId([9u8; 32]);
         let mut store = DhtStore::with_limits(
@@ -2588,9 +2840,9 @@ mod tests {
             key,
             record_type: RecordType::Content,
             sequence: 0,
-            signer: [0u8; 32],
+            signer: PeerId([0u8; 32]),
             value: vec![0x55; 32],
-            ttl: Duration::from_secs(60),
+            expires: expires_in(Duration::from_secs(60)),
             stored_at: Instant::now(),
             signer_algo: 1,
             signer_pubkey: vec![],
@@ -2619,9 +2871,9 @@ mod tests {
                 key: DhtId([i; 64]),
                 record_type: RecordType::Unknown(9),
                 sequence: i as u64,
-                signer: [i; 32],
+                signer: PeerId([i; 32]),
                 value: vec![i; 8],
-                ttl: Duration::from_secs(60),
+                expires: expires_in(Duration::from_secs(60)),
                 stored_at: Instant::now() + Duration::from_millis(i as u64),
                 signer_algo: 1,
                 signer_pubkey: vec![],

@@ -1,7 +1,9 @@
 pub mod bandwidth;
 pub mod bootstrap;
+pub mod bounded;
 pub mod channel;
 pub mod circuit;
+pub(crate) mod codec;
 pub mod crypto;
 pub mod directory;
 pub mod dht;

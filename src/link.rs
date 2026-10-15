@@ -3,7 +3,7 @@ use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -62,8 +62,6 @@ const FRAGMENT_REPAIR_BYTES: usize = 16 * 1024;
 const REPLAY_WINDOW: u64 = 128;
 /// Re-key after this many messages sent.
 pub const REKEY_INTERVAL: u64 = 65536;
-/// Maximum allowed timestamp drift in seconds.
-const MAX_TIMESTAMP_DRIFT: u64 = 300;
 /// Handshake deadline floor. A handshake fails after this long without
 /// receiving anything from the peer; see [`handshake_deadline`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -406,14 +404,6 @@ fn negotiate_version(my_min: u8, my_max: u8, peer_min: u8, peer_max: u8) -> Resu
     Ok(negotiated)
 }
 
-/// Get current unix timestamp in seconds.
-fn unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Time to send `bytes` at the transport's bandwidth hint (zero if unknown).
 fn tx_time(transport: &dyn Transport, bytes: u64) -> Duration {
     match transport.bandwidth_hint() {
@@ -661,6 +651,10 @@ pub struct PeerLink {
     /// was lost; we answer it so the initiator can finish instead of leaving
     /// us holding a link the other side gave up on.
     handshake_tail: std::sync::Mutex<Option<(Vec<u8>, Vec<u8>)>>,
+    /// Protocol categories sent on this link (see
+    /// [`crate::firewall::category_bit`]), for the firewall's connection
+    /// tracking: recorded where every outgoing message passes.
+    sent_categories: std::sync::atomic::AtomicU8,
 }
 
 impl PeerLink {
@@ -694,7 +688,6 @@ impl PeerLink {
         let my_kem_algo = identity.identity.kem.algo();
         let eph_kem = KemKeypair::generate_ephemeral(my_kem_algo);
 
-        let timestamp = unix_timestamp();
         let mut challenge = [0u8; 32];
         rng.fill_bytes(&mut challenge);
 
@@ -705,7 +698,6 @@ impl PeerLink {
             signing_pubkey: identity.identity.signing.signing_pubkey_bytes(),
             kem_algo: my_kem_algo as u8,
             kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
-            timestamp,
             challenge,
             eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
             min_version: WIRE_VERSION_MIN,
@@ -726,19 +718,6 @@ impl PeerLink {
             peer_hello.max_version,
         )?;
 
-        // Validate timestamp
-        let now = unix_timestamp();
-        let drift = if peer_hello.timestamp > now {
-            peer_hello.timestamp - now
-        } else {
-            now - peer_hello.timestamp
-        };
-        if drift > MAX_TIMESTAMP_DRIFT {
-            return Err(Error::Crypto(format!(
-                "handshake timestamp drift {}s exceeds maximum {}s",
-                drift, MAX_TIMESTAMP_DRIFT
-            )));
-        }
 
         // Compute X25519 ephemeral shared secret
         let peer_eph = X25519Public::from(peer_hello.ephemeral_pubkey);
@@ -776,8 +755,6 @@ impl PeerLink {
             &peer_hello.ephemeral_pubkey,
             &shared_bytes,
             true,
-            my_hello.timestamp,
-            peer_hello.timestamp,
             &my_hello.challenge,
             &peer_hello.challenge,
             &static_kem_ct,
@@ -802,8 +779,6 @@ impl PeerLink {
             &my_hello.ephemeral_pubkey,
             &shared_bytes,
             false,
-            peer_hello.timestamp,
-            my_hello.timestamp,
             &peer_hello.challenge,
             &my_hello.challenge,
             &[], // responder's auth has no KEM ciphertext
@@ -814,8 +789,10 @@ impl PeerLink {
         let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
             .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
         let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
-        if !identity::verify(
-            remote_signing_algo,
+        // The peer is whoever holds the key (its id is derived from it).
+        if !identity::verify_signed(
+            identity::SignedBy::AnyPeer,
+            Some(remote_signing_algo as u8),
             &peer_hello.signing_pubkey,
             &peer_transcript,
             &peer_auth.signature,
@@ -902,6 +879,7 @@ impl PeerLink {
             transport_name,
             inbox: std::sync::Mutex::new(std::collections::VecDeque::new()),
             handshake_tail: std::sync::Mutex::new(None),
+            sent_categories: std::sync::atomic::AtomicU8::new(0),
         };
         for frame in early_frames {
             link.ingest_frame(&frame);
@@ -943,21 +921,7 @@ impl PeerLink {
             peer_hello.max_version,
         )?;
 
-        // Validate timestamp
-        let now = unix_timestamp();
-        let drift = if peer_hello.timestamp > now {
-            peer_hello.timestamp - now
-        } else {
-            now - peer_hello.timestamp
-        };
-        if drift > MAX_TIMESTAMP_DRIFT {
-            return Err(Error::Crypto(format!(
-                "handshake timestamp drift {}s exceeds maximum {}s",
-                drift, MAX_TIMESTAMP_DRIFT
-            )));
-        }
 
-        let timestamp = unix_timestamp();
         let mut challenge = [0u8; 32];
         rng.fill_bytes(&mut challenge);
 
@@ -968,7 +932,6 @@ impl PeerLink {
             signing_pubkey: identity.identity.signing.signing_pubkey_bytes(),
             kem_algo: my_kem_algo as u8,
             kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
-            timestamp,
             challenge,
             eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
             min_version: WIRE_VERSION_MIN,
@@ -1016,8 +979,6 @@ impl PeerLink {
             &my_hello.ephemeral_pubkey,
             &shared_bytes,
             true,
-            peer_hello.timestamp,
-            my_hello.timestamp,
             &peer_hello.challenge,
             &my_hello.challenge,
             &peer_auth.kem_ciphertext,
@@ -1030,8 +991,10 @@ impl PeerLink {
         let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
             .map_err(|e| Error::Crypto(format!("unknown KEM algo: {}", e)))?;
         let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
-        if !identity::verify(
-            remote_signing_algo,
+        // The peer is whoever holds the key (its id is derived from it).
+        if !identity::verify_signed(
+            identity::SignedBy::AnyPeer,
+            Some(remote_signing_algo as u8),
             &peer_hello.signing_pubkey,
             &peer_transcript,
             &peer_auth.signature,
@@ -1045,8 +1008,6 @@ impl PeerLink {
             &peer_hello.ephemeral_pubkey,
             &shared_bytes,
             false,
-            my_hello.timestamp,
-            peer_hello.timestamp,
             &my_hello.challenge,
             &peer_hello.challenge,
             &[], // responder's auth has no KEM ciphertext
@@ -1115,6 +1076,7 @@ impl PeerLink {
             transport_name,
             inbox: std::sync::Mutex::new(std::collections::VecDeque::new()),
             handshake_tail: std::sync::Mutex::new(handshake_tail),
+            sent_categories: std::sync::atomic::AtomicU8::new(0),
         };
         Ok(link)
     }
@@ -1128,8 +1090,6 @@ impl PeerLink {
         peer_eph: &[u8; 32],
         shared_secret: &[u8; 32],
         is_initiator: bool,
-        my_timestamp: u64,
-        peer_timestamp: u64,
         my_challenge: &[u8; 32],
         peer_challenge: &[u8; 32],
         kem_ciphertext: &[u8],
@@ -1147,8 +1107,6 @@ impl PeerLink {
             .update(my_eph)
             .update(peer_eph)
             .update(shared_secret)
-            .update(&my_timestamp.to_be_bytes())
-            .update(&peer_timestamp.to_be_bytes())
             .update(my_challenge)
             .update(peer_challenge)
             .update(kem_ciphertext)
@@ -1339,6 +1297,24 @@ impl PeerLink {
         Ok(())
     }
 
+    /// What every outgoing message passes: the size limit, and the record of
+    /// its protocol category.
+    fn outgoing(&self, data: &[u8]) -> Result<()> {
+        Self::check_size(data, self.remote_peer)?;
+        if let Some(mt) = WireMessage::peek_type(data) {
+            self.sent_categories
+                .fetch_or(crate::firewall::category_bit(mt), std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Whether this link has sent a message of `mt`'s protocol category.
+    pub fn has_sent_category_of(&self, mt: MessageType) -> bool {
+        self.sent_categories.load(std::sync::atomic::Ordering::Relaxed)
+            & crate::firewall::category_bit(mt)
+            != 0
+    }
+
     /// Enqueue a message, dropping it if the queue is full.
     fn enqueue(&self, out: Outgoing) -> Result<()> {
         match self.outbound_tx.try_send(out) {
@@ -1358,7 +1334,7 @@ impl PeerLink {
     /// If the queue is full (peer is congested), the message is silently
     /// dropped — reliable end-to-end Channels handle recovery.
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
-        Self::check_size(data, self.remote_peer)?;
+        self.outgoing(data)?;
         self.enqueue(Outgoing::Message(data.to_vec()))
     }
 
@@ -1371,7 +1347,7 @@ impl PeerLink {
     /// correct policy for them. Bulk stream data keeps using
     /// [`send_message`], where reliable Channels recover dropped packets.
     pub async fn send_message_critical(&self, data: &[u8]) -> Result<()> {
-        Self::check_size(data, self.remote_peer)?;
+        self.outgoing(data)?;
         self.outbound_tx
             .send(Outgoing::Critical(data.to_vec()))
             .await
@@ -1385,7 +1361,7 @@ impl PeerLink {
     /// reducing the number of distinctly-timed link-layer frames an observer
     /// can see.
     pub async fn send_deferred(&self, data: &[u8]) -> Result<()> {
-        Self::check_size(data, self.remote_peer)?;
+        self.outgoing(data)?;
         self.enqueue(Outgoing::Deferred(data.to_vec()))
     }
 
@@ -1620,8 +1596,9 @@ impl PeerLink {
         // Authenticate against the peer's static signing key. (The frame is
         // already link-authenticated by AEAD; this binds it to the peer's
         // long-term identity, matching the handshake.)
-        if !identity::verify(
-            self.remote_signing_algo,
+        if !identity::verify_signed(
+            identity::SignedBy::BoundKey,
+            Some(self.remote_signing_algo as u8),
             &self.remote_signing_pubkey,
             &peer_rekey.signable_bytes(),
             &peer_rekey.signature,
@@ -2126,7 +2103,7 @@ mod tests {
 
     fn ping() -> Vec<u8> {
         crate::wire::KeepaliveMsg {
-            timestamp_us: None,
+            ping_id: None,
             padding: Vec::new(),
         }
         .to_wire()

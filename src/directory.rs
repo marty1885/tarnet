@@ -9,12 +9,47 @@ use std::time::{Duration, Instant};
 use crate::types::PeerId;
 use crate::wire::AddressRecord;
 
+/// An address record whose signature has been checked, or that this node
+/// signed itself. The directory store and address caches take only this, so
+/// no path can keep a record nobody verified (the same rule as
+/// [`crate::dht::VerifiedRecord`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedAddress(AddressRecord);
+
+impl VerifiedAddress {
+    /// A received record, if its signature verifies.
+    pub fn verify(record: AddressRecord) -> Option<Self> {
+        record.verify().then_some(Self(record))
+    }
+
+    /// A received record, if it is `peer`'s and its signature verifies.
+    pub fn verify_for(record: AddressRecord, peer: &PeerId) -> Option<Self> {
+        if record.peer != *peer {
+            return None;
+        }
+        Self::verify(record)
+    }
+
+    /// A record this node just signed.
+    pub fn signed_here(record: AddressRecord) -> Self {
+        Self(record)
+    }
+
+    pub fn record(&self) -> &AddressRecord {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> AddressRecord {
+        self.0
+    }
+}
+
 /// Directory replicas per record (`R`).
 pub const REPLICAS: u8 = 3;
 /// Landmarks responsible for one replica (`SPREAD`).
 pub const SPREAD: usize = 2;
 /// Longest a landmark keeps a record, whatever its TTL says.
-pub const MAX_RECORD_TTL: Duration = Duration::from_secs(6 * 3600);
+pub const MAX_ADDRESS_TTL: Duration = Duration::from_secs(6 * 3600);
 
 fn placement_key(replica: u8, peer: &PeerId) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
@@ -101,6 +136,12 @@ pub fn hints_from(
 /// until their TTL, bounded in number.
 pub struct DirStore {
     records: HashMap<PeerId, (AddressRecord, Instant)>,
+    /// Records that expired here: the highest dead seq per peer, and when to
+    /// forget it. The TTL is relative and nodes share no clock, so a copy
+    /// arriving later (a replay) can't be told stale by its TTL; a record
+    /// that died here is never stored again unless its owner signs a higher
+    /// seq. Remembered for `MAX_ADDRESS_TTL`, the longest any copy could live.
+    dead: crate::bounded::BoundedMap<PeerId, u32>,
     max: usize,
 }
 
@@ -108,19 +149,31 @@ impl DirStore {
     pub fn new(max: usize) -> Self {
         Self {
             records: HashMap::new(),
+            dead: crate::bounded::BoundedMap::new(max.max(1), MAX_ADDRESS_TTL),
             max: max.max(1),
         }
     }
 
     /// Store a record the caller has verified. A repeat of the stored
-    /// record refreshes its expiry; an older one, or a different record
-    /// with the same seq, is refused. When full, the record expiring
-    /// soonest makes room if it expires before the new one.
-    pub fn put(&mut self, record: AddressRecord, now: Instant) -> bool {
-        let expires = now + Duration::from_secs(record.ttl_secs as u64).min(MAX_RECORD_TTL);
+    /// record is accepted but keeps the expiry already held (only a higher
+    /// seq brings a new lifetime); an older one, a different record with the
+    /// same seq, or one that expired here, is refused. When full, the record
+    /// expiring soonest makes room if it expires before the new one.
+    pub fn put(&mut self, record: VerifiedAddress, now: Instant) -> bool {
+        let record = record.into_inner();
+        let expires = now + Duration::from_secs(record.ttl_secs as u64).min(MAX_ADDRESS_TTL);
+        if self.records.get(&record.peer).is_some_and(|(_, t)| *t <= now) {
+            self.gc(now);
+        }
+        if self.dead.get(&record.peer).is_some_and(|seq| record.seq <= *seq) {
+            return false;
+        }
         if let Some((old, _)) = self.records.get(&record.peer) {
             if old.seq > record.seq || (old.seq == record.seq && *old != record) {
                 return false;
+            }
+            if *old == record {
+                return true;
             }
         } else if self.records.len() >= self.max {
             self.gc(now);
@@ -149,7 +202,20 @@ impl DirStore {
     }
 
     pub fn gc(&mut self, now: Instant) {
-        self.records.retain(|_, (_, t)| *t > now);
+        let dead = &mut self.dead;
+        self.records.retain(|peer, (record, t)| {
+            if *t > now {
+                return true;
+            }
+            match dead.get_mut(peer) {
+                Some(seq) => *seq = (*seq).max(record.seq),
+                None => {
+                    let _ = dead.try_insert(*peer, record.seq);
+                }
+            }
+            false
+        });
+        self.dead.expire(now);
     }
 
     pub fn len(&self) -> usize {
@@ -239,8 +305,8 @@ mod tests {
         assert_eq!(responsible(&pid(1), 0, &[(pid(2), pid(2))]), vec![pid(2)]);
     }
 
-    fn record(kp: &Keypair, seq: u32, ttl: u32) -> AddressRecord {
-        AddressRecord::sign(
+    fn record(kp: &Keypair, seq: u32, ttl: u32) -> VerifiedAddress {
+        VerifiedAddress::signed_here(AddressRecord::sign(
             kp,
             seq,
             ttl,
@@ -248,7 +314,7 @@ mod tests {
                 landmark: pid(1),
                 path: vec![pid(2)],
             }],
-        )
+        ))
     }
 
     #[test]
@@ -265,6 +331,24 @@ mod tests {
         assert!(store.get(&kp.peer_id(), later).is_none());
         store.gc(later);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_copy_never_extends_or_revives_a_record() {
+        // A replay of the signed record arrives with its full TTL: it keeps
+        // the expiry held, and once the record expired here, only a higher
+        // seq is stored again.
+        let kp = Keypair::generate_ed25519();
+        let mut store = DirStore::new(16);
+        let now = Instant::now();
+        let rec = record(&kp, 5, 60);
+        assert!(store.put(rec.clone(), now));
+        assert!(store.put(rec.clone(), now + Duration::from_secs(50)), "repeat refused");
+        let later = now + Duration::from_secs(61);
+        assert!(store.get(&kp.peer_id(), later).is_none(), "repeat extended the record");
+        assert!(!store.put(rec, later), "expired record revived");
+        assert!(store.get(&kp.peer_id(), later).is_none());
+        assert!(store.put(record(&kp, 6, 60), later), "newer seq refused");
     }
 
     #[test]
