@@ -3222,7 +3222,7 @@ mod tests {
             .dht_watches
             .lock()
             .await
-            .watchers_for_news(key.as_bytes(), victim.peer_id().as_bytes(), 2);
+            .watchers_needing_news(key.as_bytes(), victim.peer_id().as_bytes(), 2);
         assert_eq!(news.len(), 1, "forged PUT suppressed the victim's news");
     }
 

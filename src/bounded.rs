@@ -234,6 +234,14 @@ impl<K: Hash + Eq + Clone, V> Requests<K, V> {
         self.entries.lock().unwrap().contains_key(key)
     }
 
+    /// Inspect a live request without consuming it.  Response handlers use
+    /// this for their validation phase, then call [`take_if`](Self::take_if)
+    /// only after the complete response has been accepted.
+    pub(crate) fn inspect<R>(&self, key: &K, f: impl FnOnce(&V) -> R) -> Option<R> {
+        let entries = self.entries.lock().unwrap();
+        entries.get(key).map(|(_, value)| f(value))
+    }
+
     pub(crate) fn take_if(&self, key: &K, accept: impl FnOnce(&V) -> bool) -> Option<V> {
         let mut entries = self.entries.lock().unwrap();
         if !entries.get(key).is_some_and(|(_, value)| accept(value)) {
@@ -265,6 +273,8 @@ mod request_tests {
         let pending = async {
             let _registration = requests.register(1, "expected").unwrap();
             assert!(requests.register(2, "other").is_none());
+            assert_eq!(requests.inspect(&1, |v| *v), Some("expected"));
+            assert!(requests.contains(&1));
             assert!(requests.take_if(&1, |v| *v == "wrong").is_none());
             std::future::pending::<()>().await;
         };

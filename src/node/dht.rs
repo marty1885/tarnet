@@ -558,7 +558,7 @@ impl Node {
                 .dht_watches
                 .lock()
                 .await
-                .watchers_for_news(&put.key, put.signer.as_bytes(), put.sequence);
+                .watchers_needing_news(&put.key, put.signer.as_bytes(), put.sequence);
             for (token, via_peer) in watchers {
                 if Some(&via_peer) == from {
                     continue;
@@ -567,7 +567,19 @@ impl Node {
                     query_token: token,
                     put: put.clone(),
                 };
-                let _ = self.send_to_peer_deferred(&via_peer, &notify.to_wire().encode()).await;
+                if self
+                    .send_to_peer_deferred(&via_peer, &notify.to_wire().encode())
+                    .await
+                    .is_ok()
+                {
+                    self.dht_watches.lock().await.mark_notified(
+                        &put.key,
+                        &token,
+                        &via_peer,
+                        put.signer.as_bytes(),
+                        put.sequence,
+                    );
+                }
             }
         }
         if local {
@@ -959,6 +971,11 @@ impl Node {
         } else {
             Vec::new()
         };
+        let rounds_left = if tokens.is_empty() {
+            SEARCH_ROUNDS
+        } else {
+            SEARCH_ROUNDS - 1
+        };
         DhtSearch {
             held,
             rx,
@@ -966,7 +983,7 @@ impl Node {
             key,
             tokens,
             deadline,
-            rounds_left: SEARCH_ROUNDS - 1,
+            rounds_left,
             next_round: Instant::now() + SEARCH_RELAUNCH_INTERVAL,
             seen: HashSet::new(),
             walker: self.dht_walker.clone(),
@@ -1076,12 +1093,14 @@ impl DhtSearch {
                         _ = tokio::time::sleep(wake.saturating_duration_since(now)) => {
                             if Instant::now() >= self.deadline { return None; }
                             if relaunch && Instant::now() >= self.next_round {
-                                self.rounds_left -= 1;
                                 self.next_round = Instant::now() + SEARCH_RELAUNCH_INTERVAL;
                                 let tokens = self
                                     .walker
                                     .launch_get(self.key.as_bytes(), (&self.registry, &self.tx))
                                     .await;
+                                if !tokens.is_empty() {
+                                    self.rounds_left -= 1;
+                                }
                                 self.tokens.extend(tokens);
                             }
                             continue;
@@ -1194,6 +1213,16 @@ mod lifetime_regressions {
         *node.dht_store.lock().await = DhtStore::with_limits(&node.peer_id(), limits);
         assert!(node.dht_put_content(b"no capacity").await.is_err());
         assert_eq!(node.dht_store.lock().await.record_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_offline_search_does_not_consume_a_walk_round() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let search = node
+            .dht_search(DhtId([7; 64]), Instant::now() + Duration::from_secs(10))
+            .await;
+        assert!(search.tokens.is_empty());
+        assert_eq!(search.rounds_left, SEARCH_ROUNDS);
     }
 
     #[test]

@@ -1383,33 +1383,59 @@ impl DhtWatchTable {
         }
     }
 
-    /// Watchers of `key` that haven't been told of this version (`signer`'s
-    /// record at `sequence`, or newer); marks them told. Call only with a
-    /// verified record: whatever is passed here suppresses later news.
-    pub fn watchers_for_news(
-        &mut self,
+    /// Watchers of `key` that have not accepted this version yet.  This is a
+    /// read-only admission check: delivery is committed separately, after the
+    /// notification has entered the outgoing queue.
+    pub fn watchers_needing_news(
+        &self,
         key: &[u8; 64],
         signer: &[u8; 32],
         sequence: u64,
     ) -> Vec<([u8; 32], PeerId)> {
         let now = Instant::now();
-        let Some(entries) = self.watches.get_mut(key) else {
+        let Some(entries) = self.watches.get(key) else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        for w in entries.iter_mut().filter(|w| w.expires_at > now) {
-            if w.notified.get(signer).is_some_and(|s| *s >= sequence) {
-                continue;
-            }
-            if !w.notified.contains_key(signer) && w.notified.len() >= MAX_NOTIFIED_SIGNERS {
-                if let Some(k) = w.notified.iter().min_by_key(|(_, s)| **s).map(|(k, _)| *k) {
-                    w.notified.remove(&k);
-                }
-            }
-            w.notified.insert(*signer, sequence);
-            out.push((w.query_token, w.via_peer));
+        entries
+            .iter()
+            .filter(|w| {
+                w.expires_at > now
+                    && !w.notified.get(signer).is_some_and(|s| *s >= sequence)
+            })
+            .map(|w| (w.query_token, w.via_peer))
+            .collect()
+    }
+
+    /// Commit successful queue admission of a notification.  Matching the
+    /// peer as well as the token prevents a stale send completion from
+    /// advancing a replacement registration that reused the token.
+    pub fn mark_notified(
+        &mut self,
+        key: &[u8; 64],
+        query_token: &[u8; 32],
+        via_peer: &PeerId,
+        signer: &[u8; 32],
+        sequence: u64,
+    ) {
+        let now = Instant::now();
+        let Some(w) = self.watches.get_mut(key).and_then(|entries| {
+            entries.iter_mut().find(|w| {
+                w.query_token == *query_token
+                    && w.via_peer == *via_peer
+                    && w.expires_at > now
+            })
+        }) else {
+            return;
+        };
+        if w.notified.get(signer).is_some_and(|s| *s >= sequence) {
+            return;
         }
-        out
+        if !w.notified.contains_key(signer) && w.notified.len() >= MAX_NOTIFIED_SIGNERS {
+            if let Some(k) = w.notified.iter().min_by_key(|(_, s)| **s).map(|(k, _)| *k) {
+                w.notified.remove(&k);
+            }
+        }
+        w.notified.insert(*signer, sequence);
     }
 
     /// Someone is watching `key`.
@@ -2533,17 +2559,21 @@ mod tests {
         let (a, b) = ([1u8; 32], [2u8; 32]);
         assert!(table.set_watch(key, a, PeerId([3; 32]), 60));
         let (signer, other) = ([7u8; 32], [8u8; 32]);
-        assert_eq!(table.watchers_for_news(&key, &signer, 5).len(), 1);
+        assert_eq!(table.watchers_needing_news(&key, &signer, 5).len(), 1);
+        // Admission alone does not suppress a retry after a failed send.
+        assert_eq!(table.watchers_needing_news(&key, &signer, 5).len(), 1);
+        table.mark_notified(&key, &a, &PeerId([3; 32]), &signer, 5);
         // A republish of the same record, or an older one: nothing.
-        assert!(table.watchers_for_news(&key, &signer, 5).is_empty());
-        assert!(table.watchers_for_news(&key, &signer, 4).is_empty());
+        assert!(table.watchers_needing_news(&key, &signer, 5).is_empty());
+        assert!(table.watchers_needing_news(&key, &signer, 4).is_empty());
         // Newer, or another signer: news.
-        assert_eq!(table.watchers_for_news(&key, &signer, 6).len(), 1);
-        assert_eq!(table.watchers_for_news(&key, &other, 1).len(), 1);
+        assert_eq!(table.watchers_needing_news(&key, &signer, 6).len(), 1);
+        table.mark_notified(&key, &a, &PeerId([3; 32]), &signer, 6);
+        assert_eq!(table.watchers_needing_news(&key, &other, 1).len(), 1);
         // A refreshed watch keeps what it was told; a new watcher hears it.
         assert!(table.set_watch(key, a, PeerId([3; 32]), 60));
         assert!(table.set_watch(key, b, PeerId([4; 32]), 60));
-        let news = table.watchers_for_news(&key, &signer, 6);
+        let news = table.watchers_needing_news(&key, &signer, 6);
         assert_eq!(news, vec![(b, PeerId([4; 32]))]);
     }
 

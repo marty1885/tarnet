@@ -57,7 +57,7 @@ impl SearchState {
 /// carry.
 fn hints_from_hops(hops: &[PeerId], reach: impl Fn(&PeerId) -> bool) -> Option<Vec<PeerId>> {
     let toward: Vec<PeerId> = hops.iter().rev().copied().collect();
-    let start = toward.iter().rposition(|p| reach(p)).unwrap_or(0);
+    let start = toward.iter().rposition(reach)?;
     let hints = toward[start..].to_vec();
     (hints.len() <= MAX_HINTS).then_some(hints)
 }
@@ -132,13 +132,32 @@ impl Node {
         if msg.hops.contains(&me) || msg.hops.len() >= ROUTE_SEARCH_PATH_MAX {
             return Ok(());
         }
-        if self.search.waiters.contains(&msg.nonce) {
+        if let Some(expected) = self
+            .search
+            .waiters
+            .inspect(&msg.nonce, |(_, target)| *target)
+        {
+            if expected != msg.target {
+                return Ok(());
+            }
+            // Stateful input validation lives at the dispatch boundary: turn
+            // wire hops into application-ready hints before consuming the
+            // request.  A bad first response therefore cannot discard a later
+            // usable one.
+            let linked: HashSet<PeerId> = self.links.lock().await.keys().copied().collect();
+            let hints = {
+                let rt = self.routing_table.lock().await;
+                hints_from_hops(&msg.hops, |p| linked.contains(p) || rt.lookup(p).is_some())
+            };
+            let Some(hints) = hints else {
+                return Ok(());
+            };
             if let Some((tx, _)) = self
                 .search
                 .waiters
                 .take_if(&msg.nonce, |(_, target)| *target == msg.target)
             {
-                let _ = tx.send(msg.hops);
+                let _ = tx.send(hints);
             }
             return Ok(());
         }
@@ -174,14 +193,21 @@ impl Node {
     /// hints toward it, or `None` if no ring found it (or a search for it
     /// ran less than `SEARCH_PER_TARGET` ago).
     pub async fn route_search(&self, target: &PeerId) -> Option<Vec<PeerId>> {
-        // A search for this target ran recently (or too many are tracked).
-        if self.search.last_search.lock().await.try_insert(*target, ()).is_err() {
-            return None;
-        }
         let me = self.peer_id();
         for ttl in RINGS {
             let links: Vec<PeerId> = self.links.lock().await.keys().copied().collect();
             if links.is_empty() {
+                return None;
+            }
+            if ttl == RINGS[0]
+                && self
+                    .search
+                    .last_search
+                    .lock()
+                    .await
+                    .try_insert(*target, ())
+                    .is_err()
+            {
                 return None;
             }
             let nonce: [u8; 16] = rand::random();
@@ -200,23 +226,10 @@ impl Node {
                 let _ = self.send_to_peer_deferred(peer, &msg).await;
             }
             let answer = tokio::time::timeout(ring_wait(ttl), rx).await;
-            let Ok(Ok(hops)) = answer else { continue };
-            let linked: HashSet<PeerId> = self.links.lock().await.keys().copied().collect();
-            let hints = {
-                let rt = self.routing_table.lock().await;
-                hints_from_hops(&hops, |p| linked.contains(p) || rt.lookup(p).is_some())
-            };
-            match hints {
-                Some(hints) => {
-                    log::info!("Route search found {:?} within {} hops", target, ttl);
-                    let _ = self.search.found.lock().await.upsert(*target, hints.clone());
-                    return Some(hints);
-                }
-                None => {
-                    log::debug!("Route search found {:?}, but too far for hints", target);
-                    return None;
-                }
-            }
+            let Ok(Ok(hints)) = answer else { continue };
+            log::info!("Route search found {:?} within {} hops", target, ttl);
+            let _ = self.search.found.lock().await.upsert(*target, hints.clone());
+            return Some(hints);
         }
         log::info!("Route search found no route to {:?}", target);
         None
@@ -253,6 +266,7 @@ mod tests {
         assert_eq!(hints_from_hops(&hops, reach), Some(vec![pid(2), pid(3), pid(4), pid(5)]));
         // We reach the answering node itself.
         assert_eq!(hints_from_hops(&hops, |p| *p == pid(5)), Some(vec![pid(5)]));
+        assert_eq!(hints_from_hops(&hops, |_| false), None);
         // Too long to carry.
         let long: Vec<PeerId> = (1..=12).rev().map(pid).collect();
         assert_eq!(hints_from_hops(&long, |p| *p == pid(1)), None);
@@ -295,9 +309,41 @@ mod response_regressions {
             .unwrap();
         assert!(node.search.waiters.contains(&nonce));
         msg.target = target;
+        node.routing_table
+            .lock()
+            .await
+            .neighbour_up(from, crate::routing::COST_FAST);
         node.handle_route_search_found(from, &msg.to_bytes())
             .await
             .unwrap();
         assert_eq!(rx.await.unwrap(), vec![from]);
+    }
+
+    #[tokio::test]
+    async fn unusable_answer_does_not_consume_the_waiter() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let from = PeerId([1; 32]);
+        let target = PeerId([2; 32]);
+        let nonce = [3; 16];
+        let (tx, _rx) = oneshot::channel();
+        let _request = node.search.waiters.register(nonce, (tx, target)).unwrap();
+        let msg = RouteSearchFoundMsg {
+            nonce,
+            target,
+            hops: vec![from],
+        };
+
+        node.handle_route_search_found(from, &msg.to_bytes())
+            .await
+            .unwrap();
+        assert!(node.search.waiters.contains(&nonce));
+    }
+
+    #[tokio::test]
+    async fn offline_search_does_not_start_the_target_cooldown() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let target = PeerId([9; 32]);
+        assert_eq!(node.route_search(&target).await, None);
+        assert!(!node.search.last_search.lock().await.contains_key(&target));
     }
 }

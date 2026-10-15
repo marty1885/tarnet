@@ -3,8 +3,8 @@
 Status: **draft, mostly implemented**. Not yet: per-transport link-death
 timing and Hidden-identity lookups over circuits. Replaces the routing part of wire
 v4 (`RouteAdvertisement`, `RouteProbe`, `RouteProbeFound`) and changes link
-framing, `Data` and circuit `EXTEND`. Ships as wire version 6, a hard break
-(`WIRE_VERSION_MIN = WIRE_VERSION_MAX = 6`); after it the wire is frozen or
+framing, `Data` and circuit `EXTEND`. Ships as wire version 7, a hard break
+(`WIRE_VERSION_MIN = WIRE_VERSION_MAX = 7`); after it the wire is frozen or
 extensible. Everything under "Local policy" may change between releases
 without a compatibility break. Open decisions are collected at the end.
 
@@ -966,10 +966,10 @@ Accepted residuals:
   unlinkability. Bytes still change at every waypoint. They learn the next
   waypoint from the routed CREATE, as they learned it from EXTEND in v4.
 
-## Wire format (version 6)
+## Wire format (version 7)
 
 All multi-byte integers are big-endian. `peer` is 32 bytes. The wire message
-header `VER(u8) | TYPE(u16) | LEN(u16)` is unchanged, with `VER = 6`.
+header `VER(u8) | TYPE(u16) | LEN(u16)` is unchanged, with `VER = 7`.
 
 Retired: `RouteAdvertisement (0x0100)`, `RouteProbe (0x0101)`,
 `RouteProbeFound (0x0102)`.
@@ -980,6 +980,8 @@ RouteUpdate        (0x0110)
                      message of a dump), bit2 FULL_END (last message of a dump);
                      others reserved, sent 0, ignored
   degree(u8)         sender's number of links, saturating at 255
+  dump_id(u16)       nonzero generation shared by all chunks of a full dump;
+                     zero on ordinary updates
   count(u16)
   count × ( dest(32) || seqno(u16) || metric(u16) || eflags(u8) )
                      metric 0xFFFF = retraction; eflags bit0 LANDMARK, others reserved
