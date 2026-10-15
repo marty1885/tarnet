@@ -503,7 +503,7 @@ pub struct Node {
     dht_watch_rx: Mutex<Option<mpsc::Receiver<(DhtId, DhtRecord)>>>,
     /// Query token routing table: maps query_token → (previous_hop, created_at).
     /// Used for anonymous hop-by-hop reply routing for DHT GETs and watch notifications.
-    query_tokens: Arc<Mutex<dht::QueryTokens>>,
+    query_tokens: Arc<std::sync::Mutex<dht::QueryTokens>>,
     /// Active local DHT searches: maps query_token → a sender that the
     /// DhtGetResponse handler feeds verified records into, waking the
     /// originating [`DhtSearch`] stream. A `std::sync::Mutex` so the stream's
@@ -820,7 +820,7 @@ impl Node {
         let stats = Arc::new(crate::stats::StatsRegistry::new());
         let bandwidth = Arc::new(crate::bandwidth::BandwidthLimiter::new(0, 0));
         let sender = sender::Sender::new(links.clone(), routing_table.clone(), bandwidth.clone(), stats.clone());
-        let query_tokens = Arc::new(Mutex::new(dht::QueryTokens::new(
+        let query_tokens = Arc::new(std::sync::Mutex::new(dht::QueryTokens::new(
             dht::MAX_QUERY_TOKENS,
             dht::QUERY_TOKEN_TTL,
         )));
@@ -1596,7 +1596,7 @@ impl Node {
                 watches_ref.lock().await.expire();
                 let now = Instant::now();
                 // Expire stale query token mappings
-                tokens_ref.lock().await.expire(now);
+                tokens_ref.lock().unwrap().expire(now);
                 kex_seen_ref.lock().await.expire(now);
                 relay_ext_ref.lock().await.expire(now);
                 pke_ref.lock().await.expire(now);
@@ -2779,16 +2779,7 @@ impl Node {
 
     /// Configure bandwidth limits. Rates are in bytes/sec; 0 = unlimited.
     pub fn set_bandwidth_limits(&mut self, upload_rate: u64, download_rate: u64) {
-        self.bandwidth = Arc::new(crate::bandwidth::BandwidthLimiter::new(
-            upload_rate,
-            download_rate,
-        ));
-        self.sender = sender::Sender::new(
-            self.links.clone(),
-            self.routing_table.clone(),
-            self.bandwidth.clone(),
-            self.stats.clone(),
-        );
+        self.bandwidth.set_rates(upload_rate, download_rate);
     }
 
     /// Update bandwidth rates on an already-running node (e.g. config reload).
@@ -3307,7 +3298,7 @@ mod tests {
     async fn local_lookups_respect_the_reverse_path_cap() {
         let node = Node::new(Keypair::generate());
         {
-            let mut qt = node.query_tokens.lock().await;
+            let mut qt = node.query_tokens.lock().unwrap();
             let mut i = 0u64;
             let entry = || dht::QueryToken {
                 prev: PeerId([1; 32]),
@@ -3322,10 +3313,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let launched = node
             .dht_walker
-            .launch_get(&[0x71; 64], (&node.dht_searches, &tx))
+            .launch_get(&[0x71; 64], (&node.dht_searches, &tx), Instant::now() + Duration::from_secs(1))
             .await;
         assert!(launched.is_empty());
-        assert_eq!(node.query_tokens.lock().await.len(), 65_536);
+        assert_eq!(node.query_tokens.lock().unwrap().len(), 65_536);
         // A relayed GET is refused the same way.
         let from = PeerId([7; 32]);
         node.governor.lock().await.peer_connected(from);
@@ -3335,7 +3326,7 @@ mod tests {
             query_token: [0x73; 32],
         };
         node.handle_message(from, 0, get.to_wire()).await.unwrap();
-        assert!(node.query_tokens.lock().await.get(&[0x73; 32]).is_none());
+        assert!(node.query_tokens.lock().unwrap().get(&[0x73; 32]).is_none());
     }
 
     /// A GET response is accepted only for the key its token asked for.
@@ -3348,8 +3339,7 @@ mod tests {
         let other = DhtId([0x20; 64]);
         let token = [0x55; 32];
         node.query_tokens
-            .lock()
-            .await
+            .lock().unwrap()
             .try_insert(
                 token,
                 dht::QueryToken {

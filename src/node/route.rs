@@ -27,9 +27,12 @@ fn link_cost(link: &PeerLink) -> u16 {
 /// The one way routing messages leave: routing is link upkeep, never held
 /// back by the upload limit, and shares the deferred queue so a neighbour
 /// receives them in the order they were sent.
-async fn send_route(sender: &super::sender::Sender, to: &PeerId, bytes: &[u8]) {
+async fn send_route(sender: &super::sender::Sender, to: &PeerId, bytes: &[u8]) -> bool {
     if let Err(e) = sender.to_peer(to, bytes, Queue::Deferred, Budget::Upkeep).await {
         log::debug!("Failed to send routing message to {:?}: {}", to, e);
+        false
+    } else {
+        true
     }
 }
 
@@ -162,7 +165,7 @@ impl Node {
                     let mut rt = routing.lock().await;
                     let mut requests = Vec::new();
                     if now >= next_gc {
-                        requests.extend(rt.gc());
+                        requests.extend(rt.advance_time(now));
                         next_gc = now + Duration::from_secs(30);
                     }
                     // The active link to a peer can change under us (failover,
@@ -214,7 +217,11 @@ impl Node {
                     }
                 }
                 for (peer, _link, msg) in to_send {
-                    send_route(&sender, &peer, &msg).await;
+                    if !send_route(&sender, &peer, &msg).await {
+                        // take_pending transfers the outbox to this task. Failed
+                        // admission must put an authoritative replacement back.
+                        routing.lock().await.request_full_dump(&peer);
+                    }
                 }
             }
         });

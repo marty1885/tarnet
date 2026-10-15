@@ -1,4 +1,4 @@
-use tokio::sync::Mutex;
+use std::sync::Mutex;
 
 /// Global bandwidth limiter using a refill-on-check token bucket.
 ///
@@ -42,7 +42,7 @@ impl TokenBucket {
         let nbytes = nbytes as f64;
         loop {
             let sleep_dur = {
-                let mut s = self.state.lock().await;
+                let mut s = self.state.lock().unwrap();
 
                 // rate == 0 means unlimited
                 if s.rate == 0.0 {
@@ -73,8 +73,8 @@ impl TokenBucket {
         }
     }
 
-    async fn update_rate(&self, rate: u64) {
-        let mut s = self.state.lock().await;
+    fn update_rate(&self, rate: u64) {
+        let mut s = self.state.lock().unwrap();
         let rate_f = rate as f64;
         s.rate = rate_f;
         s.burst = rate_f;
@@ -108,8 +108,14 @@ impl BandwidthLimiter {
     /// Update rates at runtime (e.g. on config reload). 0 = unlimited.
     /// Seamlessly transitions between unlimited and limited in either direction.
     pub async fn update_rates(&self, upload_rate: u64, download_rate: u64) {
-        self.upload.update_rate(upload_rate).await;
-        self.download.update_rate(download_rate).await;
+        self.set_rates(upload_rate, download_rate);
+    }
+
+    /// Configure the shared limiter without replacing it. Every sender clone
+    /// observes the same configuration, including before node startup.
+    pub fn set_rates(&self, upload_rate: u64, download_rate: u64) {
+        self.upload.update_rate(upload_rate);
+        self.download.update_rate(download_rate);
     }
 }
 

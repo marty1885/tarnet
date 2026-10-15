@@ -100,7 +100,7 @@ struct Neighbour {
     /// A full dump in progress, replacing `rib` when it ends.
     /// Dump snapshot plus ordinary updates that completed while it was in
     /// flight. The latter are replayed when the snapshot commits.
-    staging: Option<(u16, BTreeMap<PeerId, RouteEntry>, BTreeMap<PeerId, RouteEntry>)>,
+    staging: Option<RouteSnapshot>,
     last_dump_id: Option<u16>,
     next_dump_id: u16,
     /// No full dump from this neighbour has completed yet: its first dump
@@ -116,6 +116,43 @@ struct Neighbour {
     dump_due: bool,
     degree_dirty: bool,
     needs_resync: bool,
+}
+
+/// A snapshot and the newer changes received while it is in flight.
+/// Both incremental visibility and final commit use `view`: there is no
+/// second precedence rule for the initial dump.
+struct RouteSnapshot {
+    id: u16,
+    routes: BTreeMap<PeerId, RouteEntry>,
+    changes: BTreeMap<PeerId, RouteEntry>,
+}
+
+impl RouteSnapshot {
+    fn new(id: u16) -> Self {
+        Self {
+            id,
+            routes: BTreeMap::new(),
+            changes: BTreeMap::new(),
+        }
+    }
+
+    fn view(&self, cap: usize) -> Option<BTreeMap<PeerId, RouteEntry>> {
+        admit_routes(&self.routes, self.changes.values().copied(), cap)
+    }
+
+    fn apply(&mut self, full: bool, entries: &[RouteEntry], cap: usize) -> Option<()> {
+        if full {
+            self.routes = admit_routes(&self.routes, entries.iter().copied(), cap)?;
+        } else {
+            for entry in entries {
+                self.changes.insert(entry.dest, *entry);
+            }
+            if self.changes.len() > cap {
+                return None;
+            }
+        }
+        Some(())
+    }
 }
 
 /// Admission boundary for an authoritative route set. Apply the complete
@@ -471,14 +508,14 @@ impl RoutingTable {
             let newest = nb
                 .staging
                 .as_ref()
-                .map(|(id, _, _)| *id)
+                .map(|snapshot| snapshot.id)
                 .or(nb.last_dump_id);
             if !newest.map_or(true, |old| seqno_newer(msg.dump_id, old)) {
                 return Vec::new();
             }
-            nb.staging = Some((msg.dump_id, BTreeMap::new(), BTreeMap::new()));
+            nb.staging = Some(RouteSnapshot::new(msg.dump_id));
         }
-        if full && !nb.staging.as_ref().is_some_and(|(id, _, _)| *id == msg.dump_id) {
+        if full && !nb.staging.as_ref().is_some_and(|snapshot| snapshot.id == msg.dump_id) {
             // Part of a dump whose start we missed: useless on its own. The
             // next digest asks again.
             return Vec::new();
@@ -486,26 +523,20 @@ impl RoutingTable {
         // All authoritative sets enter through the same admission boundary.
         // The replay log is different: it retains withdrawals as tombstones.
         let accepted = (|| -> Option<()> {
-            if !full || nb.first_dump {
+            if !full {
                 nb.rib = admit_routes(&nb.rib, msg.entries.iter().copied(), cap)?;
             }
-            if let Some((_, snapshot, changes)) = nb.staging.as_mut() {
-                if full {
-                    *snapshot = admit_routes(snapshot, msg.entries.iter().copied(), cap)?;
-                } else {
-                    for e in &msg.entries {
-                        changes.insert(e.dest, *e);
-                    }
-                    if changes.len() > cap {
-                        return None;
-                    }
-                }
+            if let Some(snapshot) = nb.staging.as_mut() {
+                snapshot.apply(full, &msg.entries, cap)?;
+            }
+            if full && nb.first_dump {
+                nb.rib = nb.staging.as_ref()?.view(cap)?;
             }
             if end {
-                let (id, snapshot, changes) = nb.staging.take()?;
-                nb.rib = admit_routes(&snapshot, changes.into_values(), cap)?;
+                let snapshot = nb.staging.take()?;
+                nb.rib = snapshot.view(cap)?;
                 nb.first_dump = false;
-                nb.last_dump_id = Some(id);
+                nb.last_dump_id = Some(snapshot.id);
                 nb.needs_resync = false;
             }
             Some(())
@@ -677,13 +708,26 @@ impl RoutingTable {
     /// whose feasibility distance expired may have become selectable, so this
     /// reselects; returns the resulting seqno requests.
     pub fn gc(&mut self) -> Vec<SeqnoRequest> {
-        let now = Instant::now();
+        self.advance_time(Instant::now())
+    }
+
+    /// Explicit clock transition: expire safety history and policy penalties,
+    /// then invalidate derived selection whenever either changes.
+    pub fn advance_time(&mut self, now: Instant) -> Vec<SeqnoRequest> {
         let selected = &self.selected;
         let before = self.fd.len();
         self.fd
             .retain(|d, (_, _, t)| selected.contains_key(d) || now.duration_since(*t) < FD_GC);
         self.recent_requests.expire(now);
-        if self.fd.len() < before {
+        let policy_expired = self.flags.values_mut().fold(false, |expired, state| {
+            if state.ignored_until.is_some_and(|until| until <= now) {
+                state.ignored_until = None;
+                true
+            } else {
+                expired
+            }
+        });
+        if self.fd.len() < before || policy_expired {
             self.decide()
         } else {
             Vec::new()

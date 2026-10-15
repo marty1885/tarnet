@@ -1362,7 +1362,9 @@ impl PeerLink {
     /// can see.
     pub async fn send_deferred(&self, data: &[u8]) -> Result<()> {
         self.outgoing(data)?;
-        self.enqueue(Outgoing::Deferred(data.to_vec()))
+        self.outbound_tx
+            .try_send(Outgoing::Deferred(data.to_vec()))
+            .map_err(|e| Error::Wire(format!("deferred queue admission failed: {}", e)))
     }
 
     /// Unpack a decrypted frame: queue its messages, reassemble fragments,
@@ -1998,6 +2000,18 @@ mod tests {
         let sizes = log.sizes.lock().unwrap()[before..].to_vec();
         assert!(sizes.len() >= 3000 / SLOW_FRAME_PLAIN);
         assert!(sizes.iter().all(|&n| n == 256), "every slow-link frame is 256 B: {:?}", sizes);
+    }
+
+    #[tokio::test]
+    async fn deferred_send_reports_admission_failure_under_congestion() {
+        let (a, b) = lossy_pair(&[], &[]);
+        let (link, _remote) = handshake_over(a, b).await;
+        // Reservations deterministically fill admission capacity, independently
+        // of drain-task scheduling or transport speed.
+        let _capacity = link.outbound_tx.reserve_many(link.outbound_tx.max_capacity()).await.unwrap();
+        assert!(link.send_deferred(&ping()).await.is_err());
+        drop(_capacity);
+        assert!(link.send_deferred(&ping()).await.is_ok());
     }
 
     #[tokio::test]

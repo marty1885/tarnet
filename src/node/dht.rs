@@ -10,7 +10,7 @@ pub(crate) struct DhtWalker {
     pub(super) routing_table: Arc<Mutex<RoutingTable>>,
     /// Neighbours' `DhtNeighbor` store flags; missing means "assume it stores".
     pub(super) neighbor_stores: Arc<Mutex<HashMap<PeerId, bool>>>,
-    pub(super) query_tokens: Arc<Mutex<QueryTokens>>,
+    pub(super) query_tokens: Arc<std::sync::Mutex<QueryTokens>>,
     pub(super) sender: super::sender::Sender,
 }
 
@@ -94,14 +94,18 @@ impl DhtWalker {
     pub(super) async fn launch_get(
         &self,
         key: &[u8; 64],
-        search: (&SearchRegistry, &mpsc::Sender<VerifiedRecord>),
-    ) -> Vec<[u8; 32]> {
+        search: (&Arc<SearchRegistry>, &mpsc::Sender<VerifiedRecord>),
+        deadline: Instant,
+    ) -> SearchRound {
+        // Outbound work may not outlive either the search or the reverse path
+        // authorizing its responses.
+        let send_deadline = deadline.min(Instant::now() + QUERY_TOKEN_TTL);
         let hops = self.first_hops().await;
         let count = hops.len();
         // Each token remembers the first hop it leaves through: responses
         // under it are taken only from there.
         let walks: Vec<([u8; 32], PeerId)> = {
-            let mut qt = self.query_tokens.lock().await;
+            let mut qt = self.query_tokens.lock().unwrap();
             hops.into_iter()
                 .map(|hop| (random_token(), hop))
                 .filter(|(t, hop)| {
@@ -128,10 +132,11 @@ impl DhtWalker {
                 reg.insert(*t, tx.clone());
             }
         }
-        let mut registration = SearchLaunch {
-            registry: search.0,
-            tokens: &tokens,
-            committed: false,
+        let mut registration = SearchRound {
+            registry: search.0.clone(),
+            query_tokens: self.query_tokens.clone(),
+            tokens,
+            task: None,
         };
         let msgs = walks
             .into_iter()
@@ -144,29 +149,46 @@ impl DhtWalker {
                 (hop, get.to_wire().encode())
             })
             .collect();
-        self.send_walks(msgs).await;
-        registration.committed = true;
-        drop(registration);
-        tokens
+        let walker = self.clone();
+        registration.task = Some(tokio::spawn(async move {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(send_deadline),
+                walker.send_walks(msgs),
+            )
+            .await;
+        }));
+        registration
     }
 }
 
 pub(super) type SearchRegistry = std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<VerifiedRecord>>>;
 
-/// Roll back registration if a launch is cancelled while sending its walks.
-struct SearchLaunch<'a> {
-    registry: &'a SearchRegistry,
-    tokens: &'a [[u8; 32]],
-    committed: bool,
+/// Own all resources of one locally launched round. Cancellation has one
+/// synchronous boundary, including when the enclosing launch is cancelled.
+#[must_use = "dropping the round cancels its walks and releases its registrations"]
+pub(super) struct SearchRound {
+    registry: Arc<SearchRegistry>,
+    query_tokens: Arc<std::sync::Mutex<QueryTokens>>,
+    tokens: Vec<[u8; 32]>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl Drop for SearchLaunch<'_> {
+impl SearchRound {
+    pub(super) fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+impl Drop for SearchRound {
     fn drop(&mut self) {
-        if !self.committed {
-            let mut registry = self.registry.lock().unwrap();
-            for token in self.tokens {
-                registry.remove(token);
-            }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let mut registry = self.registry.lock().unwrap();
+        let mut queries = self.query_tokens.lock().unwrap();
+        for token in &self.tokens {
+            registry.remove(token);
+            queries.remove(token);
         }
     }
 }
@@ -325,7 +347,7 @@ impl Node {
         // Checked and added in one step, so the cap holds however dispatch
         // is scheduled.
         let first_visit = {
-            let mut qt = self.query_tokens.lock().await;
+            let mut qt = self.query_tokens.lock().unwrap();
             let fresh = QueryToken {
                 prev: from,
                 key: get.key,
@@ -355,7 +377,7 @@ impl Node {
         if let WalkStep::Forward(next, walk) = self.dht_walk_step(&key, &get.walk, &from).await {
             // Responses relayed back come only from where it went.
             {
-                let mut qt = self.query_tokens.lock().await;
+                let mut qt = self.query_tokens.lock().unwrap();
                 let Some(t) = qt.get_mut(&get.query_token) else {
                     return Ok(());
                 };
@@ -423,8 +445,7 @@ impl Node {
         // asked, from where the walk went, are accepted.
         let prev_hop = self
             .query_tokens
-            .lock()
-            .await
+            .lock().unwrap()
             .get(&resp.query_token)
             .filter(|t| t.key == resp.key && t.next.contains(&from))
             .map(|t| t.prev);
@@ -965,13 +986,13 @@ impl Node {
         let (tx, rx) = mpsc::channel(SEARCH_BUFFER);
         // No time to wait: only what is held here.
         let tokens = if deadline > Instant::now() {
-            self.dht_walker
-                .launch_get(key.as_bytes(), (&self.dht_searches, &tx))
-                .await
+            Some(self.dht_walker
+                .launch_get(key.as_bytes(), (&self.dht_searches, &tx), deadline)
+                .await)
         } else {
-            Vec::new()
+            None
         };
-        let rounds_left = if tokens.is_empty() {
+        let rounds_left = if tokens.as_ref().map_or(true, SearchRound::is_empty) {
             SEARCH_ROUNDS
         } else {
             SEARCH_ROUNDS - 1
@@ -981,7 +1002,7 @@ impl Node {
             rx,
             tx,
             key,
-            tokens,
+            rounds: tokens.into_iter().filter(|round| !round.is_empty()).collect(),
             deadline,
             rounds_left,
             next_round: Instant::now() + SEARCH_RELAUNCH_INTERVAL,
@@ -1053,8 +1074,8 @@ pub struct DhtSearch {
     rx: mpsc::Receiver<VerifiedRecord>,
     tx: mpsc::Sender<VerifiedRecord>,
     key: DhtId,
-    /// Query tokens of every walk launched so far.
-    tokens: Vec<[u8; 32]>,
+    /// Owned rounds keep registrations and outbound tasks alive together.
+    rounds: Vec<SearchRound>,
     deadline: Instant,
     rounds_left: u32,
     next_round: Instant,
@@ -1080,6 +1101,7 @@ impl DhtSearch {
                 None => {
                     let now = Instant::now();
                     if now >= self.deadline {
+                        self.rounds.clear();
                         return None;
                     }
                     let relaunch = self.rounds_left > 0;
@@ -1091,17 +1113,20 @@ impl DhtSearch {
                     tokio::select! {
                         r = self.rx.recv() => r?,
                         _ = tokio::time::sleep(wake.saturating_duration_since(now)) => {
-                            if Instant::now() >= self.deadline { return None; }
+                            if Instant::now() >= self.deadline {
+                                self.rounds.clear();
+                                return None;
+                            }
                             if relaunch && Instant::now() >= self.next_round {
                                 self.next_round = Instant::now() + SEARCH_RELAUNCH_INTERVAL;
                                 let tokens = self
                                     .walker
-                                    .launch_get(self.key.as_bytes(), (&self.registry, &self.tx))
+                                    .launch_get(self.key.as_bytes(), (&self.registry, &self.tx), self.deadline)
                                     .await;
                                 if !tokens.is_empty() {
                                     self.rounds_left -= 1;
+                                    self.rounds.push(tokens);
                                 }
-                                self.tokens.extend(tokens);
                             }
                             continue;
                         }
@@ -1120,16 +1145,6 @@ impl DhtSearch {
             );
             if self.seen.insert(id) {
                 return Some(rec);
-            }
-        }
-    }
-}
-
-impl Drop for DhtSearch {
-    fn drop(&mut self) {
-        if let Ok(mut reg) = self.registry.lock() {
-            for token in &self.tokens {
-                reg.remove(token);
             }
         }
     }
@@ -1156,18 +1171,64 @@ mod lifetime_regressions {
     }
 
     #[test]
-    fn cancelling_a_get_launch_rolls_back_search_registrations() {
-        let registry = SearchRegistry::new(HashMap::new());
+    fn cancelling_a_round_releases_both_registrations() {
+        let registry = Arc::new(SearchRegistry::new(HashMap::new()));
+        let queries = Arc::new(std::sync::Mutex::new(QueryTokens::new(1, QUERY_TOKEN_TTL)));
         let (tx, _rx) = mpsc::channel(1);
         registry.lock().unwrap().insert([1; 32], tx);
-        let tokens = [[1; 32]];
-        let launch = SearchLaunch {
-            registry: &registry,
-            tokens: &tokens,
-            committed: false,
-        };
-        drop(launch);
+        queries.lock().unwrap().try_insert([1; 32], QueryToken {
+            prev: PeerId([0; 32]), key: [0; 64], next: vec![],
+        }).unwrap();
+        let round = SearchRound { registry: registry.clone(), query_tokens: queries.clone(), tokens: vec![[1; 32]], task: None };
+        drop(round);
         assert!(registry.lock().unwrap().is_empty());
+        assert!(queries.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn throttled_search_deadline_and_cancellation_own_all_resources() {
+        use crate::transport::tcp::TcpTransport;
+        use tokio::net::{TcpListener, TcpStream};
+        let local = Keypair::generate_ed25519();
+        let remote = Keypair::generate_ed25519();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            PeerLink::responder(Box::new(TcpTransport::new(stream)), &remote).await.unwrap()
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let link = PeerLink::initiator(Box::new(TcpTransport::new(stream)), &local, None).await.unwrap();
+        let _remote_link = server.await.unwrap();
+        let mut node = Node::new(local);
+        node.set_bandwidth_limits(1, 0);
+        // Drain the burst so every outbound walk must wait for bandwidth.
+        node.bandwidth.acquire_upload(1).await;
+        node.links.lock().await.insert(link.remote_peer(), Arc::new(link));
+        let key = DhtId([7; 64]);
+        let (held, _) = VerifiedRecord::new_content(b"held", WATCH_REGISTRATION);
+        let held_key = held.record().key;
+        node.dht_store.lock().await.put(held);
+        let mut held_search = tokio::time::timeout(Duration::from_millis(100),
+            node.dht_search(held_key, Instant::now() + Duration::from_secs(10)))
+            .await.expect("walk launch blocked a held result");
+        assert!(held_search.next().await.is_some());
+        drop(held_search);
+        assert!(node.query_tokens.lock().unwrap().is_empty());
+        assert!(node.dht_searches.lock().unwrap().is_empty());
+        let mut search = node.dht_search(key, Instant::now() + Duration::from_millis(20)).await;
+        let task = search.rounds[0].task.as_ref().unwrap().abort_handle();
+        assert!(!node.query_tokens.lock().unwrap().is_empty());
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished(), "DHT sender bypassed the configured shared limiter");
+        assert!(tokio::time::timeout(Duration::from_millis(100), search.next()).await.unwrap().is_none());
+        assert!(node.query_tokens.lock().unwrap().is_empty(), "deadline retained reverse-path capacity");
+        assert!(node.dht_searches.lock().unwrap().is_empty());
+        drop(search);
+        tokio::task::yield_now().await;
+        assert!(task.is_finished(), "cancelled search left its send task alive");
+        assert!(node.query_tokens.lock().unwrap().is_empty());
+        assert!(node.dht_searches.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1221,7 +1282,7 @@ mod lifetime_regressions {
         let search = node
             .dht_search(DhtId([7; 64]), Instant::now() + Duration::from_secs(10))
             .await;
-        assert!(search.tokens.is_empty());
+        assert!(search.rounds.is_empty());
         assert_eq!(search.rounds_left, SEARCH_ROUNDS);
     }
 
