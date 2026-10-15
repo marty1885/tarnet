@@ -6,17 +6,33 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use tarnet_api::service::{ServiceApi, TnsRecord, TnsResolution};
-use tarnet_api::types::{NodeStatus, ServiceId};
+use tarnet_api::types::{ContentHandle, LinkStatus, NodeStatus, PeerId, ServiceId};
 use tarnet_client::IpcServiceApi;
 use tarnet_expose::expose::ServiceConfig;
 
 mod layout;
 
 use crate::{connect_daemon, Cli};
+
+// Tab indices, in display order.
+const NODE: usize = 0;
+const ROUTING: usize = 1;
+const SERVICES: usize = 2;
+const TNS: usize = 3;
+const LOOKUP: usize = 4;
+const DHT: usize = 5;
+const TAB_COUNT: usize = 6;
+
+/// How often the node status (peers, routing table) is re-polled.
+const STATUS_REFRESH: Duration = Duration::from_secs(2);
+/// How long a DHT playground GET waits for the network.
+const DHT_GET_TIMEOUT_SECS: u32 = 15;
+const DHT_HISTORY: usize = 50;
 
 type Identity = (String, ServiceId);
 type Label = (String, Vec<TnsRecord>, bool);
@@ -41,6 +57,25 @@ struct App {
     lookup: Option<(String, String)>,
     message: String,
     input: Option<Input>,
+    last_refresh: Instant,
+    dht_ops: Vec<DhtOp>,
+    pending: Option<Pending>,
+}
+
+/// One entry in the DHT playground history (newest first).
+struct DhtOp {
+    kind: &'static str,
+    /// Hex content handle; empty when a PUT failed before producing one.
+    handle: String,
+    data: Option<Vec<u8>>,
+    ok: bool,
+    note: String,
+}
+
+/// A slow daemon call, deferred so the "working" state is drawn first.
+enum Pending {
+    DhtPut(Vec<u8>),
+    DhtGet([u8; 64]),
 }
 
 enum Input {
@@ -62,12 +97,18 @@ enum Input {
         answer: String,
     },
     Remove(String),
+    DhtPut(String),
+    DhtGet(String),
 }
 
 impl Input {
     fn value_mut(&mut self) -> &mut String {
         match self {
-            Self::Resolve(v) | Self::SetName(v) | Self::Remove(v) => v,
+            Self::Resolve(v)
+            | Self::SetName(v)
+            | Self::Remove(v)
+            | Self::DhtPut(v)
+            | Self::DhtGet(v) => v,
             Self::SetType { value, .. } | Self::SetValue { value, .. } => value,
             Self::SetPublic { answer, .. } => answer,
         }
@@ -81,6 +122,8 @@ impl Input {
             Self::SetValue { .. } => "Value (ServiceId or text)",
             Self::SetPublic { .. } => "Publish to DHT? (y/N)",
             Self::Remove(_) => "Remove selected record? (y/N)",
+            Self::DhtPut(_) => "Put content (text, or @path to a file)",
+            Self::DhtGet(_) => "Get content handle (128 hex chars)",
         }
     }
 }
@@ -103,6 +146,9 @@ pub(super) async fn run(cli: &Cli, services_dir: Option<&Path>) {
         lookup: None,
         message: String::new(),
         input: None,
+        last_refresh: Instant::now(),
+        dht_ops: Vec::new(),
+        pending: None,
     };
     app.refresh().await;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -145,12 +191,60 @@ impl App {
             Err(e) => self.message = format!("Identity lookup failed: {e}"),
         }
         self.refresh_labels().await;
-        self.status = Some(self.client.node_status().await);
+        self.refresh_status().await;
         self.services = read_services(&self.services_dir);
         if !self.services_dir.is_dir() {
             self.message = format!("Service directory not found: {} (use --services-dir for a custom daemon directory)", self.services_dir.display());
         }
         self.selected = self.selected.min(self.item_count().saturating_sub(1));
+    }
+
+    /// Re-poll the daemon status. On the routing tab the selection follows
+    /// its destination, so a re-sorted table doesn't move the cursor.
+    async fn refresh_status(&mut self) {
+        let keep = (self.tab == ROUTING)
+            .then(|| self.sorted_routes().get(self.selected).map(|r| r.0))
+            .flatten();
+        self.status = Some(self.client.node_status().await);
+        self.last_refresh = Instant::now();
+        if let Some(dest) = keep {
+            if let Some(i) = self.sorted_routes().iter().position(|r| r.0 == dest) {
+                self.selected = i;
+            }
+        }
+        self.selected = self.selected.min(self.item_count().saturating_sub(1));
+    }
+
+    /// Routes ordered by cost, then destination, so the table is stable
+    /// between polls.
+    fn sorted_routes(&self) -> Vec<&(PeerId, PeerId, u32)> {
+        let mut routes: Vec<_> = self
+            .status
+            .as_ref()
+            .map(|s| s.routes.iter().collect())
+            .unwrap_or_default();
+        routes.sort_by_key(|(dest, _, cost)| (*cost, *dest));
+        routes
+    }
+
+    /// The link a packet to `next_hop` leaves on: its active link, or any.
+    fn link_to(&self, next_hop: &PeerId) -> Option<&LinkStatus> {
+        let peer = self
+            .status
+            .as_ref()?
+            .peers
+            .iter()
+            .find(|p| p.peer_id == *next_hop)?;
+        peer.links
+            .iter()
+            .find(|l| l.state == "active")
+            .or_else(|| peer.links.first())
+    }
+
+    fn set_tab(&mut self, tab: usize) {
+        self.tab = tab % TAB_COUNT;
+        self.selected = 0;
+        self.detail_scroll = 0;
     }
 
     async fn refresh_labels(&mut self) {
@@ -169,16 +263,29 @@ impl App {
 
     fn item_count(&self) -> usize {
         match self.tab {
-            0 => self.identities.len(),
-            1 => self.services.len(),
-            2 => self.labels.len(),
+            NODE => self.identities.len(),
+            ROUTING => self.status.as_ref().map_or(0, |s| s.routes.len()),
+            SERVICES => self.services.len(),
+            TNS => self.labels.len(),
+            DHT => self.dht_ops.len(),
             _ => 0,
         }
     }
 
     async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         loop {
+            if self.last_refresh.elapsed() >= STATUS_REFRESH {
+                self.refresh_status().await;
+            }
             self.draw(terminal)?;
+            if let Some(pending) = self.pending.take() {
+                self.run_pending(pending).await;
+                continue;
+            }
+            // Wake periodically so the node and routing views stay live.
+            if !event::poll(Duration::from_millis(500))? {
+                continue;
+            }
             let Event::Key(key) = event::read()? else {
                 continue;
             };
@@ -202,16 +309,9 @@ impl App {
             match key.code {
                 KeyCode::Char('q') => break,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                KeyCode::Char(c @ '1'..='4') => {
-                    self.tab = (c as u8 - b'1') as usize;
-                    self.selected = 0;
-                    self.detail_scroll = 0;
-                }
-                KeyCode::Tab => {
-                    self.tab = (self.tab + 1) % 4;
-                    self.selected = 0;
-                    self.detail_scroll = 0;
-                }
+                KeyCode::Char(c @ '1'..='6') => self.set_tab((c as u8 - b'1') as usize),
+                KeyCode::Tab | KeyCode::Right => self.set_tab(self.tab + 1),
+                KeyCode::BackTab | KeyCode::Left => self.set_tab(self.tab + TAB_COUNT - 1),
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.selected = (self.selected + 1).min(self.item_count().saturating_sub(1));
                     self.detail_scroll = 0;
@@ -235,17 +335,19 @@ impl App {
                     }
                 }
                 KeyCode::Char('/') => {
-                    self.tab = 3;
+                    self.tab = LOOKUP;
                     self.detail_scroll = 0;
                     self.input = Some(Input::Resolve(String::new()));
                 }
-                KeyCode::Char('a') if self.tab == 2 => {
+                KeyCode::Char('a') if self.tab == TNS => {
                     self.input = Some(Input::SetName(String::new()))
                 }
-                KeyCode::Char('d') if self.tab == 2 && self.selected < self.labels.len() => {
+                KeyCode::Char('d') if self.tab == TNS && self.selected < self.labels.len() => {
                     self.input = Some(Input::Remove(String::new()))
                 }
-                KeyCode::Char('e') if self.tab == 1 && self.selected < self.services.len() => {
+                KeyCode::Char('e')
+                    if self.tab == SERVICES && self.selected < self.services.len() =>
+                {
                     self.edit_service(terminal).await?
                 }
                 KeyCode::Char('R') => match self.client.reload().await {
@@ -254,8 +356,24 @@ impl App {
                     }
                     Err(e) => self.message = format!("Reload failed: {e}"),
                 },
-                KeyCode::Enter if self.tab == 1 => self.inspect_service().await,
-                KeyCode::Enter if self.tab == 2 => self.inspect_label().await,
+                KeyCode::Char('p') if self.tab == DHT => {
+                    self.input = Some(Input::DhtPut(String::new()))
+                }
+                KeyCode::Char('g') if self.tab == DHT => {
+                    self.input = Some(Input::DhtGet(String::new()))
+                }
+                KeyCode::Enter if self.tab == DHT => {
+                    // Re-fetch the selected entry's handle from the network.
+                    if let Some(h) = self
+                        .dht_ops
+                        .get(self.selected)
+                        .and_then(|op| parse_handle(&op.handle).ok())
+                    {
+                        self.start_get(h);
+                    }
+                }
+                KeyCode::Enter if self.tab == SERVICES => self.inspect_service().await,
+                KeyCode::Enter if self.tab == TNS => self.inspect_label().await,
                 _ => {}
             }
         }
@@ -317,6 +435,24 @@ impl App {
                     Err(e) => self.message = format!("Set failed: {e}"),
                 }
             }
+            Input::DhtPut(text) if !text.is_empty() => {
+                let data = match text.strip_prefix('@') {
+                    Some(path) => match fs::read(path.trim()) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            self.message = format!("Cannot read {}: {e} (failed)", path.trim());
+                            return;
+                        }
+                    },
+                    None => text.into_bytes(),
+                };
+                self.message = format!("Storing {} bytes in the DHT…", data.len());
+                self.pending = Some(Pending::DhtPut(data));
+            }
+            Input::DhtGet(handle) if !handle.trim().is_empty() => match parse_handle(&handle) {
+                Ok(h) => self.start_get(h),
+                Err(e) => self.message = format!("Invalid handle: {e}"),
+            },
             Input::Remove(answer)
                 if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") =>
             {
@@ -340,6 +476,63 @@ impl App {
         }
     }
 
+    fn start_get(&mut self, handle: [u8; 64]) {
+        self.message = format!("Fetching from the DHT (up to {DHT_GET_TIMEOUT_SECS}s)…");
+        self.pending = Some(Pending::DhtGet(handle));
+    }
+
+    async fn run_pending(&mut self, pending: Pending) {
+        let op = match pending {
+            Pending::DhtPut(data) => match self.client.dht_put(&data).await {
+                Ok(handle) => DhtOp {
+                    kind: "PUT",
+                    handle: hex(handle.as_bytes()),
+                    note: format!("stored {} bytes", data.len()),
+                    data: Some(data),
+                    ok: true,
+                },
+                Err(e) => DhtOp {
+                    kind: "PUT",
+                    handle: String::new(),
+                    data: None,
+                    ok: false,
+                    note: format!("put failed: {e}"),
+                },
+            },
+            Pending::DhtGet(handle) => {
+                match self
+                    .client
+                    .dht_get(&ContentHandle(handle), DHT_GET_TIMEOUT_SECS)
+                    .await
+                {
+                    Some(data) => DhtOp {
+                        kind: "GET",
+                        handle: hex(&handle),
+                        note: format!("retrieved {} bytes", data.len()),
+                        data: Some(data),
+                        ok: true,
+                    },
+                    None => DhtOp {
+                        kind: "GET",
+                        handle: hex(&handle),
+                        data: None,
+                        ok: false,
+                        note: format!("not found within {DHT_GET_TIMEOUT_SECS}s"),
+                    },
+                }
+            }
+        };
+        self.message = format!("{} {}", op.kind, op.note);
+        if !op.ok {
+            self.message.push_str(" (failed)");
+        }
+        self.dht_ops.insert(0, op);
+        self.dht_ops.truncate(DHT_HISTORY);
+        self.selected = 0;
+        self.detail_scroll = 0;
+        self.tab = DHT;
+    }
+
     async fn resolve(&mut self, name: &str) {
         // The explicit-zone daemon API reads published records. A private label
         // in a nondefault local zone is visible through the label API instead.
@@ -360,7 +553,7 @@ impl App {
                             .join("\n")
                     ),
                 ));
-                self.tab = 3;
+                self.tab = LOOKUP;
                 self.detail_scroll = 0;
                 return;
             }
@@ -399,7 +592,7 @@ impl App {
                 Err(e) => format!("Lookup failed: {e}"),
             },
         ));
-        self.tab = 3;
+        self.tab = LOOKUP;
         self.detail_scroll = 0;
     }
 
@@ -457,7 +650,7 @@ impl App {
             format!("{}.{} (service {})", name, zone_name, file.name),
             diagnosis,
         ));
-        self.tab = 3;
+        self.tab = LOOKUP;
         self.detail_scroll = 0;
     }
 
@@ -482,6 +675,24 @@ impl App {
         terminal.draw(|frame| layout::render(frame, self))?;
         Ok(())
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Parse a 64-byte content handle from 128 hex characters.
+fn parse_handle(text: &str) -> Result<[u8; 64], String> {
+    let text = text.trim();
+    if text.len() != 128 || !text.is_ascii() {
+        return Err(format!("expected 128 hex chars, got {}", text.len()));
+    }
+    let mut out = [0u8; 64];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&text[2 * i..2 * i + 2], 16)
+            .map_err(|_| "not valid hex".to_string())?;
+    }
+    Ok(out)
 }
 
 fn read_services(dir: &Path) -> Vec<ServiceFile> {
@@ -571,7 +782,11 @@ fn parse_record(kind: &str, value: &str) -> Result<TnsRecord, String> {
 
 fn input_text(input: &Input) -> &str {
     match input {
-        Input::Resolve(s) | Input::SetName(s) | Input::Remove(s) => s,
+        Input::Resolve(s)
+        | Input::SetName(s)
+        | Input::Remove(s)
+        | Input::DhtPut(s)
+        | Input::DhtGet(s) => s,
         Input::SetType { value, .. } | Input::SetValue { value, .. } => value,
         Input::SetPublic { answer, .. } => answer,
     }
@@ -580,6 +795,15 @@ fn input_text(input: &Input) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handle_parsing_requires_128_hex_chars() {
+        assert!(parse_handle(&"ab".repeat(64)).is_ok());
+        assert!(parse_handle(&format!("  {}\n", "01".repeat(64))).is_ok());
+        assert!(parse_handle("abcd").is_err());
+        assert!(parse_handle(&"zz".repeat(64)).is_err());
+        assert!(parse_handle(&"é".repeat(64)).is_err());
+    }
 
     #[test]
     fn deployment_diagnostic_distinguishes_target_and_record_type() {
