@@ -57,11 +57,21 @@ struct App {
     services: Vec<ServiceFile>,
     status: Option<NodeStatus>,
     lookup: Option<(String, String)>,
+    lookup_task: Option<LookupTask>,
     message: String,
     input: Option<Input>,
     last_refresh: Instant,
     dht_ops: Vec<DhtOp>,
     pending: Option<Pending>,
+}
+
+/// Cancel abandoned lookups on replacement or when the TUI closes.
+struct LookupTask(tokio::task::JoinHandle<String>);
+
+impl Drop for LookupTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// One entry in the DHT playground history (newest first).
@@ -147,6 +157,7 @@ pub(super) async fn run(cli: &Cli, services_dir: Option<&Path>) {
         services: Vec::new(),
         status: None,
         lookup: None,
+        lookup_task: None,
         message: String::new(),
         input: None,
         last_refresh: Instant::now(),
@@ -278,6 +289,7 @@ impl App {
 
     async fn event_loop(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
         loop {
+            self.poll_lookup().await;
             if self.last_refresh.elapsed() >= STATUS_REFRESH {
                 self.refresh_status().await;
             }
@@ -387,7 +399,7 @@ impl App {
     async fn submit(&mut self) {
         let input = self.input.take().unwrap();
         match input {
-            Input::Resolve(name) if !name.trim().is_empty() => self.resolve(&name).await,
+            Input::Resolve(name) if !name.trim().is_empty() => self.resolve(&name),
             Input::SetName(name) if !name.trim().is_empty() => {
                 self.input = Some(Input::SetType {
                     name,
@@ -537,33 +549,60 @@ impl App {
         self.tab = DHT;
     }
 
-    async fn resolve(&mut self, name: &str) {
-        let zone = match self.identities.get(self.identity) {
-            Some((_, sid)) => *sid,
-            None => self.client.default_service_id().await,
-        };
-        let client = self.client.as_ref();
-        let lookup =
-            |zone, label: String| async move { client.tns_lookup_label(zone, &label).await };
-        let mut steps = Vec::new();
-        let result = match tokio::time::timeout(
-            Duration::from_secs(30),
-            resolve_lookup(&lookup, zone, name, 0, &mut steps),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => TnsResolution::Error("total resolution timeout exceeded".into()),
-        };
-        self.lookup = Some((name.to_string(), describe_trace(&steps, &result)));
+    fn start_lookup<F>(&mut self, title: String, work: F)
+    where
+        F: std::future::Future<Output = String> + Send + 'static,
+    {
+        self.lookup_task = Some(LookupTask(tokio::spawn(async move {
+            match tokio::time::timeout(Duration::from_secs(30), work).await {
+                Ok(description) => description,
+                Err(_) => "Resolution timed out without a conclusive answer".into(),
+            }
+        })));
+        self.lookup = Some((title, "Resolving… (waiting for a response)".into()));
         self.tab = LOOKUP;
         self.detail_scroll = 0;
+    }
+
+    async fn poll_lookup(&mut self) {
+        if self
+            .lookup_task
+            .as_ref()
+            .is_some_and(|task| task.0.is_finished())
+        {
+            let mut task = self.lookup_task.take().unwrap();
+            let description = match (&mut task.0).await {
+                Ok(description) => description,
+                Err(e) => format!("Lookup failed: {e}"),
+            };
+            if let Some((_, text)) = &mut self.lookup {
+                *text = description;
+            }
+        }
+    }
+
+    fn resolve(&mut self, name: &str) {
+        let zone = self.identities.get(self.identity).map(|(_, sid)| *sid);
+        let client = Arc::clone(&self.client);
+        let name = name.to_string();
+        self.start_lookup(name.clone(), async move {
+            let zone = match zone {
+                Some(zone) => zone,
+                None => client.default_service_id().await,
+            };
+            let client = client.as_ref();
+            let lookup =
+                |zone, label: String| async move { client.tns_lookup_label(zone, &label).await };
+            let mut steps = Vec::new();
+            let result = resolve_lookup(&lookup, zone, &name, 0, &mut steps).await;
+            describe_trace(&steps, &result)
+        });
     }
 
     async fn inspect_label(&mut self) {
         if let Some((name, _, _)) = self.labels.get(self.selected) {
             let name = name.clone();
-            self.resolve(&name).await;
+            self.resolve(&name);
         }
     }
 
@@ -601,21 +640,21 @@ impl App {
         } else {
             "VHOST"
         };
-        let result = if zone_name == "default" {
-            self.client.tns_resolve_name(&name).await
-        } else {
-            self.client.tns_resolve(*zone, &name).await
-        };
-        let diagnosis = match result {
-            Ok(ref r) => compare_resolution(r, expected_kind, expected_sid),
-            Err(e) => format!("Lookup failed: {e}"),
-        };
-        self.lookup = Some((
-            format!("{}.{} (service {})", name, zone_name, file.name),
-            diagnosis,
-        ));
-        self.tab = LOOKUP;
-        self.detail_scroll = 0;
+        let use_default = zone_name == "default";
+        let zone = *zone;
+        let title = format!("{}.{} (service {})", name, zone_name, file.name);
+        let client = Arc::clone(&self.client);
+        self.start_lookup(title, async move {
+            let result = if use_default {
+                client.tns_resolve_name(&name).await
+            } else {
+                client.tns_resolve(zone, &name).await
+            };
+            match result {
+                Ok(ref r) => compare_resolution(r, expected_kind, expected_sid),
+                Err(e) => format!("Lookup failed: {e}"),
+            }
+        });
     }
 
     async fn edit_service(&mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
@@ -925,6 +964,28 @@ fn input_text(input: &Input) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unanswered_lookup_keeps_ui_available_and_can_be_replaced() {
+        // No daemon connection is needed to exercise background lookup handling.
+        let mut task = LookupTask(tokio::spawn(std::future::pending::<String>()));
+        tokio::task::yield_now().await;
+        assert!(!task.0.is_finished());
+        // Checking for a result must return even when no NX response arrives.
+        assert!(tokio::time::timeout(Duration::from_millis(100), async {
+            if task.0.is_finished() {
+                let _ = (&mut task.0).await;
+            }
+        })
+        .await
+        .is_ok());
+        let abandoned = task.0.abort_handle();
+        drop(task);
+        tokio::task::yield_now().await;
+        assert!(abandoned.is_finished());
+        let mut replacement = LookupTask(tokio::spawn(async { "answer".to_string() }));
+        assert_eq!((&mut replacement.0).await.unwrap(), "answer");
+    }
 
     #[tokio::test]
     async fn recursive_lookup_traces_delegation_alias_and_apex() {
