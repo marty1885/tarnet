@@ -124,12 +124,6 @@ impl TnsCache {
         self.insert(zone, label, Vec::new(), NEGATIVE_CACHE_TTL);
     }
 
-    /// Drop all cached resolutions (e.g. after a local publish/unpublish changes
-    /// what a name resolves to).
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
     /// Remove expired entries.
     fn evict_expired(&mut self) {
         self.entries.retain(|_, e| !e.is_expired());
@@ -501,18 +495,6 @@ pub(crate) fn unseal(namespace: &ServiceId, label: &str, blob: &[u8]) -> Result<
         .map_err(|_| Error::Crypto("TNS AEAD decryption failed".into()))
 }
 
-/// Encrypt a record set's confidentiality layer only (no authenticity bundle).
-/// Retained for the encrypt/decrypt unit tests; the publish path uses the full
-/// [`seal`] + [`build_bundle`] envelope.
-pub fn encrypt_record_set(zone: &ServiceId, label: &str, records: &[TnsRecord]) -> Vec<u8> {
-    seal(zone, label, &serialize_record_set(records))
-}
-
-/// Reverse of [`encrypt_record_set`].
-pub fn decrypt_record_set(zone: &ServiceId, label: &str, blob: &[u8]) -> Result<Vec<TnsRecord>> {
-    deserialize_record_set(&unseal(zone, label, blob)?)
-}
-
 // ── Authenticity layer (bundle) ──
 //
 // The bundle carries the namespace owner's master public key and a signature
@@ -623,12 +605,7 @@ pub(crate) fn open_bundle(
 /// Returns the terminal record set or a resolution error. Never hangs —
 /// bounded by per-step and total timeouts plus a delegation depth limit.
 pub async fn resolve(node: &Node, zone: ServiceId, name: &str) -> TnsResolution {
-    let local_zone = node.default_service_id().await;
-    match tokio::time::timeout(
-        TOTAL_RESOLUTION_TIMEOUT,
-        resolve_inner(node, zone, name, 0, &local_zone),
-    )
-    .await
+    match tokio::time::timeout(TOTAL_RESOLUTION_TIMEOUT, resolve_inner(node, zone, name, 0)).await
     {
         Ok(result) => result,
         Err(_) => TnsResolution::Error("total resolution timeout exceeded".into()),
@@ -652,13 +629,7 @@ pub async fn resolve_name(node: &Node, name: &str) -> TnsResolution {
     resolve(node, local_zone, name).await
 }
 
-async fn resolve_inner(
-    node: &Node,
-    zone: ServiceId,
-    name: &str,
-    depth: usize,
-    local_zone: &ServiceId,
-) -> TnsResolution {
+async fn resolve_inner(node: &Node, zone: ServiceId, name: &str, depth: usize) -> TnsResolution {
     if depth >= MAX_DELEGATION_DEPTH {
         return TnsResolution::Error("max delegation/redirect depth exceeded".into());
     }
@@ -694,16 +665,7 @@ async fn resolve_inner(
             }
         }
 
-        // When looking up a label in our own zone, we are the only valid
-        // signer so the record MUST already be in the local DHT store.
-        // Skip the expensive DHT poll — it can't produce results we don't
-        // already have, and waiting for the timeout is what causes 30s
-        // latency on clearnet names that aren't in TNS.
-        let is_local = current_zone == *local_zone;
-        let records = match fetch_records(node, &current_zone, label, is_local).await {
-            Ok(records) => records,
-            Err(e) => return TnsResolution::Error(e),
-        };
+        let records = fetch_records(node, &current_zone, label).await;
 
         if records.is_empty() {
             return TnsResolution::NotFound;
@@ -724,14 +686,7 @@ async fn resolve_inner(
 
             // Follow the alias in the current zone. Absolute aliases (rightmost
             // component is a raw ServiceId) are parsed naturally by resolve_inner.
-            return Box::pin(resolve_inner(
-                node,
-                current_zone,
-                &new_name,
-                current_depth,
-                local_zone,
-            ))
-            .await;
+            return Box::pin(resolve_inner(node, current_zone, &new_name, current_depth)).await;
         }
 
         if is_terminal {
@@ -750,29 +705,20 @@ async fn resolve_inner(
             }
 
             // If the terminal label is a Zone delegation, auto-follow into
-            // that zone and look up "@" (the apex).  This lets petnames like
-            // `lacia.self` resolve to lacia's Identity record published at @
-            // by expose, mirroring how DNS follows NS delegations to find
-            // apex A records.
+            // that zone and resolve "@" (the apex) like any other name, so an
+            // apex VHost, Alias or further delegation is honoured. This lets
+            // petnames like `lacia.self` resolve to lacia's Identity record
+            // published at @ by expose, mirroring how DNS follows NS
+            // delegations to find apex A records.
             if let Some(zone_sid) = records.iter().find_map(|r| match r {
                 TnsRecord::Zone(sid) => Some(*sid),
                 _ => None,
             }) {
-                if current_depth >= MAX_DELEGATION_DEPTH {
-                    return TnsResolution::Error(
-                        "max delegation/redirect depth exceeded".into(),
-                    );
-                }
-                let is_local = zone_sid == *local_zone;
-                match fetch_records(node, &zone_sid, "@", is_local).await {
-                    Ok(apex) if !apex.is_empty() => {
-                        return TnsResolution::Records(apex);
-                    }
-                    _ => {
-                        // No apex records — return the Zone records as-is.
-                        return TnsResolution::Records(records);
-                    }
-                }
+                return match Box::pin(resolve_inner(node, zone_sid, "@", current_depth)).await {
+                    // No apex records — return the Zone records as-is.
+                    TnsResolution::NotFound => TnsResolution::Records(records),
+                    apex => apex,
+                };
             }
             return TnsResolution::Records(records);
         }
@@ -796,32 +742,27 @@ async fn resolve_inner(
     TnsResolution::NotFound
 }
 
-/// Fetch and decrypt the record set for a single label in a zone: from the
-/// TNS cache, else from the zone's root found by a DHT search. Results are
-/// cached with TTL.
-async fn fetch_records(
-    node: &Node,
-    zone: &ServiceId,
-    label: &str,
-    is_local_zone: bool,
-) -> std::result::Result<Vec<TnsRecord>, String> {
-    // 1. Check the TNS resolution cache (skip for local zones — always authoritative).
-    if !is_local_zone {
+/// The record set for a single label in a zone. For a zone we own, what we
+/// hold locally is authoritative (no DHT poll: nothing out there is newer
+/// than what we sign, and waiting out the search is what made unknown names
+/// slow). Otherwise from the TNS cache, else from the zone's root found by a
+/// DHT search, cached with its TTL. Empty means not found.
+async fn fetch_records(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRecord> {
+    // 1. Our own zone: local labels (published or not) and live publishers.
+    if node.owns_zone(zone).await {
+        return node.local_zone_label(zone, label).await.unwrap_or_default();
+    }
+
+    // 2. The TNS resolution cache.
+    {
         let mut cache = node.tns_cache().lock().await;
         if let Some(cached) = cache.get(zone, label) {
             log::debug!("TNS cache hit: {:?}/{}", zone, label);
-            return Ok(cached.clone());
+            return cached.clone();
         }
     }
 
     let root_key = crate::dht::zone_root_key(zone);
-
-    // 2. Our own zone: our root is held here, and nothing out there is newer
-    //    than what we sign.
-    if is_local_zone {
-        let held = node.dht_held(&root_key).await;
-        return Ok(open_root(zone, label, &held).map(|(r, _)| r).unwrap_or_default());
-    }
 
     // 3. Search: roots held here come first, then what the walks bring back.
     //    The newest root among everything that has arrived once one has is
@@ -841,12 +782,12 @@ async fn fetch_records(
         Some((records, ttl)) if !records.is_empty() => {
             let ttl = if ttl.is_zero() { Duration::from_secs(60) } else { ttl };
             cache.insert(*zone, label.to_string(), records.clone(), ttl);
-            Ok(records)
+            records
         }
         // No root, or the root lacks the label: remember it wasn't found.
         _ => {
             cache.insert_negative(*zone, label.to_string());
-            Ok(Vec::new())
+            Vec::new()
         }
     }
 }
@@ -943,9 +884,29 @@ pub fn validate_alias_target(target: &str) -> Result<()> {
 ///   non-supplemental record at its label (so `Identity + VHost` — ambiguous
 ///   "entity or vhost?" — is rejected).
 /// - Alias targets must be valid (bare label or absolute).
+/// - Every length fits its u16 wire prefix, and so does the whole set (its
+///   length prefix inside the zone root), so nothing is silently truncated.
 pub fn validate_records(records: &[TnsRecord]) -> Result<()> {
     if records.is_empty() {
         return Err(Error::Protocol("record set is empty".into()));
+    }
+    if records.len() > u16::MAX as usize {
+        return Err(Error::Protocol("too many records at a label".into()));
+    }
+    for record in records {
+        let field = match record {
+            TnsRecord::Text(s) | TnsRecord::Alias(s) => s.len(),
+            TnsRecord::Service { port, meta, .. } => port.len().max(meta.len()),
+            TnsRecord::IntroductionPoint { kem_pubkey, .. } => kem_pubkey.len(),
+            TnsRecord::Peer { signing_pubkey, signature, .. } => signing_pubkey.len().max(signature.len()),
+            TnsRecord::Identity(_) | TnsRecord::Zone(_) | TnsRecord::VHost(_) | TnsRecord::ContentRef(_) => 0,
+        };
+        if field > u16::MAX as usize {
+            return Err(Error::Protocol("record field too long".into()));
+        }
+    }
+    if serialize_record_set(records).len() > u16::MAX as usize {
+        return Err(Error::Protocol("record set too large".into()));
     }
 
     let has_zone = records.iter().any(|r| matches!(r, TnsRecord::Zone(_)));
@@ -1195,13 +1156,7 @@ pub async fn publish(
     label: &str,
     records: &[TnsRecord],
 ) -> Result<()> {
-    let sid = zone_keypair.identity.service_id();
-    if node
-        .zone_published_update(&sid, label, Some(serialize_record_set(records)))
-        .await
-    {
-        refresh_zone(node, zone_keypair).await?;
-    }
+    set_zone_label(node, zone_keypair, label, Some(serialize_record_set(records))).await?;
     Ok(())
 }
 
@@ -1213,11 +1168,30 @@ pub async fn unpublish(
     zone_keypair: &Keypair,
     label: &str,
 ) -> Result<()> {
-    let sid = zone_keypair.identity.service_id();
-    if node.zone_published_update(&sid, label, None).await {
-        refresh_zone(node, zone_keypair).await?;
-    }
+    set_zone_label(node, zone_keypair, label, None).await?;
     Ok(())
+}
+
+/// Set (`Some(serialized record set)`) or drop (`None`) one label of an owned
+/// zone and re-sign the root, if that changed anything; returns whether it
+/// did. All-or-nothing: if the new root can't be published (e.g. it outgrew
+/// the DHT value limit) the label is put back, so one bad label can't stop
+/// every later refresh and dark the whole zone.
+pub(crate) async fn set_zone_label(
+    node: &Node,
+    zone_keypair: &Keypair,
+    label: &str,
+    set: Option<Vec<u8>>,
+) -> Result<bool> {
+    let sid = zone_keypair.identity.service_id();
+    let Some(previous) = node.zone_published_update(&sid, label, set.clone()).await else {
+        return Ok(false);
+    };
+    if let Err(e) = refresh_zone(node, zone_keypair).await {
+        node.zone_published_revert(&sid, label, set.as_deref(), previous).await;
+        return Err(e);
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1384,8 +1358,8 @@ mod tests {
             TnsRecord::Identity(ServiceId::from_signing_pubkey(&[1; 32])),
             TnsRecord::Identity(ServiceId::from_signing_pubkey(&[2; 32])),
         ];
-        let blob = encrypt_record_set(&zone, label, &records);
-        let decrypted = decrypt_record_set(&zone, label, &blob).unwrap();
+        let blob = seal(&zone, label, &serialize_record_set(&records));
+        let decrypted = deserialize_record_set(&unseal(&zone, label, &blob).unwrap()).unwrap();
         assert_eq!(decrypted, records);
     }
 
@@ -1420,42 +1394,6 @@ mod tests {
         let evil = build_bundle(&attacker, &zone, label, 8, &recs);
         assert!(open_bundle(&zone, label, &evil, true).is_none());
         assert!(open_bundle(&zone, label, &evil, false).is_some());
-    }
-
-    #[test]
-    fn forged_record_rejected_legit_accepted() {
-        // An attacker who knows the public name can derive the seal key and the
-        // DHT location and plant a validly-sealed, self-signed record at the same
-        // place. Resolution must reject it (signer != zone owner) and still serve
-        // the legitimate record.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let node = Node::new(Keypair::generate());
-            let zone_id = node.default_service_id().await;
-            let victim = node.keypair_for_service(&zone_id).await.unwrap();
-            let label = "www";
-
-            let good = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0x11; 32]))];
-            publish(&node, &victim, label, &good).await.unwrap();
-
-            // Attacker forges at the same location with their own key.
-            let attacker = Keypair::generate();
-            let loc = tns_dht_key(&zone_id, label);
-            let seq = node.next_dht_sequence().await;
-            let evil = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(&[0xEE; 32]))];
-            let bundle = build_bundle(&attacker, &zone_id, label, seq, &evil);
-            let value = seal(&zone_id, label, &bundle);
-            let lk = disposable_record_key();
-            node.dht_put_signed_at_key(&lk, loc, &value, seq, 600)
-                .await
-                .unwrap();
-
-            // Only the legitimate record resolves.
-            match resolve(&node, zone_id, label).await {
-                TnsResolution::Records(r) => assert_eq!(r, good),
-                other => panic!("expected legit Records only, got {:?}", other),
-            }
-        });
     }
 
     #[test]
@@ -1544,7 +1482,7 @@ mod tests {
 
             // Remove www; mail must survive, www must become NotFound.
             unpublish(&node, &zone, "www").await.unwrap();
-            node.tns_cache().lock().await.clear();
+            node.tns_cache().lock().await.forget(&zone_id, "www");
             match resolve(&node, zone_id, "www").await {
                 TnsResolution::NotFound => {}
                 other => panic!("expected NotFound after unpublish, got {:?}", other),
@@ -1564,8 +1502,8 @@ mod tests {
         let records = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(
             &[1; 32],
         ))];
-        let blob = encrypt_record_set(&zone, label, &records);
-        assert!(decrypt_record_set(&wrong_zone, label, &blob).is_err());
+        let blob = seal(&zone, label, &serialize_record_set(&records));
+        assert!(unseal(&wrong_zone, label, &blob).is_err());
     }
 
     #[test]
@@ -1574,8 +1512,8 @@ mod tests {
         let records = vec![TnsRecord::Identity(ServiceId::from_signing_pubkey(
             &[1; 32],
         ))];
-        let blob = encrypt_record_set(&zone, "www", &records);
-        assert!(decrypt_record_set(&zone, "mail", &blob).is_err());
+        let blob = seal(&zone, "www", &serialize_record_set(&records));
+        assert!(unseal(&zone, "mail", &blob).is_err());
     }
 
     #[test]
@@ -2596,5 +2534,161 @@ mod tests {
 
         // Should not exceed max entries.
         assert!(cache.entries.len() <= TNS_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn oversized_label_is_rolled_back_and_zone_keeps_publishing() {
+        // A label that pushes the zone root past the DHT value limit must fail
+        // without poisoning the working set: later publishes and refreshes of
+        // the same zone still succeed, and the label never resolves.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone_id = node.default_service_id().await;
+            let kp = node.keypair_for_service(&zone_id).await.unwrap();
+            publish(&node, &kp, "ok", &[TnsRecord::Text("a".into())]).await.unwrap();
+
+            let big = vec![TnsRecord::Text("x".repeat(62_000))];
+            assert!(validate_records(&big).is_ok(), "fits the wire, not the root");
+            assert!(publish(&node, &kp, "big", &big).await.is_err());
+
+            publish(&node, &kp, "small", &[TnsRecord::Text("b".into())]).await.unwrap();
+            refresh_zone(&node, &kp).await.unwrap();
+            assert!(matches!(resolve(&node, zone_id, "big").await, TnsResolution::NotFound));
+            assert!(matches!(resolve(&node, zone_id, "small").await, TnsResolution::Records(_)));
+        });
+    }
+
+    #[test]
+    fn validate_records_rejects_wire_overflow() {
+        // Lengths are u16 on the wire; longer must be refused, not truncated.
+        assert!(validate_records(&[TnsRecord::Text("x".repeat(70_000))]).is_err());
+        let many: Vec<TnsRecord> = (0..2_000).map(|_| TnsRecord::Text("y".repeat(40))).collect();
+        assert!(validate_records(&many).is_err(), "set length prefix overflows");
+    }
+
+    #[test]
+    fn delegated_apex_vhost_surfaces_as_vhost() {
+        // `friend` delegates to a zone whose apex is a VHost: resolving
+        // `friend` must yield the VHost endpoint (canonical label "@"), not a
+        // raw record set the connector can't derive a wire port from.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone_id = node.default_service_id().await;
+            let me = node.keypair_for_service(&zone_id).await.unwrap();
+            let friend = Keypair::generate();
+            let friend_id = friend.identity.service_id();
+            let serving = ServiceId::from_signing_pubkey(&[0x77; 32]);
+
+            publish(&node, &friend, "@", &[TnsRecord::VHost(serving)]).await.unwrap();
+            publish(&node, &me, "friend", &[TnsRecord::Zone(friend_id)]).await.unwrap();
+
+            match resolve_name(&node, "friend").await {
+                TnsResolution::VHost { serving: s, canonical_label } => {
+                    assert_eq!(s, serving);
+                    assert_eq!(canonical_label, "@");
+                }
+                other => panic!("expected VHost, got {:?}", other),
+            }
+        });
+    }
+
+    #[test]
+    fn unpublished_local_labels_resolve_like_any_zone() {
+        // Private petnames live only in the label table. They must resolve
+        // with the same rules as published names: a Zone petname follows to
+        // its apex, an alias is followed, and a name below a non-Zone label
+        // is an error rather than that label's records.
+        use crate::state::{StateDb, StorageLimits};
+        let path = std::env::temp_dir().join(format!(
+            "tarnet-local-resolve-{}.sqlite3",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = std::sync::Arc::new(StateDb::open(&path).unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
+            let friend = Keypair::generate();
+            let friend_id = friend.identity.service_id();
+            let target = ServiceId::from_signing_pubkey(&[0x55; 32]);
+            publish(&node, &friend, "@", &[TnsRecord::Identity(target)]).await.unwrap();
+
+            let set = |label: &str, rec: TnsRecord| {
+                db.label_set("", label, &[tns_record_to_bytes(&rec)], false).unwrap()
+            };
+            set("pal", TnsRecord::Zone(friend_id));
+            set("buddy", TnsRecord::Alias("pal".into()));
+            set("server", TnsRecord::Identity(target));
+
+            for name in ["pal", "buddy"] {
+                match resolve_name(&node, name).await {
+                    TnsResolution::Records(r) => assert_eq!(r, vec![TnsRecord::Identity(target)], "{name}"),
+                    other => panic!("{name}: expected apex Identity, got {:?}", other),
+                }
+            }
+            assert!(matches!(
+                resolve_name(&node, "www.server").await,
+                TnsResolution::Error(_)
+            ));
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zone_root_sequence_beats_held_root() {
+        // A zone key moved to a node whose counter is lower (or a lost db):
+        // the old, higher-sequence root is held here. Re-signing must climb
+        // above it, or the local store refuses the new root and publish fails.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone_id = node.default_service_id().await;
+            let kp = node.keypair_for_service(&zone_id).await.unwrap();
+            let old = crate::dht::VerifiedRecord::new_zone_root(
+                &kp,
+                &build_zone_root_value(&zone_id, &Default::default()),
+                1_000_000,
+                Duration::from_secs(ZONE_ROOT_TTL as u64),
+            );
+            node.dht_store_insert_local_for_test(old.into_inner()).await;
+
+            publish(&node, &kp, "www", &[TnsRecord::Text("new".into())]).await.unwrap();
+            let held = node.dht_held(&crate::dht::zone_root_key(&zone_id)).await;
+            let (records, _) = open_root(&zone_id, "www", &held).unwrap();
+            assert_eq!(records, vec![TnsRecord::Text("new".into())]);
+            assert!(node.next_dht_sequence().await > 1_000_000);
+        });
+    }
+
+    #[test]
+    fn failed_intro_registration_keeps_other_labels_and_drops_intro() {
+        // No relays: intro registration fails. The stale intro points must
+        // stop being signed, and the zone's other labels must stay in the root.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let node = Node::new(Keypair::generate());
+            let zone_id = node.default_service_id().await;
+            let kp = node.keypair_for_service(&zone_id).await.unwrap();
+            let stale_intro = TnsRecord::IntroductionPoint {
+                relay_peer_id: PeerId([0x33; 32]),
+                kem_algo: 0,
+                kem_pubkey: vec![1, 2, 3],
+            };
+            publish(&node, &kp, "intro", &[stale_intro]).await.unwrap();
+            publish(&node, &kp, "blog", &[TnsRecord::Text("kept".into())]).await.unwrap();
+
+            assert!(node.publish_hidden_service(zone_id, 3).await.is_err());
+
+            let held = node.dht_held(&crate::dht::zone_root_key(&zone_id)).await;
+            assert!(open_root(&zone_id, "intro", &held).unwrap().0.is_empty());
+            assert_eq!(
+                open_root(&zone_id, "blog", &held).unwrap().0,
+                vec![TnsRecord::Text("kept".into())]
+            );
+        });
     }
 }

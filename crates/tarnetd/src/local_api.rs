@@ -97,12 +97,6 @@ impl LocalServiceApi {
 }
 
 impl LocalServiceApi {
-    /// Local labels changed: drop cached resolutions (the node's cache is
-    /// the only one).
-    async fn tns_cache_clear(&self) {
-        self.node.tns_cache().lock().await.clear();
-    }
-
     /// Resolve an identity option to a DB key string.
     /// None or "default" → the default identity's label (or "" if unnamed).
     async fn identity_db_key(&self, identity: Option<&str>) -> ApiResult<String> {
@@ -133,71 +127,6 @@ impl LocalServiceApi {
                 "no keypair found for identity '{}'",
                 identity.unwrap_or("default")
             ))
-        })
-    }
-
-    /// Uncached TNS name resolution (called by the cached wrapper).
-    fn tns_resolve_name_inner<'a>(
-        &'a self,
-        name: &'a str,
-        depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<TnsResolution>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            // Local aliases can point at each other (or themselves): follow
-            // them no further than the network resolver follows delegations.
-            if depth > tns::MAX_DELEGATION_DEPTH {
-                return Ok(TnsResolution::Error(format!("alias chain too deep at '{}'", name)));
-            }
-            // Check if the rightmost label (root of the name) is a local label.
-            // Search the default identity's zone.
-            let id_key = self.identity_db_key(None).await?;
-            let labels: Vec<&str> = name.split('.').collect();
-            if let Some(root_label) = labels.last() {
-                if let Ok(Some((record_blobs, _publish))) = self.db.label_get(&id_key, root_label) {
-                    let records: Vec<TnsRecord> = record_blobs
-                        .iter()
-                        .filter_map(|b| tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
-                        .collect();
-
-                    if labels.len() == 1 {
-                        // A terminal VHost in our own zone: surface the serving
-                        // SID + canonical label (the label itself) so connect_to
-                        // can derive the wire port.
-                        if let Some(serving) = records.iter().find_map(|r| match r {
-                            TnsRecord::VHost(sid) => Some(*sid),
-                            _ => None,
-                        }) {
-                            return Ok(TnsResolution::VHost {
-                                serving,
-                                canonical_label: root_label.to_string(),
-                            });
-                        }
-                        return Ok(TnsResolution::Records(records));
-                    }
-
-                    let remaining = labels[..labels.len() - 1].join(".");
-
-                    if let Some(alias_target) = records.iter().find_map(|r| match r {
-                        TnsRecord::Alias(s) => Some(s.clone()),
-                        _ => None,
-                    }) {
-                        let new_name = format!("{}.{}", remaining, alias_target);
-                        return self.tns_resolve_name_inner(&new_name, depth + 1).await;
-                    }
-
-                    if let Some(zone) = records.iter().find_map(|r| match r {
-                        TnsRecord::Zone(sid) => Some(*sid),
-                        _ => None,
-                    }) {
-                        return Ok(tns::resolve(&self.node, zone, &remaining).await);
-                    }
-
-                    return Ok(TnsResolution::Records(records));
-                }
-            }
-
-            Ok(tns::resolve_name(&self.node, name).await)
         })
     }
 }
@@ -438,7 +367,6 @@ impl ServiceApi for LocalServiceApi {
         tns::publish(&self.node, &zone_keypair, label, &records)
             .await
             .map_err(map_err)?;
-        self.tns_cache_clear().await;
         Ok(())
     }
 
@@ -448,7 +376,9 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution> {
-        self.tns_resolve_name_inner(name, 0).await
+        // Local labels (published or not) are resolved by the node itself,
+        // with the same alias / delegation / apex rules as any zone.
+        Ok(tns::resolve_name(&self.node, name).await)
     }
 
     async fn tns_set_label(
@@ -463,16 +393,10 @@ impl ServiceApi for LocalServiceApi {
         if publish {
             tns::validate_published_aliases(&records, &self.db, &id_key).map_err(map_err)?;
         }
-        let record_blobs: Vec<Vec<u8>> = records
-            .iter()
-            .map(|r| tns::tns_record_to_bytes(r))
-            .collect();
-        self.db
-            .label_set(&id_key, label, &record_blobs, publish)
-            .map_err(map_err)?;
-
         // Published while marked so; a label marked private is no longer
-        // re-signed into the zone (copies already out there expire).
+        // re-signed into the zone (copies already out there expire). Publish
+        // before storing: a label the zone root can't take is never stored
+        // as published, so it can't come back after a restart.
         let zone_keypair = self.keypair_for_identity(identity).await?;
         if publish {
             tns::publish(&self.node, &zone_keypair, label, &records)
@@ -484,7 +408,14 @@ impl ServiceApi for LocalServiceApi {
                 .map_err(map_err)?;
         }
 
-        self.tns_cache_clear().await;
+        let record_blobs: Vec<Vec<u8>> = records
+            .iter()
+            .map(|r| tns::tns_record_to_bytes(r))
+            .collect();
+        self.db
+            .label_set(&id_key, label, &record_blobs, publish)
+            .map_err(map_err)?;
+
         Ok(())
     }
 
@@ -498,7 +429,6 @@ impl ServiceApi for LocalServiceApi {
         tns::unpublish(&self.node, &zone_keypair, label)
             .await
             .map_err(map_err)?;
-        self.tns_cache_clear().await;
         Ok(())
     }
 
@@ -530,7 +460,6 @@ impl ServiceApi for LocalServiceApi {
         tns::unpublish(&self.node, &zone_keypair, label)
             .await
             .map_err(map_err)?;
-        self.tns_cache_clear().await;
         Ok(())
     }
 

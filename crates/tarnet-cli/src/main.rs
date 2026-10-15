@@ -2150,6 +2150,10 @@ fn parse_scheme(s: &str) -> tarnet_api::types::IdentityScheme {
 fn parse_privacy(s: &str, intro_points: u8) -> tarnet_api::types::PrivacyLevel {
     match s {
         "public" => tarnet_api::types::PrivacyLevel::Public,
+        "hidden" if intro_points == 0 => {
+            eprintln!("A hidden identity needs at least 1 intro point (--intro-points); with 0 it cannot be reached.");
+            std::process::exit(1);
+        }
         "hidden" => tarnet_api::types::PrivacyLevel::Hidden { intro_points },
         other => {
             eprintln!(

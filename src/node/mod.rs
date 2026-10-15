@@ -375,7 +375,8 @@ pub struct HiddenServiceState {
     /// Circuits we built TO intro points for our hidden services.
     /// Maps service_id → Vec<(intro_peer_id, circuit_id)>
     pub intros: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Vec<(PeerId, u32)>>>>,
-    /// Tracks when each hidden service was last successfully published.
+    /// When each hidden service's zone root was last signed (with intro
+    /// points, or without while none can be registered).
     pub last_publish: Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Instant>>>,
     /// Hidden identities that have a running maintenance task.
     pub(super) maintained: Arc<Mutex<HashSet<tarnet_api::types::ServiceId>>>,
@@ -579,8 +580,8 @@ pub struct Node {
     /// zone ServiceId then label (serialized TnsRecord set). The durable source
     /// of truth a zone root is rebuilt and re-signed from on every change; the
     /// single funnel for ALL publishers (user labels, hidden-service intro/peer)
-    /// so the rebuilt root always carries the whole zone. Write-through to the
-    /// `tns_zone_records` table when a db is present; hydrated lazily per zone.
+    /// so the rebuilt root always carries the whole zone. Hydrated lazily per
+    /// zone from the published local labels.
     zone_published: Arc<
         Mutex<
             HashMap<tarnet_api::types::ServiceId, std::collections::BTreeMap<String, Vec<u8>>>,
@@ -978,6 +979,11 @@ impl Node {
     /// The node's default ServiceId.
     pub async fn default_service_id(&self) -> tarnet_api::types::ServiceId {
         self.identity_store.lock().await.default_service_id()
+    }
+
+    /// Whether one of our identities is the zone `sid`.
+    pub async fn owns_zone(&self, sid: &tarnet_api::types::ServiceId) -> bool {
+        self.identity_store.lock().await.contains_service_id(sid)
     }
 
     /// Look up a keypair by ServiceId. Returns None if no matching identity exists.

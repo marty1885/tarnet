@@ -669,8 +669,13 @@ impl Node {
     /// Next monotonic sequence for signed-content / signed-at-key records,
     /// persisted so it survives restart.
     async fn next_signed_content_sequence(&self) -> u64 {
+        self.next_signed_content_sequence_above(0).await
+    }
+
+    /// Next signed-content sequence, and above `floor` (persisted like any).
+    async fn next_signed_content_sequence_above(&self, floor: u64) -> u64 {
         let mut seq = self.signed_content_sequence.lock().await;
-        *seq += 1;
+        *seq = (*seq).max(floor) + 1;
         let sequence = *seq;
         self.db_set_metadata("signed_content_sequence", sequence);
         sequence
@@ -789,7 +794,8 @@ impl Node {
     }
 
     /// Update one label in an owned zone's published working set
-    /// (`label → serialized TnsRecord set`). Returns whether it changed.
+    /// (`label → serialized TnsRecord set`). Returns `Some(previous)` if it
+    /// changed, `None` if it already held `records`.
     ///
     /// The working set lives in memory. It starts as the zone's local labels
     /// marked published (the label table is where persistent names live);
@@ -798,28 +804,83 @@ impl Node {
     /// as it stays connected — and is put back by that publisher after a
     /// restart, or not at all.
     ///
+    /// Publishers go through [`crate::tns::set_zone_label`], which reverts
+    /// the change if the re-signed root can't be published.
     pub(crate) async fn zone_published_update(
         &self,
         zone_sid: &tarnet_api::types::ServiceId,
         label: &str,
         records: Option<Vec<u8>>,
-    ) -> bool {
+    ) -> Option<Option<Vec<u8>>> {
         let mut map = self.zone_published.lock().await;
         if !map.contains_key(zone_sid) {
             let loaded = self.published_labels(zone_sid).await;
             map.insert(*zone_sid, loaded);
         }
         let entry = map.get_mut(zone_sid).expect("loaded above");
-        match records {
-            Some(blob) => entry.insert(label.to_string(), blob.clone()).as_ref() != Some(&blob),
-            None => entry.remove(label).is_some(),
+        let previous = match records {
+            Some(blob) => entry.insert(label.to_string(), blob),
+            None => entry.remove(label),
+        };
+        (previous != entry.get(label).cloned()).then_some(previous)
+    }
+
+    /// Undo a [`zone_published_update`] that set `label` to `applied`: put
+    /// `previous` back, unless another publisher has changed it since.
+    pub(crate) async fn zone_published_revert(
+        &self,
+        zone_sid: &tarnet_api::types::ServiceId,
+        label: &str,
+        applied: Option<&[u8]>,
+        previous: Option<Vec<u8>>,
+    ) {
+        let mut map = self.zone_published.lock().await;
+        let Some(entry) = map.get_mut(zone_sid) else {
+            return;
+        };
+        if entry.get(label).map(Vec::as_slice) != applied {
+            return;
         }
+        match previous {
+            Some(blob) => entry.insert(label.to_string(), blob),
+            None => entry.remove(label),
+        };
+    }
+
+    /// What an owned zone holds at `label`, for resolving it here: the local
+    /// label (published or not — a private petname resolves for its owner),
+    /// else what a live publisher put in the working set. `None` if neither.
+    pub(crate) async fn local_zone_label(
+        &self,
+        zone_sid: &tarnet_api::types::ServiceId,
+        label: &str,
+    ) -> Option<Vec<crate::tns::TnsRecord>> {
+        if let Some(db) = &self.db {
+            for key in self.zone_label_keys(zone_sid).await {
+                if let Ok(Some((blobs, _publish))) = db.label_get(&key, label) {
+                    return Some(
+                        blobs
+                            .iter()
+                            .filter_map(|b| crate::tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
+                            .collect(),
+                    );
+                }
+            }
+        }
+        let map = self.zone_published.lock().await;
+        let set = map.get(zone_sid)?.get(label)?;
+        crate::tns::deserialize_record_set(set).ok()
     }
 
     /// The zone's working set to sign, with a fresh sequence. Both are taken
     /// under one lock, so a higher sequence always carries a same-or-newer
     /// set: concurrent publishers (a hidden service's "intro" and a user
     /// label) can't invert.
+    ///
+    /// The sequence also beats any root of this zone held here. The counter
+    /// is per node, so a zone key moved to another node (or a lost db)
+    /// signs with a lower one, and stores refuse a lower sequence until the
+    /// old root expires. Copies held only elsewhere still win until then.
     pub(crate) async fn zone_signing_snapshot(
         &self,
         zone_sid: &tarnet_api::types::ServiceId,
@@ -830,7 +891,18 @@ impl Node {
             map.insert(*zone_sid, loaded);
         }
         let snapshot = map[zone_sid].clone();
-        let sequence = self.next_signed_content_sequence().await;
+        let held = self
+            .dht_held(&crate::dht::zone_root_key(zone_sid))
+            .await
+            .iter()
+            .filter(|r| {
+                r.record_type == RecordType::ZoneRoot
+                    && tarnet_api::types::ServiceId::from_signing_pubkey(&r.signer_pubkey) == *zone_sid
+            })
+            .map(|r| r.sequence)
+            .max()
+            .unwrap_or(0);
+        let sequence = self.next_signed_content_sequence_above(held).await;
         (snapshot, sequence)
     }
 
@@ -843,18 +915,7 @@ impl Node {
         let Some(db) = &self.db else {
             return out;
         };
-        // Labels are filed under the identity's name, or the ServiceId it
-        // was named by; the default identity's also under "".
-        let mut keys = vec![tarnet_api::types::encode_base32(zone_sid.as_bytes())];
-        for (name, sid, ..) in self.list_identities().await {
-            if sid == *zone_sid {
-                if sid == self.default_service_id().await {
-                    keys.push(String::new());
-                }
-                keys.push(name);
-            }
-        }
-        for key in keys {
+        for key in self.zone_label_keys(zone_sid).await {
             for (label, blobs, publish) in db.label_list(&key).unwrap_or_default() {
                 if !publish {
                     continue;
@@ -867,6 +928,23 @@ impl Node {
             }
         }
         out
+    }
+
+    /// The label-table keys an owned zone's labels are filed under: the
+    /// identity's name, or the ServiceId it was named by; the default
+    /// identity's also under "".
+    async fn zone_label_keys(&self, zone_sid: &tarnet_api::types::ServiceId) -> Vec<String> {
+        let mut keys = vec![tarnet_api::types::encode_base32(zone_sid.as_bytes())];
+        let default_sid = self.default_service_id().await;
+        for (name, sid, ..) in self.list_identities().await {
+            if sid == *zone_sid {
+                if sid == default_sid {
+                    keys.push(String::new());
+                }
+                keys.push(name);
+            }
+        }
+        keys
     }
 
     /// Insert a record directly into the local DHT store, bypassing

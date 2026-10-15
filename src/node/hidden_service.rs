@@ -487,11 +487,15 @@ impl Node {
                 }
             }
         }
-        if tried.is_empty() {
-            return Err(Error::Protocol("no relays for intro points".into()));
-        }
         if intro_circuits.is_empty() {
-            return Err(Error::Protocol("no intro point could be registered".into()));
+            // Stop advertising intro points that lead nowhere. The zone's
+            // other labels are kept alive by `maintain_hidden_service`.
+            self.drop_zone_label(&service_id, "intro").await;
+            return Err(Error::Protocol(if tried.is_empty() {
+                "no relays for intro points".into()
+            } else {
+                "no intro point could be registered".into()
+            }));
         }
         let count = intro_circuits.len();
         self.hidden
@@ -501,8 +505,11 @@ impl Node {
             .insert(service_id, intro_circuits);
 
         let intro = crate::tns::serialize_record_set(&intro_records);
-        self.zone_published_update(&service_id, "intro", Some(intro)).await;
-        crate::tns::refresh_zone(self, &zone_keypair).await?;
+        // Re-signs the zone root even if the intro set is unchanged: this is
+        // the hidden zone's refresh timer.
+        if !crate::tns::set_zone_label(self, &zone_keypair, "intro", Some(intro)).await? {
+            crate::tns::refresh_zone(self, &zone_keypair).await?;
+        }
 
         log::info!(
             "Hidden service published: {:?} with {} intro points",
@@ -568,9 +575,11 @@ impl Node {
     }
 
     /// Drop one of the identity's own labels (`peer`, `intro`) from its zone,
-    /// re-signing the root without it if it was there.
+    /// re-signing the root without it if it was there. Unlike
+    /// [`crate::tns::set_zone_label`] the drop sticks even if the re-sign
+    /// fails: a Hidden zone's `peer` label must never be signed again.
     pub(super) async fn drop_zone_label(&self, service_id: &tarnet_api::types::ServiceId, label: &str) {
-        if !self.zone_published_update(service_id, label, None).await {
+        if self.zone_published_update(service_id, label, None).await.is_none() {
             return;
         }
         let Some(kp) = self.keypair_for_service(service_id).await else {
@@ -622,8 +631,9 @@ impl Node {
         // Re-signs the zone root, with every label the zone publishes: this
         // is the zone's refresh timer.
         let peer = crate::tns::serialize_record_set(&[record]);
-        self.zone_published_update(&service_id, "peer", Some(peer)).await;
-        crate::tns::refresh_zone(self, &zone_keypair).await?;
+        if !crate::tns::set_zone_label(self, &zone_keypair, "peer", Some(peer)).await? {
+            crate::tns::refresh_zone(self, &zone_keypair).await?;
+        }
 
         log::info!("Published peer record for {:?} → {:?}", service_id, peer_id);
         Ok(())
@@ -716,6 +726,7 @@ impl Node {
         let ttl = Duration::from_secs(crate::tns::ZONE_ROOT_TTL as u64);
         let draw_republish_after = || rand::thread_rng().gen_range(ttl / 3..ttl / 2);
         let mut republish_after = draw_republish_after();
+        let mut warned_no_intros = false;
 
         loop {
             let wait = rand::thread_rng().gen_range(HIDDEN_SERVICE_CHECK_INTERVAL);
@@ -725,6 +736,24 @@ impl Node {
                 self.hidden.maintained.lock().await.remove(&sid);
                 return;
             };
+
+            // Hidden with no intro points: nobody can connect, but the zone's
+            // other labels (delegations, aliases, text) are still served.
+            if desired_intros == 0 {
+                if !warned_no_intros {
+                    log::warn!(
+                        "Hidden identity {:?} has 0 intro points: it cannot be reached, only its names are published",
+                        sid
+                    );
+                    warned_no_intros = true;
+                }
+                self.drop_zone_label(&sid, "intro").await;
+                if self.refresh_zone_if_stale(sid, republish_after).await {
+                    republish_after = draw_republish_after();
+                }
+                continue;
+            }
+            warned_no_intros = false;
 
             if self.connected_peers().await.is_empty() {
                 log::debug!("maintain_hidden_service: no peers, skipping");
@@ -775,9 +804,39 @@ impl Node {
                 }
                 Err(e) => {
                     log::warn!("Failed to maintain hidden service {:?}: {}", sid, e);
+                    // Keep the zone's other labels alive until intro points
+                    // can be had again (which is retried every check).
+                    if self.refresh_zone_if_stale(sid, republish_after).await {
+                        republish_after = draw_republish_after();
+                    }
                 }
             }
         }
+    }
+
+    /// Re-sign a Hidden zone that has no intro points, if it was last signed
+    /// longer than `republish_after` ago, so its other labels don't expire.
+    /// Returns whether it was re-signed.
+    async fn refresh_zone_if_stale(&self, sid: tarnet_api::types::ServiceId, republish_after: Duration) -> bool {
+        let stale = self
+            .hidden
+            .last_publish
+            .lock()
+            .await
+            .get(&sid)
+            .map_or(true, |t| t.elapsed() > republish_after);
+        if !stale {
+            return false;
+        }
+        let Some(kp) = self.keypair_for_service(&sid).await else {
+            return false;
+        };
+        if let Err(e) = crate::tns::refresh_zone(self, &kp).await {
+            log::warn!("Re-signing hidden zone {:?} failed: {}", sid, e);
+            return false;
+        }
+        self.hidden.last_publish.lock().await.insert(sid, Instant::now());
+        true
     }
 
     /// Handle an INTRODUCE message arriving at the service (forwarded by intro point).
