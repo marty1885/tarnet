@@ -445,6 +445,10 @@ impl Node {
                 .ok_or_else(|| Error::Protocol("no keypair for hidden service".into()))?;
             crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap()
         };
+        // A Hidden identity has no peer record. Drop it before anything can
+        // fail, and re-sign at once, so a root naming this host is never
+        // signed again (copies already out there expire).
+        self.drop_zone_label(&service_id, "peer").await;
         let hops = self.identity_hops(&service_id).await;
         let mut intro_records = Vec::new();
         let mut intro_circuits: Vec<(PeerId, u32)> = Vec::new();
@@ -496,10 +500,9 @@ impl Node {
             .await
             .insert(service_id, intro_circuits);
 
-        // A Hidden identity has no peer record: drop it from the zone in case
-        // the identity was Public before. The new root replaces the old one.
-        self.zone_published_update(&service_id, "peer", None).await;
-        crate::tns::publish(self, &zone_keypair, "intro", &intro_records).await?;
+        let intro = crate::tns::serialize_record_set(&intro_records);
+        self.zone_published_update(&service_id, "intro", Some(intro)).await;
+        crate::tns::refresh_zone(self, &zone_keypair).await?;
 
         log::info!(
             "Hidden service published: {:?} with {} intro points",
@@ -564,8 +567,24 @@ impl Node {
         Ok(circuit_id)
     }
 
-    /// Tear down all intro circuits for a hidden service and remove tracking state.
+    /// Drop one of the identity's own labels (`peer`, `intro`) from its zone,
+    /// re-signing the root without it if it was there.
+    pub(super) async fn drop_zone_label(&self, service_id: &tarnet_api::types::ServiceId, label: &str) {
+        if !self.zone_published_update(service_id, label, None).await {
+            return;
+        }
+        let Some(kp) = self.keypair_for_service(service_id).await else {
+            return;
+        };
+        if let Err(e) = crate::tns::refresh_zone(self, &kp).await {
+            log::warn!("Re-signing zone {:?} without '{}' failed: {}", service_id, label, e);
+        }
+    }
+
+    /// Tear down all intro circuits for a hidden service and remove tracking
+    /// state, including its intro points in its zone.
     pub(super) async fn teardown_hidden_service(&self, service_id: &tarnet_api::types::ServiceId) {
+        self.drop_zone_label(service_id, "intro").await;
         let removed = self.hidden.intros.lock().await.remove(service_id);
         self.hidden.last_publish.lock().await.remove(service_id);
         if let Some(circuits) = removed {
@@ -600,8 +619,11 @@ impl Node {
 
         let peer_id = self.peer_id();
         let record = crate::tns::build_peer_record(&zone_keypair, &peer_id);
-        // Re-signs the zone root, with every label the zone publishes.
-        crate::tns::publish(self, &zone_keypair, "peer", &[record]).await?;
+        // Re-signs the zone root, with every label the zone publishes: this
+        // is the zone's refresh timer.
+        let peer = crate::tns::serialize_record_set(&[record]);
+        self.zone_published_update(&service_id, "peer", Some(peer)).await;
+        crate::tns::refresh_zone(self, &zone_keypair).await?;
 
         log::info!("Published peer record for {:?} → {:?}", service_id, peer_id);
         Ok(())
@@ -640,18 +662,6 @@ impl Node {
                 }
             }
         }
-    }
-
-    /// DHT record signers (`Keypair::peer_id`) of every local Hidden identity.
-    pub(super) async fn hidden_identity_signers(&self) -> HashSet<[u8; 32]> {
-        let is = self.identity_store.lock().await;
-        is.list()
-            .into_iter()
-            .filter(|(_, _, privacy, ..)| {
-                matches!(privacy, tarnet_api::types::PrivacyLevel::Hidden { .. })
-            })
-            .filter_map(|(_, sid, ..)| is.keypair_for(&sid).map(|kp| *kp.peer_id().as_bytes()))
-            .collect()
     }
 
     /// Start a maintenance task for every Hidden identity that lacks one.
@@ -702,7 +712,8 @@ impl Node {
     /// drawn afresh after every publish.
     async fn maintain_hidden_service(&self, sid: tarnet_api::types::ServiceId) {
         use rand::Rng;
-        let ttl = Duration::from_secs(HIDDEN_SERVICE_TTL as u64);
+        // Intro points live in the zone root, so they live as long as it.
+        let ttl = Duration::from_secs(crate::tns::ZONE_ROOT_TTL as u64);
         let draw_republish_after = || rand::thread_rng().gen_range(ttl / 3..ttl / 2);
         let mut republish_after = draw_republish_after();
 
@@ -1005,8 +1016,9 @@ mod tests {
         ));
     }
 
-    /// Link-up republish must not carry a Hidden identity's records: a watcher
-    /// could trigger it by opening a link to a suspected host.
+    /// Link-up republish carries only the node's own records, never an
+    /// identity's (a Hidden one's would let a watcher trigger it by opening a
+    /// link to a suspected host): those have their owners' timers.
     #[tokio::test]
     async fn hidden_identity_records_are_not_event_republished() {
         use tarnet_api::types::{IdentityScheme, PrivacyLevel};
@@ -1035,6 +1047,8 @@ mod tests {
             .map(|r| r.signer)
             .collect();
         assert!(!signers.contains(&hidden_kp.peer_id()));
-        assert!(signers.contains(&public_kp.peer_id()));
+        assert!(!signers.contains(&public_kp.peer_id()));
+        node.dht_put_signed_content(b"node's own", 600).await.unwrap();
+        assert_eq!(node.own_records_to_republish().await.len(), 1);
     }
 }

@@ -55,13 +55,17 @@ impl TokenBucket {
                 s.tokens = (s.tokens + elapsed * s.rate).min(s.burst);
                 s.last_refill = now;
 
-                if s.tokens >= nbytes {
+                // A message larger than the burst could never fit: it waits
+                // for a full bucket and leaves it in debt, which later
+                // messages wait out.
+                let need = nbytes.min(s.burst);
+                if s.tokens >= need {
                     s.tokens -= nbytes;
                     return;
                 }
 
                 // Not enough tokens — compute how long to wait
-                let deficit = nbytes - s.tokens;
+                let deficit = need - s.tokens;
                 std::time::Duration::from_secs_f64(deficit / s.rate)
             };
             // Sleep outside the lock so other tasks can proceed
@@ -238,6 +242,20 @@ mod tests {
     fn parse_invalid() {
         assert!(parse_bandwidth("abc").is_err());
         assert!(parse_bandwidth("10xyz").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_message_larger_than_the_burst_goes_through() {
+        let bucket = TokenBucket::new(4000);
+        bucket.acquire(1000).await;
+        // A second and a half's worth: waits for a full bucket (~0.25 s),
+        // then goes into debt.
+        tokio::time::timeout(std::time::Duration::from_secs(2), bucket.acquire(6000))
+            .await
+            .expect("an oversized message never went through");
+        let start = tokio::time::Instant::now();
+        bucket.acquire(1).await;
+        assert!(start.elapsed() >= std::time::Duration::from_millis(400), "the debt was not waited out");
     }
 
     #[tokio::test]

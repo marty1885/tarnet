@@ -47,7 +47,6 @@ fn default_node_status() -> tarnet_api::types::NodeStatus {
         dht: tarnet_api::types::DhtStatus {
             stored_keys: 0,
             stored_records: 0,
-            kbucket_peers: 0,
             local_watches: 0,
             remote_watches: 0,
             nse: 0,

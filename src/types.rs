@@ -229,6 +229,27 @@ impl ScopedAddress {
         ta.to_connect_string()
     }
 
+    /// Whether a peer may make us dial this from its hello: Global scope, a
+    /// known transport, and not an address that only means "this host" or
+    /// "everyone" (loopback, unspecified, multicast). Private addresses are
+    /// allowed: a cluster without an uplink reaches its nodes by them.
+    pub fn is_dialable_global(&self) -> bool {
+        if self.scope != AddressScope::Global || matches!(self.transport_type, TransportType::Unknown(_)) {
+            return false;
+        }
+        match self
+            .to_connect_string()
+            .and_then(|s| s.parse::<std::net::SocketAddr>().ok())
+        {
+            Some(sa) => {
+                let ip = sa.ip();
+                !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast())
+            }
+            // Not an IP transport: nothing to screen.
+            None => true,
+        }
+    }
+
     /// Create a Global-scoped address from a socket addr.
     pub fn global_from_socket_addr(addr: std::net::SocketAddr) -> Self {
         let ta = TransportAddress::from_socket_addr(addr);

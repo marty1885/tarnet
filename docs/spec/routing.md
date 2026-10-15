@@ -318,7 +318,11 @@ KB); the slow-link constraint is handled by sending changes only.
   replaces everything it held from that sender when the dump ends, so entries
   whose retraction was lost disappear. A dump whose end is lost changes
   nothing until the next digest asks again. Ordinary updates arriving during a
-  dump apply to both.
+  dump apply to both. A sender sends a dump from the same queue as its
+  updates, so no update built after the dump can arrive before its end and be
+  undone by it; a receiver applies a neighbour's routing messages one at a
+  time, in arrival order. A dump missing a middle part is not detected by
+  itself; the next digest finds the mismatch and asks again.
 * Every node sends the same entries to every neighbour (no split horizon); the
   feasibility condition already prevents loops.
 * **Link death** retracts every route via that neighbour immediately and sends

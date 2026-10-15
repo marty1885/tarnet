@@ -1,18 +1,8 @@
 use super::*;
+use crate::dht::VerifiedRecord;
 use crate::types::ContentHandle;
 
-/// Compute a 64-byte BLAKE3 hash (used for content-addressed DHT keys).
-pub(super) fn blake3_hash_64(input: &[u8]) -> [u8; 64] {
-    let mut out = [0u8; 64];
-    blake3::Hasher::new()
-        .update(input)
-        .finalize_xof()
-        .fill(&mut out);
-    out
-}
-
-/// What launching DHT walks needs, cloneable into a [`DhtSearch`] so a search
-/// can relaunch rounds without a handle to the node.
+/// What launching DHT walks needs.
 #[derive(Clone)]
 pub(crate) struct DhtWalker {
     pub(super) local: PeerId,
@@ -31,9 +21,9 @@ pub(crate) struct DhtWalker {
 pub(crate) struct QueryToken {
     pub(super) prev: PeerId,
     pub(super) key: [u8; 64],
-    /// The neighbour we passed the walk to: responses come back only from
-    /// it. `None` if the walk ended here (no response is expected).
-    pub(super) next: Option<PeerId>,
+    /// The neighbours we passed the walk to (once per visit): responses come
+    /// back only from them. Empty if the walk ended here.
+    pub(super) next: Vec<PeerId>,
 }
 
 /// Hard ceiling on reverse-path state, for GETs we relay and GETs we launch
@@ -42,10 +32,19 @@ pub(crate) struct QueryToken {
 pub(super) const MAX_QUERY_TOKENS: usize = 65_536;
 /// How long a query token lives.
 pub(super) const QUERY_TOKEN_TTL: Duration = Duration::from_secs(30);
+/// Visits of one GET walk a node forwards. Walks revisit a node only in
+/// their random phase or right after it, so a few is plenty.
+const MAX_GET_VISITS: usize = 4;
 
 /// The reverse-path table: query token → where responses go and the key
 /// asked for.
 pub(crate) type QueryTokens = crate::bounded::BoundedMap<[u8; 32], QueryToken>;
+
+/// Watch walks are relaunched this often by the watcher.
+pub(super) const WATCH_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Registrations along a watch walk last two relaunch periods: one lost
+/// relaunch doesn't drop the watch, and old walks expire instead of piling up.
+const WATCH_REGISTRATION: Duration = Duration::from_secs(2 * 60);
 
 impl DhtWalker {
     pub(super) async fn neighbors(&self) -> Vec<DhtNeighbor> {
@@ -57,57 +56,47 @@ impl DhtWalker {
             .collect()
     }
 
-    /// ρ for the estimated network size and our degree.
-    pub(super) async fn walk_count(&self) -> usize {
-        let n = self.routing_table.lock().await.network_size_estimate();
-        let d = self.links.lock().await.iter().count();
-        crate::dht::walk_count(n, d)
-    }
-
-    /// First hops for `count` walks: distinct random neighbours, cycling
-    /// once every neighbour has one. Empty without links.
-    pub(super) async fn first_hops(&self, count: usize) -> Vec<PeerId> {
+    /// First hops for one round of walks (ρ of them, for the estimated
+    /// network size and our degree): distinct random neighbours, cycling once
+    /// every neighbour has one. Empty without links.
+    pub(super) async fn first_hops(&self) -> Vec<PeerId> {
         use rand::seq::SliceRandom;
         let mut peers: Vec<PeerId> = self.links.lock().await.iter().map(|(p, _)| *p).collect();
         if peers.is_empty() {
             return Vec::new();
         }
+        let n = self.routing_table.lock().await.network_size_estimate();
+        let count = crate::dht::walk_count(n, peers.len());
         peers.shuffle(&mut rand::thread_rng());
         (0..count).map(|i| peers[i % peers.len()]).collect()
     }
 
-    /// Send each walk to its first hop. Returns how many a link took.
-    async fn send_walks(&self, walks: Vec<(PeerId, Vec<u8>)>) -> usize {
+    /// Send each walk to its first hop.
+    pub(super) async fn send_walks(&self, walks: Vec<(PeerId, Vec<u8>)>) {
         use super::sender::{Budget, Queue};
-        let mut sent = 0;
         for (peer, bytes) in walks {
-            if self.sender.to_peer(&peer, &bytes, Queue::Deferred, Budget::Limited).await.is_ok() {
-                sent += 1;
-            }
+            let _ = self.sender.to_peer(&peer, &bytes, Queue::Deferred, Budget::Limited).await;
         }
-        sent
     }
 
-    /// Send `count` walks, the i-th built by `build(i)`, through distinct random
-    /// neighbours (see [`first_hops`](Self::first_hops)). Returns how many were
-    /// handed to a link.
-    pub(super) async fn launch(&self, count: usize, mut build: impl FnMut(usize) -> Vec<u8>) -> usize {
-        let hops = self.first_hops(count).await;
-        let walks = hops.into_iter().enumerate().map(|(i, p)| (p, build(i))).collect();
-        self.send_walks(walks).await
+    /// Send one round of PUT walks for `put`.
+    pub(super) async fn launch_put(&self, put: &DhtPutMsg) {
+        let encoded = put.to_wire().encode();
+        let walks = self.first_hops().await.into_iter().map(|p| (p, encoded.clone())).collect();
+        self.send_walks(walks).await;
     }
 
     /// Launch one round of GET walks for `key`, each under a fresh query token
-    /// registered with us as originator. `search`, if given, is registered for
-    /// every token before any walk leaves, so no fast reply is missed. Only
-    /// as many walks leave as there are tokens the table admits: with the
-    /// reverse-path table full, fewer (or none) are launched.
+    /// registered with us as originator and with `search` before any walk
+    /// leaves, so no fast reply is missed. Only as many walks leave as there
+    /// are tokens the table admits: with the reverse-path table full, fewer
+    /// (or none) are launched.
     pub(super) async fn launch_get(
         &self,
         key: &[u8; 64],
-        search: Option<(&SearchRegistry, &mpsc::Sender<crate::dht::VerifiedRecord>)>,
+        search: (&SearchRegistry, &mpsc::Sender<VerifiedRecord>),
     ) -> Vec<[u8; 32]> {
-        let hops = self.first_hops(self.walk_count().await).await;
+        let hops = self.first_hops().await;
         let count = hops.len();
         // Each token remembers the first hop it leaves through: responses
         // under it are taken only from there.
@@ -121,7 +110,7 @@ impl DhtWalker {
                         QueryToken {
                             prev: self.local,
                             key: *key,
-                            next: Some(*hop),
+                            next: vec![*hop],
                         },
                     )
                     .is_ok()
@@ -132,7 +121,8 @@ impl DhtWalker {
             log::debug!("DHT GET state full: launching {} of {} walks", walks.len(), count);
         }
         let tokens: Vec<[u8; 32]> = walks.iter().map(|(t, _)| *t).collect();
-        if let Some((registry, tx)) = search {
+        {
+            let (registry, tx) = search;
             let mut reg = registry.lock().unwrap();
             for t in &tokens {
                 reg.insert(*t, tx.clone());
@@ -152,35 +142,9 @@ impl DhtWalker {
         self.send_walks(msgs).await;
         tokens
     }
-
-    /// Launch one round of WATCH walks for `key`. Returns (token, first
-    /// hop) per walk: notifications under a token come only from its hop.
-    pub(super) async fn launch_watch(
-        &self,
-        key: &[u8; 64],
-        expiration_secs: u32,
-    ) -> Vec<([u8; 32], PeerId)> {
-        let hops = self.first_hops(self.walk_count().await).await;
-        let walks: Vec<([u8; 32], PeerId)> = hops.into_iter().map(|hop| (random_token(), hop)).collect();
-        let msgs = walks
-            .iter()
-            .map(|(token, hop)| {
-                let watch = DhtWatchMsg {
-                    walk: WalkHeader::origin(),
-                    key: *key,
-                    query_token: *token,
-                    expiration_secs,
-                };
-                (*hop, watch.to_wire().encode())
-            })
-            .collect();
-        self.send_walks(msgs).await;
-        walks
-    }
 }
 
-pub(super) type SearchRegistry =
-    std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<crate::dht::VerifiedRecord>>>;
+pub(super) type SearchRegistry = std::sync::Mutex<HashMap<[u8; 32], mpsc::Sender<VerifiedRecord>>>;
 
 fn random_token() -> [u8; 32] {
     let mut t = [0u8; 32];
@@ -188,21 +152,67 @@ fn random_token() -> [u8; 32] {
     t
 }
 
-/// A key this node watches, with the tokens of its live watch walks.
+/// Signers whose newest version a local watch remembers handing the app.
+/// Past this, a new signer's records are still delivered, just not tracked.
+const MAX_TOLD_SIGNERS: usize = 256;
+
+/// A key this node watches.
 pub(super) struct LocalWatch {
     pub(super) expires_at: Instant,
-    /// Tokens of our watch walks, each with the neighbour it left through.
-    pub(super) tokens: Vec<([u8; 32], PeerId)>,
+    /// Tokens of this round's and the previous round's watch walks, each
+    /// with the neighbour it left through: notifications under a token come
+    /// only from there. Older rounds' registrations have expired.
+    tokens: Vec<([u8; 32], PeerId)>,
+    prev_tokens: Vec<([u8; 32], PeerId)>,
+    /// Newest sequence handed to the app, per signer: the app hears of each
+    /// version once, however many walks report it, and never of an older one.
+    told: HashMap<PeerId, u64>,
+}
+
+impl LocalWatch {
+    fn new(expires_at: Instant) -> Self {
+        Self {
+            expires_at,
+            tokens: Vec::new(),
+            prev_tokens: Vec::new(),
+            told: HashMap::new(),
+        }
+    }
+
+    fn live(&self) -> bool {
+        self.expires_at > Instant::now()
+    }
+
+    fn owns(&self, token: &[u8; 32], from: &PeerId) -> bool {
+        let t = (*token, *from);
+        self.tokens.contains(&t) || self.prev_tokens.contains(&t)
+    }
+
+    fn new_round(&mut self, tokens: Vec<([u8; 32], PeerId)>) {
+        self.prev_tokens = std::mem::replace(&mut self.tokens, tokens);
+    }
+
+    /// Whether `signer`'s `sequence` is news to the app (and now told).
+    fn news(&mut self, signer: &PeerId, sequence: u64) -> bool {
+        match self.told.get_mut(signer) {
+            Some(told) if *told >= sequence => false,
+            Some(told) => {
+                *told = sequence;
+                true
+            }
+            None => {
+                if self.told.len() < MAX_TOLD_SIGNERS {
+                    self.told.insert(*signer, sequence);
+                }
+                true
+            }
+        }
+    }
 }
 
 impl Node {
     /// Next routing step for a walk this node received from `from`.
-    pub(super) async fn dht_walk_step(
-        &self,
-        key: &DhtId,
-        header: &WalkHeader,
-        from: &PeerId,
-    ) -> WalkStep {
+    async fn dht_walk_step(&self, key: &DhtId, header: &WalkHeader, from: &PeerId) -> WalkStep {
         let neighbors = self.dht_walker.neighbors().await;
         crate::dht::walk_step(
             &self.peer_id(),
@@ -215,96 +225,354 @@ impl Node {
         )
     }
 
-    /// Tell every watcher registered here (except via `exclude`) about `put`.
-    pub(super) async fn notify_dht_watchers(&self, put: &DhtPutMsg, exclude: Option<&PeerId>) {
-        if !self.dht_watches.lock().await.is_watched(&put.key) {
+    // ── Walk handlers ──
+
+    pub(super) async fn handle_dht_put(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let mut put = DhtPutMsg::from_bytes(payload)?;
+        let key = DhtId(put.key);
+        // `ttl` is unsigned: never store or forward more than the per-type
+        // ceiling, whatever the sender claimed.
+        put.ttl = crate::dht::clamp_ttl_secs(put.record_type, put.ttl);
+
+        match self.dht_walk_step(&key, &put.walk, &from).await {
+            WalkStep::Forward(next, walk) => {
+                // Nodes on the way neither verify nor store: only the end of
+                // the walk does. Watchers here still hear of it.
+                put.walk = walk;
+                if let Err(e) = self.send_to_peer_deferred(&next, &put.to_wire().encode()).await {
+                    log::debug!("DHT PUT forward to {:?} failed: {}", next, e);
+                }
+                self.dht_put_seen(&put, None, Some(&from)).await;
+            }
+            WalkStep::End => {
+                let record = match VerifiedRecord::from_put_msg(&put) {
+                    Ok(verified) => verified,
+                    Err(reason) => {
+                        log::warn!("DHT PUT from {:?}: {}, dropping", from, reason);
+                        return Ok(());
+                    }
+                };
+                self.dht_store
+                    .lock()
+                    .await
+                    .put_record(record.clone(), RecordSource::Peer(from));
+                self.dht_put_seen(&put, Some(record), Some(&from)).await;
+            }
+            WalkStep::Drop => {
+                log::debug!("DHT PUT walk from {:?} has nowhere to go", from);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn handle_dht_get(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let mut get = DhtGetMsg::from_bytes(payload)?;
+        let key = DhtId(get.key);
+
+        // The first visit of a walk records where its responses go back
+        // (`prev`) and is answered. A walk may pass here again and travels on
+        // from here each time, but its responses always follow the first
+        // visit's `prev`: a node can't be its own predecessor's predecessor,
+        // so replies walk a tree rooted at the originator and can't loop.
+        // Checked and added in one step, so the cap holds however dispatch
+        // is scheduled.
+        let first_visit = {
+            let mut qt = self.query_tokens.lock().await;
+            let fresh = QueryToken {
+                prev: from,
+                key: get.key,
+                next: Vec::new(),
+            };
+            match qt.try_insert(get.query_token, fresh) {
+                Ok(()) => true,
+                // The same walk again, unless someone reuses its token for
+                // another key.
+                Err(crate::bounded::Refused::Duplicate) => {
+                    if qt.get(&get.query_token).map_or(true, |t| t.key != get.key) {
+                        return Ok(());
+                    }
+                    false
+                }
+                Err(crate::bounded::Refused::Full) => {
+                    log::debug!("Global DHT GET state limit reached");
+                    return Ok(());
+                }
+            }
+        };
+
+        if first_visit {
+            self.answer_dht_get(&from, &get).await;
+        }
+
+        if let WalkStep::Forward(next, walk) = self.dht_walk_step(&key, &get.walk, &from).await {
+            // Responses relayed back come only from where it went.
+            {
+                let mut qt = self.query_tokens.lock().await;
+                let Some(t) = qt.get_mut(&get.query_token) else {
+                    return Ok(());
+                };
+                if t.next.len() >= MAX_GET_VISITS {
+                    return Ok(());
+                }
+                t.next.push(next);
+            }
+            get.walk = walk;
+            if let Err(e) = self.send_to_peer_deferred(&next, &get.to_wire().encode()).await {
+                log::debug!("DHT GET forward to {:?} failed: {}", next, e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Answer a GET with the records held here, along the reverse path. The
+    /// response must fit one message: owner-bound records (the zone root /
+    /// hello the key exists for) go first, then a random sample of the rest,
+    /// skipping any that would overflow. Junk piled onto a key can then never
+    /// push the real record out of the reply or make the reply unsendable.
+    async fn answer_dht_get(&self, to: &PeerId, get: &DhtGetMsg) {
+        let records: Vec<DhtResponseRecord> = {
+            use rand::seq::SliceRandom;
+            let store = self.dht_store.lock().await;
+            let mut records = store.get(&DhtId(get.key));
+            records.shuffle(&mut rand::thread_rng());
+            records.sort_by_key(|r| !matches!(r.record_type, RecordType::Hello | RecordType::ZoneRoot));
+            let mut size = 32 + 64 + 2; // token + key + count
+            let mut out = Vec::new();
+            for r in records {
+                // Every signed field (incl. the signer pubkey the requester
+                // must verify against) and the remaining TTL.
+                let rec = r.to_response_record();
+                let rec_len = rec.to_bytes().len();
+                if size + rec_len > MAX_PAYLOAD {
+                    continue;
+                }
+                size += rec_len;
+                out.push(rec);
+            }
+            out
+        };
+        if records.is_empty() {
+            return;
+        }
+        let response = DhtGetResponseMsg {
+            query_token: get.query_token,
+            key: get.key,
+            records,
+        };
+        // A failed reply must not stop the query from travelling on.
+        if let Err(e) = self.send_to_peer_deferred(to, &response.to_wire().encode()).await {
+            log::debug!("DHT GET reply to {:?} failed: {}", to, e);
+        }
+    }
+
+    pub(super) async fn handle_dht_get_response(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let mut resp = DhtGetResponseMsg::from_bytes(payload)?;
+        for rec in &mut resp.records {
+            rec.ttl = crate::dht::clamp_ttl_secs(rec.record_type, rec.ttl);
+        }
+
+        // Only responses to a query we issued or relayed, for the key it
+        // asked, from where the walk went, are accepted.
+        let prev_hop = self
+            .query_tokens
+            .lock()
+            .await
+            .get(&resp.query_token)
+            .filter(|t| t.key == resp.key && t.next.contains(&from))
+            .map(|t| t.prev);
+        let Some(prev) = prev_hop else {
+            log::debug!("DhtGetResponse with unknown query_token, another key, or not from where the walk went, from {:?}, dropping", from);
+            return Ok(());
+        };
+
+        if prev != self.peer_id() {
+            // Relay toward the originator, who verifies. Relays don't keep
+            // anything: holding results for someone else's lookup only
+            // records what passed through.
+            return self.send_to_peer_deferred(&prev, &resp.to_wire().encode()).await;
+        }
+
+        // Ours: verified records go to the search that asked. Nothing is
+        // stored: the store holds what walks placed here, and our own.
+        let tx = self.dht_searches.lock().unwrap().get(&resp.query_token).cloned();
+        let Some(tx) = tx else {
+            return Ok(());
+        };
+        let resp_key = DhtId(resp.key);
+        for rec in &resp.records {
+            match VerifiedRecord::from_response_record(resp_key, rec) {
+                Ok(verified) => {
+                    let _ = tx.try_send(verified);
+                }
+                Err(reason) => {
+                    log::warn!("DhtGetResponse from {:?}: {}, dropping record", from, reason);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) async fn handle_dht_watch(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let mut watch = DhtWatchMsg::from_bytes(payload)?;
+        let key = DhtId(watch.key);
+        {
+            let mut watches = self.dht_watches.lock().await;
+            if watch.expiration_secs == 0 {
+                watches.set_watch(watch.key, watch.query_token, from, 0);
+                return Ok(());
+            }
+            // A walk revisiting us must not re-point the return path (it
+            // would loop back through the later hops).
+            if watches.has_token(&watch.key, &watch.query_token) {
+                return Ok(());
+            }
+            if !watches.set_watch(watch.key, watch.query_token, from, watch.expiration_secs) {
+                log::debug!("DHT watch from {:?} refused (cap)", from);
+                return Ok(());
+            }
+        }
+        if let WalkStep::Forward(next, walk) = self.dht_walk_step(&key, &watch.walk, &from).await {
+            // Notifications relayed back come only from where it went.
+            self.dht_watches
+                .lock()
+                .await
+                .set_next(&watch.key, &watch.query_token, next);
+            watch.walk = walk;
+            let _ = self.send_to_peer_deferred(&next, &watch.to_wire().encode()).await;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn handle_dht_watch_notify(&self, from: PeerId, payload: &[u8]) -> Result<()> {
+        let mut notify = DhtWatchNotifyMsg::from_bytes(payload)?;
+        notify.put.ttl = crate::dht::clamp_ttl_secs(notify.put.record_type, notify.put.ttl);
+
+        let ours = self
+            .local_watches
+            .lock()
+            .await
+            .get(&notify.put.key)
+            .is_some_and(|w| w.live() && w.owns(&notify.query_token, &from));
+        if ours {
+            match VerifiedRecord::from_put_msg(&notify.put) {
+                Ok(record) => self.tell_app(record).await,
+                Err(reason) => log::warn!("DhtWatchNotify from {:?}: {}, dropping", from, reason),
+            }
+            return Ok(());
+        }
+        // Relay back along the watch walk without verifying; the watcher
+        // verifies.
+        let prev_hop = self
+            .dht_watches
+            .lock()
+            .await
+            .relay_for(&notify.put.key, &notify.query_token, &from);
+        match prev_hop {
+            Some(prev) => self.send_to_peer_deferred(&prev, &notify.to_wire().encode()).await,
+            None => {
+                log::debug!("DhtWatchNotify with unknown query_token, or not from where the watch went, dropping");
+                Ok(())
+            }
+        }
+    }
+
+    /// A PUT for `put.key` passed through or ended here, or we published it:
+    /// tell the watchers registered here (other than via `from`) and, if we
+    /// watch the key ourselves, the app. Each hears only of versions it
+    /// hasn't been told, so the ρ walks of one PUT and an owner's republishes
+    /// tell nobody twice.
+    pub(super) async fn dht_put_seen(&self, put: &DhtPutMsg, verified: Option<VerifiedRecord>, from: Option<&PeerId>) {
+        let remote = self.dht_watches.lock().await.is_watched(&put.key);
+        let local = self
+            .local_watches
+            .lock()
+            .await
+            .get(&put.key)
+            .is_some_and(|w| w.live());
+        if !remote && !local {
             return;
         }
         // Verify first, even as a relay: what we notify is remembered as
         // told, so a forged record claiming a victim's signer and a huge
         // sequence would otherwise suppress the victim's real news.
-        if crate::dht::VerifiedRecord::from_put_msg(put).is_err() {
-            return;
-        }
-        // Only news: a republish of what a watcher already has tells it
-        // nothing, and would show the watcher when the owner republishes.
-        let watchers = self
-            .dht_watches
-            .lock()
-            .await
-            .watchers_for_news(&put.key, put.signer.as_bytes(), put.sequence);
-        if watchers.is_empty() {
-            return;
-        }
-        for (token, via_peer) in watchers {
-            if Some(&via_peer) == exclude {
-                continue;
+        let record = match verified {
+            Some(r) => r,
+            None => match VerifiedRecord::from_put_msg(put) {
+                Ok(r) => r,
+                Err(_) => return,
+            },
+        };
+        if remote {
+            let watchers = self
+                .dht_watches
+                .lock()
+                .await
+                .watchers_for_news(&put.key, put.signer.as_bytes(), put.sequence);
+            for (token, via_peer) in watchers {
+                if Some(&via_peer) == from {
+                    continue;
+                }
+                let notify = DhtWatchNotifyMsg {
+                    query_token: token,
+                    put: put.clone(),
+                };
+                let _ = self.send_to_peer_deferred(&via_peer, &notify.to_wire().encode()).await;
             }
-            let notify = DhtWatchNotifyMsg {
-                query_token: token,
-                put: put.clone(),
-            };
-            let _ = self.send_to_peer_deferred(&via_peer, &notify.to_wire().encode()).await;
+        }
+        if local {
+            self.tell_app(record).await;
         }
     }
 
-    /// Republish every record this node published itself (hellos excepted:
-    /// they have their own timer). Owners republishing is what keeps records
-    /// alive; there is no replication sweep.
+    /// Hand a record for a key we watch to the app, if it is news to it.
+    async fn tell_app(&self, record: VerifiedRecord) {
+        let r = record.into_inner();
+        let news = self
+            .local_watches
+            .lock()
+            .await
+            .get_mut(r.key.as_bytes())
+            .is_some_and(|w| w.live() && w.news(&r.signer, r.sequence));
+        if news {
+            let _ = self.dht_watch_tx.send((r.key, r)).await;
+        }
+    }
+
+    // ── Publishing ──
+
+    /// Republish the records this node signed itself, and unsigned content
+    /// it published. Owners republishing is what keeps records alive; there
+    /// is no replication sweep. Hellos have their own timer, and records
+    /// signed by any other key (identities, zones, disposable label keys)
+    /// are republished by their owners' own timers. That keeps a Hidden
+    /// identity's records out of this republish, which runs on link-up and
+    /// alongside the node's own records: a watcher could otherwise open a
+    /// link to a suspected host and see the hidden service's re-PUT follow.
     pub(crate) async fn dht_republish_own(&self) {
         let records = self.own_records_to_republish().await;
         for record in &records {
-            let encoded = record.to_put_msg().to_wire().encode();
-            let count = self.dht_walker.walk_count().await;
-            self.dht_walker.launch(count, |_| encoded.clone()).await;
+            self.dht_walker.launch_put(&record.to_put_msg()).await;
         }
         if !records.is_empty() {
             log::debug!("Republished {} own DHT records", records.len());
         }
     }
 
-    /// The records [`dht_republish_own`](Self::dht_republish_own) sends: our
-    /// own records minus hellos and minus anything signed by a Hidden identity.
-    ///
-    /// This republish runs on link-up and alongside the node's other records,
-    /// so a Hidden identity's records in it would leave together with records
-    /// tied to this node — a watcher could open a link to a suspected host and
-    /// see the hidden service's re-PUT follow. Hidden identities republish only
-    /// from `maintain_hidden_services`, on their own timer.
+    /// The records [`dht_republish_own`](Self::dht_republish_own) sends.
     pub(super) async fn own_records_to_republish(&self) -> Vec<DhtRecord> {
-        let hidden = self.hidden_identity_signers().await;
-        let store = self.dht_store.lock().await;
-        store
-            .records_by_origin()
-            .0
+        let me = self.peer_id();
+        self.dht_store
+            .lock()
+            .await
+            .own_records()
             .into_iter()
-            .filter(|r| r.record_type != RecordType::Hello && !hidden.contains(r.signer.as_bytes()))
+            .filter(|r| match r.record_type {
+                RecordType::Hello => false,
+                RecordType::Content => true,
+                _ => r.signer == me,
+            })
             .cloned()
             .collect()
-    }
-
-    /// Relaunch watch walks for every live local watch (fresh tokens), and
-    /// drop expired ones. Paths change with the topology, so watches are kept
-    /// alive by the watcher rather than by the nodes on the old path.
-    pub(crate) async fn dht_refresh_watches(&self) {
-        let now = Instant::now();
-        let live: Vec<([u8; 64], u32)> = {
-            let mut watches = self.local_watches.lock().await;
-            watches.retain(|_, w| w.expires_at > now);
-            watches
-                .iter()
-                .map(|(k, w)| (*k, w.expires_at.duration_since(now).as_secs().max(1) as u32))
-                .collect()
-        };
-        for (key, remaining) in live {
-            let tokens = self.dht_walker.launch_watch(&key, remaining).await;
-            if let Some(w) = self.local_watches.lock().await.get_mut(&key) {
-                // Keep the previous round's tokens until their paths expire, so
-                // a notification already in flight still lands.
-                w.tokens.drain(..w.tokens.len().saturating_sub(MAX_WALKS));
-                w.tokens.extend(tokens);
-            }
-        }
     }
 
     /// Next monotonic sequence for signed-content / signed-at-key records,
@@ -317,11 +585,11 @@ impl Node {
         sequence
     }
 
-    /// The single publish path: persist a freshly-minted record, store it
-    /// locally, and send ρ PUT walks. The `DhtPutMsg` is *derived* from the
-    /// record via [`to_put_msg`](crate::dht::DhtRecord::to_put_msg), never built
-    /// in parallel — so the wire copy and the stored copy can't drift.
-    pub(crate) async fn dht_publish(&self, record: crate::dht::VerifiedRecord) -> Result<()> {
+    /// The single publish path: store a freshly-minted record locally (and
+    /// so in the database), tell watchers, and send ρ PUT walks. The
+    /// `DhtPutMsg` is *derived* from the record, never built in parallel, so
+    /// the wire copy and the stored copy can't drift.
+    pub(crate) async fn dht_publish(&self, record: VerifiedRecord) -> Result<()> {
         // A record too large to store is too large to send: say so rather
         // than send a PUT nobody keeps.
         let max = self.dht_store.lock().await.limits().max_value_bytes;
@@ -333,140 +601,41 @@ impl Node {
             )));
         }
         let put = record.record().to_put_msg();
-        self.dht_store_record(record, crate::dht::RecordSource::Local, true)
-            .await;
-        self.notify_dht_watchers(&put, None).await;
-        let encoded = put.to_wire().encode();
-        let count = self.dht_walker.walk_count().await;
-        self.dht_walker.launch(count, |_| encoded.clone()).await;
+        self.dht_store
+            .lock()
+            .await
+            .put_record(record.clone(), RecordSource::Local);
+        self.dht_put_seen(&put, Some(record), None).await;
+        self.dht_walker.launch_put(&put).await;
         Ok(())
     }
 
     /// Content-addressed DHT put: stores locally and sends PUT walks.
     /// Returns the content handle (64 bytes) needed for retrieval.
     pub async fn dht_put_content(&self, value: &[u8]) -> Result<ContentHandle> {
-        let (record, handle) =
-            crate::dht::VerifiedRecord::new_content(value, Duration::from_secs(3600));
+        let (record, handle) = VerifiedRecord::new_content(value, Duration::from_secs(3600));
         self.dht_publish(record).await?;
         // Not the handle itself: its first half decrypts the content.
         log::info!("DHT content put at {:?}", crate::dht::content_key(&handle));
         Ok(handle)
     }
 
-    /// Content-addressed DHT get: looks up the handle's key, checks and
-    /// decrypts the blob with the handle.
-    pub async fn dht_get_content(&self, inner_hash: &ContentHandle) -> Option<Vec<u8>> {
-        let key = crate::dht::content_key(inner_hash);
-
-        let store = self.dht_store.lock().await;
-        let records = store.get(&key);
-        for record in records {
-            if let Ok(plaintext) = crate::dht::content_address_get(inner_hash, &record.value) {
-                return Some(plaintext);
-            }
-        }
-        None
-    }
-
-    /// Send GET walks for a content-addressed key.
-    /// Uses anonymous query token routing for reply privacy.
-    pub async fn request_content(&self, inner_hash: &ContentHandle) -> Result<()> {
-        let key = crate::dht::content_key(inner_hash);
-        self.dht_walker.launch_get(key.as_bytes(), None).await;
-        Ok(())
-    }
-
-    /// Watch a DHT key for changes: sends ρ watch walks, refreshed by the
-    /// node's periodic task until `expiration_secs` passes.
-    pub async fn dht_watch(&self, key: &DhtId, expiration_secs: u32) {
-        let key_bytes = *key.as_bytes();
-        let expiration_secs = expiration_secs.min(crate::dht::MAX_WATCH_EXPIRATION_SECS);
-        let tokens = self.dht_walker.launch_watch(&key_bytes, expiration_secs).await;
-        let mut watches = self.local_watches.lock().await;
-        let w = watches.entry(key_bytes).or_insert(LocalWatch {
-            expires_at: Instant::now(),
-            tokens: Vec::new(),
-        });
-        w.expires_at = Instant::now() + Duration::from_secs(expiration_secs as u64);
-        w.tokens.extend(tokens);
-        log::debug!("Watching DHT key {:?}", key);
-    }
-
-    /// Stop watching a DHT key. Registrations along the walks expire on their
-    /// own; notifications that still arrive are dropped here.
-    pub async fn dht_unwatch(&self, key: &DhtId) {
-        self.local_watches.lock().await.remove(key.as_bytes());
-    }
-
-    /// Take the DHT watch notification receiver.
-    pub async fn take_dht_watch_receiver(&self) -> Option<mpsc::Receiver<(DhtId, DhtRecord)>> {
-        self.dht_watch_rx.lock().await.take()
-    }
-
-    // ── Signed Content DHT ──
-
-    /// Signed content-addressed DHT put: encrypts the value via content-addressing,
-    /// signs the record, stores locally as SignedContent, and propagates via
-    /// probabilistic PUT. Multiple publishers can store at the same key — each
-    /// signer's record is stored independently (supplemental).
-    ///
-    /// The value is encrypted so DHT storage nodes see only an opaque blob.
-    /// Self-authentication happens on retrieval: only holders of the handle
-    /// (derived from the plaintext) can decrypt and verify.
-    ///
-    /// Returns the content handle (64 bytes) needed for retrieval.
+    /// Signed content-addressed DHT put: the value is encrypted under its own
+    /// hash (storage nodes see an opaque blob), signed, and published. Each
+    /// signer's record at a content key is kept independently. Returns the
+    /// content handle needed for retrieval.
     pub async fn dht_put_signed_content(&self, value: &[u8], ttl_secs: u32) -> Result<ContentHandle> {
         let sequence = self.next_signed_content_sequence().await;
-        let (record, inner_hash) = crate::dht::VerifiedRecord::new_signed_content(
+        let (record, inner_hash) = VerifiedRecord::new_signed_content(
             &self.identity,
             value,
             sequence,
             Duration::from_secs(ttl_secs as u64),
         );
         self.dht_publish(record).await?;
-
         log::info!("DHT signed content put");
         Ok(inner_hash)
     }
-
-    /// Retrieve all valid signed content records at a content-addressed key.
-    /// Takes the content handle (see [`crate::dht::content_address_put`]), computes
-    /// the DHT key, fetches all records, attempts decryption on each, and returns
-    /// the signer PeerId for each successfully decrypted record along with the
-    /// decrypted plaintext.
-    ///
-    /// Invalid records (spam, garbage from storage nodes) silently fail decryption
-    /// and are excluded from results.
-    pub async fn dht_get_signed_content(&self, inner_hash: &ContentHandle) -> Vec<(PeerId, Vec<u8>)> {
-        let key = crate::dht::content_key(inner_hash);
-
-        let store = self.dht_store.lock().await;
-        let records = store.get(&key);
-        let mut results = Vec::new();
-        for record in records {
-            if record.record_type != RecordType::SignedContent {
-                continue;
-            }
-            let inner_blob = match crate::dht::signed_record_decrypt(&key, &record.value) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if let Ok(plaintext) = crate::dht::content_address_get(inner_hash, &inner_blob) {
-                results.push((record.signer, plaintext));
-            }
-        }
-        results
-    }
-
-    /// Send GET walks for a signed content-addressed key.
-    /// Uses anonymous query token routing for reply privacy.
-    pub async fn request_signed_content(&self, inner_hash: &ContentHandle) -> Result<()> {
-        let key = crate::dht::content_key(inner_hash);
-        self.dht_walker.launch_get(key.as_bytes(), None).await;
-        Ok(())
-    }
-
-    // ── TNS support: arbitrary-key DHT operations ──
 
     /// Next monotonic, restart-persisted sequence for signed-at-key records.
     /// Callers that must embed the sequence in a value *before* publishing (the
@@ -488,7 +657,7 @@ impl Node {
         sequence: u64,
         ttl_secs: u32,
     ) -> Result<()> {
-        let record = crate::dht::VerifiedRecord::new_signed_at_key(
+        let record = VerifiedRecord::new_signed_at_key(
             signer_keypair,
             key,
             value,
@@ -496,7 +665,6 @@ impl Node {
             Duration::from_secs(ttl_secs as u64),
         );
         self.dht_publish(record).await?;
-
         log::info!("TNS signed put at key {:?}", key);
         Ok(())
     }
@@ -512,7 +680,7 @@ impl Node {
         sequence: u64,
         ttl_secs: u32,
     ) -> Result<()> {
-        let record = crate::dht::VerifiedRecord::new_zone_root(
+        let record = VerifiedRecord::new_zone_root(
             zone_keypair,
             value,
             sequence,
@@ -523,117 +691,208 @@ impl Node {
         Ok(())
     }
 
-    /// Update one label in an owned zone's published working set and return the
-    /// full current map (`label → serialized TnsRecord set`) together with a fresh
-    /// monotonic sequence. `records = Some(..)` upserts the label; `None` removes
-    /// it. The map is the durable source of truth the zone root is rebuilt from;
-    /// it is hydrated lazily from the `tns_zone_records` table on first touch and
-    /// written through on change, so it survives restart and accumulates across
-    /// every publisher path.
+    /// Update one label in an owned zone's published working set
+    /// (`label → serialized TnsRecord set`). Returns whether it changed.
     ///
-    /// The sequence is allocated *inside* the same critical section as the
-    /// snapshot, so a higher sequence always corresponds to a same-or-newer
-    /// snapshot. Without this, two concurrent publishers (e.g. a hidden service's
-    /// "intro" and "peer") could invert — a stale, smaller snapshot winning with a
-    /// higher sequence and silently dropping the other label from the root.
+    /// The working set lives in memory. It starts as the zone's local labels
+    /// marked published (the label table is where persistent names live);
+    /// everything else in it belongs to a live publisher — the identity's
+    /// own `peer` or `intro` label, or a label a client published for as long
+    /// as it stays connected — and is put back by that publisher after a
+    /// restart, or not at all.
+    ///
     pub(crate) async fn zone_published_update(
         &self,
         zone_sid: &tarnet_api::types::ServiceId,
         label: &str,
         records: Option<Vec<u8>>,
-    ) -> (std::collections::BTreeMap<String, Vec<u8>>, u64) {
+    ) -> bool {
         let mut map = self.zone_published.lock().await;
-        // Lazy hydrate from the DB the first time we touch this zone.
         if !map.contains_key(zone_sid) {
-            let mut loaded = std::collections::BTreeMap::new();
-            if let Some(db) = &self.db {
-                if let Ok(rows) = db.zone_record_list(zone_sid.as_bytes()) {
-                    loaded.extend(rows);
-                }
-            }
+            let loaded = self.published_labels(zone_sid).await;
             map.insert(*zone_sid, loaded);
         }
-        let entry = map.get_mut(zone_sid).expect("hydrated above");
-        match &records {
-            Some(blob) => {
-                entry.insert(label.to_string(), blob.clone());
-            }
-            None => {
-                entry.remove(label);
-            }
+        let entry = map.get_mut(zone_sid).expect("loaded above");
+        match records {
+            Some(blob) => entry.insert(label.to_string(), blob.clone()).as_ref() != Some(&blob),
+            None => entry.remove(label).is_some(),
         }
-        let snapshot = entry.clone();
-        // Allocate the sequence under the map lock so seq and snapshot can't
-        // invert across concurrent publishers.
+    }
+
+    /// The zone's working set to sign, with a fresh sequence. Both are taken
+    /// under one lock, so a higher sequence always carries a same-or-newer
+    /// set: concurrent publishers (a hidden service's "intro" and a user
+    /// label) can't invert.
+    pub(crate) async fn zone_signing_snapshot(
+        &self,
+        zone_sid: &tarnet_api::types::ServiceId,
+    ) -> (std::collections::BTreeMap<String, Vec<u8>>, u64) {
+        let mut map = self.zone_published.lock().await;
+        if !map.contains_key(zone_sid) {
+            let loaded = self.published_labels(zone_sid).await;
+            map.insert(*zone_sid, loaded);
+        }
+        let snapshot = map[zone_sid].clone();
         let sequence = self.next_signed_content_sequence().await;
-        // Write through to durable storage (best-effort; the in-memory copy is
-        // authoritative for this process either way).
-        if let Some(db) = &self.db {
-            let res = match &records {
-                Some(blob) => db.zone_record_set(zone_sid.as_bytes(), label, blob),
-                None => db.zone_record_remove(zone_sid.as_bytes(), label),
-            };
-            if let Err(e) = res {
-                log::warn!("zone_published_update: db write failed: {}", e);
-            }
-        }
         (snapshot, sequence)
     }
 
-    /// Get all non-expired records at an arbitrary DHT key from local store.
-    pub async fn dht_get_records_at_key(&self, key: &DhtId) -> Vec<crate::dht::DhtRecord> {
-        self.dht_store
-            .lock()
-            .await
-            .get(key)
-            .into_iter()
-            .cloned()
-            .collect()
+    /// The zone's local labels marked published, as a working set.
+    async fn published_labels(
+        &self,
+        zone_sid: &tarnet_api::types::ServiceId,
+    ) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let mut out = std::collections::BTreeMap::new();
+        let Some(db) = &self.db else {
+            return out;
+        };
+        // Labels are filed under the identity's name, or the ServiceId it
+        // was named by; the default identity's also under "".
+        let mut keys = vec![tarnet_api::types::encode_base32(zone_sid.as_bytes())];
+        for (name, sid, ..) in self.list_identities().await {
+            if sid == *zone_sid {
+                if sid == self.default_service_id().await {
+                    keys.push(String::new());
+                }
+                keys.push(name);
+            }
+        }
+        for key in keys {
+            for (label, blobs, publish) in db.label_list(&key).unwrap_or_default() {
+                if !publish {
+                    continue;
+                }
+                let records: Vec<crate::tns::TnsRecord> = blobs
+                    .iter()
+                    .filter_map(|b| crate::tns::tns_record_from_bytes(b).ok().map(|(r, _)| r))
+                    .collect();
+                out.insert(label, crate::tns::serialize_record_set(&records));
+            }
+        }
+        out
     }
 
-    /// Insert a record directly into the local DHT store, bypassing propagation,
-    /// link-up store-dump, and replication. Test-only seam: it is the only way to
-    /// place a record on a node such that a *peer* can obtain it solely via a
-    /// DhtGet pull (every production path pushes a full copy, masking the
-    /// GET-response code path).
+    /// Insert a record directly into the local DHT store, bypassing
+    /// propagation. Test-only seam: the only way to place a record on a node
+    /// such that a *peer* can obtain it solely via a DhtGet pull.
     #[doc(hidden)]
     pub async fn dht_store_insert_local_for_test(&self, record: crate::dht::DhtRecord) {
         self.dht_store
             .lock()
             .await
-            .put(crate::dht::VerifiedRecord::locally_trusted(record));
+            .put(VerifiedRecord::locally_trusted(record));
     }
 
-    /// Send GET walks for an arbitrary key.
-    /// Uses anonymous query token routing for reply privacy.
-    pub async fn request_dht_key(&self, key: &DhtId) -> Result<()> {
-        self.dht_walker.launch_get(key.as_bytes(), None).await;
-        Ok(())
+    // ── Watching ──
+
+    /// Watch a DHT key for changes until `expiration_secs` passes: watch walks
+    /// are relaunched every [`WATCH_REFRESH_INTERVAL`] meanwhile.
+    pub async fn dht_watch(&self, key: &DhtId, expiration_secs: u32) {
+        let secs = expiration_secs.min(crate::dht::MAX_WATCH_EXPIRATION_SECS);
+        let expires_at = Instant::now() + Duration::from_secs(secs as u64);
+        self.local_watches
+            .lock()
+            .await
+            .entry(*key.as_bytes())
+            .or_insert_with(|| LocalWatch::new(expires_at))
+            .expires_at = expires_at;
+        self.launch_watch_round(key.as_bytes()).await;
+        log::debug!("Watching DHT key {:?}", key);
     }
 
-    /// Issue a DHT search for `key` and return a [`DhtSearch`] stream that yields
-    /// distinct, infra-verified records as responses route back, ending at
-    /// `deadline`. This is the single read primitive: it ties the act of reading
-    /// search results to actually having issued the query, and replaces the old
-    /// "fire a `request_*` then busy-poll the store" pattern. Dropping the
-    /// returned stream cancels the search (RAII) — callers terminate simply by
-    /// breaking their loop or letting it fall out of scope.
+    /// Stop watching a DHT key. Registrations along the walks expire on their
+    /// own; notifications that still arrive are dropped here.
+    pub async fn dht_unwatch(&self, key: &DhtId) {
+        self.local_watches.lock().await.remove(key.as_bytes());
+    }
+
+    /// Relaunch watch walks for every live local watch, and drop expired
+    /// ones. Paths change with the topology, so watches are kept alive by the
+    /// watcher rather than by the nodes on the old path.
+    pub(crate) async fn dht_refresh_watches(&self) {
+        let keys: Vec<[u8; 64]> = {
+            let mut watches = self.local_watches.lock().await;
+            watches.retain(|_, w| w.live());
+            watches.keys().copied().collect()
+        };
+        for key in keys {
+            self.launch_watch_round(&key).await;
+        }
+    }
+
+    /// One round of watch walks for `key`, registered as the watch's current
+    /// round before any leaves, so no fast notification is missed.
+    async fn launch_watch_round(&self, key: &[u8; 64]) {
+        let walks: Vec<([u8; 32], PeerId)> = self
+            .dht_walker
+            .first_hops()
+            .await
+            .into_iter()
+            .map(|hop| (random_token(), hop))
+            .collect();
+        let secs = {
+            let mut watches = self.local_watches.lock().await;
+            let Some(w) = watches.get_mut(key).filter(|w| w.live()) else {
+                return;
+            };
+            w.new_round(walks.clone());
+            w.expires_at
+                .saturating_duration_since(Instant::now())
+                .min(WATCH_REGISTRATION)
+                .as_secs()
+                .max(1) as u32
+        };
+        let msgs = walks
+            .into_iter()
+            .map(|(token, hop)| {
+                let watch = DhtWatchMsg {
+                    walk: WalkHeader::origin(),
+                    key: *key,
+                    query_token: token,
+                    expiration_secs: secs,
+                };
+                (hop, watch.to_wire().encode())
+            })
+            .collect();
+        self.dht_walker.send_walks(msgs).await;
+    }
+
+    /// Take the DHT watch notification receiver.
+    pub async fn take_dht_watch_receiver(&self) -> Option<mpsc::Receiver<(DhtId, DhtRecord)>> {
+        self.dht_watch_rx.lock().await.take()
+    }
+
+    // ── Reading ──
+
+    /// Search the DHT for `key` until `deadline`: a stream of distinct,
+    /// verified records, those held here first, then what the walks bring
+    /// back. The one way to read the DHT. Dropping the search cancels it.
     ///
     /// Walks find a record only probabilistically, so the search relaunches a
     /// fresh round of walks every [`SEARCH_RELAUNCH_INTERVAL`], up to
     /// [`SEARCH_ROUNDS`] rounds (keys can hold several records, so finding one
     /// does not stop the rounds; dropping the search does).
     pub async fn dht_search(&self, key: DhtId, deadline: Instant) -> DhtSearch {
-        // Bounded: a response that finds the channel full is dropped from it,
-        // but it is stored, and `DhtSearch::next` also yields records stored
-        // since the search began, so nothing delivered is lost.
-        let (tx, rx) = mpsc::channel(16);
-        let tokens = self
-            .dht_walker
-            .launch_get(key.as_bytes(), Some((&self.dht_searches, &tx)))
-            .await;
-
+        let held: VecDeque<VerifiedRecord> = self
+            .dht_store
+            .lock()
+            .await
+            .get(&key)
+            .into_iter()
+            .map(|r| VerifiedRecord::locally_trusted(r.clone()))
+            .collect();
+        // Bounded: past this many records waiting, responses are dropped.
+        let (tx, rx) = mpsc::channel(SEARCH_BUFFER);
+        // No time to wait: only what is held here.
+        let tokens = if deadline > Instant::now() {
+            self.dht_walker
+                .launch_get(key.as_bytes(), (&self.dht_searches, &tx))
+                .await
+        } else {
+            Vec::new()
+        };
         DhtSearch {
+            held,
             rx,
             tx,
             key,
@@ -644,26 +903,51 @@ impl Node {
             seen: HashSet::new(),
             walker: self.dht_walker.clone(),
             registry: self.dht_searches.clone(),
-            store: self.dht_store.clone(),
-            started: Instant::now(),
         }
     }
 
-    /// [`dht_search`](Self::dht_search) for a content-addressed key: derives the
-    /// outer lookup hash from `inner_hash` (the same derivation
-    /// [`request_content`](Self::request_content) /
-    /// [`request_signed_content`](Self::request_signed_content) use). Serves both
-    /// plain and signed content gets — they share the lookup key and differ only
-    /// in how the caller decrypts the streamed records.
-    pub async fn dht_search_content(&self, inner_hash: &ContentHandle, deadline: Instant) -> DhtSearch {
-        self.dht_search(crate::dht::content_key(inner_hash), deadline).await
+    /// The records held here at `key` (placed here by walks, or our own),
+    /// without searching.
+    pub async fn dht_held(&self, key: &DhtId) -> Vec<DhtRecord> {
+        self.dht_store.lock().await.get(key).into_iter().cloned().collect()
     }
 
-    /// [`dht_search`](Self::dht_search) for a peer's hello record, keyed by the
-    /// identity-addressed DHT key for `target`.
-    pub async fn dht_search_hello(&self, target: &PeerId, deadline: Instant) -> DhtSearch {
-        let key = crate::dht::identity_address_key(target);
-        self.dht_search(key, deadline).await
+    /// The plaintext of the content behind `handle`, searched for until
+    /// `timeout`.
+    pub async fn dht_get_content(&self, handle: &ContentHandle, timeout: Duration) -> Option<Vec<u8>> {
+        let key = crate::dht::content_key(handle);
+        let mut search = self.dht_search(key, Instant::now() + timeout).await;
+        while let Some(rec) = search.next().await {
+            if let Ok(plain) = crate::dht::content_address_get(handle, &rec.record().value) {
+                return Some(plain);
+            }
+        }
+        None
+    }
+
+    /// The signed copies of the content behind `handle`: (signer, plaintext),
+    /// everything that has arrived once the first has, searched for until
+    /// `timeout`. Records that don't decrypt to it are skipped.
+    pub async fn dht_get_signed_content(&self, handle: &ContentHandle, timeout: Duration) -> Vec<(PeerId, Vec<u8>)> {
+        let key = crate::dht::content_key(handle);
+        let mut search = self.dht_search(key, Instant::now() + timeout).await;
+        let mut results: Vec<(PeerId, Vec<u8>)> = Vec::new();
+        while let Some(rec) = search.next().await {
+            let r = rec.record();
+            if r.record_type != RecordType::SignedContent || results.iter().any(|(s, _)| *s == r.signer) {
+                continue;
+            }
+            let Ok(blob) = crate::dht::signed_record_decrypt(&key, &r.value) else {
+                continue;
+            };
+            if let Ok(plain) = crate::dht::content_address_get(handle, &blob) {
+                results.push((r.signer, plain));
+            }
+            if !results.is_empty() && search.is_idle() {
+                break;
+            }
+        }
+        results
     }
 }
 
@@ -672,91 +956,73 @@ impl Node {
 const SEARCH_ROUNDS: u32 = 3;
 /// Time between search rounds.
 const SEARCH_RELAUNCH_INTERVAL: Duration = Duration::from_millis(1500);
+/// Records a search buffers before its reader takes them.
+const SEARCH_BUFFER: usize = 256;
 
-/// A live DHT search: an async stream of distinct, infra-verified records routed
-/// back for one query. The only way to consume search results, so a caller
-/// cannot read results without having issued the query (the read-side mirror of
-/// the typed publish constructors). [`Drop`] deregisters the query tokens,
-/// cancelling the search.
+/// A live DHT search: a stream of distinct verified records for one key (see
+/// [`Node::dht_search`]). [`Drop`] deregisters the query tokens, cancelling
+/// the search.
 pub struct DhtSearch {
-    rx: mpsc::Receiver<crate::dht::VerifiedRecord>,
-    tx: mpsc::Sender<crate::dht::VerifiedRecord>,
+    /// Records held here when the search began, yielded first.
+    held: VecDeque<VerifiedRecord>,
+    rx: mpsc::Receiver<VerifiedRecord>,
+    tx: mpsc::Sender<VerifiedRecord>,
     key: DhtId,
     /// Query tokens of every walk launched so far.
     tokens: Vec<[u8; 32]>,
     deadline: Instant,
     rounds_left: u32,
     next_round: Instant,
-    /// Fingerprints of records already yielded, so a record delivered over
-    /// multiple walks is surfaced once.
-    seen: HashSet<[u8; 64]>,
+    /// Records already yielded, so one delivered over several walks is
+    /// surfaced once.
+    seen: HashSet<(PeerId, u64, RecordType, [u8; 32])>,
     walker: DhtWalker,
     registry: Arc<SearchRegistry>,
-    /// Backlog: a record that arrived while the channel was full is still
-    /// in the store, stored after `started`.
-    store: Arc<Mutex<DhtStore>>,
-    started: Instant,
-}
-
-fn search_fingerprint(r: &DhtRecord) -> [u8; 64] {
-    let mut fp_input = Vec::with_capacity(64 + 1 + 8 + 32 + r.value.len());
-    fp_input.extend_from_slice(r.key.as_bytes());
-    fp_input.push(r.record_type.as_u8());
-    fp_input.extend_from_slice(&r.sequence.to_be_bytes());
-    fp_input.extend_from_slice(r.signer.as_bytes());
-    fp_input.extend_from_slice(&r.value);
-    blake3_hash_64(&fp_input)
 }
 
 impl DhtSearch {
-    /// A record stored since the search began that hasn't been yielded.
-    /// Everything in the store passed the trust gate on the way in.
-    async fn from_backlog(&mut self) -> Option<crate::dht::VerifiedRecord> {
-        let store = self.store.lock().await;
-        let rec = store
-            .get(&self.key)
-            .into_iter()
-            .find(|r| r.stored_at >= self.started && !self.seen.contains(&search_fingerprint(r)))?
-            .clone();
-        drop(store);
-        self.seen.insert(search_fingerprint(&rec));
-        Some(crate::dht::VerifiedRecord::locally_trusted(rec))
+    /// Nothing is waiting to be yielded right now.
+    pub fn is_idle(&self) -> bool {
+        self.held.is_empty() && self.rx.is_empty()
     }
 
     /// Await the next distinct verified record, or `None` once the deadline
-    /// passes (or the node shuts the channel). Records are guaranteed to have
-    /// cleared the trust gate — invalid records never reach application logic.
-    pub async fn next(&mut self) -> Option<crate::dht::VerifiedRecord> {
+    /// passes.
+    pub async fn next(&mut self) -> Option<VerifiedRecord> {
         loop {
-            let now = Instant::now();
-            if now >= self.deadline {
-                return None;
-            }
-            if let Some(rec) = self.from_backlog().await {
-                return Some(rec);
-            }
-            let relaunch = self.rounds_left > 0;
-            let wake = if relaunch {
-                self.next_round.min(self.deadline)
-            } else {
-                self.deadline
-            };
-            let rec = tokio::select! {
-                r = self.rx.recv() => r?,
-                _ = tokio::time::sleep(wake.saturating_duration_since(now)) => {
-                    if relaunch && Instant::now() >= self.next_round {
-                        self.rounds_left -= 1;
-                        self.next_round = Instant::now() + SEARCH_RELAUNCH_INTERVAL;
-                        let tokens = self
-                            .walker
-                            .launch_get(self.key.as_bytes(), Some((&self.registry, &self.tx)))
-                            .await;
-                        self.tokens.extend(tokens);
+            let rec = match self.held.pop_front() {
+                Some(rec) => rec,
+                None => {
+                    let now = Instant::now();
+                    if now >= self.deadline {
+                        return None;
                     }
-                    continue;
+                    let relaunch = self.rounds_left > 0;
+                    let wake = if relaunch {
+                        self.next_round.min(self.deadline)
+                    } else {
+                        self.deadline
+                    };
+                    tokio::select! {
+                        r = self.rx.recv() => r?,
+                        _ = tokio::time::sleep(wake.saturating_duration_since(now)) => {
+                            if relaunch && Instant::now() >= self.next_round {
+                                self.rounds_left -= 1;
+                                self.next_round = Instant::now() + SEARCH_RELAUNCH_INTERVAL;
+                                let tokens = self
+                                    .walker
+                                    .launch_get(self.key.as_bytes(), (&self.registry, &self.tx))
+                                    .await;
+                                self.tokens.extend(tokens);
+                            }
+                            continue;
+                        }
+                    }
                 }
             };
-            if self.seen.insert(search_fingerprint(rec.record())) {
+            let r = rec.record();
+            let id = (r.signer, r.sequence, r.record_type, *blake3::hash(&r.value).as_bytes());
+            if self.seen.insert(id) {
                 return Some(rec);
             }
         }

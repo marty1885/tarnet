@@ -190,12 +190,7 @@ impl StateDb {
                  kind INTEGER NOT NULL,
                  key BLOB NOT NULL
              );
-             CREATE TABLE IF NOT EXISTS tns_zone_records (
-                 zone_sid BLOB NOT NULL,
-                 label TEXT NOT NULL,
-                 records BLOB NOT NULL,
-                 PRIMARY KEY (zone_sid, label)
-             );",
+             DROP TABLE IF EXISTS tns_zone_records;",
         )
         .map_err(sqlite_err)?;
         ensure_dht_records_table(&conn).map_err(sqlite_err)?;
@@ -566,52 +561,6 @@ impl StateDb {
             }
         }
         Ok(result)
-    }
-
-    // ── Zone published record map (TNS zone-root source of truth) ──
-    //
-    // The authoritative set of records a zone publishes, keyed by the zone's
-    // ServiceId so EVERY publisher path (user labels, hidden-service intro/peer)
-    // funnels into one place. The zone root is rebuilt and re-signed from this
-    // map on every change; `records` is a serialized TnsRecord set for one label.
-
-    /// Upsert the record set for `label` in zone `zone_sid`.
-    pub fn zone_record_set(&self, zone_sid: &[u8; 32], label: &str, records: &[u8]) -> Result<()> {
-        let conn = self.lock()?;
-        conn.prepare_cached(
-            "INSERT INTO tns_zone_records(zone_sid, label, records) VALUES(?1, ?2, ?3)
-             ON CONFLICT(zone_sid, label) DO UPDATE SET records = excluded.records",
-        )
-        .map_err(sqlite_err)?
-        .execute(params![zone_sid.as_slice(), label, records])
-        .map_err(sqlite_err)?;
-        Ok(())
-    }
-
-    /// Remove `label` from zone `zone_sid`. No-op if absent.
-    pub fn zone_record_remove(&self, zone_sid: &[u8; 32], label: &str) -> Result<()> {
-        let conn = self.lock()?;
-        conn.prepare_cached("DELETE FROM tns_zone_records WHERE zone_sid = ?1 AND label = ?2")
-            .map_err(sqlite_err)?
-            .execute(params![zone_sid.as_slice(), label])
-            .map_err(sqlite_err)?;
-        Ok(())
-    }
-
-    /// All `(label, serialized records)` published in zone `zone_sid`, ordered by label.
-    pub fn zone_record_list(&self, zone_sid: &[u8; 32]) -> Result<Vec<(String, Vec<u8>)>> {
-        let conn = self.lock()?;
-        let mut stmt = conn
-            .prepare_cached(
-                "SELECT label, records FROM tns_zone_records WHERE zone_sid = ?1 ORDER BY label",
-            )
-            .map_err(sqlite_err)?;
-        let rows = stmt
-            .query_map(params![zone_sid.as_slice()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(sqlite_err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(sqlite_err)
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {

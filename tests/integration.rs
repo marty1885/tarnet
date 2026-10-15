@@ -1,14 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tarnet::dht::{BloomFilter, KBucketTable};
-use tarnet::identity::{self, dht_id_from_peer_id, Keypair};
+use tarnet::dht::BloomFilter;
+use tarnet::identity::{self, Keypair};
 use tarnet::link::PeerLink;
 use tarnet::node::Node;
 use tarnet::routing::RoutingTable;
 use tarnet::state::{StateDb, StorageLimits};
 use tarnet::transport::tcp::{TcpDiscovery, TcpTransport};
-use tarnet::types::{DhtId, PeerId, RecordType};
+use tarnet::types::{PeerId, RecordType};
 use tarnet::wire::*;
 use tarnet_api::service::{ListenerOptions, PortMode};
 use tarnet_api::types::ServiceId;
@@ -231,8 +231,10 @@ async fn route_propagation_three_nodes() {
     let mut table_a = RoutingTable::new(a);
     let mut table_b = RoutingTable::new(b);
     let mut table_c = RoutingTable::new(c);
-    let (dump_a_to_b, _) = table_a.neighbour_up(b, COST_FAST);
-    let (dump_c_to_b, _) = table_c.neighbour_up(b, COST_FAST);
+    table_a.neighbour_up(b, COST_FAST);
+    table_c.neighbour_up(b, COST_FAST);
+    let dump_a_to_b = table_a.take_pending(&b);
+    let dump_c_to_b = table_c.take_pending(&b);
     table_b.neighbour_up(a, COST_FAST);
     table_b.neighbour_up(c, COST_FAST);
     for m in dump_a_to_b {
@@ -523,39 +525,6 @@ async fn dht_watch_notification() {
     assert_eq!(record.record_type, tarnet::types::RecordType::Hello);
 }
 
-/// Test k-bucket insert, eviction, and closest_peers.
-#[test]
-fn kbucket_insert_and_closest() {
-    let local = Keypair::generate();
-    let mut table = KBucketTable::new(&local.peer_id());
-
-    // Insert several peers
-    let mut peers = Vec::new();
-    for _ in 0..30 {
-        let kp = Keypair::generate();
-        let pid = kp.peer_id();
-        let did = dht_id_from_peer_id(&pid);
-        table.insert(pid, did);
-        peers.push((pid, did));
-    }
-
-    assert!(table.len() <= 30);
-    assert!(table.len() > 0);
-
-    // closest_peers should return up to k
-    let target = DhtId([0xAA; 64]);
-    let closest = table.closest_peers(&target, 10);
-    assert!(closest.len() <= 10);
-    assert!(!closest.is_empty());
-
-    // Verify ordering: each peer should be at least as close as the next
-    for i in 1..closest.len() {
-        let dist_prev = target.xor_distance(&closest[i - 1].1);
-        let dist_curr = target.xor_distance(&closest[i].1);
-        assert!(dist_prev <= dist_curr);
-    }
-}
-
 /// Test bloom filter insert and contains.
 #[test]
 fn bloom_filter_dedup() {
@@ -689,12 +658,8 @@ async fn dht_put_and_get_walks_meet_across_a_line() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Node C's GET walks find it.
-    let mut search = node_c
-        .dht_search_content(&inner_hash, std::time::Instant::now() + Duration::from_secs(6))
-        .await;
-    assert!(search.next().await.is_some(), "C's GET walks should reach a node holding A's PUT");
-    let result_c = node_c.dht_get_content(&inner_hash).await;
-    assert_eq!(result_c.as_deref(), Some(&data[..]));
+    let result_c = node_c.dht_get_content(&inner_hash, Duration::from_secs(6)).await;
+    assert_eq!(result_c.as_deref(), Some(&data[..]), "C's GET walks should reach a node holding A's PUT");
 }
 
 /// Test signature rejection on DHT GET response.
@@ -887,15 +852,23 @@ async fn signed_content_multi_publisher() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Client searches for the signed content until both providers turn up.
+    let key = tarnet::dht::content_key(&inner_hash_a);
     let mut search = client
-        .dht_search_content(&inner_hash_a, std::time::Instant::now() + Duration::from_secs(6))
+        .dht_search(key, std::time::Instant::now() + Duration::from_secs(6))
         .await;
-    let results = loop {
-        let results = client.dht_get_signed_content(&inner_hash_a).await;
-        if results.len() >= 2 || search.next().await.is_none() {
-            break results;
+    let mut results: Vec<(PeerId, Vec<u8>)> = Vec::new();
+    while let Some(rec) = search.next().await {
+        let r = rec.record();
+        let Ok(blob) = tarnet::dht::signed_record_decrypt(&key, &r.value) else { continue };
+        if let Ok(plain) = tarnet::dht::content_address_get(&inner_hash_a, &blob) {
+            if !results.iter().any(|(s, _)| *s == r.signer) {
+                results.push((r.signer, plain));
+            }
         }
-    };
+        if results.len() >= 2 {
+            break;
+        }
+    }
 
     // Collect signer PeerIds
     let signer_pids: Vec<PeerId> = results.iter().map(|(pid, _)| *pid).collect();
@@ -937,14 +910,14 @@ async fn signed_content_garbage_rejected() {
     let inner_hash = node.dht_put_signed_content(topic, 600).await.unwrap();
 
     // Retrieve with correct inner hash — should find the record
-    let results = node.dht_get_signed_content(&inner_hash).await;
+    let results = node.dht_get_signed_content(&inner_hash, Duration::ZERO).await;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, node.peer_id());
     assert_eq!(results[0].1, topic);
 
     // Retrieve with wrong inner hash — should find nothing (self-authentication)
     let wrong_hash = tarnet::types::ContentHandle(hash_64(b"wrong-secret||model-x"));
-    let wrong_results = node.dht_get_signed_content(&wrong_hash).await;
+    let wrong_results = node.dht_get_signed_content(&wrong_hash, Duration::ZERO).await;
     assert!(wrong_results.is_empty());
 }
 
@@ -966,7 +939,7 @@ async fn node_db_restores_sequences_and_records() {
     let restored = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
 
     assert!(restored.lookup_hello(&original.peer_id()).await.is_some());
-    let restored_signed = restored.dht_get_signed_content(&signed_hash).await;
+    let restored_signed = restored.dht_get_signed_content(&signed_hash, Duration::ZERO).await;
     assert_eq!(restored_signed.len(), 1);
     assert_eq!(restored_signed[0].1, b"payload");
 

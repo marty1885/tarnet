@@ -2018,8 +2018,7 @@ impl HelloRecord {
         let mut global_addresses = Vec::with_capacity(addr_count.min(r.remaining() / 5));
         for _ in 0..addr_count {
             let (addr, consumed) = ScopedAddress::from_bytes(&data[r.pos..])?;
-            // Only keep known transports and Global scope
-            if !matches!(addr.transport_type, TransportType::Unknown(_)) {
+            if addr.is_dialable_global() {
                 global_addresses.push(addr);
             }
             r.pos += consumed;

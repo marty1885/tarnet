@@ -244,52 +244,48 @@ fn record_set_to_endpoint(set: &[TnsRecord]) -> Option<PoolEndpoint> {
     })
 }
 
+/// The record sets members published under `label`, searched for until
+/// `timeout`: everything that has arrived once the first set has.
+async fn search_sets(node: &Node, pool_root: &ServiceId, label: &str, timeout: Duration) -> Vec<Vec<TnsRecord>> {
+    let mut search = node
+        .dht_search(tns_dht_key(pool_root, label), Instant::now() + timeout)
+        .await;
+    let mut records = Vec::new();
+    let mut sets = Vec::new();
+    while let Some(rec) = search.next().await {
+        records.push(rec.into_inner());
+        sets = decrypt_all_sets(&records, pool_root, label);
+        if !sets.is_empty() && search.is_idle() {
+            break;
+        }
+    }
+    sets
+}
+
 /// Resolve the live endpoint set for `service` in the pool. One endpoint per member.
-/// Issues a DHT GET and polls the local store until something arrives or `timeout`.
 pub async fn resolve_endpoints(
     node: &Node,
     pool_root: &ServiceId,
     service: &str,
     timeout: Duration,
 ) -> Vec<PoolEndpoint> {
-    let dht_key = tns_dht_key(pool_root, service);
-
-    // Fast path: already in the local store.
-    let local = node.dht_get_records_at_key(&dht_key).await;
-    let mut sets = decrypt_all_sets(&local, pool_root, service);
-    if sets.is_empty() {
-        // Search the network, re-reading the store as records stream back.
-        let mut search = node.dht_search(dht_key, Instant::now() + timeout).await;
-        loop {
-            let recs = node.dht_get_records_at_key(&dht_key).await;
-            sets = decrypt_all_sets(&recs, pool_root, service);
-            if !sets.is_empty() || search.next().await.is_none() {
-                break;
-            }
-        }
-    }
-
-    sets.iter().filter_map(|s| record_set_to_endpoint(s)).collect()
+    search_sets(node, pool_root, service, timeout)
+        .await
+        .iter()
+        .filter_map(|s| record_set_to_endpoint(s))
+        .collect()
 }
 
 /// Resolve the pool catalog: the union of service names members have published.
 pub async fn resolve_catalog(node: &Node, pool_root: &ServiceId, timeout: Duration) -> Vec<String> {
-    let dht_key = tns_dht_key(pool_root, CATALOG_LABEL);
-    let mut search = node.dht_search(dht_key, Instant::now() + timeout).await;
     let mut names: Vec<String> = Vec::new();
-    loop {
-        let recs = node.dht_get_records_at_key(&dht_key).await;
-        for set in decrypt_all_sets(&recs, pool_root, CATALOG_LABEL) {
-            for rec in set {
-                if let TnsRecord::Text(name) = rec {
-                    if !names.contains(&name) {
-                        names.push(name);
-                    }
+    for set in search_sets(node, pool_root, CATALOG_LABEL, timeout).await {
+        for rec in set {
+            if let TnsRecord::Text(name) = rec {
+                if !names.contains(&name) {
+                    names.push(name);
                 }
             }
-        }
-        if !names.is_empty() || search.next().await.is_none() {
-            break;
         }
     }
     names

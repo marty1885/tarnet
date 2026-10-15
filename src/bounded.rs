@@ -75,7 +75,9 @@ impl<K: Hash + Eq, V> BoundedMap<K, V> {
             .map(|(v, _)| v)
     }
 
-    /// The live entry for `key`, to change in place (its age is kept).
+    /// The live entry for `key`, to change in place. Its age is kept: to
+    /// record something again, restarting its lifetime, use
+    /// [`upsert`](Self::upsert).
     pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
         let now = Instant::now();
         let ttl = self.ttl;

@@ -105,6 +105,11 @@ struct Neighbour {
     first_dump: bool,
     /// Changes to our advertised set not yet sent to this neighbour.
     pending: BTreeMap<PeerId, RouteEntry>,
+    /// A full dump is owed to this neighbour (it supersedes `pending`).
+    /// Dumps leave through [`take_pending`](RoutingTable::take_pending) like
+    /// every other update, so one sender sends them all, in order: an update
+    /// can't overtake a dump built before it and be undone by its end.
+    dump_due: bool,
 }
 
 /// A seqno request to send.
@@ -341,9 +346,9 @@ impl RoutingTable {
 
     // ── Link events ──
 
-    /// A neighbour came up (or another link to it did). Returns the full
-    /// dump to send it, and seqno requests if its cost changed.
-    pub fn neighbour_up(&mut self, n: PeerId, cost: u16) -> (Vec<RouteUpdateMsg>, Vec<SeqnoRequest>) {
+    /// A neighbour came up (or another link to it did): it is owed a full
+    /// dump. Returns seqno requests if its cost changed.
+    pub fn neighbour_up(&mut self, n: PeerId, cost: u16) -> Vec<SeqnoRequest> {
         let requests = if self.neighbours.contains_key(&n) {
             self.neighbour_cost(&n, cost)
         } else {
@@ -356,11 +361,13 @@ impl RoutingTable {
                     staging: None,
                     first_dump: true,
                     pending: BTreeMap::new(),
+                    dump_due: false,
                 },
             );
             Vec::new()
         };
-        (self.full_dump(&n), requests)
+        self.request_full_dump(&n);
+        requests
     }
 
     /// The cost of the link to `n` changed (its active link failed over, or
@@ -474,15 +481,16 @@ impl RoutingTable {
             }
             return None;
         }
-        // Seen recently (or too many tracked): don't forward it again.
-        if self.recent_requests.try_insert((dest, seqno), ()).is_err() {
-            return None;
-        }
+        // We can answer it: whoever asks gets our route, however many ask.
         if let Some(best) = self.selected.get(&dest).and_then(|r| r.first()) {
             if !seqno_newer(seqno, best.seqno) {
                 self.resend(&dest, from);
                 return None;
             }
+        }
+        // Seen recently (or too many tracked): don't forward it again.
+        if self.recent_requests.try_insert((dest, seqno), ()).is_err() {
+            return None;
         }
         // The hop budget comes from the wire: never more than we'd start with.
         if hops.min(SEQNO_REQUEST_HOPS) <= 1 {
@@ -511,12 +519,16 @@ impl RoutingTable {
 
     // ── Outgoing ──
 
-    /// Changes not yet sent to `n`, split into messages.
+    /// What is owed to `n` — a full dump, or the changes not yet sent —
+    /// split into messages.
     pub fn take_pending(&mut self, n: &PeerId) -> Vec<RouteUpdateMsg> {
         let degree = self.degree();
         let Some(nb) = self.neighbours.get_mut(n) else {
             return Vec::new();
         };
+        if nb.dump_due {
+            return self.full_dump(n);
+        }
         let entries: Vec<RouteEntry> = std::mem::take(&mut nb.pending).into_values().collect();
         entries
             .chunks(RouteUpdateMsg::MAX_ENTRIES)
@@ -531,14 +543,23 @@ impl RoutingTable {
     pub fn has_pending(&self, n: &PeerId) -> bool {
         self.neighbours
             .get(n)
-            .is_some_and(|nb| !nb.pending.is_empty())
+            .is_some_and(|nb| nb.dump_due || !nb.pending.is_empty())
     }
 
-    /// Everything we advertise, as a full dump for `n`. Clears its pending
-    /// changes, which the dump includes.
-    pub fn full_dump(&mut self, n: &PeerId) -> Vec<RouteUpdateMsg> {
+    /// `n` is owed a full dump; [`take_pending`](Self::take_pending) hands it
+    /// out.
+    pub fn request_full_dump(&mut self, n: &PeerId) {
+        if let Some(nb) = self.neighbours.get_mut(n) {
+            nb.dump_due = true;
+        }
+    }
+
+    /// Everything we advertise, as a full dump for `n`. Clears what is owed
+    /// to it, which the dump includes.
+    fn full_dump(&mut self, n: &PeerId) -> Vec<RouteUpdateMsg> {
         if let Some(nb) = self.neighbours.get_mut(n) {
             nb.pending.clear();
+            nb.dump_due = false;
         }
         let degree = self.degree();
         let entries: Vec<RouteEntry> = self.advertised.values().copied().collect();
@@ -642,6 +663,11 @@ impl RoutingTable {
             if self.advertised.remove(&e.dest).is_none() {
                 return;
             }
+            // The distance guards against loops until FD_GC after we last
+            // advertised the destination, which is now.
+            if let Some(fd) = self.fd.get_mut(&e.dest) {
+                fd.2 = Instant::now();
+            }
         } else {
             if self.advertised.get(&e.dest) == Some(&e) {
                 return;
@@ -654,10 +680,34 @@ impl RoutingTable {
                     *fd = (e.seqno, e.metric, now);
                 }
                 fd.2 = now;
+                self.bound_fd();
             }
         }
         for nb in self.neighbours.values_mut() {
             nb.pending.insert(e.dest, e);
+        }
+    }
+
+    /// Keep the feasibility distances of destinations no longer selected
+    /// within a few times what we may select: a neighbour churning through
+    /// fresh destinations can't grow the map without bound. The oldest go
+    /// first.
+    fn bound_fd(&mut self) {
+        let cap = self.budget.saturating_add(self.limits.max).saturating_mul(4);
+        if self.fd.len() <= cap {
+            return;
+        }
+        let selected = &self.selected;
+        let mut idle: Vec<(Instant, PeerId)> = self
+            .fd
+            .iter()
+            .filter(|(d, _)| !selected.contains_key(*d))
+            .map(|(d, (_, _, t))| (*t, *d))
+            .collect();
+        idle.sort_unstable();
+        let excess = self.fd.len() - cap;
+        for (_, d) in idle.into_iter().take(excess) {
+            self.fd.remove(&d);
         }
     }
 
@@ -916,7 +966,9 @@ mod tests {
 
     fn link(a: &mut RoutingTable, b: &mut RoutingTable) {
         let (pa, pb) = (a.local, b.local);
-        let (to_b, to_a) = (a.neighbour_up(pb, COST_FAST).0, b.neighbour_up(pa, COST_FAST).0);
+        a.neighbour_up(pb, COST_FAST);
+        b.neighbour_up(pa, COST_FAST);
+        let (to_b, to_a) = (a.take_pending(&pb), b.take_pending(&pa));
         for m in to_b {
             b.apply_update(&pa, &m);
         }
@@ -1081,6 +1133,58 @@ mod tests {
     }
 
     #[test]
+    fn a_retracted_route_keeps_its_feasibility_distance() {
+        // Long advertised, then retracted: the distance guards against loops
+        // for FD_GC from the retraction, not from when it was first set.
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.apply_update(&pid(2), &update(vec![entry(9, 1, 1)]));
+        let Some(old) = Instant::now().checked_sub(FD_GC + Duration::from_secs(1)) else {
+            return;
+        };
+        a.fd.get_mut(&pid(9)).unwrap().2 = old;
+        a.apply_update(&pid(2), &update(vec![entry(9, 1, ROUTE_INFINITY)]));
+        a.gc();
+        assert!(a.fd.contains_key(&pid(9)), "distance dropped at retraction");
+    }
+
+    #[test]
+    fn a_seen_seqno_request_is_still_answered() {
+        let mut b = RoutingTable::new(pid(2));
+        b.neighbour_up(pid(1), COST_FAST);
+        b.neighbour_up(pid(3), COST_FAST);
+        b.neighbour_up(pid(4), COST_FAST);
+        b.apply_update(&pid(3), &update(vec![entry(9, 5, 1)]));
+        for n in [1, 3, 4] {
+            b.take_pending(&pid(n));
+        }
+        // An older seqno than ours, asked twice: both askers get our route.
+        assert!(b.seqno_request(&pid(1), pid(9), 4, 64).is_none());
+        assert!(b.seqno_request(&pid(4), pid(9), 4, 64).is_none());
+        for n in [1, 4] {
+            let sent = b.take_pending(&pid(n));
+            assert_eq!(sent[0].entries[0].dest, pid(9), "neighbour {} not answered", n);
+        }
+    }
+
+    #[test]
+    fn a_dump_owed_includes_later_changes() {
+        // A dump leaves through the outbox, so a change made after it was
+        // asked for is in it rather than sent ahead of it.
+        let mut a = RoutingTable::new(pid(1));
+        a.neighbour_up(pid(2), COST_FAST);
+        a.neighbour_up(pid(3), COST_FAST);
+        a.take_pending(&pid(2));
+        a.request_full_dump(&pid(2));
+        a.apply_update(&pid(3), &update(vec![entry(9, 1, 1)]));
+        let sent = a.take_pending(&pid(2));
+        assert_eq!(sent.len(), 1);
+        assert_ne!(sent[0].flags & ROUTE_FULL_END, 0);
+        assert!(sent[0].entries.iter().any(|e| e.dest == pid(9)));
+        assert!(a.take_pending(&pid(2)).is_empty());
+    }
+
+    #[test]
     fn a_neighbour_cost_change_reprices_its_routes() {
         let mut a = RoutingTable::new(pid(1));
         a.neighbour_up(pid(2), COST_FAST);
@@ -1169,7 +1273,8 @@ mod tests {
         b.take_pending(&pid(1));
         let digest = b.digest_for(&pid(1)).unwrap();
         assert!(!a.digest_matches(&pid(2), &digest));
-        for m in b.full_dump(&pid(1)) {
+        b.request_full_dump(&pid(1));
+        for m in b.take_pending(&pid(1)) {
             a.apply_update(&pid(2), &m);
         }
         assert!(a.digest_matches(&pid(2), &digest));
@@ -1180,7 +1285,7 @@ mod tests {
     fn full_dump_flags_bracket_the_dump() {
         let mut a = RoutingTable::new(pid(1));
         a.neighbour_up(pid(2), COST_FAST);
-        let dump = a.full_dump(&pid(2));
+        let dump = a.take_pending(&pid(2));
         assert_eq!(dump.len(), 1);
         assert_eq!(
             dump[0].flags,

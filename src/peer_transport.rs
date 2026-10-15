@@ -13,8 +13,6 @@ struct LinkScore {
     ewma_rtt_us: u64,
     /// Loss rate as 0..255 (0 = no loss, 255 = total loss).
     loss_rate: u8,
-    /// Monotonic timestamp of last successful send/recv.
-    last_active: Instant,
 }
 
 impl LinkScore {
@@ -22,7 +20,6 @@ impl LinkScore {
         Self {
             ewma_rtt_us: 0,
             loss_rate: 0,
-            last_active: Instant::now(),
         }
     }
 
@@ -55,6 +52,9 @@ struct ScoredLink {
     evictable: bool,
     /// When this link was created (for age-based eviction scoring).
     created_at: Instant,
+    /// The task reading this link: stopped when the link leaves the table,
+    /// so a removed link delivers nothing more and its transport closes.
+    recv_task: Option<tokio::task::AbortHandle>,
     /// When the next heartbeat / cover-traffic packet should fire on this
     /// link. Drawn from a Poisson process so an observer can't distinguish
     /// heartbeats from real traffic by timing alone.
@@ -111,7 +111,14 @@ fn next_heartbeat_delay() -> Duration {
 struct PeerTransport {
     links: BTreeMap<LinkId, ScoredLink>,
     active: Option<LinkId>,
-    next_id: LinkId,
+}
+
+impl Drop for ScoredLink {
+    fn drop(&mut self) {
+        if let Some(task) = &self.recv_task {
+            task.abort();
+        }
+    }
 }
 
 impl PeerTransport {
@@ -119,14 +126,11 @@ impl PeerTransport {
         Self {
             links: BTreeMap::new(),
             active: None,
-            next_id: 0,
         }
     }
 
-    /// Insert a new link. Returns (assigned LinkId, whether the active link changed).
-    fn add_link(&mut self, link: Arc<PeerLink>) -> (LinkId, bool) {
-        let id = self.next_id;
-        self.next_id += 1;
+    /// Insert a new link under `id`. Returns whether the active link changed.
+    fn add_link(&mut self, id: LinkId, link: Arc<PeerLink>) -> bool {
 
         let is_outbound = link.is_initiator();
         self.links.insert(
@@ -140,11 +144,11 @@ impl PeerTransport {
                 evictable: true,
                 created_at: Instant::now(),
                 next_heartbeat_at: Instant::now() + next_heartbeat_delay(),
+                recv_task: None,
             },
         );
 
-        let active_changed = self.recompute_active();
-        (id, active_changed)
+        self.recompute_active()
     }
 
     /// Remove a link by id. If it was active, promotes the next-best.
@@ -169,12 +173,13 @@ impl PeerTransport {
     }
 
     /// Update scoring metrics for a link after keepalive pong.
+    // Nothing measures link RTT or loss yet: only tests feed scores.
+    #[cfg(test)]
     fn update_score(&mut self, id: LinkId, rtt_us: u64, loss_rate: u8) {
         if let Some(sl) = self.links.get_mut(&id) {
             // EWMA with alpha=0.25: new = 0.75*old + 0.25*sample
             sl.score.ewma_rtt_us = (sl.score.ewma_rtt_us * 3 + rtt_us) / 4;
             sl.score.loss_rate = loss_rate;
-            sl.score.last_active = Instant::now();
         }
         self.recompute_active();
     }
@@ -334,34 +339,70 @@ pub struct PeerInfo {
 /// per peer transparently. Only `insert` and `remove_link` differ.
 pub struct LinkTable {
     peers: HashMap<PeerId, PeerTransport>,
+    /// Link ids are never reused, whatever peer they belong to: an event
+    /// naming a link that is gone can't be mistaken for a newer link.
+    next_id: LinkId,
+}
+
+/// What [`LinkTable::remove_link`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removed {
+    /// No such link (already removed): nothing changed.
+    Unknown,
+    /// The link is gone; the peer has others.
+    Link,
+    /// The link was the peer's last.
+    Peer,
 }
 
 impl LinkTable {
     pub fn new() -> Self {
         Self {
             peers: HashMap::new(),
+            next_id: 0,
         }
     }
 
     /// Add a link to a peer. Returns (LinkId, is_first_link_for_peer).
     pub fn insert(&mut self, peer: PeerId, link: Arc<PeerLink>) -> (LinkId, bool) {
+        let link_id = self.next_id;
+        self.next_id += 1;
         let pt = self.peers.entry(peer).or_insert_with(PeerTransport::new);
         let is_first = pt.is_empty();
-        let (link_id, _active_changed) = pt.add_link(link);
+        pt.add_link(link_id, link);
         (link_id, is_first)
     }
 
-    /// Remove a specific link. Returns true if the peer has no links left
-    /// (caller should clean up routing state).
-    pub fn remove_link(&mut self, peer: &PeerId, link_id: LinkId) -> bool {
-        if let Some(pt) = self.peers.get_mut(peer) {
-            pt.remove_link(link_id);
-            if pt.is_empty() {
-                self.peers.remove(peer);
-                return true;
-            }
+    /// Tie the task reading a link to the link's place in the table.
+    pub fn set_recv_task(&mut self, peer: &PeerId, link_id: LinkId, task: tokio::task::AbortHandle) {
+        match self.peers.get_mut(peer).and_then(|pt| pt.links.get_mut(&link_id)) {
+            Some(sl) => sl.recv_task = Some(task),
+            None => task.abort(),
         }
-        false
+    }
+
+    /// Remove a specific link (stopping its reader).
+    pub fn remove_link(&mut self, peer: &PeerId, link_id: LinkId) -> Removed {
+        let Some(pt) = self.peers.get_mut(peer) else {
+            return Removed::Unknown;
+        };
+        if !pt.links.contains_key(&link_id) {
+            return Removed::Unknown;
+        }
+        pt.remove_link(link_id);
+        if pt.is_empty() {
+            self.peers.remove(peer);
+            return Removed::Peer;
+        }
+        Removed::Link
+    }
+
+    /// The ids of every link to `peer`.
+    pub fn link_ids(&self, peer: &PeerId) -> Vec<LinkId> {
+        self.peers
+            .get(peer)
+            .map(|pt| pt.links.keys().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Get the best link to a peer (same signature as HashMap::get).
@@ -425,17 +466,15 @@ impl LinkTable {
         self.peers.get(peer).map(|pt| pt.link_count()).unwrap_or(0)
     }
 
-    /// Record that we received a message on a specific link.
-    pub fn touch_recv(&mut self, peer: &PeerId, link_id: LinkId) {
-        if let Some(pt) = self.peers.get_mut(peer) {
-            pt.touch_recv(link_id);
-        }
-    }
-
-    /// Update RTT scoring for a link (from keepalive pong).
-    pub fn update_link_score(&mut self, peer: &PeerId, link_id: LinkId, rtt_us: u64) {
-        if let Some(pt) = self.peers.get_mut(peer) {
-            pt.update_score(link_id, rtt_us, 0);
+    /// Record that we received a message on a specific link. False if the
+    /// link is no longer in the table (its message is stale).
+    pub fn touch_recv(&mut self, peer: &PeerId, link_id: LinkId) -> bool {
+        match self.peers.get_mut(peer) {
+            Some(pt) if pt.links.contains_key(&link_id) => {
+                pt.touch_recv(link_id);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -765,8 +804,10 @@ mod tests {
         second.set_awaiting_peer(true);
 
         let mut pt = PeerTransport::new();
-        let (id0, _) = pt.add_link(half_open.clone());
-        let (id1, _) = pt.add_link(second.clone());
+        let id0 = 0;
+        pt.add_link(id0, half_open.clone());
+        let id1 = 1;
+        pt.add_link(id1, second.clone());
         assert_eq!(pt.active, Some(id0));
 
         // The redialled link hears from the peer: it takes over at once.
@@ -776,10 +817,9 @@ mod tests {
 
         // A confirmed link is preferred from the start over an unconfirmed one.
         let mut pt2 = PeerTransport::new();
-        pt2.add_link(half_open.clone());
-        let (good, changed) = pt2.add_link(second.clone());
-        assert!(changed);
-        assert_eq!(pt2.active, Some(good));
+        pt2.add_link(0, half_open.clone());
+        assert!(pt2.add_link(1, second.clone()));
+        assert_eq!(pt2.active, Some(1));
 
         assert_eq!(pt.unconfirmed_links(Duration::ZERO), vec![id0]);
         assert!(pt.unconfirmed_links(Duration::from_secs(3600)).is_empty());
@@ -789,7 +829,8 @@ mod tests {
     async fn quiet_link_is_probed_quickly() {
         let (link, _) = make_test_link_pair().await;
         let mut pt = PeerTransport::new();
-        let (id, _) = pt.add_link(link);
+        let id = 0;
+        pt.add_link(id, link);
         let now = Instant::now();
 
         // A link that just heard from its peer keeps its slow schedule.
@@ -817,13 +858,8 @@ mod tests {
         let (link_b, _) = make_test_link_pair().await;
 
         let mut pt = PeerTransport::new();
-        let (id0, changed0) = pt.add_link(link_a.clone());
-        assert!(changed0); // first link becomes active
-        assert_eq!(id0, 0);
-
-        let (id1, changed1) = pt.add_link(link_b.clone());
-        assert!(!changed1); // equal score, no promotion (hysteresis)
-        assert_eq!(id1, 1);
+        assert!(pt.add_link(0, link_a.clone())); // first link becomes active
+        assert!(!pt.add_link(1, link_b.clone())); // equal score, no promotion (hysteresis)
 
         // Active should still be the first link
         assert!(Arc::ptr_eq(pt.active_link().unwrap(), &link_a));
@@ -835,8 +871,10 @@ mod tests {
         let (link_b, _) = make_test_link_pair().await;
 
         let mut pt = PeerTransport::new();
-        let (id0, _) = pt.add_link(link_a);
-        let (_id1, _) = pt.add_link(link_b.clone());
+        let id0 = 0;
+        pt.add_link(id0, link_a);
+        let _id1 = 1;
+        pt.add_link(_id1, link_b.clone());
 
         pt.remove_link(id0);
 
@@ -850,8 +888,10 @@ mod tests {
         let (link_b, _) = make_test_link_pair().await;
 
         let mut pt = PeerTransport::new();
-        let (id0, _) = pt.add_link(link_a.clone());
-        let (id1, _) = pt.add_link(link_b);
+        let id0 = 0;
+        pt.add_link(id0, link_a.clone());
+        let id1 = 1;
+        pt.add_link(id1, link_b);
 
         // Converge both links to similar scores via multiple rounds.
         // Update id1 first each round (it starts at 0, so giving it a high
@@ -871,8 +911,10 @@ mod tests {
         let (link_b, _) = make_test_link_pair().await;
 
         let mut pt = PeerTransport::new();
-        let (id0, _) = pt.add_link(link_a);
-        let (id1, _) = pt.add_link(link_b.clone());
+        let id0 = 0;
+        pt.add_link(id0, link_a);
+        let id1 = 1;
+        pt.add_link(id1, link_b.clone());
 
         // Give link_b a much better score (>20% better)
         pt.update_score(id0, 10000, 0);
@@ -888,8 +930,10 @@ mod tests {
         let (link_b, _) = make_test_link_pair().await;
 
         let mut pt = PeerTransport::new();
-        let (id0, _) = pt.add_link(link_a);
-        let (id1, _) = pt.add_link(link_b);
+        let id0 = 0;
+        pt.add_link(id0, link_a);
+        let id1 = 1;
+        pt.add_link(id1, link_b);
 
         assert!(!pt.is_empty());
         pt.remove_link(id0);
@@ -937,8 +981,7 @@ mod tests {
         let (_id_b, _) = table.insert(peer, link_b.clone());
 
         // Remove first link — second should take over
-        let peer_gone = table.remove_link(&peer, id_a);
-        assert!(!peer_gone);
+        assert_eq!(table.remove_link(&peer, id_a), Removed::Link);
         assert!(table.get(&peer).is_some());
         assert!(Arc::ptr_eq(table.get(&peer).unwrap(), &link_b));
     }
@@ -951,8 +994,8 @@ mod tests {
         let mut table = LinkTable::new();
         let (id_a, _) = table.insert(peer, link_a);
 
-        let peer_gone = table.remove_link(&peer, id_a);
-        assert!(peer_gone);
+        assert_eq!(table.remove_link(&peer, id_a), Removed::Peer);
+        assert_eq!(table.remove_link(&peer, id_a), Removed::Unknown);
         assert!(table.get(&peer).is_none());
         assert!(!table.contains_key(&peer));
     }

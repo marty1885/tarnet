@@ -24,22 +24,27 @@ fn link_cost(link: &PeerLink) -> u16 {
     }
 }
 
+/// The one way routing messages leave: routing is link upkeep, never held
+/// back by the upload limit, and shares the deferred queue so a neighbour
+/// receives them in the order they were sent.
+async fn send_route(sender: &super::sender::Sender, to: &PeerId, bytes: &[u8]) {
+    if let Err(e) = sender.to_peer(to, bytes, Queue::Deferred, Budget::Upkeep).await {
+        log::debug!("Failed to send routing message to {:?}: {}", to, e);
+    }
+}
+
 impl Node {
+    /// A neighbour came up: it is owed a full dump, which the routing task
+    /// sends with its other updates.
     pub(super) async fn routing_link_up(&self, peer: &PeerId) {
         let Some(link) = self.links.lock().await.get(peer).cloned() else {
             return;
         };
-        let (dump, requests) = self
+        let requests = self
             .routing_table
             .lock()
             .await
             .neighbour_up(*peer, link_cost(&link));
-        for m in dump {
-            let bytes = m.to_wire().encode();
-            if let Err(e) = self.sender.to_peer(peer, &bytes, Queue::Deferred, Budget::Upkeep).await {
-                log::warn!("Failed to send route dump to {:?}: {}", peer, e);
-            }
-        }
         self.send_seqno_requests(requests).await;
     }
 
@@ -59,7 +64,6 @@ impl Node {
 
     pub(super) async fn routing_link_down(&self, peer: &PeerId) {
         let requests = self.routing_table.lock().await.neighbour_down(peer);
-        self.route_dumps_sent.lock().await.remove(peer);
         self.send_seqno_requests(requests).await;
     }
 
@@ -88,8 +92,8 @@ impl Node {
             full_dump: true,
             seqno: None,
         };
-        self.send_to_peer_deferred(&from, &req.to_wire().encode())
-            .await
+        send_route(&self.sender, &from, &req.to_wire().encode()).await;
+        Ok(())
     }
 
     pub(super) async fn handle_route_request(&self, from: PeerId, payload: &[u8]) -> Result<()> {
@@ -107,11 +111,7 @@ impl Node {
                 due
             };
             if due {
-                let dump = self.routing_table.lock().await.full_dump(&from);
-                for m in dump {
-                    self.send_to_peer_deferred(&from, &m.to_wire().encode())
-                        .await?;
-                }
+                self.routing_table.lock().await.request_full_dump(&from);
             }
         }
         if let Some((dest, seqno, hops)) = req.seqno {
@@ -132,9 +132,7 @@ impl Node {
                 full_dump: false,
                 seqno: Some((r.dest, r.seqno, r.hops)),
             };
-            if let Err(e) = self.send_to_peer(&r.to, &msg.to_wire().encode()).await {
-                log::debug!("Failed to send seqno request to {:?}: {}", r.to, e);
-            }
+            send_route(&self.sender, &r.to, &msg.to_wire().encode()).await;
         }
     }
 
@@ -216,9 +214,7 @@ impl Node {
                     }
                 }
                 for (peer, _link, msg) in to_send {
-                    if let Err(e) = sender.to_peer(&peer, &msg, Queue::Deferred, Budget::Upkeep).await {
-                        log::warn!("Failed to send routing message to {:?}: {}", peer, e);
-                    }
+                    send_route(&sender, &peer, &msg).await;
                 }
             }
         });

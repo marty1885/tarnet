@@ -552,7 +552,6 @@ pub struct TrafficStatus {
 pub struct DhtStatus {
     pub stored_keys: usize,
     pub stored_records: usize,
-    pub kbucket_peers: usize,
     pub local_watches: usize,
     pub remote_watches: usize,
     /// Estimated network size (2^l2nse).

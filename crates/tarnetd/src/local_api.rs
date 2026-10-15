@@ -140,9 +140,15 @@ impl LocalServiceApi {
     fn tns_resolve_name_inner<'a>(
         &'a self,
         name: &'a str,
+        depth: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<TnsResolution>> + Send + 'a>>
     {
         Box::pin(async move {
+            // Local aliases can point at each other (or themselves): follow
+            // them no further than the network resolver follows delegations.
+            if depth > tns::MAX_DELEGATION_DEPTH {
+                return Ok(TnsResolution::Error(format!("alias chain too deep at '{}'", name)));
+            }
             // Check if the rightmost label (root of the name) is a local label.
             // Search the default identity's zone.
             let id_key = self.identity_db_key(None).await?;
@@ -177,7 +183,7 @@ impl LocalServiceApi {
                         _ => None,
                     }) {
                         let new_name = format!("{}.{}", remaining, alias_target);
-                        return self.tns_resolve_name_inner(&new_name).await;
+                        return self.tns_resolve_name_inner(&new_name, depth + 1).await;
                     }
 
                     if let Some(zone) = records.iter().find_map(|r| match r {
@@ -348,28 +354,7 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn dht_get(&self, inner_hash: &ContentHandle, timeout_secs: u32) -> Option<Vec<u8>> {
-
-        // Check local store first.
-        if let Some(data) = self.node.dht_get_content(inner_hash).await {
-            return Some(data);
-        }
-
-        if timeout_secs == 0 {
-            return None;
-        }
-
-        // Search the network, re-reading the store as records stream back.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
-        let mut search = self.node.dht_search_content(inner_hash, deadline).await;
-        loop {
-            if let Some(data) = self.node.dht_get_content(inner_hash).await {
-                return Some(data);
-            }
-            if search.next().await.is_none() {
-                return None;
-            }
-        }
+        self.node.dht_get_content(inner_hash, secs(timeout_secs)).await
     }
 
     async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
@@ -380,36 +365,12 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn dht_get_signed(&self, inner_hash: &ContentHandle, timeout_secs: u32) -> Vec<DhtEntry> {
-
-        // Check local store first.
-        let results = self.node.dht_get_signed_content(inner_hash).await;
-        if !results.is_empty() {
-            return results
-                .into_iter()
-                .map(|(signer, data)| DhtEntry { signer, data })
-                .collect();
-        }
-
-        if timeout_secs == 0 {
-            return Vec::new();
-        }
-
-        // Search the network, re-reading the store as records stream back.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
-        let mut search = self.node.dht_search_content(inner_hash, deadline).await;
-        loop {
-            let results = self.node.dht_get_signed_content(inner_hash).await;
-            if !results.is_empty() {
-                return results
-                    .into_iter()
-                    .map(|(signer, data)| DhtEntry { signer, data })
-                    .collect();
-            }
-            if search.next().await.is_none() {
-                return Vec::new();
-            }
-        }
+        self.node
+            .dht_get_signed_content(inner_hash, secs(timeout_secs))
+            .await
+            .into_iter()
+            .map(|(signer, data)| DhtEntry { signer, data })
+            .collect()
     }
 
     async fn lookup_hello(&self, peer_id: &PeerId, timeout_secs: u32) -> Option<HelloInfo> {
@@ -425,27 +386,7 @@ impl ServiceApi for LocalServiceApi {
                 .collect(),
         };
 
-        // Check local store first.
-        if let Some(hello) = self.node.lookup_hello(peer_id).await {
-            return Some(to_hello_info(hello));
-        }
-
-        if timeout_secs == 0 {
-            return None;
-        }
-
-        // Search the network, re-reading the store as records stream back.
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
-        let mut search = self.node.dht_search_hello(peer_id, deadline).await;
-        loop {
-            if let Some(hello) = self.node.lookup_hello(peer_id).await {
-                return Some(to_hello_info(hello));
-            }
-            if search.next().await.is_none() {
-                return None;
-            }
-        }
+        self.node.find_hello(peer_id, secs(timeout_secs)).await.map(to_hello_info)
     }
 
     async fn dht_watch(&self, key: &DhtId, expiration_secs: u32) {
@@ -507,7 +448,7 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn tns_resolve_name(&self, name: &str) -> ApiResult<TnsResolution> {
-        self.tns_resolve_name_inner(name).await
+        self.tns_resolve_name_inner(name, 0).await
     }
 
     async fn tns_set_label(
@@ -530,14 +471,33 @@ impl ServiceApi for LocalServiceApi {
             .label_set(&id_key, label, &record_blobs, publish)
             .map_err(map_err)?;
 
-        // Auto-publish to DHT when marked public.
+        // Published while marked so; a label marked private is no longer
+        // re-signed into the zone (copies already out there expire).
+        let zone_keypair = self.keypair_for_identity(identity).await?;
         if publish {
-            let zone_keypair = self.keypair_for_identity(identity).await?;
             tns::publish(&self.node, &zone_keypair, label, &records)
+                .await
+                .map_err(map_err)?;
+        } else {
+            tns::unpublish(&self.node, &zone_keypair, label)
                 .await
                 .map_err(map_err)?;
         }
 
+        self.tns_cache_clear().await;
+        Ok(())
+    }
+
+    async fn tns_withdraw(&self, identity: Option<&str>, label: &str) -> ApiResult<()> {
+        // A local label marked published stays: it is published in its own right.
+        let id_key = self.identity_db_key(identity).await?;
+        if let Ok(Some((_, true))) = self.db.label_get(&id_key, label) {
+            return Ok(());
+        }
+        let zone_keypair = self.keypair_for_identity(identity).await?;
+        tns::unpublish(&self.node, &zone_keypair, label)
+            .await
+            .map_err(map_err)?;
         self.tns_cache_clear().await;
         Ok(())
     }
@@ -736,4 +696,9 @@ impl ServiceApi for LocalServiceApi {
             .await
             .map_err(map_err)
     }
+}
+
+/// An API timeout in seconds (0: only what this node holds).
+fn secs(timeout_secs: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(timeout_secs as u64)
 }

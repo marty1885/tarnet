@@ -55,10 +55,15 @@ are ever inserted. No originator, random-walk node, or greedy node appears in it
   verify, store or deduplicate; each hop forwards to exactly one neighbour.
 * **GET**: every node on the walk that holds records for the key answers along
   the reverse path (`query_token` → previous hop, as before). The walk continues
-  to its end regardless. Each walk has its own `query_token`. Every node on the
+  to its end regardless, also when it passes a node a second time (in its
+  random phase, or right after it): that visit is not answered again, and
+  responses keep following the first visit's previous hop, so they travel a
+  tree rooted at the originator and can't loop. A node forwards at most a few
+  visits of one walk. Each walk has its own `query_token`. Every node on the
   walk keeps the key with the token and drops a `DhtGetResponse` whose key
-  differs, so a node that saw a token can't use it to write records for other
-  keys into the originator's store.
+  differs, or that doesn't come from a neighbour the walk was passed to.
+  Results go to the lookup that asked; no node stores what it fetched (the
+  store holds what PUT walks placed there, and the node's own records).
 * **WATCH**: every node on the walk registers `(key, query_token, previous hop,
   expiry)`; a node that already holds the token drops the duplicate visit. When
   such a node stores, publishes or forwards a PUT for the key it sends
@@ -145,17 +150,23 @@ lifetime instead:
   replaying it) changes nothing: the copy held keeps its deadline. Only a
   higher sequence, which only the owner can sign, brings a new lifetime.
 * A record that expired at a node is not stored there again unless its
-  sequence is higher. The node
-  remembers this for the type's TTL cap, the longest any copy could claim to
-  live, in a table bounded like the store.
+  sequence is higher. The node remembers this for the TTL cap after the
+  latest such expiry, the longest any copy could claim to live, in a table
+  bounded like the store. Unsigned content is the exception: it has no
+  sequence its owner could raise, so remembering it would refuse its
+  republish, and a replay can only bring back the one immutable blob its key
+  admits.
 
 A replay can still seed a node that never held the record, for at most the
 type's cap. Owners end a record early by publishing a higher sequence.
 
-A node that persists records keeps its database a mirror of the store: a
-record is written only while the store holds it, together with who handed it
-over (this node, or which link peer), records the caps evict lose their rows,
-and on start-up rows the caps no longer admit are deleted. The store caps
+A node that persists records keeps its database a mirror of the store: the
+store writes every change to it itself, in the same step, so a record is
+written only while the store holds it, together with who handed it over (this
+node, or which link peer), records the caps evict or that expire lose their
+rows, and on start-up rows the caps no longer admit are deleted. A node's own
+records are never evicted for others' (nothing would put them back), and a
+relay-only node drops the replicas it held when it was storing. The store caps
 therefore bound the database too, and a restarted node republishes only the
 records it published itself, never replicas it held for others. The table is
 a cache owners refill: a layout change drops it rather than migrating it.
@@ -195,12 +206,12 @@ is a secret, so it is never logged.
 | Random-phase end probability *q* | 1/3 |
 | Greedy budget | 32 |
 | Walks per PUT and per GET round, ρ | `max(2, ceil(sqrt(3 · N / (d + 1))))`, capped at 32 |
-| N (network size) | routing-table destinations + 1 |
+| N (network size) | routing-table destinations + 1 while the table is a complete view, else landmarks × budget (see the routing spec) |
 | d | number of direct links |
 | GET rounds | a search launches ρ fresh walks every 1.5 s, 3 rounds in total (keys can hold several records); dropping the search stops it |
 | Originator walks | spread over distinct random neighbours, cycling if ρ > d |
-| Republish | owners republish their own records (hello every 5 min, hidden-service intros every 4 min, TNS every 30 min, everything else a node published every 30 min); hello + own records republished and watches relaunched 1–3 s after a link-up, at most once per 60 s |
-| Watches | the watcher relaunches its watch walks every 60 s until the requested expiry; unwatch only drops local state, registrations along old walks expire |
+| Republish | owners republish their own records: hello every 5 min; a zone root (all of a zone's TNS labels) every 4 min for a Public identity, with each intro refresh (every 200–300 s) for a Hidden one; records signed by the node's own key every 30 min. Records signed by any other key are republished only by their owners' timers. Hello + own records republished and watches relaunched 1–3 s after links come or go, at most once per 60 s: changes inside that window are folded into one republish at its end |
+| Watches | the watcher relaunches its watch walks every 60 s until the requested expiry, each walk registering for 120 s; unwatch only drops local state, registrations along old walks expire. The app hears of each record version once, and never of one older than it was told |
 | Store caps | 4096 records / 16 MB (full encoded size), fair-share eviction by source, TTL caps |
 | DHT budget | per link: 256 queries (GET, WATCH) per window, plus the phase 1 ingest budget for records |
 

@@ -202,19 +202,19 @@ impl DirStore {
     }
 
     pub fn gc(&mut self, now: Instant) {
-        let dead = &mut self.dead;
+        let mut gone = Vec::new();
         self.records.retain(|peer, (record, t)| {
             if *t > now {
                 return true;
             }
-            match dead.get_mut(peer) {
-                Some(seq) => *seq = (*seq).max(record.seq),
-                None => {
-                    let _ = dead.try_insert(*peer, record.seq);
-                }
-            }
+            gone.push((*peer, record.seq));
             false
         });
+        // Remembered for the full cap after each death, the latest included.
+        for (peer, seq) in gone {
+            let seq = self.dead.get(&peer).map_or(seq, |s| (*s).max(seq));
+            let _ = self.dead.upsert(peer, seq);
+        }
         self.dead.expire(now);
     }
 

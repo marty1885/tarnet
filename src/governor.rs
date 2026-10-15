@@ -1,8 +1,7 @@
 //! Resource governor: per-link-peer budgeting with load-adaptive enforcement.
 //!
-//! Always active but zero-cost when idle.  Reads from [`StatsRegistry`]
-//! (lock-free, already running) and [`CircuitTable`].  Other subsystems
-//! report misbehavior via an mpsc channel.
+//! Always active but zero-cost when idle.  Budgets live as long as a
+//! peer's links; strikes and blocks belong to the identity and outlive them.
 //!
 //! Design principles:
 //!   - Key on link peers only (bounded by physical connections)
@@ -11,8 +10,6 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-use tokio::sync::mpsc;
 
 use crate::types::PeerId;
 use crate::wire::MessageType;
@@ -70,8 +67,7 @@ pub enum Cost {
     /// DHT records: a count and their bytes.
     Records { records: u32, bytes: usize },
     /// Charged by the handler, which can tell new work from a resend: the
-    /// named resource, through [`Governor::admit_circuit`] or
-    /// [`Governor::charge`].
+    /// named resource, through [`Governor::admit_circuit`].
     ByHandler(Resource),
 }
 
@@ -104,7 +100,7 @@ pub fn message_cost(mt: MessageType, payload: &[u8]) -> Cost {
         // Only valid inside tunnels; dropped if they arrive on a link.
         M::ChannelOpen | M::ChannelData | M::ChannelAck | M::ChannelClose => Cost::Free,
         // Forwarding, bounded by link bandwidth. A key exchange carried
-        // inside is charged by its handler.
+        // inside a Data message is re-evaluated as one by its handler.
         M::Data | M::EncryptedData => Cost::Free,
         M::CircuitCreate => Cost::ByHandler(R::CircuitCreate),
         M::CircuitCreated | M::CircuitRelay | M::CircuitDestroy => Cost::Free,
@@ -205,29 +201,10 @@ impl Bucket {
 pub enum Verdict {
     /// Process normally.
     Allow,
-    /// Drop the message (peer over budget or blocked).
+    /// Drop the message (peer over budget, or not a link peer).
     Shed,
-}
-
-// ── Reports ─────────────────────────────────────────────────────────
-
-/// Misbehavior report from other subsystems.
-#[derive(Debug)]
-pub struct Report {
-    /// The link peer that delivered the offending traffic.
-    pub link_peer: PeerId,
-    /// What went wrong.
-    pub reason: ReportReason,
-}
-
-#[derive(Debug)]
-pub enum ReportReason {
-    /// Invalid cell, bad MAC, protocol sequence error.
-    ProtocolViolation,
-    /// Excessive resource consumption on a circuit.
-    ResourceAbuse,
-    /// Malformed data on a channel/stream.
-    MalformedData,
+    /// The peer is blocked: drop its links.
+    Blocked,
 }
 
 // ── Pressure ────────────────────────────────────────────────────────
@@ -255,24 +232,34 @@ impl Pressure {
     }
 }
 
-// ── Per-link-peer budget ────────────────────────────────────────────
+// ── Standing: what a peer did, kept past its links ──────────────────
 
-/// Enforcement standing for a link peer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Standing {
-    Normal,
-    Throttled,
-    Blocked { until: Instant },
-}
+/// Peers with strikes or a block remembered at once. Strikes are earned
+/// over a link, so filling this takes many links' worth of misbehaviour;
+/// when full, the mildest record makes room.
+const MAX_STANDINGS: usize = 4096;
 
-/// Resource budget for a single link peer.
-/// Created on LinkUp, removed on (last) LinkDown.
-struct PeerBudget {
-    standing: Standing,
-    /// Accumulated strikes.
+/// Strikes against a peer identity. Kept by identity, not by link: a
+/// blocked peer that drops its link and redials is still blocked.
+#[derive(Debug, Clone, Copy)]
+struct Standing {
     strikes: u16,
     /// When the last strike was recorded (for decay).
-    last_strike: Option<Instant>,
+    last_strike: Instant,
+    blocked_until: Option<Instant>,
+}
+
+impl Standing {
+    fn blocked(&self, now: Instant) -> bool {
+        self.blocked_until.is_some_and(|t| now < t)
+    }
+}
+
+// ── Per-link-peer budget ────────────────────────────────────────────
+
+/// Resource buckets for a single link peer.
+/// Created on LinkUp, removed on (last) LinkDown.
+struct PeerBudget {
     buckets: [Bucket; Resource::COUNT],
 }
 
@@ -281,9 +268,6 @@ impl PeerBudget {
         let r = |r| Bucket::full(config.limit(r).1);
         use Resource::*;
         Self {
-            standing: Standing::Normal,
-            strikes: 0,
-            last_strike: None,
             buckets: [
                 r(CircuitCreate),
                 r(DhtQuery),
@@ -311,51 +295,6 @@ impl PeerBudget {
         }
         true
     }
-
-    /// Add a strike and update standing based on thresholds.
-    fn add_strike(&mut self, throttle_at: u16, block_at: u16, block_duration: Duration) {
-        self.strikes = self.strikes.saturating_add(1);
-        self.last_strike = Some(Instant::now());
-
-        if self.strikes >= block_at {
-            self.standing = Standing::Blocked {
-                until: Instant::now() + block_duration,
-            };
-        } else if self.strikes >= throttle_at {
-            self.standing = Standing::Throttled;
-        }
-    }
-
-    /// Decay strikes over time.  Called periodically from tick().
-    fn decay_strikes(&mut self) {
-        let dominated = match self.last_strike {
-            Some(t) => t.elapsed() >= STRIKE_DECAY_INTERVAL,
-            None => false,
-        };
-        if !dominated {
-            return;
-        }
-
-        // Halve strikes.
-        self.strikes /= 2;
-
-        // Decay standing: Blocked → Throttled → Normal.
-        match self.standing {
-            Standing::Blocked { until } if Instant::now() >= until => {
-                self.standing = Standing::Throttled;
-            }
-            Standing::Throttled if self.strikes == 0 => {
-                self.standing = Standing::Normal;
-            }
-            _ => {}
-        }
-
-        if self.strikes > 0 {
-            self.last_strike = Some(Instant::now());
-        } else {
-            self.last_strike = None;
-        }
-    }
 }
 
 // ── Governor ────────────────────────────────────────────────────────
@@ -363,42 +302,39 @@ impl PeerBudget {
 /// Resource governor.  Non-optional, always-on core infrastructure.
 pub struct Governor {
     config: GovernorConfig,
-    /// One budget per link peer — bounded by transport connections.
+    /// One budget per link peer — bounded by transport connections. A
+    /// message from a peer without one (its links are gone) is shed.
     budgets: HashMap<PeerId, PeerBudget>,
+    /// Strikes and blocks, by identity, outliving links.
+    standings: HashMap<PeerId, Standing>,
     /// Cached pressure level, updated each tick.
     pressure: Pressure,
-    /// Report channel (receiver).
-    report_rx: mpsc::UnboundedReceiver<Report>,
-    /// Report channel (sender), cloned out to subsystems.
-    report_tx: mpsc::UnboundedSender<Report>,
 }
 
 impl Governor {
     pub fn new(config: GovernorConfig) -> Self {
-        let (report_tx, report_rx) = mpsc::unbounded_channel();
         Self {
             config,
             budgets: HashMap::new(),
+            standings: HashMap::new(),
             pressure: Pressure { level: 0.0 },
-            report_rx,
-            report_tx,
         }
-    }
-
-    /// Clone the report sender for other subsystems to use.
-    pub fn reporter(&self) -> mpsc::UnboundedSender<Report> {
-        self.report_tx.clone()
     }
 
     // ── Lifecycle (tied to link peers) ──
 
-    /// Call when a new link peer connects (first link).
-    pub fn peer_connected(&mut self, peer: PeerId) {
+    /// Call when a new link peer connects (first link). False if the peer
+    /// is blocked: refuse the link.
+    pub fn peer_connected(&mut self, peer: PeerId) -> bool {
+        if self.is_blocked(&peer) {
+            return false;
+        }
         let config = &self.config;
         self.budgets.entry(peer).or_insert_with(|| PeerBudget::new(config));
+        true
     }
 
-    /// Call when the last link to a peer drops.
+    /// Call when the last link to a peer drops. Its strikes stay.
     pub fn peer_disconnected(&mut self, peer: &PeerId) {
         self.budgets.remove(peer);
     }
@@ -408,6 +344,12 @@ impl Governor {
         self.budgets.len()
     }
 
+    pub fn is_blocked(&self, peer: &PeerId) -> bool {
+        self.standings
+            .get(peer)
+            .is_some_and(|s| s.blocked(Instant::now()))
+    }
+
     // ── Hot path ──
 
     /// Evaluate an inbound message and charge its [`message_cost`]. Called
@@ -415,20 +357,14 @@ impl Governor {
     /// directory, sampling, search, seqno and key-exchange message pays here,
     /// before its handler allocates or forwards anything.
     pub fn evaluate(&mut self, from: &PeerId, msg_type: MessageType, payload: &[u8]) -> Verdict {
-        let config = &self.config;
-        let budget = self
-            .budgets
-            .entry(*from)
-            .or_insert_with(|| PeerBudget::new(config));
-
-        // ── Hard block ──
-        if let Standing::Blocked { until } = budget.standing {
-            if Instant::now() < until {
-                return Verdict::Shed;
-            }
-            // Block expired, decay to Throttled.
-            budget.standing = Standing::Throttled;
+        let standing = self.standings.get(from).copied();
+        if standing.is_some_and(|s| s.blocked(Instant::now())) {
+            return Verdict::Blocked;
         }
+        let config = &self.config;
+        let Some(budget) = self.budgets.get_mut(from) else {
+            return Verdict::Shed;
+        };
 
         // ── Always-on budgets ──
         // Over budget is shed without a strike: a link-up sync or a busy
@@ -452,82 +388,82 @@ impl Governor {
         }
 
         // ── Generous by default ──
-        if self.pressure.level < self.config.pressure_threshold {
+        if self.pressure.level < config.pressure_threshold {
             return Verdict::Allow;
         }
 
         // ── Throttled: shed non-essential traffic ──
-        if budget.standing == Standing::Throttled && !is_essential(msg_type) {
+        let throttled = standing.is_some_and(|s| s.strikes >= config.throttle_strikes);
+        if throttled && !is_essential(msg_type) {
             return Verdict::Shed;
         }
 
         Verdict::Allow
     }
 
-    /// Admit a new circuit leg from `from` (a CREATE, or an EXTEND at a
-    /// relay, which installs legs on its behalf): the per-peer circuit cap
-    /// and the create rate, with a strike when either is exceeded. Called by
-    /// the handlers after they have told a resend from new work, so a lossy
-    /// link's retransmits cost nothing.
+    /// Admit a new circuit leg on `from`'s behalf (a CREATE, or an EXTEND at
+    /// a relay, which installs legs on its behalf): the per-peer circuit cap
+    /// and the create rate. Called by the handlers after they have told a
+    /// resend from new work, so a lossy link's retransmits cost nothing.
+    /// No strike: a busy honest relay forwards many clients' CREATEs.
     pub fn admit_circuit(&mut self, from: &PeerId, circuits_for_peer: usize) -> bool {
         let config = &self.config;
-        let budget = self
-            .budgets
-            .entry(*from)
-            .or_insert_with(|| PeerBudget::new(config));
-        if circuits_for_peer >= config.max_circuits_per_peer
-            || !budget.take(config, &[(Resource::CircuitCreate, 1.0)])
-        {
-            budget.add_strike(config.throttle_strikes, config.block_strikes, config.block_duration);
+        let Some(budget) = self.budgets.get_mut(from) else {
             return false;
-        }
-        true
+        };
+        circuits_for_peer < config.max_circuits_per_peer
+            && budget.take(config, &[(Resource::CircuitCreate, 1.0)])
     }
 
-    /// Charge work a handler found inside a message (e.g. a key exchange
-    /// carried in Data). No strike.
-    pub fn charge(&mut self, from: &PeerId, resource: Resource) -> bool {
+    /// Record a protocol violation by `peer`.
+    pub fn strike(&mut self, peer: PeerId) {
+        let now = Instant::now();
+        if !self.standings.contains_key(&peer) && self.standings.len() >= MAX_STANDINGS {
+            if let Some(mildest) = self
+                .standings
+                .iter()
+                .filter(|(_, s)| !s.blocked(now))
+                .min_by_key(|(_, s)| s.strikes)
+                .map(|(p, _)| *p)
+            {
+                self.standings.remove(&mildest);
+            } else {
+                return;
+            }
+        }
         let config = &self.config;
-        self.budgets
-            .entry(*from)
-            .or_insert_with(|| PeerBudget::new(config))
-            .take(config, &[(resource, 1.0)])
+        let s = self.standings.entry(peer).or_insert(Standing {
+            strikes: 0,
+            last_strike: now,
+            blocked_until: None,
+        });
+        s.strikes = s.strikes.saturating_add(1);
+        s.last_strike = now;
+        if s.strikes >= config.block_strikes {
+            s.blocked_until = Some(now + config.block_duration);
+        }
+        log::debug!("Governor: strike on {:?} (now {} strikes)", peer, s.strikes);
     }
 
     // ── Maintenance ──
 
-    /// Drain pending reports from subsystems.
-    pub fn drain_reports(&mut self) {
-        while let Ok(report) = self.report_rx.try_recv() {
-            if let Some(budget) = self.budgets.get_mut(&report.link_peer) {
-                budget.add_strike(
-                    self.config.throttle_strikes,
-                    self.config.block_strikes,
-                    self.config.block_duration,
-                );
-                log::debug!(
-                    "Governor: strike on {:?} for {:?} (now {} strikes, {:?})",
-                    report.link_peer,
-                    report.reason,
-                    budget.strikes,
-                    budget.standing,
-                );
-            }
-        }
-    }
-
-    /// Periodic maintenance: decay strikes, reset windows, update pressure.
+    /// Periodic maintenance: decay strikes, update pressure.
     pub fn tick(&mut self, circuit_table_len: usize) {
-        // Drain any pending reports first.
-        self.drain_reports();
-
-        // Update cached pressure.
         self.pressure = Pressure::compute(circuit_table_len, self.config.max_circuits);
 
-        // Decay strikes and standing for all peers.
-        for budget in self.budgets.values_mut() {
-            budget.decay_strikes();
-        }
+        // Strikes halve after a quiet STRIKE_DECAY_INTERVAL; a record with
+        // none left and no block running is forgotten.
+        let now = Instant::now();
+        self.standings.retain(|_, s| {
+            if now.duration_since(s.last_strike) >= STRIKE_DECAY_INTERVAL {
+                s.strikes /= 2;
+                s.last_strike = now;
+            }
+            if !s.blocked(now) {
+                s.blocked_until = None;
+            }
+            s.strikes > 0 || s.blocked_until.is_some()
+        });
     }
 }
 
@@ -560,10 +496,11 @@ mod tests {
     }
 
     #[test]
-    fn circuit_admission_caps_rate_and_count_with_strikes() {
+    fn circuit_admission_caps_rate_and_count_without_strikes() {
         let mut config = GovernorConfig::default();
         config.circuit_creates = (0.0, 2.0);
         config.max_circuits_per_peer = 5;
+        config.block_strikes = 1;
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
@@ -573,49 +510,51 @@ mod tests {
         assert!(gov.admit_circuit(&peer, 0));
         // Rate spent.
         assert!(!gov.admit_circuit(&peer, 0));
-        // A CREATE itself is charged by its handler, not at the gate.
+        // A CREATE itself is charged by its handler, not at the gate, and
+        // refusals cost the forwarding neighbour nothing more.
         assert_eq!(gov.evaluate(&peer, MessageType::CircuitCreate, &[]), Verdict::Allow);
     }
 
     #[test]
-    fn strikes_escalate_to_block() {
+    fn a_block_outlives_the_link() {
         let mut config = GovernorConfig::default();
-        config.circuit_creates = (0.0, 1.0);
-        config.throttle_strikes = 2;
-        config.block_strikes = 4;
+        config.block_strikes = 2;
         config.block_duration = Duration::from_secs(3600);
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
-        gov.peer_connected(peer);
-        assert!(gov.admit_circuit(&peer, 0));
-        for _ in 0..5 {
-            assert!(!gov.admit_circuit(&peer, 0));
-        }
-        // Now blocked: everything is shed, essential messages included.
-        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Shed);
-        assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Shed);
+        assert!(gov.peer_connected(peer));
+        gov.strike(peer);
+        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Allow);
+        gov.strike(peer);
+        assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Blocked);
+        gov.peer_disconnected(&peer);
+        gov.tick(0);
+        // Redialling doesn't wipe it.
+        assert!(!gov.peer_connected(peer));
+        assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Blocked);
     }
 
     #[test]
     fn throttled_allows_essential() {
         let mut config = GovernorConfig::default();
-        config.circuit_creates = (0.0, 1.0);
         config.pressure_threshold = 0.0;
         config.throttle_strikes = 1;
         config.block_strikes = 100;
         let mut gov = Governor::new(config);
         let peer = test_peer(1);
         gov.peer_connected(peer);
-        gov.admit_circuit(&peer, 0);
-        gov.admit_circuit(&peer, 0); // strike → throttled
+        gov.strike(peer); // → throttled
         assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Shed);
         assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Allow);
     }
 
     #[test]
-    fn peer_disconnect_removes_budget() {
+    fn no_budget_without_a_link() {
         let mut gov = Governor::new(GovernorConfig::default());
         let peer = test_peer(1);
+        // A message left over from a link that is gone recreates nothing.
+        assert_eq!(gov.evaluate(&peer, MessageType::Keepalive, &[]), Verdict::Shed);
+        assert_eq!(gov.peer_count(), 0);
         gov.peer_connected(peer);
         assert_eq!(gov.peer_count(), 1);
         gov.peer_disconnected(&peer);
@@ -672,36 +611,6 @@ mod tests {
         assert_eq!(gov.evaluate(&peer, MessageType::DhtPut, &[0; 50]), Verdict::Allow);
         assert_eq!(gov.evaluate(&peer, MessageType::DhtWatchNotify, &[0; 5]), Verdict::Allow);
         assert_eq!(gov.evaluate(&peer, MessageType::DhtPut, &[0; 1]), Verdict::Shed);
-    }
-
-    #[test]
-    fn handler_charges_share_the_budget() {
-        let mut config = GovernorConfig::default();
-        config.tunnel_kex = (0.0, 1.0);
-        let mut gov = Governor::new(config);
-        let peer = test_peer(1);
-        gov.peer_connected(peer);
-        assert!(gov.charge(&peer, Resource::TunnelKex));
-        assert_eq!(gov.evaluate(&peer, MessageType::TunnelKeyExchange, &[]), Verdict::Shed);
-    }
-
-    #[test]
-    fn report_adds_strike() {
-        let mut config = GovernorConfig::default();
-        config.pressure_threshold = 0.0;
-        config.throttle_strikes = 1;
-        config.block_strikes = 100;
-        let mut gov = Governor::new(config);
-        let peer = test_peer(1);
-        gov.peer_connected(peer);
-        gov.reporter()
-            .send(Report {
-                link_peer: peer,
-                reason: ReportReason::ProtocolViolation,
-            })
-            .unwrap();
-        gov.drain_reports();
-        assert_eq!(gov.evaluate(&peer, MessageType::DhtGet, &[]), Verdict::Shed);
     }
 
     #[test]

@@ -1857,12 +1857,10 @@ async fn cmd_status(cli: &Cli) {
         format!("{}/{}", status.dht.local_watches, status.dht.remote_watches)
     };
     println!(
-        "  {} {} {}  {} {}  {} {}  {} ~{}",
+        "  {} {} {}  {} {}  {} ~{}",
         dim("dht"),
         status.dht.stored_records,
         dim(&format!("records / {} keys", status.dht.stored_keys)),
-        dim("kbucket"),
-        status.dht.kbucket_peers,
         dim("watches"),
         watches,
         dim("nse"),

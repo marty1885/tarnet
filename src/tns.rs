@@ -26,7 +26,7 @@ pub use tarnet_api::service::TnsRecord;
 pub use tarnet_api::service::TnsResolution;
 
 /// Maximum delegation/redirect hops before giving up.
-const MAX_DELEGATION_DEPTH: usize = 16;
+pub const MAX_DELEGATION_DEPTH: usize = 16;
 /// How long to wait for a single DHT lookup step.
 const PER_STEP_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long to wait for the entire resolution chain.
@@ -112,6 +112,11 @@ impl TnsCache {
                 ttl,
             },
         );
+    }
+
+    /// Forget what is cached for `label` in `zone` (it proved stale).
+    pub fn forget(&mut self, zone: &ServiceId, label: &str) {
+        self.entries.remove(&(*zone, label.to_string()));
     }
 
     /// Insert a negative cache entry (name not found).
@@ -791,9 +796,9 @@ async fn resolve_inner(
     TnsResolution::NotFound
 }
 
-/// Fetch and decrypt the record set for a single label in a zone.
-/// Checks the TNS cache first, then the local DHT store, then issues a
-/// DHT GET and polls with timeout. Results are cached with TTL.
+/// Fetch and decrypt the record set for a single label in a zone: from the
+/// TNS cache, else from the zone's root found by a DHT search. Results are
+/// cached with TTL.
 async fn fetch_records(
     node: &Node,
     zone: &ServiceId,
@@ -811,103 +816,57 @@ async fn fetch_records(
 
     let root_key = crate::dht::zone_root_key(zone);
 
-    // 2. Check local DHT store for the zone root.
-    if let Some((records, root_present, remaining_ttl)) =
-        try_open_root_local(node, zone, label, &root_key).await
-    {
-        // The root is authoritative: if it was found, its answer (records or
-        // "label absent") is final; do not keep polling the network.
-        if !is_local_zone && root_present {
-            let ttl = if remaining_ttl.is_zero() {
-                Duration::from_secs(60)
-            } else {
-                remaining_ttl
-            };
-            if records.is_empty() {
-                node.tns_cache()
-                    .lock()
-                    .await
-                    .insert_negative(*zone, label.to_string());
-            } else {
-                node.tns_cache()
-                    .lock()
-                    .await
-                    .insert(*zone, label.to_string(), records.clone(), ttl);
-            }
-        }
-        if root_present {
-            return Ok(records);
-        }
-    }
-
-    // When the zone is our own, our root (if any) is already in the local store;
-    // a DHT poll cannot produce a newer authoritative root than the one we sign,
-    // so return immediately.
+    // 2. Our own zone: our root is held here, and nothing out there is newer
+    //    than what we sign.
     if is_local_zone {
-        return Ok(Vec::new());
+        let held = node.dht_held(&root_key).await;
+        return Ok(open_root(zone, label, &held).map(|(r, _)| r).unwrap_or_default());
     }
 
-    // 3. Issue a DHT search for the zone root; re-check as it streams back.
+    // 3. Search: roots held here come first, then what the walks bring back.
+    //    The newest root among everything that has arrived once one has is
+    //    authoritative: its answer (records, or "label absent") is final.
     let mut search = node.dht_search(root_key, Instant::now() + PER_STEP_TIMEOUT).await;
-    loop {
-        if let Some((records, root_present, remaining_ttl)) =
-            try_open_root_local(node, zone, label, &root_key).await
-        {
-            if root_present {
-                let ttl = if remaining_ttl.is_zero() {
-                    Duration::from_secs(60)
-                } else {
-                    remaining_ttl
-                };
-                if records.is_empty() {
-                    node.tns_cache()
-                        .lock()
-                        .await
-                        .insert_negative(*zone, label.to_string());
-                } else {
-                    node.tns_cache()
-                        .lock()
-                        .await
-                        .insert(*zone, label.to_string(), records.clone(), ttl);
-                }
-                return Ok(records);
-            }
+    let mut roots = Vec::new();
+    let mut found = None;
+    while let Some(rec) = search.next().await {
+        roots.push(rec.into_inner());
+        found = open_root(zone, label, &roots);
+        if found.is_some() && search.is_idle() {
+            break;
         }
-
-        if search.next().await.is_none() {
-            // Deadline reached. Negative cache: remember this name was not found.
-            node.tns_cache()
-                .lock()
-                .await
-                .insert_negative(*zone, label.to_string());
-            return Ok(Vec::new());
+    }
+    let mut cache = node.tns_cache().lock().await;
+    match found {
+        Some((records, ttl)) if !records.is_empty() => {
+            let ttl = if ttl.is_zero() { Duration::from_secs(60) } else { ttl };
+            cache.insert(*zone, label.to_string(), records.clone(), ttl);
+            Ok(records)
+        }
+        // No root, or the root lacks the label: remember it wasn't found.
+        _ => {
+            cache.insert_negative(*zone, label.to_string());
+            Ok(Vec::new())
         }
     }
 }
 
-/// Open the **authenticated** zone root for `zone` from the local DHT store and
-/// look up `label`. The DHT ingest gate already guarantees that any `ZoneRoot`
-/// record at `root_key` was signed by the zone key (self-address invariant), so
-/// flooding/squatting is impossible upstream; we re-derive the signer's ServiceId
-/// here too, because locally-trusted test fixtures bypass the gate. Among valid
-/// roots the highest sequence wins.
+/// Open the **authenticated** zone root for `zone` among `records` and look
+/// up `label`. The DHT ingest gate already guarantees that any `ZoneRoot`
+/// record at the root key was signed by the zone key (self-address
+/// invariant); we re-derive the signer's ServiceId here too, because
+/// locally-trusted test fixtures bypass the gate. Among valid roots the
+/// highest sequence wins.
 ///
-/// Returns `None` if no valid root is present yet (keep searching). Returns
-/// `Some((records, true, ttl))` once a root is found — `records` empty means the
-/// root exists but does not carry this label (authoritative NotFound).
-async fn try_open_root_local(
-    node: &Node,
-    zone: &ServiceId,
-    label: &str,
-    root_key: &DhtId,
-) -> Option<(Vec<TnsRecord>, bool, Duration)> {
-    let raw_records = node.dht_get_records_at_key(root_key).await;
+/// `None` if no valid root is among them. `Some((records, ttl))` once one is:
+/// `records` empty means the root does not carry this label (authoritative
+/// NotFound).
+fn open_root(zone: &ServiceId, label: &str, records: &[crate::dht::DhtRecord]) -> Option<(Vec<TnsRecord>, Duration)> {
     let mut best: Option<(HashMap<[u8; 32], Vec<u8>>, u64, Duration)> = None;
-    for record in &raw_records {
+    for record in records {
         if record.record_type != RecordType::ZoneRoot {
             continue;
         }
-        // Re-check the self-address binding for fixtures that bypassed the gate.
         if ServiceId::from_signing_pubkey(&record.signer_pubkey) != *zone {
             continue;
         }
@@ -926,7 +885,7 @@ async fn try_open_root_local(
         Some(set_bytes) => deserialize_record_set(set_bytes).ok().unwrap_or_default(),
         None => Vec::new(),
     };
-    Some((records, true, ttl))
+    Some((records, ttl))
 }
 
 /// Try to parse a label as a raw Crockford Base32-encoded ServiceId.
@@ -1205,23 +1164,18 @@ fn open_zone_root_value(sid: &ServiceId, blob: &[u8]) -> Result<HashMap<[u8; 32]
     Ok(map)
 }
 
-/// (Re)build and publish the zone root from the working map at `sequence`. The
-/// sequence is allocated atomically with the map snapshot (see
-/// [`Node::zone_published_update`]) so a higher sequence always carries a
-/// same-or-newer snapshot — concurrent publishers can't clobber each other.
 /// How long a published zone root lives. A zone root is one signed object
 /// holding every label, so it has one lifetime; the node refreshes it well
 /// within this (see `maintain_peer_records` and `maintain_hidden_services`).
 pub const ZONE_ROOT_TTL: u32 = 600;
 
-async fn publish_zone_root(
-    node: &Node,
-    zone_keypair: &Keypair,
-    sid: &ServiceId,
-    map: &std::collections::BTreeMap<String, Vec<u8>>,
-    sequence: u64,
-) -> Result<()> {
-    let value = build_zone_root_value(sid, map);
+/// Re-sign and publish the zone root with its whole working set (see
+/// [`Node::zone_published_update`]). Owners call this on their refresh
+/// timer; [`publish`] and [`unpublish`] call it when a label changed.
+pub async fn refresh_zone(node: &Node, zone_keypair: &Keypair) -> Result<()> {
+    let sid = zone_keypair.identity.service_id();
+    let (map, sequence) = node.zone_signing_snapshot(&sid).await;
+    let value = build_zone_root_value(&sid, &map);
     node.dht_put_zone_root(zone_keypair, &value, sequence, ZONE_ROOT_TTL).await
 }
 
@@ -1242,20 +1196,28 @@ pub async fn publish(
     records: &[TnsRecord],
 ) -> Result<()> {
     let sid = zone_keypair.identity.service_id();
-    let set_bytes = serialize_record_set(records);
-    let (map, sequence) = node.zone_published_update(&sid, label, Some(set_bytes)).await;
-    publish_zone_root(node, zone_keypair, &sid, &map, sequence).await
+    if node
+        .zone_published_update(&sid, label, Some(serialize_record_set(records)))
+        .await
+    {
+        refresh_zone(node, zone_keypair).await?;
+    }
+    Ok(())
 }
 
-/// Remove a label from the zone and republish the root without it.
+/// Remove a label from the zone and republish the root without it (nothing,
+/// if the zone doesn't publish it). Copies of the old root out there keep
+/// the label until they expire; the root is no longer re-signed with it.
 pub async fn unpublish(
     node: &Node,
     zone_keypair: &Keypair,
     label: &str,
 ) -> Result<()> {
     let sid = zone_keypair.identity.service_id();
-    let (map, sequence) = node.zone_published_update(&sid, label, None).await;
-    publish_zone_root(node, zone_keypair, &sid, &map, sequence).await
+    if node.zone_published_update(&sid, label, None).await {
+        refresh_zone(node, zone_keypair).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

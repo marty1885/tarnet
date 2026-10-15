@@ -2476,9 +2476,16 @@ impl Node {
             }
         }
 
-        // 3. Rendezvous via TNS intro points (hidden services).
-        let resolution = crate::tns::resolve(self, service_id, "intro").await;
-        if let crate::tns::TnsResolution::Records(records) = resolution {
+        // 3. Rendezvous via TNS intro points (hidden services). A service
+        //    moves its intro points every few minutes, while a resolved set
+        //    is cached for the root's lifetime: if the cached set fails, ask
+        //    once more for the current one.
+        let mut last_err = None;
+        for _ in 0..2 {
+            let resolution = crate::tns::resolve(self, service_id, "intro").await;
+            let crate::tns::TnsResolution::Records(records) = resolution else {
+                break;
+            };
             let intro_points: Vec<_> = records
                 .iter()
                 .filter_map(|r| match r {
@@ -2490,12 +2497,22 @@ impl Node {
                     _ => None,
                 })
                 .collect();
-
-            if !intro_points.is_empty() {
-                return self
-                    .connect_via_rendezvous(service_id, mode, port, &intro_points, min_hops)
-                    .await;
+            if intro_points.is_empty() {
+                break;
             }
+            match self
+                .connect_via_rendezvous(service_id, mode, port, &intro_points, min_hops)
+                .await
+            {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    self.tns_cache().lock().await.forget(&service_id, "intro");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
         }
 
         Err(Error::Protocol(

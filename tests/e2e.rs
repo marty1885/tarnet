@@ -102,35 +102,10 @@ where
     false
 }
 
-/// Search the DHT for content until found or `timeout`.
-async fn search_content(node: &Node, inner_hash: &ContentHandle, timeout: Duration) -> bool {
-    let mut search = node
-        .dht_search_content(inner_hash, std::time::Instant::now() + timeout)
-        .await;
-    loop {
-        if node.dht_get_content(inner_hash).await.is_some() {
-            return true;
-        }
-        if search.next().await.is_none() {
-            return false;
-        }
-    }
-}
-
 /// Search the DHT for signed content until at least one valid record is found
 /// or `timeout`.
 async fn search_signed_content(node: &Node, inner_hash: &ContentHandle, timeout: Duration) -> bool {
-    let mut search = node
-        .dht_search_content(inner_hash, std::time::Instant::now() + timeout)
-        .await;
-    loop {
-        if !node.dht_get_signed_content(inner_hash).await.is_empty() {
-            return true;
-        }
-        if search.next().await.is_none() {
-            return false;
-        }
-    }
+    !node.dht_get_signed_content(inner_hash, timeout).await.is_empty()
 }
 
 /// Wait until node has a route to peer_id.
@@ -645,11 +620,8 @@ async fn dht_get_from_remote_node() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let found = search_content(c, &inner_hash, Duration::from_secs(6)).await;
-
-    assert!(found, "Node C should find content put by Node A");
-    let retrieved = c.dht_get_content(&inner_hash).await.unwrap();
-    assert_eq!(retrieved, data);
+    let retrieved = c.dht_get_content(&inner_hash, Duration::from_secs(6)).await;
+    assert_eq!(retrieved.as_deref(), Some(&data[..]), "Node C should find content put by Node A");
 }
 
 /// Signed content put by A, retrieved by C with signer verification.
@@ -663,11 +635,8 @@ async fn signed_content_cross_node() {
     let inner_hash = a.dht_put_signed_content(topic, 600).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let found = search_signed_content(c, &inner_hash, Duration::from_secs(6)).await;
-
-    assert!(found, "Node C should find signed content from Node A");
-    let results = c.dht_get_signed_content(&inner_hash).await;
-    assert_eq!(results.len(), 1);
+    let results = c.dht_get_signed_content(&inner_hash, Duration::from_secs(6)).await;
+    assert_eq!(results.len(), 1, "Node C should find signed content from Node A");
     assert_eq!(results[0].0, a.peer_id());
     assert_eq!(results[0].1, topic);
 }
@@ -692,13 +661,7 @@ async fn tns_resolve_cross_node() {
         .await
         .unwrap();
 
-    // Wait for DHT propagation and actively request the key
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let dht_key = tarnet::tns::tns_dht_key(&zone_sid, "server");
-    for _ in 0..5 {
-        let _ = b.request_dht_key(&dht_key).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 
     // B resolves "server" in A's zone
     let resolution = wait_for(Duration::from_secs(15), || {
@@ -745,15 +708,6 @@ async fn tns_delegation_chain() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Actively request the DHT keys to help propagation
-    let key_blog = tarnet::tns::tns_dht_key(&zone_a, "blog");
-    let key_home = tarnet::tns::tns_dht_key(&zone_b, "home");
-    for _ in 0..5 {
-        let _ = c.request_dht_key(&key_blog).await;
-        let _ = c.request_dht_key(&key_home).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-
     let resolved = wait_for(Duration::from_secs(15), || {
         let c = c.clone();
         async move {
@@ -794,11 +748,6 @@ async fn repro_vhost_resolve_cross_node() {
         .unwrap();
 
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let dht_key = tarnet::tns::tns_dht_key(&zone_sid, "blog");
-    for _ in 0..5 {
-        let _ = b.request_dht_key(&dht_key).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 
     let resolution = wait_for(Duration::from_secs(15), || {
         let b = b.clone();
@@ -841,7 +790,7 @@ async fn repro_dht_pull_carries_pubkey() {
     // The zone's records live in one self-addressed root at zone_root_key(sid),
     // not at per-label keys — that is what makes the location flood-proof.
     let dht_key = tarnet::dht::zone_root_key(&zone_sid);
-    let record = publisher.node.dht_get_records_at_key(&dht_key).await;
+    let record = publisher.node.dht_held(&dht_key).await;
     assert_eq!(record.len(), 1, "publisher should hold exactly one record");
     assert!(
         !record[0].signer_pubkey.is_empty(),
@@ -862,10 +811,7 @@ async fn repro_dht_pull_carries_pubkey() {
     // Resolver has no local copy; its only route is a GET pulled from the holder.
     let resolved = wait_for(Duration::from_secs(15), || {
         let r = resolver.node.clone();
-        let key = dht_key;
         async move {
-            let _ = r.request_dht_key(&key).await;
-            tokio::time::sleep(Duration::from_millis(400)).await;
             matches!(
                 tarnet::tns::resolve(&*r, zone_sid, "blog").await,
                 tarnet::tns::TnsResolution::VHost { .. }
@@ -1079,13 +1025,12 @@ async fn dht_content_self_authenticating() {
     let inner_hash = a.dht_put_content(data).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let found = search_content(b, &inner_hash, Duration::from_secs(6)).await;
-    assert!(found);
-    assert_eq!(b.dht_get_content(&inner_hash).await.unwrap(), data);
+    let found = b.dht_get_content(&inner_hash, Duration::from_secs(6)).await;
+    assert_eq!(found.as_deref(), Some(&data[..]));
 
     let wrong_hash = ContentHandle([0xAA; 64]);
     assert!(
-        b.dht_get_content(&wrong_hash).await.is_none(),
+        b.dht_get_content(&wrong_hash, Duration::from_secs(1)).await.is_none(),
         "Wrong inner hash should not decrypt content"
     );
 }
@@ -1833,11 +1778,6 @@ async fn cross_algo_tns_resolution() {
         .unwrap();
 
     // B (falcon_ed25519) resolves A's zone
-    let dht_key = tarnet::tns::tns_dht_key(&zone_a_sid, "www");
-    for _ in 0..5 {
-        let _ = b.node.request_dht_key(&dht_key).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 
     let resolution = wait_for(Duration::from_secs(10), || {
         let b = b.node.clone();
@@ -1862,11 +1802,6 @@ async fn cross_algo_tns_resolution() {
         .unwrap();
 
     // A (ed25519) resolves B's zone
-    let dht_key_b = tarnet::tns::tns_dht_key(&zone_b_sid, "api");
-    for _ in 0..5 {
-        let _ = a.node.request_dht_key(&dht_key_b).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
 
     let resolution_b = wait_for(Duration::from_secs(10), || {
         let a = a.node.clone();

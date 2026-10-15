@@ -450,13 +450,23 @@ pub trait ServiceApi: Send + Sync {
     /// Publish a TNS record set for a label in the given identity's zone.
     /// If `identity` is None, uses the default identity.
     /// The string may be an identity label or a base32-encoded ServiceId.
-    /// The node keeps it published (it refreshes the zone) until removed.
+    /// The node keeps it published (it refreshes the zone) until it is
+    /// withdrawn, the label is removed, or the publishing client's IPC
+    /// connection closes. A name meant to outlive its publisher is a local
+    /// label marked published ([`tns_set_label`](Self::tns_set_label)).
     async fn tns_publish(
         &self,
         identity: Option<&str>,
         label: &str,
         records: Vec<TnsRecord>,
     ) -> ApiResult<()>;
+
+    /// Stop publishing a label published with [`tns_publish`](Self::tns_publish),
+    /// unless a local label marks it published.
+    async fn tns_withdraw(&self, identity: Option<&str>, label: &str) -> ApiResult<()> {
+        let _ = (identity, label);
+        Ok(())
+    }
 
     /// Resolve a dot-separated name starting from a zone.
     async fn tns_resolve(&self, zone: ServiceId, name: &str) -> ApiResult<TnsResolution>;

@@ -26,6 +26,9 @@ struct ConnEntry {
 /// Shared between the dispatch task and event-pushing tasks.
 type ConnTable = Arc<Mutex<HashMap<u32, ConnEntry>>>;
 type ListenerTable = Arc<Mutex<HashMap<u32, Listener>>>;
+/// Labels a client published with `tns_publish`: withdrawn when it goes, so
+/// a name doesn't outlive the process that serves it.
+type PublishedTable = Arc<Mutex<Vec<(Option<String>, String)>>>;
 
 /// Allocate an opaque client-local handle ID for a connection.
 /// The handle space is scoped to a single Unix socket connection.
@@ -180,6 +183,7 @@ async fn handle_client(
     let writer = Arc::new(Mutex::new(writer));
     let conns: ConnTable = Arc::new(Mutex::new(HashMap::new()));
     let listeners: ListenerTable = Arc::new(Mutex::new(HashMap::new()));
+    let published: PublishedTable = Arc::new(Mutex::new(Vec::new()));
 
     // Auto-subscribe: start relaying all events to this client immediately.
     if let Ok(mut rx) = api.subscribe_events().await {
@@ -325,11 +329,13 @@ async fn handle_client(
                         let writer = writer.clone();
                         let conns = conns.clone();
                         let listeners = listeners.clone();
+                        let published = published.clone();
                         // Handle each request concurrently so one slow DHT lookup
                         // doesn't block quick peer_id queries.
                         tokio::spawn(async move {
                             let response = dispatch_request(
                                 &*api, method, &payload, request_id, &writer, &conns, &listeners,
+                                &published,
                             )
                             .await;
                             let mut w = writer.lock().await;
@@ -347,6 +353,11 @@ async fn handle_client(
     };
 
     close_client_listeners(&*api, &listeners).await;
+    for (identity, label) in published.lock().await.drain(..) {
+        if let Err(e) = api.tns_withdraw(identity.as_deref(), &label).await {
+            log::debug!("Failed to withdraw '{}' after its client left: {}", label, e);
+        }
+    }
     result
 }
 
@@ -396,6 +407,7 @@ async fn dispatch_request(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     conns: &ConnTable,
     listeners: &ListenerTable,
+    published: &PublishedTable,
 ) -> IpcFrame {
     match method {
         METHOD_GET_PEER_ID => {
@@ -545,7 +557,14 @@ async fn dispatch_request(
                 .tns_publish(identity.as_deref(), &label, records)
                 .await
             {
-                Ok(()) => ok_response(request_id, &[]),
+                Ok(()) => {
+                    let mut published = published.lock().await;
+                    let entry = (identity, label);
+                    if !published.contains(&entry) {
+                        published.push(entry);
+                    }
+                    ok_response(request_id, &[])
+                }
                 Err(e) => err_response(request_id, &e.to_string()),
             }
         }

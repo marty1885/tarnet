@@ -483,23 +483,11 @@ impl Node {
     /// A peer's newest hello: searched for in the DHT first, so a stale
     /// copy in our store doesn't decide.
     async fn fetch_hello(&self, peer: &PeerId) -> Option<HelloRecord> {
-        let mut search = self
-            .dht_search_hello(peer, Instant::now() + HELLO_FETCH_TIMEOUT)
-            .await;
-        while search.next().await.is_some() {}
-        self.lookup_hello(peer).await
+        self.search_hello(peer, HELLO_FETCH_TIMEOUT, true).await
     }
 
     async fn strike(&self, peer: PeerId) {
-        let _ = self
-            .governor
-            .lock()
-            .await
-            .reporter()
-            .send(crate::governor::Report {
-                link_peer: peer,
-                reason: crate::governor::ReportReason::ProtocolViolation,
-            });
+        self.governor.lock().await.strike(peer);
     }
 
     // ── Our address ──

@@ -68,6 +68,9 @@ fn default_protocol() -> String {
 struct ExposeState<S: ServiceApi> {
     api: Arc<S>,
     services: Mutex<Vec<RegisteredService>>,
+    /// (identity, label) of every name the last publish published: a reload
+    /// withdraws the ones no longer configured.
+    published: Mutex<Vec<(Option<String>, String)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -442,6 +445,7 @@ fn spawn_accept_tasks<S: ServiceApi + 'static>(api: Arc<S>, services: &[Register
 
 async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
     let services = state.services.lock().await;
+    let mut published: Vec<(Option<String>, String)> = Vec::new();
 
     // Track which identities have already published their apex Identity record.
     let mut apex_published: HashMap<String, bool> = HashMap::new();
@@ -499,10 +503,13 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                 .tns_publish(identity_label, subdomain, vec![record])
                 .await
             {
-                Ok(()) => info!(
-                    "Published {} record for '{}.{}' -> {}",
-                    kind, subdomain, identity_key, serving_sid
-                ),
+                Ok(()) => {
+                    published.push((identity_label.map(String::from), subdomain.clone()));
+                    info!(
+                        "Published {} record for '{}.{}' -> {}",
+                        kind, subdomain, identity_key, serving_sid
+                    )
+                }
                 Err(e) => error!(
                     "{}: failed to publish subdomain '{}': {}",
                     svc.filename, subdomain, e
@@ -549,6 +556,7 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                 .await
             {
                 Ok(()) => {
+                    published.push((identity_label.map(String::from), "@".to_string()));
                     info!(
                         "Published Identity at apex (@) for identity '{}' -> {}",
                         identity_key, serving_sid
@@ -560,6 +568,19 @@ async fn publish_services<S: ServiceApi>(state: &ExposeState<S>) {
                     svc.filename, e
                 ),
             }
+        }
+    }
+    drop(services);
+
+    // Names a previous config published and this one doesn't.
+    let old = std::mem::replace(&mut *state.published.lock().await, published.clone());
+    for (identity, label) in old {
+        if published.contains(&(identity.clone(), label.clone())) {
+            continue;
+        }
+        match state.api.tns_withdraw(identity.as_deref(), &label).await {
+            Ok(()) => info!("Withdrew '{}', no longer configured", label),
+            Err(e) => warn!("Failed to withdraw '{}': {}", label, e),
         }
     }
 }
@@ -739,6 +760,7 @@ pub async fn run_expose<S: ServiceApi + 'static>(
     let state = Arc::new(ExposeState {
         api: api.clone(),
         services: Mutex::new(services),
+        published: Mutex::new(Vec::new()),
     });
     {
         let current = state.services.lock().await.clone();
@@ -945,7 +967,6 @@ mod tests {
                 dht: tarnet_api::types::DhtStatus {
                     stored_keys: 0,
                     stored_records: 0,
-                    kbucket_peers: 0,
                     local_watches: 0,
                     remote_watches: 0,
                     nse: 0,
@@ -1156,6 +1177,7 @@ mod tests {
         ExposeState {
             api,
             services: Mutex::new(services),
+            published: Mutex::new(Vec::new()),
         }
     }
 

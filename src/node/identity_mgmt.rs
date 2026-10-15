@@ -299,20 +299,27 @@ impl Node {
         if let Some(hello) = self.lookup_hello(peer_id).await {
             return Some(hello);
         }
-        let mut search = self.dht_search_hello(peer_id, Instant::now() + timeout).await;
-        loop {
-            if let Some(hello) = self.lookup_hello(peer_id).await {
-                return Some(hello);
-            }
-            search.next().await?;
-        }
+        self.search_hello(peer_id, timeout, false).await
     }
 
-    /// Send GET walks for a peer's hello record.
-    /// Uses anonymous query token routing for reply privacy.
-    pub async fn request_hello(&self, target: &PeerId) -> Result<()> {
-        let key = crate::dht::identity_address_key(target);
-        self.dht_walker.launch_get(key.as_bytes(), None).await;
-        Ok(())
+    /// Search the DHT for `peer`'s hello until `timeout`, keeping the newest
+    /// version seen: the search's whole span if `all`, else only what has
+    /// arrived by the time the first one does.
+    pub(super) async fn search_hello(&self, peer: &PeerId, timeout: Duration, all: bool) -> Option<HelloRecord> {
+        let key = crate::dht::identity_address_key(peer);
+        let mut search = self.dht_search(key, Instant::now() + timeout).await;
+        let mut best: Option<(u64, HelloRecord)> = None;
+        while let Some(rec) = search.next().await {
+            let seq = rec.record().sequence;
+            if let Some(hello) = crate::dht::hello_from_record(peer, rec.record()) {
+                if best.as_ref().map_or(true, |(s, _)| seq > *s) {
+                    best = Some((seq, hello));
+                }
+            }
+            if best.is_some() && !all && search.is_idle() {
+                break;
+            }
+        }
+        best.map(|(_, h)| h)
     }
 }

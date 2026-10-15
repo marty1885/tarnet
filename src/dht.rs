@@ -620,6 +620,9 @@ pub const MAX_HELLO_TTL: Duration = Duration::from_secs(3600);
 pub fn max_ttl(record_type: RecordType) -> Duration {
     match record_type {
         RecordType::Hello => MAX_HELLO_TTL,
+        // A zone root is re-signed well within its lifetime: a replayed old
+        // root can't be made to outlive it.
+        RecordType::ZoneRoot => Duration::from_secs(crate::tns::ZONE_ROOT_TTL as u64),
         _ => MAX_RECORD_TTL,
     }
 }
@@ -635,24 +638,24 @@ pub fn clamp_ttl_secs(record_type: RecordType, ttl: u32) -> u32 {
 }
 
 /// What [`DhtStore::put_record`] did.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PutOutcome {
     /// The record is in the store now (new, newer, or an equal copy already
     /// held) and survived the storage limits.
     pub stored: bool,
-    /// The stored copy, when `stored`: what to persist. An equal copy keeps
-    /// the deadline already held, not the one it arrived with.
-    pub record: Option<DhtRecord>,
-    /// Who handed us the stored copy (persisted with it).
-    pub source: RecordSource,
-    /// Records the limits evicted, possibly the new one itself.
-    pub evicted: Vec<DhtRecord>,
+    /// It is a version this store did not hold before: news for watchers.
+    pub news: bool,
 }
 
+/// The records this node holds: those PUT walks ended here with, and its
+/// own. A node with a database keeps it a mirror of the store: every change
+/// to the store is written there by the store itself, under the same lock,
+/// so the two can't disagree.
 pub struct DhtStore {
     records: HashMap<[u8; 64], Vec<StoredRecord>>,
     local_id: DhtId,
     limits: StorageLimits,
+    db: Option<std::sync::Arc<crate::state::StateDb>>,
     /// Records that expired here, by (key, signer): the highest dead
     /// sequence, and when to forget it.
     /// TTLs are unsigned and nodes share no clock, so a copy arriving later
@@ -677,13 +680,44 @@ impl DhtStore {
             records: HashMap::new(),
             local_id: dht_id_from_peer_id(local_peer),
             limits,
+            db: None,
             dead: crate::bounded::BoundedMap::new(limits.max_records.saturating_mul(2), MAX_RECORD_TTL),
         }
     }
 
-    /// Store a record this node minted or reloaded itself. See [`put_from`](Self::put_from).
+    /// A store mirrored in `db`, loaded from it. Rows the store no longer
+    /// admits (expired, failing verification, over the limits, or written
+    /// under a clock that has since gone back) are deleted.
+    pub fn open(local_peer: &PeerId, limits: StorageLimits, db: std::sync::Arc<crate::state::StateDb>) -> Self {
+        let mut store = Self::with_limits(local_peer, limits);
+        if let Err(e) = db.delete_expired_dht_records() {
+            log::warn!("Failed to delete expired DHT records: {}", e);
+        }
+        let rows = db.load_dht_records().unwrap_or_default();
+        store.db = Some(db);
+        store.import_records(rows);
+        store
+    }
+
+    fn mirror_put(&self, e: &StoredRecord) {
+        let Some(db) = &self.db else { return };
+        if let Some(row) = PersistedRecord::from_stored(&e.record, e.source) {
+            if let Err(err) = db.upsert_dht_record(&row) {
+                log::warn!("Failed to persist DHT record: {}", err);
+            }
+        }
+    }
+
+    fn mirror_delete(&self, key: &[u8; 64], signer: &[u8; 32]) {
+        let Some(db) = &self.db else { return };
+        if let Err(e) = db.delete_dht_record(key, signer) {
+            log::warn!("Failed to delete DHT record: {}", e);
+        }
+    }
+
+    /// Store a record this node minted itself. See [`put_record`](Self::put_record).
     pub fn put(&mut self, record: VerifiedRecord) -> bool {
-        self.put_from(record, RecordSource::Local)
+        self.put_record(record, RecordSource::Local).stored
     }
 
     /// [`put_record`](Self::put_record), reporting only whether the record is
@@ -692,70 +726,73 @@ impl DhtStore {
         self.put_record(record, source).stored
     }
 
-    /// Store a record with type-aware replacement policy, attributing it to
-    /// `source` for fair-share eviction.
+    /// Store a record, attributing it to `source` for fair-share eviction.
     /// One version per signer at a key; a higher sequence replaces it.
     /// `SignedContent` and `Content` accept a repeat of the version held
     /// without extending it. Unsigned content is self-certifying (the ingest
-    /// gate checks its key), so it has one valid version per key.
-    ///
-    /// The stored TTL is clamped to [`max_ttl`] for the record type.
-    ///
-    /// Whoever mirrors the store (the node's database) must drop the
-    /// [`evicted`](PutOutcome::evicted) records too, and keep the new one only
-    /// if [`stored`](PutOutcome::stored): the limits may evict it at once.
+    /// gate checks its key), so it has one valid version per key. Our own
+    /// records ([`RecordSource::Local`]) are never evicted for others'.
     pub fn put_record(&mut self, record: VerifiedRecord, source: RecordSource) -> PutOutcome {
         let record = record.into_inner();
         self.expire();
-        let mut out = PutOutcome {
+        let refused = PutOutcome {
             stored: false,
-            record: None,
-            source,
-            evicted: Vec::new(),
+            news: false,
         };
         if record.value.len() > self.limits.max_value_bytes {
-            return out;
+            return refused;
         }
         if record.is_expired() || self.died_here(&record) {
-            return out;
+            return refused;
         }
 
         let key = *record.key.as_bytes();
         let (signer, sequence, record_type) = (record.signer, record.sequence, record.record_type);
         let entries = self.records.entry(key).or_default();
-        // Every type holds one version per signer at a key; a higher sequence
-        // replaces it. Unsigned content has a zero signer and is
-        // self-certifying, so its one valid blob is the only version.
+        let held = entries.iter().find(|e| e.record.signer == signer).map(|e| e.record.sequence);
         // `SignedContent` and `Content` also accept a repeat of the version
         // held (it keeps the deadline held).
         let allow_equal = matches!(record_type, RecordType::SignedContent | RecordType::Content);
-        let stored = upsert_by_signer(entries, record, source, allow_equal);
-
-        if !stored {
+        if !upsert_by_signer(entries, record, source, allow_equal) {
             self.records.retain(|_, v| !v.is_empty());
-            return out;
+            return refused;
         }
-        self.enforce_key_limits(&key, &mut out.evicted);
-        self.enforce_global_limits(&mut out.evicted);
-        if let Some(e) = self.records.get(&key).and_then(|entries| {
-            entries.iter().find(|e| {
-                e.record.signer == signer && e.record.sequence == sequence && e.record.record_type == record_type
-            })
-        }) {
-            out.record = Some(e.record.clone());
-            out.source = e.source;
-            out.stored = true;
+        let mut evicted = Vec::new();
+        self.enforce_key_limits(&key, &mut evicted);
+        self.enforce_global_limits(&mut evicted);
+        for r in &evicted {
+            self.mirror_delete(r.key.as_bytes(), r.signer.as_bytes());
         }
-        out
+        let Some(e) = self.records.get(&key).and_then(|entries| {
+            entries
+                .iter()
+                .find(|e| e.record.signer == signer && e.record.sequence == sequence && e.record.record_type == record_type)
+        }) else {
+            return refused;
+        };
+        let news = held.map_or(true, |seq| sequence > seq);
+        if news {
+            self.mirror_put(e);
+        }
+        PutOutcome { stored: true, news }
     }
 
-    /// Whether the store already holds this version of this record: one
-    /// version per signer at a key (unsigned content included, being
-    /// self-certifying).
-    pub fn holds(&self, key: &DhtId, record_type: RecordType, signer: &PeerId, sequence: u64) -> bool {
-        self.get(key)
-            .iter()
-            .any(|r| r.record_type == record_type && r.sequence == sequence && r.signer == *signer)
+    /// A relay-only node keeps only its own records: drop everyone else's.
+    pub fn drop_replicas(&mut self) {
+        let mut gone = Vec::new();
+        for entries in self.records.values_mut() {
+            entries.retain(|e| {
+                if e.source == RecordSource::Local {
+                    return true;
+                }
+                gone.push((*e.record.key.as_bytes(), *e.record.signer.as_bytes()));
+                false
+            });
+        }
+        self.records.retain(|_, v| !v.is_empty());
+        for (key, signer) in &gone {
+            self.mirror_delete(key, signer);
+        }
     }
 
     /// `peer`'s hello, from its newest hello record here: signed by `peer`
@@ -766,9 +803,20 @@ impl DhtStore {
             .into_iter()
             .filter(|r| r.record_type == RecordType::Hello && r.signer == *peer)
             .max_by_key(|r| r.sequence)
-            .and_then(|r| signed_record_decrypt(&key, &r.value).ok())
-            .and_then(|p| crate::wire::HelloRecord::from_bytes(&p).ok())
-            .filter(|h| h.peer_id == *peer)
+            .and_then(|r| hello_from_record(peer, r))
+    }
+
+    /// Every hello held here, each checked as [`hello_of`](Self::hello_of)
+    /// checks it.
+    pub fn hellos(&self) -> Vec<crate::wire::HelloRecord> {
+        let signers: std::collections::HashSet<PeerId> = self
+            .records
+            .values()
+            .flatten()
+            .filter(|e| e.record.record_type == RecordType::Hello)
+            .map(|e| e.record.signer)
+            .collect();
+        signers.iter().filter_map(|p| self.hello_of(p)).collect()
     }
 
     /// Retrieve all non-expired records at a key.
@@ -783,28 +831,36 @@ impl DhtStore {
         }
     }
 
-    /// Remove expired records.
+    /// Remove expired records, remembering each as dead here. Unsigned
+    /// content is not remembered: it has no sequence an owner could raise,
+    /// so remembering it would refuse its republish, and a replay can only
+    /// bring back the one immutable blob its key admits.
     pub fn expire(&mut self) {
         let now = Instant::now();
-        let dead = &mut self.dead;
+        let mut gone = Vec::new();
         for entries in self.records.values_mut() {
             entries.retain(|e| {
-                if !e.record.is_expired() {
-                    return true;
+                if e.record.is_expired() {
+                    gone.push(e.record.clone());
+                    false
+                } else {
+                    true
                 }
-                let r = &e.record;
-                let k = (*r.key.as_bytes(), dead_id(r));
-                match dead.get_mut(&k) {
-                    Some(seq) => *seq = (*seq).max(r.sequence),
-                    // Full: a replay of this one may be stored again.
-                    None => {
-                        let _ = dead.try_insert(k, r.sequence);
-                    }
-                }
-                false
             });
         }
         self.records.retain(|_, v| !v.is_empty());
+        for r in &gone {
+            self.mirror_delete(r.key.as_bytes(), r.signer.as_bytes());
+            if r.record_type == RecordType::Content {
+                continue;
+            }
+            // The lifetime restarts with each death: a later sequence that
+            // died is remembered for the full cap after it died. Full: a
+            // replay of this one may be stored again.
+            let k = (*r.key.as_bytes(), dead_id(r));
+            let seq = self.dead.get(&k).map_or(r.sequence, |s| (*s).max(r.sequence));
+            let _ = self.dead.upsert(k, seq);
+        }
         self.dead.expire(now);
     }
 
@@ -851,22 +907,14 @@ impl DhtStore {
             .collect()
     }
 
-    /// Non-expired records split by origin: `(ours, everyone else's)`, where
-    /// "ours" are those with source [`RecordSource::Local`].
-    pub fn records_by_origin(&self) -> (Vec<&DhtRecord>, Vec<&DhtRecord>) {
-        let mut ours = Vec::new();
-        let mut theirs = Vec::new();
-        for e in self.records.values().flat_map(|entries| entries.iter()) {
-            if e.record.is_expired() {
-                continue;
-            }
-            if e.source == RecordSource::Local {
-                ours.push(&e.record);
-            } else {
-                theirs.push(&e.record);
-            }
-        }
-        (ours, theirs)
+    /// Our own non-expired records ([`RecordSource::Local`]).
+    pub fn own_records(&self) -> Vec<&DhtRecord> {
+        self.records
+            .values()
+            .flatten()
+            .filter(|e| e.source == RecordSource::Local && !e.record.is_expired())
+            .map(|e| &e.record)
+            .collect()
     }
 
     pub fn export_records(&self) -> Vec<PersistedRecord> {
@@ -877,37 +925,30 @@ impl DhtStore {
             .collect()
     }
 
-    /// Re-verify each persisted record on the way back in, dropping any that no
-    /// longer pass the trust gate (DB corruption or tampering). Records that
-    /// passed verification when first accepted re-verify here, since their signed
-    /// fields round-trip faithfully through persistence.
-    /// Load persisted records. Returns the ones that are no longer stored
-    /// (expired, failing verification, or over the limits), whose rows the
-    /// caller deletes so the database stays within the store's limits.
-    pub fn import_records(&mut self, records: Vec<PersistedRecord>) -> Vec<DhtRecord> {
-        let mut dropped = Vec::new();
-        for record in records {
+    /// Load persisted records, re-verifying each on the way back in (DB
+    /// corruption or tampering): signed fields round-trip faithfully, so a
+    /// record that passed when first accepted passes again. Rows no longer
+    /// stored are deleted from the mirror.
+    pub fn import_records(&mut self, records: Vec<PersistedRecord>) {
+        for row in records {
+            let (key, signer) = (row.key, row.signer);
             // Each record comes back with who handed it to us: a replica a
             // peer delivered stays a peer's after a restart, and is never
             // republished as ours.
-            let Some((live, source)) = record.into_stored() else {
-                continue;
-            };
-            match VerifiedRecord::verify_incoming(live.clone()) {
-                Ok(verified) => {
-                    let outcome = self.put_record(verified, source);
-                    if !outcome.stored {
-                        dropped.push(live);
+            let stored = match row.into_stored() {
+                None => false,
+                Some((live, source)) => match VerifiedRecord::verify_incoming(live) {
+                    Ok(verified) => self.put_record(verified, source).stored,
+                    Err(reason) => {
+                        log::warn!("dropping persisted DHT record on load: {}", reason);
+                        false
                     }
-                    dropped.extend(outcome.evicted);
-                }
-                Err(reason) => {
-                    log::warn!("dropping persisted DHT record on load: {}", reason);
-                    dropped.push(live);
-                }
+                },
+            };
+            if !stored {
+                self.mirror_delete(&key, &signer);
             }
         }
-        dropped
     }
 
     fn total_record_count(&self) -> usize {
@@ -974,6 +1015,19 @@ impl DhtStore {
     }
 }
 
+/// `peer`'s hello from a verified record: a hello at `peer`'s own key,
+/// signed by `peer`, naming `peer`.
+pub fn hello_from_record(peer: &PeerId, r: &DhtRecord) -> Option<crate::wire::HelloRecord> {
+    let key = identity_address_key(peer);
+    if r.record_type != RecordType::Hello || r.signer != *peer || r.key != key {
+        return None;
+    }
+    let plain = signed_record_decrypt(&key, &r.value).ok()?;
+    crate::wire::HelloRecord::from_bytes(&plain)
+        .ok()
+        .filter(|h| h.peer_id == *peer)
+}
+
 /// Record types that only the key's owner can write (enforced at ingest by
 /// [`verify_incoming_record`]).
 fn is_owner_bound(record_type: RecordType) -> bool {
@@ -983,10 +1037,12 @@ fn is_owner_bound(record_type: RecordType) -> bool {
 /// Pick the record to evict: the oldest record from whichever source holds the
 /// most of the candidates. Under normal load this approximates oldest-first;
 /// under a flood from one link it evicts that link's records before anyone
-/// else's.
+/// else's. Our own records are never candidates: they are what we publish,
+/// and nothing would put them back.
 fn fair_share_victim<'a, I: Copy>(
     candidates: impl Iterator<Item = (I, &'a StoredRecord)> + Clone,
 ) -> Option<I> {
+    let candidates = candidates.filter(|(_, e)| e.source != RecordSource::Local);
     let mut counts: HashMap<RecordSource, usize> = HashMap::new();
     for (_, e) in candidates.clone() {
         *counts.entry(e.source).or_default() += 1;
@@ -1049,11 +1105,11 @@ pub struct DhtWatch {
 /// oldest-looking entry is forgotten (it may then be notified once more).
 const MAX_NOTIFIED_SIGNERS: usize = 64;
 
-/// Cap on a watch's lifetime, regardless of the (wire-supplied) request. Watch
-/// re-sends are short-lived: callers refresh at 300s (see node::mod re-send and
-/// dht_watch). 1 hour gives ample slack over that cadence while bounding how
-/// long an abandoned/forged watch can squat memory after its via_peer goes
-/// quiet — without it, a u32::MAX request would pin an entry for ~136 years.
+/// Cap on a watch's lifetime, regardless of the (wire-supplied) request.
+/// Watchers relaunch their walks every minute asking for two minutes, so an
+/// honest registration never needs this; it bounds how long an abandoned or
+/// forged one can squat memory (a u32::MAX request would otherwise pin an
+/// entry for ~136 years).
 pub const MAX_WATCH_EXPIRATION_SECS: u32 = 3600;
 
 /// Per-via_peer cap on distinct watches. A single neighbor proxies many local
@@ -1132,6 +1188,8 @@ impl DhtWatchTable {
         // clamp a cancel up into a live watch.
         let expiration_secs = expiration_secs.min(MAX_WATCH_EXPIRATION_SECS);
         let expires_at = Instant::now() + Duration::from_secs(expiration_secs as u64);
+        // An expired registration neither blocks its token nor comes back.
+        self.prune(&key);
         if let Some(entries) = self.watches.get_mut(&key) {
             // Refresh (must always succeed, so a legit periodic refresh isn't
             // broken once a peer is at its cap).
@@ -1168,6 +1226,27 @@ impl DhtWatchTable {
         *self.per_peer_count.entry(via_peer).or_insert(0) += 1;
         self.total_count += 1;
         true
+    }
+
+    /// Drop `key`'s expired registrations.
+    fn prune(&mut self, key: &[u8; 64]) {
+        let now = Instant::now();
+        let Some(entries) = self.watches.get_mut(key) else { return };
+        let mut dropped = Vec::new();
+        entries.retain(|w| {
+            let live = w.expires_at > now;
+            if !live {
+                dropped.push(w.via_peer);
+            }
+            live
+        });
+        if entries.is_empty() {
+            self.watches.remove(key);
+        }
+        self.total_count = self.total_count.saturating_sub(dropped.len());
+        for peer in &dropped {
+            self.decr_peer(peer);
+        }
     }
 
     /// Decrement the per-peer counter for `peer`, removing the map entry at zero.
@@ -1217,6 +1296,7 @@ impl DhtWatchTable {
     }
 
     /// Get all non-expired watchers for a key: returns (query_token, via_peer).
+    #[cfg(test)]
     pub fn get_watchers(&self, key: &[u8; 64]) -> Vec<([u8; 32], PeerId)> {
         let now = Instant::now();
         match self.watches.get(key) {
@@ -1229,9 +1309,6 @@ impl DhtWatchTable {
         }
     }
 
-    /// Watchers of `key` to notify about a PUT of `(signer, sequence)`: those
-    /// not yet notified of that sequence or a newer one from that signer.
-    /// Marks them notified.
     /// Watchers of `key` that haven't been told of this version (`signer`'s
     /// record at `sequence`, or newer); marks them told. Call only with a
     /// verified record: whatever is passed here suppresses later news.
@@ -1305,126 +1382,6 @@ impl DhtWatchTable {
 }
 
 // ── K-Bucket Routing Table ──
-
-/// Entry in a k-bucket.
-#[derive(Debug, Clone)]
-pub struct KBucketEntry {
-    pub peer_id: PeerId,
-    pub dht_id: DhtId,
-    pub last_seen: Instant,
-}
-
-/// K-bucket routing table organizing peers by XOR distance.
-pub struct KBucketTable {
-    buckets: Vec<Vec<KBucketEntry>>,
-    pub local_id: DhtId,
-}
-
-impl KBucketTable {
-    pub fn new(local_peer: &PeerId) -> Self {
-        let local_id = dht_id_from_peer_id(local_peer);
-        Self {
-            buckets: (0..512).map(|_| Vec::new()).collect(),
-            local_id,
-        }
-    }
-
-    /// Find the bucket index for a given DHT ID (highest differing bit).
-    pub fn bucket_index(&self, id: &DhtId) -> usize {
-        let dist = self.local_id.xor_distance(id);
-        // Find the highest set bit
-        for byte_idx in 0..64 {
-            let byte = dist.0[byte_idx];
-            if byte != 0 {
-                let bit = 7 - byte.leading_zeros() as usize;
-                return (63 - byte_idx) * 8 + bit;
-            }
-        }
-        0 // same ID
-    }
-
-    /// Insert a peer into the appropriate k-bucket.
-    pub fn insert(&mut self, peer_id: PeerId, dht_id: DhtId) {
-        if dht_id == self.local_id {
-            return; // don't insert ourselves
-        }
-        let idx = self.bucket_index(&dht_id);
-        let bucket = &mut self.buckets[idx];
-
-        // If already present, update last_seen
-        if let Some(entry) = bucket.iter_mut().find(|e| e.peer_id == peer_id) {
-            entry.last_seen = Instant::now();
-            return;
-        }
-
-        if bucket.len() < KBUCKET_SIZE {
-            bucket.push(KBucketEntry {
-                peer_id,
-                dht_id,
-                last_seen: Instant::now(),
-            });
-        } else {
-            // Sybil-resistant eviction: prefer long-lived peers.
-            // Discard the new peer unless the least-recently-seen bucket
-            // member hasn't been heard from in over 5 minutes (likely dead).
-            // This prevents an attacker from flushing established peers by
-            // generating fresh identities — new nodes are discarded when the
-            // bucket is healthy.
-            const STALE_THRESHOLD: Duration = Duration::from_secs(300);
-            if let Some(oldest_idx) = bucket
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, e)| e.last_seen)
-                .map(|(i, _)| i)
-            {
-                if bucket[oldest_idx].last_seen.elapsed() > STALE_THRESHOLD {
-                    bucket[oldest_idx] = KBucketEntry {
-                        peer_id,
-                        dht_id,
-                        last_seen: Instant::now(),
-                    };
-                }
-                // Otherwise: bucket is full of active peers — discard the new one.
-            }
-        }
-    }
-
-    /// Find the k closest peers to a given key.
-    pub fn closest_peers(&self, key: &DhtId, k: usize) -> Vec<(PeerId, DhtId)> {
-        let mut all_peers: Vec<(PeerId, DhtId, DhtId)> = Vec::new();
-        for bucket in &self.buckets {
-            for entry in bucket {
-                let dist = key.xor_distance(&entry.dht_id);
-                all_peers.push((entry.peer_id, entry.dht_id, dist));
-            }
-        }
-        all_peers.sort_by(|a, b| a.2.cmp(&b.2));
-        all_peers
-            .into_iter()
-            .take(k)
-            .map(|(pid, did, _)| (pid, did))
-            .collect()
-    }
-
-    /// Get all known peers (for iteration).
-    pub fn all_peers(&self) -> Vec<(PeerId, DhtId)> {
-        self.buckets
-            .iter()
-            .flat_map(|bucket| bucket.iter().map(|e| (e.peer_id, e.dht_id)))
-            .collect()
-    }
-
-    /// Total number of peers in the table.
-    pub fn len(&self) -> usize {
-        self.buckets.iter().map(|b| b.len()).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
-// ── Bloom Filter ──
 
 /// Simple 256-byte (2048-bit) bloom filter with 4 hash functions.
 #[derive(Debug, Clone)]
@@ -1648,8 +1605,9 @@ mod tests {
     /// Store a hand-built record in tests without going through the signature
     /// gate. These fixtures carry dummy signatures by design; `locally_trusted`
     /// is the sanctioned bypass for records the test itself constructs.
+    /// Store a record as one a neighbour delivered (ours are never evicted).
     fn put(store: &mut DhtStore, record: DhtRecord) {
-        store.put(VerifiedRecord::locally_trusted(record));
+        store.put_from(VerifiedRecord::locally_trusted(record), RecordSource::Peer(PeerId([0xEE; 32])));
     }
 
     /// Mint a genuinely-signed record, exactly as the publish path builds one:
@@ -1844,7 +1802,7 @@ mod tests {
         let mut store = DhtStore::with_limits(&PeerId([0; 32]), limits);
         for i in 0..10u8 {
             let r = signed_record(&kp, DhtId([i; 64]), RecordType::SignedContent, 1, b"v".to_vec());
-            store.put(VerifiedRecord::verify_incoming(r).unwrap());
+            store.put_from(VerifiedRecord::verify_incoming(r).unwrap(), RecordSource::Peer(PeerId([7; 32])));
         }
         // Falcon signatures vary in length: two or three fit.
         assert!((2..=3).contains(&store.record_count()), "{} records", store.record_count());
@@ -1888,7 +1846,8 @@ mod tests {
         put.ttl = u32::MAX;
         let got = VerifiedRecord::from_put_msg(&put).unwrap();
         assert!(got.record().remaining_ttl() <= MAX_HELLO_TTL);
-        assert_eq!(clamp_ttl_secs(RecordType::ZoneRoot, u32::MAX), MAX_RECORD_TTL.as_secs() as u32);
+        assert_eq!(clamp_ttl_secs(RecordType::ZoneRoot, u32::MAX), crate::tns::ZONE_ROOT_TTL);
+        assert_eq!(clamp_ttl_secs(RecordType::SignedContent, u32::MAX), MAX_RECORD_TTL.as_secs() as u32);
         let minted = VerifiedRecord::new_hello(&kp, b"h", 2, Duration::from_secs(u32::MAX as u64));
         assert!(minted.record().remaining_ttl() <= MAX_HELLO_TTL);
     }
@@ -2072,16 +2031,14 @@ mod tests {
         let newer = signed_record(&kp, key, RecordType::SignedContent, 4, b"v'".to_vec());
         assert!(store.put(VerifiedRecord::verify_incoming(newer).unwrap()));
 
-        // Unsigned content: the same blob stays dead; another blob at the key
-        // is someone else's candidate.
+        // Unsigned content has no sequence to raise, so it isn't remembered:
+        // its owner can publish it again.
         let (content, _) = VerifiedRecord::new_content(b"blob", Duration::from_millis(20));
-        let ckey = content.record().key;
         assert!(store.put(content));
         std::thread::sleep(Duration::from_millis(30));
         store.expire();
         let (again, _) = VerifiedRecord::new_content(b"blob", Duration::from_secs(600));
-        assert!(!store.put(again));
-        assert!(store.get(&ckey).is_empty());
+        assert!(store.put(again));
     }
 
     #[test]
@@ -2671,56 +2628,22 @@ mod tests {
         assert_eq!(table.watch_count(), 2);
     }
 
-    // ── F2: a stale lower-sequence record is is_new BUT not accepted ──
-
-    /// Replicates the (signer, sequence, record_type) exact-tuple test the DhtPut
-    /// handler uses for `is_new`.
-    fn is_new(store: &DhtStore, key: &DhtId, rec: &DhtRecord) -> bool {
-        !store
-            .get(key)
-            .iter()
-            .any(|r| r.signer == rec.signer && r.sequence == rec.sequence && r.record_type == rec.record_type)
-    }
-
     #[test]
-    fn stale_lower_seq_is_new_but_not_accepted() {
-        // The exact case behind F2: a known signer's lower-sequence record has no
-        // matching stored tuple (is_new=true) yet the store refuses it
-        // (accepted=false). The handler must forward only on is_new && accepted —
-        // forwarding on is_new alone re-floods this rejected record forever.
+    fn only_a_newer_version_is_news() {
+        // What watchers hear of is decided by the store, in the same step
+        // that stores: a replayed older sequence is neither stored nor news,
+        // an equal one (a republish) is held but not news, a newer one is.
         let kp = Keypair::generate();
         let key = DhtId([0x70; 64]);
         let mut store = DhtStore::new(&PeerId([0u8; 32]));
-
-        let high = signed_record(&kp, key, RecordType::SignedContent, 5, b"v5".to_vec());
-        assert!(store.put(VerifiedRecord::verify_incoming(high).unwrap()));
-
-        // Replay an older sequence from the same signer.
-        let stale = signed_record(&kp, key, RecordType::SignedContent, 3, b"v3".to_vec());
-        assert!(is_new(&store, &key, &stale), "lower seq has no exact tuple -> is_new");
-        let accepted = store.put(VerifiedRecord::verify_incoming(stale).unwrap());
-        assert!(!accepted, "store must reject the stale lower-seq record");
-        // is_new && accepted == false -> the handler does NOT forward. (bug fixed)
-    }
-
-    #[test]
-    fn equal_seq_refresh_is_accepted_but_not_new() {
-        // The reason the gate is is_new && accepted, not accepted alone:
-        // SignedContent uses allow_equal=true, so an equal-sequence re-arrival is
-        // ACCEPTED (replaces) but is NOT new (tuple already present). Gating on
-        // accepted alone would re-flood every refresh.
-        let kp = Keypair::generate();
-        let key = DhtId([0x71; 64]);
-        let mut store = DhtStore::new(&PeerId([0u8; 32]));
-
-        let first = signed_record(&kp, key, RecordType::SignedContent, 4, b"v4".to_vec());
-        assert!(store.put(VerifiedRecord::verify_incoming(first).unwrap()));
-
-        let again = signed_record(&kp, key, RecordType::SignedContent, 4, b"v4".to_vec());
-        assert!(!is_new(&store, &key, &again), "equal-seq tuple already stored -> not new");
-        let accepted = store.put(VerifiedRecord::verify_incoming(again).unwrap());
-        assert!(accepted, "allow_equal=true: equal-seq replaces -> accepted");
-        // is_new && accepted == false -> handler does NOT re-flood. (correct)
+        let put = |store: &mut DhtStore, seq: u64| {
+            let r = signed_record(&kp, key, RecordType::SignedContent, seq, format!("v{}", seq).into_bytes());
+            store.put_record(VerifiedRecord::verify_incoming(r).unwrap(), RecordSource::Peer(PeerId([7; 32])))
+        };
+        assert_eq!(put(&mut store, 5), PutOutcome { stored: true, news: true });
+        assert_eq!(put(&mut store, 3), PutOutcome { stored: false, news: false });
+        assert_eq!(put(&mut store, 5), PutOutcome { stored: true, news: false });
+        assert_eq!(put(&mut store, 6), PutOutcome { stored: true, news: true });
     }
 
     #[test]
@@ -2734,7 +2657,8 @@ mod tests {
         store.put(VerifiedRecord::verify_incoming(first.clone()).unwrap());
         let outcome = store.put_record(VerifiedRecord::verify_incoming(first.clone()).unwrap(), RecordSource::Local);
         assert!(outcome.stored);
-        assert_eq!(outcome.record.unwrap().expires, first.expires);
+        assert!(!outcome.news);
+        assert_eq!(store.get(&key)[0].expires, first.expires);
 
         let newer = signed_record_expiring(&kp, key, RecordType::SignedContent, 5, b"v5".to_vec(), expires_in(Duration::from_secs(3600)));
         store.put(VerifiedRecord::verify_incoming(newer.clone()).unwrap());
@@ -2764,37 +2688,6 @@ mod tests {
     }
 
     #[test]
-    fn put_record_reports_what_the_limits_evicted() {
-        let limits = StorageLimits {
-            max_records: 3,
-            ..StorageLimits::default()
-        };
-        let mut store = DhtStore::with_limits(&PeerId([0u8; 32]), limits);
-        let kp = Keypair::generate();
-        let mut held: Vec<DhtRecord> = Vec::new();
-        let mut evicted: Vec<DhtRecord> = Vec::new();
-        for i in 0..10u8 {
-            let rec = signed_record(&kp, DhtId([i; 64]), RecordType::SignedContent, 1, vec![i]);
-            let outcome = store.put_record(
-                VerifiedRecord::verify_incoming(rec).unwrap(),
-                RecordSource::Peer(PeerId([7; 32])),
-            );
-            if let Some(r) = outcome.record {
-                held.push(r);
-            }
-            evicted.extend(outcome.evicted);
-        }
-        // Mirroring the outcomes (keep what's stored, drop what's evicted)
-        // leaves exactly what the store holds.
-        held.retain(|r| !evicted.iter().any(|e| e.key == r.key && e.signer == r.signer));
-        assert_eq!(store.record_count(), 3);
-        assert_eq!(held.len(), 3);
-        for r in &held {
-            assert_eq!(store.get(&r.key).len(), 1);
-        }
-    }
-
-    #[test]
     fn a_record_evicted_on_arrival_is_not_stored() {
         // A key holding its owner's hello, one record per key: the hello is
         // never evicted for other records, so a newcomer is evicted at once
@@ -2816,9 +2709,7 @@ mod tests {
             RecordSource::Peer(PeerId([7; 32])),
         );
         assert!(!outcome.stored);
-        assert!(outcome.record.is_none());
-        assert_eq!(outcome.evicted.len(), 1);
-        assert_eq!(outcome.evicted[0].signer, other.peer_id());
+        assert!(!outcome.news);
         assert_eq!(store.get(&key).len(), 1);
     }
 
