@@ -22,6 +22,7 @@ use aes::Aes256;
 use chacha20::cipher::{KeyIvInit, StreamCipher};
 use chacha20::XChaCha20;
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::mac_16;
 
@@ -48,7 +49,7 @@ const END: u8 = 1;
 const THROUGH: u8 = 0;
 
 /// Keys of one direction of one onion layer.
-#[derive(Clone)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct LayerKeys {
     stream: [u8; 32],
     prp: [u8; 32],
@@ -63,11 +64,11 @@ impl std::fmt::Debug for LayerKeys {
 
 impl LayerKeys {
     fn derive(secret: &[u8; 32], transcript: &[u8; 32], dir: &str) -> Self {
-        let mut material = [0u8; 64];
+        let mut material = Zeroizing::new([0u8; 64]);
         material[..32].copy_from_slice(secret);
         material[32..].copy_from_slice(transcript);
         let key = |what: &str| {
-            blake3::derive_key(&format!("tarnet onion v1 {} {}", dir, what), &material)
+            blake3::derive_key(&format!("tarnet onion v1 {} {}", dir, what), &*material)
         };
         Self {
             stream: key("stream"),

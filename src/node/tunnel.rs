@@ -1,4 +1,5 @@
 use super::*;
+use zeroize::Zeroizing;
 
 /// Tunnel key exchange resend schedule: first after this, doubling to the max,
 /// for as long as the pending exchange lives.
@@ -102,6 +103,7 @@ impl Node {
         let offer_algo = tarnet_api::types::KemAlgo::from_u8(ke.kem_algo)
             .map_err(|e| Error::Wire(format!("TunnelKeyExchange unknown KEM algo: {}", e)))?;
         let (shared_bytes, reply_ciphertext) = kex_accept(offer_algo, &ke.ephemeral_pubkey)?;
+        let shared_bytes = Zeroizing::new(shared_bytes);
 
         // The initiator may be beyond our local area: reach it by its address.
         let hints = self.address_hints(&ke.initiator_peer_id).await;
@@ -213,7 +215,7 @@ impl Node {
                 return Ok(());
             }
 
-            let shared_bytes = kex.complete(&kr.ciphertext)?;
+            let shared_bytes = Zeroizing::new(kex.complete(&kr.ciphertext)?);
 
             // Authentication and decapsulation both succeeded.  Only now is it
             // safe to consume the one-shot state and notifier.

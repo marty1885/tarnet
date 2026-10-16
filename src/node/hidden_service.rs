@@ -1,4 +1,5 @@
 use super::*;
+use zeroize::Zeroizing;
 
 const ANY_PORT: &str = "*";
 
@@ -208,6 +209,7 @@ impl Node {
         let (static_secret, kem_ciphertext) =
             crate::identity::KemKeypair::encapsulate_to(&kem_pubkey, kem_algo)
                 .map_err(|e| Error::Crypto(format!("INTRODUCE KEM encapsulate failed: {}", e)))?;
+        let static_secret = Zeroizing::new(static_secret);
         let client_kex = KexOffer::new(self.identity.identity.kem_algo());
         let introduction = crate::circuit::Introduction {
             rendezvous: rendezvous_peer,
@@ -262,7 +264,7 @@ impl Node {
 
         // The service proves it read the introduction and answered our key.
         let (join_ct, confirm) = crate::circuit::parse_join(&join)?;
-        let eph_secret = client_kex.complete(join_ct)?;
+        let eph_secret = Zeroizing::new(client_kex.complete(join_ct)?);
         let (e2e, expected) =
             crate::circuit::rendezvous_keys(&static_secret, &eph_secret, &sealed, join_ct);
         if !bool::from(subtle::ConstantTimeEq::ct_eq(&confirm[..], &expected[..])) {
@@ -443,7 +445,7 @@ impl Node {
             let kp = is
                 .keypair_for(&service_id)
                 .ok_or_else(|| Error::Protocol("no keypair for hidden service".into()))?;
-            crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap()
+            crate::identity::Keypair::from_full_bytes(&Zeroizing::new(kp.to_full_bytes())).unwrap()
         };
         // A Hidden identity has no peer record. Drop it before anything can
         // fail, and re-sign at once, so a root naming this host is never
@@ -624,7 +626,7 @@ impl Node {
         let zone_keypair = {
             let is = self.identity_store.lock().await;
             match is.keypair_for(&service_id) {
-                Some(kp) => crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap(),
+                Some(kp) => crate::identity::Keypair::from_full_bytes(&Zeroizing::new(kp.to_full_bytes())).unwrap(),
                 None => {
                     return Err(Error::Protocol("no keypair found for service".into()));
                 }
@@ -875,7 +877,7 @@ impl Node {
         let service_keypair = {
             let is = self.identity_store.lock().await;
             match is.keypair_for(&service_sid) {
-                Some(kp) => crate::identity::Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap(),
+                Some(kp) => crate::identity::Keypair::from_full_bytes(&Zeroizing::new(kp.to_full_bytes())).unwrap(),
                 None => {
                     log::debug!(
                         "No keypair for hidden service {:?}, dropping INTRODUCE",
@@ -899,6 +901,7 @@ impl Node {
                     return;
                 }
             };
+        let static_secret = Zeroizing::new(static_secret);
         // Remembered only once it decrypted, so junk can't fill the table;
         // a racing copy loses here.
         if self.hidden.introduce_seen.lock().await.try_insert(digest, ()).is_err() {
@@ -915,6 +918,7 @@ impl Node {
         let Ok((eph_secret, join_ct)) = kex_accept(client_algo, &intro.client_eph_pk) else {
             return;
         };
+        let eph_secret = Zeroizing::new(eph_secret);
         let (e2e, confirm) =
             crate::circuit::rendezvous_keys(&static_secret, &eph_secret, payload, &join_ct);
 

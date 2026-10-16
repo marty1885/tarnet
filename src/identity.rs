@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use pqcrypto_falcon::falcon512;
 use pqcrypto_kyber::kyber768;
 use pqcrypto_traits::kem::{
@@ -12,6 +12,9 @@ use pqcrypto_traits::sign::{
 use sha2::Sha512;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
+use zeroize::Zeroizing;
+
+use crate::crypto::Wiping;
 use crate::types::{DhtId, PeerId};
 use tarnet_api::types::ServiceId;
 use tarnet_api::types::{IdentityScheme, KemAlgo, SigningAlgo};
@@ -26,7 +29,7 @@ enum SigningInner {
     },
     FalconEd25519 {
         ed_sk: SigningKey,
-        falcon_sk: falcon512::SecretKey,
+        falcon_sk: Wiping<falcon512::SecretKey>,
         falcon_pk: falcon512::PublicKey,
     },
 }
@@ -51,6 +54,7 @@ impl SigningKeypair {
                 let mut rng = rand::rngs::OsRng;
                 let ed_sk = SigningKey::generate(&mut rng);
                 let (falcon_pk, falcon_sk) = falcon512::keypair();
+                let falcon_sk = Wiping::new(falcon_sk);
                 Self {
                     inner: SigningInner::FalconEd25519 {
                         ed_sk,
@@ -106,7 +110,7 @@ impl SigningKeypair {
                 if data.len() < 33 {
                     return Err("ed25519 signing key too short");
                 }
-                let mut seed = [0u8; 32];
+                let mut seed = Zeroizing::new([0u8; 32]);
                 seed.copy_from_slice(&data[1..33]);
                 Ok(Self {
                     inner: SigningInner::Ed25519 {
@@ -118,7 +122,7 @@ impl SigningKeypair {
                 if data.len() < 37 {
                     return Err("falcon_ed25519 signing key too short");
                 }
-                let mut ed_seed = [0u8; 32];
+                let mut ed_seed = Zeroizing::new([0u8; 32]);
                 ed_seed.copy_from_slice(&data[1..33]);
                 let ed_sk = SigningKey::from_bytes(&ed_seed);
 
@@ -126,8 +130,10 @@ impl SigningKeypair {
                 if data.len() < 35 + sk_len + 2 {
                     return Err("falcon_ed25519 signing key truncated");
                 }
-                let falcon_sk = falcon512::SecretKey::from_bytes(&data[35..35 + sk_len])
-                    .map_err(|_| "invalid falcon secret key")?;
+                let falcon_sk = Wiping::new(
+                    falcon512::SecretKey::from_bytes(&data[35..35 + sk_len])
+                        .map_err(|_| "invalid falcon secret key")?,
+                );
 
                 let pk_off = 35 + sk_len;
                 let pk_len = u16::from_be_bytes([data[pk_off], data[pk_off + 1]]) as usize;
@@ -233,7 +239,7 @@ enum KemInner {
     },
     MlkemX25519 {
         x_secret: X25519Secret,
-        mlkem_sk: kyber768::SecretKey,
+        mlkem_sk: Wiping<kyber768::SecretKey>,
         mlkem_pk: kyber768::PublicKey,
     },
 }
@@ -255,6 +261,7 @@ impl KemKeypair {
             KemAlgo::MlkemX25519 => {
                 let x_secret = X25519Secret::random_from_rng(rand::rngs::OsRng);
                 let (mlkem_pk, mlkem_sk) = kyber768::keypair();
+                let mlkem_sk = Wiping::new(mlkem_sk);
                 Self {
                     inner: KemInner::MlkemX25519 {
                         x_secret,
@@ -271,13 +278,14 @@ impl KemKeypair {
     /// X25519: derived from Ed25519 seed (SHA-512, as existing code).
     /// MlkemX25519: X25519 derived from Ed25519 seed, ML-KEM generated independently.
     pub fn generate(algo: KemAlgo, signing: &SigningKeypair) -> Self {
-        let x_secret = derive_x25519_secret(&signing.ed25519_seed());
+        let x_secret = derive_x25519_secret(&Zeroizing::new(signing.ed25519_seed()));
         match algo {
             KemAlgo::X25519 => Self {
                 inner: KemInner::X25519 { secret: x_secret },
             },
             KemAlgo::MlkemX25519 => {
                 let (mlkem_pk, mlkem_sk) = kyber768::keypair();
+                let mlkem_sk = Wiping::new(mlkem_sk);
                 Self {
                     inner: KemInner::MlkemX25519 {
                         x_secret,
@@ -320,7 +328,7 @@ impl KemKeypair {
             return Err("empty KEM key data");
         }
         let algo = KemAlgo::from_u8(data[0])?;
-        let x_secret = derive_x25519_secret(&signing.ed25519_seed());
+        let x_secret = derive_x25519_secret(&Zeroizing::new(signing.ed25519_seed()));
         match algo {
             KemAlgo::X25519 => Ok(Self {
                 inner: KemInner::X25519 { secret: x_secret },
@@ -333,8 +341,10 @@ impl KemKeypair {
                 if data.len() < 3 + sk_len + 2 {
                     return Err("mlkem_x25519 key truncated");
                 }
-                let mlkem_sk = kyber768::SecretKey::from_bytes(&data[3..3 + sk_len])
-                    .map_err(|_| "invalid ML-KEM secret key")?;
+                let mlkem_sk = Wiping::new(
+                    kyber768::SecretKey::from_bytes(&data[3..3 + sk_len])
+                        .map_err(|_| "invalid ML-KEM secret key")?,
+                );
                 let pk_off = 3 + sk_len;
                 let pk_len = u16::from_be_bytes([data[pk_off], data[pk_off + 1]]) as usize;
                 if data.len() < pk_off + 2 + pk_len {
@@ -385,14 +395,17 @@ impl KemKeypair {
     ) -> Result<([u8; 32], Vec<u8>), &'static str> {
         match algo {
             KemAlgo::X25519 => {
-                if remote_pk.len() < 32 {
-                    return Err("X25519 pubkey too short");
+                if remote_pk.len() != 32 {
+                    return Err("invalid X25519 pubkey length");
                 }
                 let mut rpk = [0u8; 32];
                 rpk.copy_from_slice(&remote_pk[..32]);
                 let eph = x25519_dalek::EphemeralSecret::random_from_rng(rand::rngs::OsRng);
                 let eph_pk = X25519Public::from(&eph);
                 let shared = eph.diffie_hellman(&X25519Public::from(rpk));
+                if !shared.was_contributory() {
+                    return Err("non-contributory X25519 input");
+                }
                 Ok((shared.to_bytes(), eph_pk.to_bytes().to_vec()))
             }
             KemAlgo::MlkemX25519 => {
@@ -405,14 +418,19 @@ impl KemKeypair {
                 let x_eph = x25519_dalek::EphemeralSecret::random_from_rng(rand::rngs::OsRng);
                 let x_eph_pk = X25519Public::from(&x_eph);
                 let x_ss = x_eph.diffie_hellman(&X25519Public::from(x_rpk));
+                if !x_ss.was_contributory() {
+                    return Err("non-contributory X25519 input");
+                }
 
                 // ML-KEM part
                 let mlkem_pk = kyber768::PublicKey::from_bytes(&remote_pk[32..])
                     .map_err(|_| "invalid ML-KEM pubkey")?;
                 let (mlkem_ss, mlkem_ct) = kyber768::encapsulate(&mlkem_pk);
+                let mlkem_ss = Wiping::new(mlkem_ss);
 
                 // Combined shared secret
-                let mut combined = Vec::with_capacity(32 + mlkem_ss.as_bytes().len());
+                let mut combined =
+                    Zeroizing::new(Vec::with_capacity(32 + mlkem_ss.as_bytes().len()));
                 combined.extend_from_slice(&x_ss.to_bytes());
                 combined.extend_from_slice(mlkem_ss.as_bytes());
                 let ss = blake3::derive_key("tarnet kem", &combined);
@@ -432,12 +450,15 @@ impl KemKeypair {
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<[u8; 32], &'static str> {
         match &self.inner {
             KemInner::X25519 { secret } => {
-                if ciphertext.len() < 32 {
-                    return Err("X25519 ciphertext too short");
+                if ciphertext.len() != 32 {
+                    return Err("invalid X25519 ciphertext length");
                 }
                 let mut eph_pk = [0u8; 32];
                 eph_pk.copy_from_slice(&ciphertext[..32]);
                 let shared = secret.diffie_hellman(&X25519Public::from(eph_pk));
+                if !shared.was_contributory() {
+                    return Err("non-contributory X25519 input");
+                }
                 Ok(shared.to_bytes())
             }
             KemInner::MlkemX25519 {
@@ -450,14 +471,18 @@ impl KemKeypair {
                 let mut x_eph_pk = [0u8; 32];
                 x_eph_pk.copy_from_slice(&ciphertext[..32]);
                 let x_ss = x_secret.diffie_hellman(&X25519Public::from(x_eph_pk));
+                if !x_ss.was_contributory() {
+                    return Err("non-contributory X25519 input");
+                }
 
                 // ML-KEM part
                 let mlkem_ct = kyber768::Ciphertext::from_bytes(&ciphertext[32..])
                     .map_err(|_| "invalid ML-KEM ciphertext")?;
-                let mlkem_ss = kyber768::decapsulate(&mlkem_ct, mlkem_sk);
+                let mlkem_ss = Wiping::new(kyber768::decapsulate(&mlkem_ct, mlkem_sk));
 
                 // Combined
-                let mut combined = Vec::with_capacity(32 + mlkem_ss.as_bytes().len());
+                let mut combined =
+                    Zeroizing::new(Vec::with_capacity(32 + mlkem_ss.as_bytes().len()));
                 combined.extend_from_slice(&x_ss.to_bytes());
                 combined.extend_from_slice(mlkem_ss.as_bytes());
                 let ss = blake3::derive_key("tarnet kem", &combined);
@@ -545,8 +570,8 @@ impl IdentityKeypair {
 
     /// Serialize both keypairs for persistence.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let signing_bytes = self.signing.to_bytes();
-        let kem_bytes = self.kem.to_bytes();
+        let signing_bytes = Zeroizing::new(self.signing.to_bytes());
+        let kem_bytes = Zeroizing::new(self.kem.to_bytes());
         let mut buf = Vec::with_capacity(4 + signing_bytes.len() + kem_bytes.len());
         buf.extend_from_slice(&(signing_bytes.len() as u16).to_be_bytes());
         buf.extend_from_slice(&signing_bytes);
@@ -694,7 +719,7 @@ impl Keypair {
 
     /// Derive X25519 static secret from Ed25519 seed.
     pub fn x25519_secret(&self) -> X25519Secret {
-        derive_x25519_secret(&self.identity.signing.ed25519_seed())
+        derive_x25519_secret(&Zeroizing::new(self.identity.signing.ed25519_seed()))
     }
 
     /// Derive X25519 public key.
@@ -728,10 +753,10 @@ pub fn dht_id_from_peer_id(peer_id: &PeerId) -> DhtId {
 
 /// Derive X25519 static secret from Ed25519 seed bytes.
 fn derive_x25519_secret(ed25519_seed: &[u8; 32]) -> X25519Secret {
-    let hash = <Sha512 as sha2::Digest>::digest(ed25519_seed);
-    let mut scalar = [0u8; 32];
+    let hash = Zeroizing::new(<[u8; 64]>::from(<Sha512 as sha2::Digest>::digest(ed25519_seed)));
+    let mut scalar = Zeroizing::new([0u8; 32]);
     scalar.copy_from_slice(&hash[..32]);
-    X25519Secret::from(scalar)
+    X25519Secret::from(*scalar)
 }
 
 /// Convert an Ed25519 public key (32 bytes) to its X25519 equivalent.
@@ -816,7 +841,7 @@ fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
             };
             let mut sig_bytes = [0u8; 64];
             sig_bytes.copy_from_slice(&sig[..64]);
-            vk.verify(msg, &Signature::from_bytes(&sig_bytes)).is_ok()
+            vk.verify_strict(msg, &Signature::from_bytes(&sig_bytes)).is_ok()
         }
         SigningAlgo::FalconEd25519 => {
             if sig.len() <= 64 {
@@ -830,7 +855,7 @@ fn verify(algo: SigningAlgo, pubkey: &[u8], msg: &[u8], sig: &[u8]) -> bool {
             };
             let mut ed_sig = [0u8; 64];
             ed_sig.copy_from_slice(&sig[..64]);
-            if vk.verify(msg, &Signature::from_bytes(&ed_sig)).is_err() {
+            if vk.verify_strict(msg, &Signature::from_bytes(&ed_sig)).is_err() {
                 return false;
             }
 

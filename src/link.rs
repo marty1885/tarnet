@@ -6,7 +6,7 @@ use subtle::ConstantTimeEq;
 use std::time::Duration;
 use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::crypto::kdf;
 use crate::identity::{self, peer_id_from_signing_pubkey, KemKeypair, Keypair};
@@ -116,16 +116,16 @@ impl LinkCrypto {
     /// Derive session keys from shared secret. Initiator and responder derive
     /// complementary key pairs (initiator's send = responder's recv).
     fn derive(shared_secret: &[u8; 32], is_initiator: bool) -> Self {
-        let mut send_enc = kdf(shared_secret, "tarnet link i2r_enc");
-        let mut recv_enc = kdf(shared_secret, "tarnet link r2i_enc");
+        let mut send_enc = Zeroizing::new(kdf(shared_secret, "tarnet link i2r_enc"));
+        let mut recv_enc = Zeroizing::new(kdf(shared_secret, "tarnet link r2i_enc"));
 
         if !is_initiator {
             std::mem::swap(&mut send_enc, &mut recv_enc);
         }
 
         Self {
-            send_enc_key: send_enc,
-            recv_enc_key: recv_enc,
+            send_enc_key: *send_enc,
+            recv_enc_key: *recv_enc,
             prev_recv_key: None,
             send_seq: 0,
             recv_window: 0,
@@ -777,6 +777,9 @@ impl PeerLink {
         // Compute X25519 ephemeral shared secret
         let peer_eph = X25519Public::from(peer_hello.ephemeral_pubkey);
         let x25519_shared = eph_secret.diffie_hellman(&peer_eph);
+        if !x25519_shared.was_contributory() {
+            return Err(Error::Crypto("non-contributory X25519 input".into()));
+        }
 
         // KEM encapsulate to responder's static KEM pubkey (identity binding)
         let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
@@ -785,19 +788,23 @@ impl PeerLink {
             KemKeypair::encapsulate_to(&peer_hello.kem_pubkey, remote_kem_algo)
                 .map_err(|e| Error::Crypto(format!("KEM encapsulate (static) failed: {}", e)))?;
 
+        let static_kem_ss = Zeroizing::new(static_kem_ss);
+
         // KEM encapsulate to responder's ephemeral KEM pubkey (PQ forward secrecy)
         let (eph_kem_ss, eph_kem_ct) =
             KemKeypair::encapsulate_to(&peer_hello.eph_kem_pubkey, remote_kem_algo)
                 .map_err(|e| Error::Crypto(format!("KEM encapsulate (ephemeral) failed: {}", e)))?;
 
+        let eph_kem_ss = Zeroizing::new(eph_kem_ss);
+
         // Combine: ss = BLAKE3("tarnet link", x25519_ss || static_kem_ss || eph_kem_ss)
-        let shared_bytes = {
-            let mut combined = Vec::with_capacity(96);
+        let shared_bytes = Zeroizing::new({
+            let mut combined = Zeroizing::new(Vec::with_capacity(96));
             combined.extend_from_slice(&x25519_shared.to_bytes());
-            combined.extend_from_slice(&static_kem_ss);
-            combined.extend_from_slice(&eph_kem_ss);
+            combined.extend_from_slice(&*static_kem_ss);
+            combined.extend_from_slice(&*eph_kem_ss);
             blake3::derive_key("tarnet link", &combined)
-        };
+        });
 
         // Derive session keys
         let crypto = LinkCrypto::derive(&shared_bytes, true);
@@ -930,7 +937,7 @@ impl PeerLink {
             force_rekey: std::sync::atomic::AtomicBool::new(false),
             negotiated_version,
             identity: std::sync::Arc::new(
-                Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
+                Keypair::from_full_bytes(&Zeroizing::new(identity.to_full_bytes())).unwrap(),
             ),
             _drain_task: pipes.task,
             transport_name,
@@ -999,6 +1006,9 @@ impl PeerLink {
         // Compute X25519 ephemeral shared secret
         let peer_eph = X25519Public::from(peer_hello.ephemeral_pubkey);
         let x25519_shared = eph_secret.diffie_hellman(&peer_eph);
+        if !x25519_shared.was_contributory() {
+            return Err(Error::Crypto("non-contributory X25519 input".into()));
+        }
 
         // Receive peer auth (contains both static + ephemeral KEM ciphertexts)
         let wire = io.expect(MessageType::HandshakeAuth).await?;
@@ -1011,19 +1021,23 @@ impl PeerLink {
             .decapsulate(&peer_auth.kem_ciphertext)
             .map_err(|e| Error::Crypto(format!("KEM decapsulate (static) failed: {}", e)))?;
 
+        let static_kem_ss = Zeroizing::new(static_kem_ss);
+
         // KEM decapsulate ephemeral: recover shared secret using our ephemeral KEM key
         let eph_kem_ss = eph_kem
             .decapsulate(&peer_auth.eph_kem_ciphertext)
             .map_err(|e| Error::Crypto(format!("KEM decapsulate (ephemeral) failed: {}", e)))?;
 
+        let eph_kem_ss = Zeroizing::new(eph_kem_ss);
+
         // Combine: ss = BLAKE3("tarnet link", x25519_ss || static_kem_ss || eph_kem_ss)
-        let shared_bytes = {
-            let mut combined = Vec::with_capacity(96);
+        let shared_bytes = Zeroizing::new({
+            let mut combined = Zeroizing::new(Vec::with_capacity(96));
             combined.extend_from_slice(&x25519_shared.to_bytes());
-            combined.extend_from_slice(&static_kem_ss);
-            combined.extend_from_slice(&eph_kem_ss);
+            combined.extend_from_slice(&*static_kem_ss);
+            combined.extend_from_slice(&*eph_kem_ss);
             blake3::derive_key("tarnet link", &combined)
-        };
+        });
 
         // Derive session keys
         let crypto = LinkCrypto::derive(&shared_bytes, false);
@@ -1129,7 +1143,7 @@ impl PeerLink {
             force_rekey: std::sync::atomic::AtomicBool::new(false),
             negotiated_version,
             identity: std::sync::Arc::new(
-                Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(),
+                Keypair::from_full_bytes(&Zeroizing::new(identity.to_full_bytes())).unwrap(),
             ),
             _drain_task: pipes.task,
             transport_name,
@@ -1813,7 +1827,8 @@ impl PeerLink {
             reply.signature = self.identity.sign(&reply.signable_bytes());
             let reply = reply.to_wire().encode();
 
-            let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
+            let kem_ss = Zeroizing::new(kem_ss);
+            let new_shared = Zeroizing::new(blake3::derive_key("tarnet rekey", &*kem_ss));
             self.crypto
                 .lock()
                 .await
@@ -1836,7 +1851,8 @@ impl PeerLink {
                 .eph_kem
                 .decapsulate(&peer_rekey.kem_ciphertext)
                 .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
-            let new_shared = blake3::derive_key("tarnet rekey", &kem_ss);
+            let kem_ss = Zeroizing::new(kem_ss);
+            let new_shared = Zeroizing::new(blake3::derive_key("tarnet rekey", &*kem_ss));
             self.crypto
                 .lock()
                 .await
@@ -2406,6 +2422,40 @@ mod tests {
         .await
         .expect("handshake hung");
         (Arc::new(la.unwrap()), Arc::new(lb.unwrap()))
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_low_order_ephemeral_in_both_roles() {
+        for is_initiator in [true, false] {
+            for first_byte in [0, 1] {
+                let (a, b) = lossy_pair(&[], &[]);
+                let identity = Keypair::generate();
+                let mut ephemeral_pubkey = [0; 32];
+                ephemeral_pubkey[0] = first_byte;
+                let hello = HandshakeHello {
+                    ephemeral_pubkey,
+                    signing_algo: identity.identity.signing_algo() as u8,
+                    signing_pubkey: identity.identity.signing.signing_pubkey_bytes(),
+                    kem_algo: identity.identity.kem_algo() as u8,
+                    kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
+                    challenge: [42; 32],
+                    eph_kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
+                    min_version: WIRE_VERSION_MIN,
+                    max_version: WIRE_VERSION_MAX,
+                };
+                b.send(&hello.to_wire().encode()).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), async {
+                    if is_initiator {
+                        PeerLink::initiator(Box::new(a), &identity, None).await
+                    } else {
+                        PeerLink::responder(Box::new(a), &identity).await
+                    }
+                })
+                .await
+                .expect("invalid DH must fail before waiting for authentication");
+                assert!(matches!(result, Err(Error::Crypto(ref e)) if e == "non-contributory X25519 input"));
+            }
+        }
     }
 
     fn ping() -> Vec<u8> {

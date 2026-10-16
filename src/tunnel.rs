@@ -3,6 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 use rand::RngCore;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::kdf;
 use crate::types::{Error, PeerId, Result};
@@ -32,6 +33,13 @@ pub struct Tunnel {
     last_used: std::time::Instant,
 }
 
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        self.enc_key.zeroize();
+        self.dec_key.zeroize();
+    }
+}
+
 /// Key exchanges a tunnel remembers (see [`Tunnel::kex_nonces`]).
 const KEX_NONCES_MAX: usize = 64;
 
@@ -47,8 +55,8 @@ impl Tunnel {
     /// Create a new tunnel from a completed key exchange.
     /// `is_initiator` determines which direction gets which keys.
     pub fn new(remote_peer: PeerId, shared_secret: &[u8; 32], is_initiator: bool) -> Self {
-        let mut enc = kdf(shared_secret, "tarnet tunnel i2r_enc");
-        let mut dec = kdf(shared_secret, "tarnet tunnel r2i_enc");
+        let mut enc = Zeroizing::new(kdf(shared_secret, "tarnet tunnel i2r_enc"));
+        let mut dec = Zeroizing::new(kdf(shared_secret, "tarnet tunnel r2i_enc"));
 
         if !is_initiator {
             std::mem::swap(&mut enc, &mut dec);
@@ -57,8 +65,8 @@ impl Tunnel {
         Self {
             remote_peer,
             hints: Vec::new(),
-            enc_key: enc,
-            dec_key: dec,
+            enc_key: *enc,
+            dec_key: *dec,
             send_seq: 0,
             recv_highest: None,
             recv_seen: BTreeSet::new(),

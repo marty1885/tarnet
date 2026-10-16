@@ -13,6 +13,7 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
 
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 use crate::crypto::{kdf, mac_16};
 use crate::types::{Error, PeerId, Result};
@@ -1131,10 +1132,10 @@ pub fn build_introduce_payload(
     kem_ciphertext: &[u8],
     shared_secret: &[u8; 32],
 ) -> Vec<u8> {
-    let enc_key = kdf(shared_secret, "tarnet introduce enc");
+    let enc_key = Zeroizing::new(kdf(shared_secret, "tarnet introduce enc"));
     let mut nonce = [0u8; 24];
     RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
-    let ciphertext = XChaCha20Poly1305::new((&enc_key).into())
+    let ciphertext = XChaCha20Poly1305::new((&*enc_key).into())
         .encrypt(
             (&nonce).into(),
             Payload {
@@ -1170,8 +1171,9 @@ pub fn parse_introduce_payload(
     let shared = service_kem
         .decapsulate(kem_ct)
         .map_err(|e| Error::Crypto(format!("INTRODUCE KEM decapsulate failed: {}", e)))?;
-    let enc_key = kdf(&shared, "tarnet introduce enc");
-    let plaintext = XChaCha20Poly1305::new((&enc_key).into())
+    let shared = Zeroizing::new(shared);
+    let enc_key = Zeroizing::new(kdf(&shared, "tarnet introduce enc"));
+    let plaintext = XChaCha20Poly1305::new((&*enc_key).into())
         .decrypt(
             nonce.into(),
             Payload {
@@ -1180,7 +1182,7 @@ pub fn parse_introduce_payload(
             },
         )
         .map_err(|_| Error::Crypto("INTRODUCE AEAD decryption failed".into()))?;
-    Ok((Introduction::from_plaintext(&plaintext)?, shared))
+    Ok((Introduction::from_plaintext(&plaintext)?, *shared))
 }
 
 /// The INTRODUCE relay-cell payload: `service_id(32) || ext_len(u16) || ext
@@ -1228,12 +1230,12 @@ pub fn rendezvous_keys(
     h.update(&(kem_ct.len() as u32).to_be_bytes());
     h.update(kem_ct);
     let transcript = *h.finalize().as_bytes();
-    let mut material = Vec::with_capacity(96);
+    let mut material = Zeroizing::new(Vec::with_capacity(96));
     material.extend_from_slice(static_secret);
     material.extend_from_slice(eph_secret);
     material.extend_from_slice(&transcript);
-    let secret = blake3::derive_key("tarnet rendezvous secret v1", &material);
-    let confirm_key = blake3::derive_key("tarnet rendezvous confirm v1", &secret);
+    let secret = Zeroizing::new(blake3::derive_key("tarnet rendezvous secret v1", &material));
+    let confirm_key = Zeroizing::new(blake3::derive_key("tarnet rendezvous confirm v1", &*secret));
     (HopKey::derive(&secret, &transcript), mac_16(&confirm_key, &[&transcript]))
 }
 

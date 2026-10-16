@@ -1,4 +1,5 @@
 use super::*;
+use zeroize::Zeroizing;
 
 /// How long the initiator waits for CircuitCreated, resending CREATE every
 /// `CREATE_RESEND_INTERVAL` meanwhile.
@@ -1285,6 +1286,7 @@ impl Node {
         let algo = tarnet_api::types::KemAlgo::from_u8(req.kem_algo)
             .map_err(|e| Error::Wire(format!("CircuitCreate unknown KEM algo: {}", e)))?;
         let (shared, kem_ct) = kex_accept(algo, &req.eph_pk)?;
+        let shared = Zeroizing::new(shared);
         let transcript = req.transcript(&kem_ct);
         let hop_keys = HopKey::derive(&shared, &transcript);
         let reply = CreatedReply {
@@ -1972,7 +1974,7 @@ impl Node {
     ) -> Result<(HopKey, [u8; 32])> {
         let reply = CreatedReply::from_bytes(reply)?;
         let transcript = reply.verify(request)?;
-        let shared = kex.complete(&reply.kem_ct)?;
+        let shared = Zeroizing::new(kex.complete(&reply.kem_ct)?);
         Ok((HopKey::derive(&shared, &transcript), transcript))
     }
 
