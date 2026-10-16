@@ -48,6 +48,29 @@ async fn spawn_node(bootstrap: Vec<String>) -> TestNode {
     TestNode { node, addr }
 }
 
+/// Copy real publications in tests isolating GET delivery from propagation.
+async fn held_label_records(
+    node: &Node,
+    owner: &Keypair,
+    label: &str,
+) -> Vec<tarnet::dht::DhtRecord> {
+    let mut keys = vec![tarnet::dht::zone_key(&owner.identity.service_id())];
+    keys.extend(
+        tarnet::tns::label_lookup_keys(&owner.identity.signing.signing_pubkey_bytes(), label)
+            .unwrap(),
+    );
+    let mut out = Vec::new();
+    for key in keys {
+        let records = node.dht_held(&key).await;
+        assert!(
+            !records.is_empty(),
+            "publisher lacks a key descriptor or label lane"
+        );
+        out.extend(records);
+    }
+    out
+}
+
 /// Spawn a linear chain: A — B — C — D ...
 async fn spawn_chain(count: usize) -> Vec<TestNode> {
     assert!(count >= 2);
@@ -781,15 +804,9 @@ async fn repro_dht_pull_carries_pubkey() {
     )
     .await
     .unwrap();
-    // The zone's records live in one self-addressed root at zone_root_key(sid),
-    // not at per-label keys — that is what makes the location flood-proof.
-    let dht_key = tarnet::dht::zone_root_key(&zone_sid);
-    let record = publisher.node.dht_held(&dht_key).await;
-    assert_eq!(record.len(), 1, "publisher should hold exactly one record");
-    assert!(
-        !record[0].signer_pubkey.is_empty(),
-        "minted record must carry a signer pubkey"
-    );
+    // Both bootstrap and all encrypted label lanes must survive a GET pull.
+    let records = held_label_records(&publisher.node, &publisher.node.identity, "blog").await;
+    assert!(records.iter().all(|r| !r.signer_pubkey.is_empty()), "minted records must carry their verification keys");
 
     // Holder and resolver link first; the link-up store dump is empty for both.
     let holder = spawn_node(vec![]).await;
@@ -797,10 +814,9 @@ async fn repro_dht_pull_carries_pubkey() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Place the record on the holder ONLY, bypassing propagation/link-up dump.
-    holder
-        .node
-        .dht_store_insert_local_for_test(record[0].clone())
-        .await;
+    for record in records {
+        holder.node.dht_store_insert_local_for_test(record).await;
+    }
 
     // Resolver has no local copy; its only route is a GET pulled from the holder.
     let resolved = wait_for(Duration::from_secs(15), || {
@@ -1459,11 +1475,7 @@ async fn cross_algo_connect_pq_to_classic() {
         .publish_hidden_service(service_id_c, 1)
         .await
         .expect("publish_hidden_service failed");
-    for record in c
-        .node
-        .dht_held(&tarnet::dht::zone_root_key(&service_id_c))
-        .await
-    {
+    for record in held_label_records(&c.node, &default_kp_c, "intro").await {
         a.node.dht_store_insert_local_for_test(record).await;
     }
 
@@ -1560,11 +1572,7 @@ async fn cross_algo_connect_classic_to_pq() {
         .publish_hidden_service(service_id_c, 1)
         .await
         .expect("publish_hidden_service failed");
-    for record in c
-        .node
-        .dht_held(&tarnet::dht::zone_root_key(&service_id_c))
-        .await
-    {
+    for record in held_label_records(&c.node, &default_kp_c, "intro").await {
         a.node.dht_store_insert_local_for_test(record).await;
     }
 

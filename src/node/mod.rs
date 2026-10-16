@@ -587,6 +587,7 @@ pub struct Node {
             HashMap<tarnet_api::types::ServiceId, std::collections::BTreeMap<String, Vec<u8>>>,
         >,
     >,
+    pub(crate) zone_publication: Arc<Mutex<()>>,
     /// When we last sent each neighbour a full route dump on request.
     route_dumps_sent: Arc<Mutex<HashMap<PeerId, Instant>>>,
     /// Discovery handle for reconnection. Set by `run()`.
@@ -908,6 +909,7 @@ impl Node {
             started_at: std::time::Instant::now(),
             tns_cache: Arc::new(Mutex::new(crate::tns::TnsCache::new())),
             zone_published: Arc::new(Mutex::new(HashMap::new())),
+            zone_publication: Arc::new(Mutex::new(())),
             route_dumps_sent: Arc::new(Mutex::new(HashMap::new())),
             discovery: Arc::new(Mutex::new(None)),
             bootstrap_addrs: Arc::new(Mutex::new(Vec::new())),
@@ -3308,7 +3310,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let launched = node
             .dht_walker
-            .launch_get(&[0x71; 64], (&node.dht_searches, &tx), Instant::now() + Duration::from_secs(1))
+            .launch_get(&[0x71; 64], (&node.dht_searches, &tx), Instant::now() + Duration::from_secs(1), 1)
             .await;
         assert!(launched.is_empty());
         assert_eq!(node.query_tokens.lock().unwrap().len(), 65_536);

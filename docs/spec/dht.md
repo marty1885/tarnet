@@ -1,4 +1,4 @@
-# DHT protocol (v1)
+# DHT protocol (v1 messages over wire v8)
 
 Status: wire format frozen with this revision. Everything under "Local policy"
 may change between releases without a compatibility break.
@@ -196,10 +196,26 @@ it is full sends only the walks that fit, possibly none.
 `DhtNeighbor` is a link message rather than a handshake field so the handshake
 transcript is untouched; it travels on the already-authenticated link.
 
-A TNS zone root is one signed record holding every label of the zone, so it
-has one lifetime (`ZONE_ROOT_TTL`, 10 min): the node re-signs it, with all its
-labels, on one timer per identity (the peer-record refresh for Public
-identities, the intro refresh for Hidden ones), never once per label.
+TNS uses a small identity-signed `ZoneKey` descriptor (type 4), containing only
+its fixed protocol marker, and independent encrypted `TnsLabel` candidates
+(type 5). Legacy zone roots (type 3) are rejected. A label has four separately
+addressed lanes and a 10-minute TTL. Its outer sequence is zero and its signer
+slot identifies immutable ciphertext, not an identity. The admission gate checks
+the blinded ECC key's location, candidate digest, size-weighted hash puzzle,
+and strict Ed25519 signature. Readers check the encrypted identity signature.
+Each label lane uses half the ordinary originator PUT/GET walks, rounded up;
+the four independent lanes preserve the aggregate meeting exponent in the R5N
+model. Multiple candidates coexist; storage never chooses a winner by an unverified
+version. Identical replays do not renew a deadline. See [TNS](tns.md).
+
+Local TNS publications preflight the complete descriptor/lane batch against
+pinned storage capacity before admitting or sending any edit. Local replacement
+keeps one current candidate per lane; replicas keep bounded history. Generic
+records at a label location cannot evict its candidates under the per-key cap.
+An expiring incumbent is retained when the cap permits, with source fairness
+among the remaining candidates. Global capacity remains bounded by the ordinary
+fair-share policy; neither ECC admission nor work removes Sybil or censorship
+risks.
 
 A content handle (`ContentHandle`) is a reader's capability, not a DHT
 location: its location is derived from it (`content_key`), and its first half
@@ -216,7 +232,7 @@ is a secret, so it is never logged.
 | d | number of direct links |
 | GET rounds | a search launches ρ fresh walks every 1.5 s, 3 rounds in total (keys can hold several records); dropping the search stops it |
 | Originator walks | spread over distinct random neighbours, cycling if ρ > d |
-| Republish | owners republish their own records: hello every 5 min; a zone root (all of a zone's TNS labels) every 4 min for a Public identity, with each intro refresh (every 200–300 s) for a Hidden one; records signed by the node's own key every 30 min. Records signed by any other key are republished only by their owners' timers. Hello + own records republished and watches relaunched 1–3 s after links come or go, at most once per 60 s: changes inside that window are folded into one republish at its end |
+| Republish | owners republish their own records: hello every 5 min; a zone's descriptor and independent label candidates every 4 min for a Public identity, with each intro refresh (every 200–300 s) for a Hidden one; other records signed by the node's own key every 30 min. TNS records are republished only by their identity timers, including the node identity's zone. Hello + other own records republished and watches relaunched 1–3 s after links come or go, at most once per 60 s: changes inside that window are folded into one republish at its end |
 | Watches | the watcher relaunches its watch walks every 60 s until the requested expiry, each walk registering for 120 s; unwatch only drops local state, registrations along old walks expire. The app hears of each record version once, and never of one older than it was told |
 | Store caps | 4096 records / 16 MB (full encoded size), fair-share eviction by source, TTL caps |
 | DHT budget | per link: 256 queries (GET, WATCH) per window, plus the phase 1 ingest budget for records |

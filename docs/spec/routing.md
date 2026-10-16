@@ -922,7 +922,8 @@ These change `dht.md`'s "Local policy" table only; no DHT wire change.
 1. **Hidden identities never republish on link events.** Event-triggered
    republish (link-up today, link-down below) covers only node records (hello)
    and records of Public identities. A Hidden identity's records (TNS intro
-   records, zone root) republish only on their own independent, jittered timer.
+   records, opaque label candidates, public-key descriptor) republish only on
+   their own independent, jittered timer.
    *This fixes a leak present in v4 today:*
    * Intro records are stored as the host's own records, and
      `dht_republish_own` re-sends them 1–3 s after any link-up.

@@ -505,11 +505,10 @@ impl Node {
             .insert(service_id, intro_circuits);
 
         let intro = crate::tns::serialize_record_set(&intro_records);
-        // Re-signs the zone root even if the intro set is unchanged: this is
+        // Re-signs the zone publication even if the intro set is unchanged: this is
         // the hidden zone's refresh timer.
-        if !crate::tns::set_zone_label(self, &zone_keypair, "intro", Some(intro)).await? {
-            crate::tns::refresh_zone(self, &zone_keypair).await?;
-        }
+        crate::tns::set_zone_label(self, &zone_keypair, "intro", Some(intro)).await?;
+        crate::tns::refresh_zone(self, &zone_keypair).await?;
 
         log::info!(
             "Hidden service published: {:?} with {} intro points",
@@ -578,15 +577,21 @@ impl Node {
     /// re-signing the root without it if it was there. Unlike
     /// [`crate::tns::set_zone_label`] the drop sticks even if the re-sign
     /// fails: a Hidden zone's `peer` label must never be signed again.
-    pub(super) async fn drop_zone_label(&self, service_id: &tarnet_api::types::ServiceId, label: &str) {
-        if self.zone_published_update(service_id, label, None).await.is_none() {
-            return;
-        }
+    pub(super) async fn drop_zone_label(
+        &self,
+        service_id: &tarnet_api::types::ServiceId,
+        label: &str,
+    ) {
         let Some(kp) = self.keypair_for_service(service_id).await else {
             return;
         };
-        if let Err(e) = crate::tns::refresh_zone(self, &kp).await {
-            log::warn!("Re-signing zone {:?} without '{}' failed: {}", service_id, label, e);
+        if let Err(e) = crate::tns::retire_zone_label(self, &kp, label).await {
+            log::warn!(
+                "Retiring zone {:?} label '{}' failed: {}",
+                service_id,
+                label,
+                e
+            );
         }
     }
 
@@ -628,12 +633,11 @@ impl Node {
 
         let peer_id = self.peer_id();
         let record = crate::tns::build_peer_record(&zone_keypair, &peer_id);
-        // Re-signs the zone root, with every label the zone publishes: this
+        // Re-signs the zone publication, with every label the zone publishes: this
         // is the zone's refresh timer.
         let peer = crate::tns::serialize_record_set(&[record]);
-        if !crate::tns::set_zone_label(self, &zone_keypair, "peer", Some(peer)).await? {
-            crate::tns::refresh_zone(self, &zone_keypair).await?;
-        }
+        crate::tns::set_zone_label(self, &zone_keypair, "peer", Some(peer)).await?;
+        crate::tns::refresh_zone(self, &zone_keypair).await?;
 
         log::info!("Published peer record for {:?} → {:?}", service_id, peer_id);
         Ok(())
@@ -722,7 +726,7 @@ impl Node {
     /// drawn afresh after every publish.
     async fn maintain_hidden_service(&self, sid: tarnet_api::types::ServiceId) {
         use rand::Rng;
-        // Intro points live in the zone root, so they live as long as it.
+        // Intro labels and the key descriptor share this bounded lifetime.
         let ttl = Duration::from_secs(crate::tns::ZONE_ROOT_TTL as u64);
         let draw_republish_after = || rand::thread_rng().gen_range(ttl / 3..ttl / 2);
         let mut republish_after = draw_republish_after();
@@ -1094,9 +1098,8 @@ mod tests {
         let hidden_kp = node.keypair_for_service(&hidden).await.unwrap();
         let public_kp = node.keypair_for_service(&public).await.unwrap();
         for kp in [&hidden_kp, &public_kp] {
-            let record = crate::dht::VerifiedRecord::new_zone_root(
+            let record = crate::dht::VerifiedRecord::new_zone_key(
                 kp,
-                b"zone",
                 node.next_dht_sequence().await,
                 Duration::from_secs(600),
             );

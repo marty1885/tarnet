@@ -13,12 +13,15 @@ use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::XChaCha20Poly1305;
+use futures_util::StreamExt;
 use rand::RngCore;
 
 use crate::identity::Keypair;
 use crate::node::Node;
 use crate::types::{DhtId, Error, PeerId, RecordType, Result};
 use tarnet_api::types::ServiceId;
+
+pub(crate) mod publication;
 
 /// Re-export TnsRecord from the API crate (canonical definition).
 pub use tarnet_api::service::TnsRecord;
@@ -62,12 +65,16 @@ impl TnsCacheEntry {
 /// (name not found) to avoid repeated DHT queries.
 pub struct TnsCache {
     entries: HashMap<(ServiceId, String), TnsCacheEntry>,
+    public_keys: HashMap<ServiceId, Vec<u8>>,
+    versions: HashMap<(ServiceId, String), (u64, Instant)>,
 }
 
 impl TnsCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            public_keys: HashMap::new(),
+            versions: HashMap::new(),
         }
     }
 
@@ -127,6 +134,46 @@ impl TnsCache {
     /// Remove expired entries.
     fn evict_expired(&mut self) {
         self.entries.retain(|_, e| !e.is_expired());
+    }
+
+    fn public_key(&self, sid: &ServiceId) -> Option<Vec<u8>> {
+        self.public_keys.get(sid).cloned()
+    }
+
+    fn remember_public_key(&mut self, sid: ServiceId, pk: Vec<u8>) {
+        if self.public_keys.len() >= TNS_CACHE_MAX_ENTRIES && !self.public_keys.contains_key(&sid) {
+            if let Some(old) = self.public_keys.keys().next().copied() {
+                self.public_keys.remove(&old);
+            }
+        }
+        self.public_keys.insert(sid, pk);
+    }
+
+    /// Only called after full identity verification. Keep the floor after
+    /// the answer expires; bounded eviction can eventually forget it.
+    fn accept_version(&mut self, sid: ServiceId, label: &str, sequence: u64) -> bool {
+        let key = (sid, label.to_string());
+        if let Some((floor, _)) = self.versions.get(&key) {
+            if sequence < *floor {
+                return false;
+            }
+            if sequence == *floor {
+                return true;
+            }
+        }
+        if self.versions.len() >= TNS_CACHE_MAX_ENTRIES && !self.versions.contains_key(&key) {
+            if let Some(old) = self
+                .versions
+                .iter()
+                .min_by_key(|(_, (_, when))| *when)
+                .map(|(k, _)| k.clone())
+            {
+                self.versions.remove(&old);
+            }
+        }
+        self.entries.remove(&key);
+        self.versions.insert(key, (sequence, Instant::now()));
+        true
     }
 }
 /// Context string for record encryption key derivation.
@@ -399,8 +446,8 @@ pub fn deserialize_record_set(data: &[u8]) -> Result<Vec<TnsRecord>> {
 
 // ── Key Derivation ──
 
-/// DHT lookup key for a label within a zone.
-/// 64-byte XOF hash of `zone_pubkey || label`.
+/// Legacy shared-namespace lookup used by closed resource pools.
+/// Published TNS labels use `label_lookup_keys` and blinded keys instead.
 pub fn tns_dht_key(zone: &ServiceId, label: &str) -> DhtId {
     let mut out = [0u8; 64];
     blake3::Hasher::new()
@@ -421,9 +468,18 @@ fn derive_tns_key(context: &str, zone: &ServiceId, label: &str) -> [u8; 32] {
     })
 }
 
-/// Symmetric encryption key for a label's record set within a zone.
+/// Legacy shared-namespace encryption key used by resource pools.
+/// Opaque TNS publications use independent lane-bound encryption keys.
 pub fn tns_encryption_key(zone: &ServiceId, label: &str) -> [u8; 32] {
     derive_tns_key(TNS_RECORD_ENC_LABEL, zone, label)
+}
+
+/// Independent lookup locations for a published label. The public key must
+/// first be authenticated against its SID using the ZoneKey descriptor.
+pub fn label_lookup_keys(public_key: &[u8], label: &str) -> Result<Vec<DhtId>> {
+    (0..publication::LANES)
+        .map(|lane| publication::label_key(public_key, label, lane).map(|(_, key)| key))
+        .collect()
 }
 
 /// Derive the opaque wire port for a VHost endpoint (canonical, shared with the
@@ -743,10 +799,9 @@ async fn resolve_inner(node: &Node, zone: ServiceId, name: &str, depth: usize) -
 }
 
 /// The record set for a single label in a zone. For a zone we own, what we
-/// hold locally is authoritative (no DHT poll: nothing out there is newer
-/// than what we sign, and waiting out the search is what made unknown names
-/// slow). Otherwise from the TNS cache, else from the zone's root found by a
-/// DHT search, cached with its TTL. Empty means not found.
+/// hold locally is authoritative. Otherwise use the TTL cache, discover the
+/// immutable public key, and search independent encrypted label lanes. Empty
+/// means no authenticated positive answer, including a signed tombstone.
 pub async fn lookup_label(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRecord> {
     fetch_records(node, zone, label).await
 }
@@ -766,71 +821,115 @@ async fn fetch_records(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRec
         }
     }
 
-    let root_key = crate::dht::zone_root_key(zone);
-
-    // 3. Search: roots held here come first, then what the walks bring back.
-    //    The newest root among everything that has arrived once one has is
-    //    authoritative: its answer (records, or "label absent") is final.
-    let mut search = node.dht_search(root_key, Instant::now() + PER_STEP_TIMEOUT).await;
-    let mut roots = Vec::new();
-    let mut found = None;
-    while let Some(rec) = search.next().await {
-        roots.push(rec.into_inner());
-        found = open_root(zone, label, &roots);
-        if found.is_some() && search.is_idle() {
-            break;
+    let deadline = Instant::now() + PER_STEP_TIMEOUT;
+    let Some(pk) = fetch_zone_public_key(node, zone, deadline).await else {
+        let mut cache = node.tns_cache().lock().await;
+        if let Some(records) = cache.get(zone, label) {
+            return records.clone();
+        }
+        cache.insert_negative(*zone, label.to_string());
+        return Vec::new();
+    };
+    let floor = node
+        .tns_cache()
+        .lock()
+        .await
+        .versions
+        .get(&(*zone, label.to_string()))
+        .map_or(0, |(sequence, _)| *sequence);
+    // Independent lanes are searched concurrently within ONE step budget.
+    let searches = (0..publication::LANES).map(|lane| {
+        let pk = &pk;
+        async move {
+            let (_, key) = publication::label_key(pk, label, lane).ok()?;
+            let mut search = node.dht_search_tns(key, deadline).await;
+            let mut best = None;
+            while let Some(rec) = search.next().await {
+                if let Some((records, sequence)) =
+                    publication::open(zone, pk, label, lane, rec.record())
+                {
+                    let expires = rec.record().expires;
+                    if sequence >= floor
+                        && expires > Instant::now()
+                        && best.as_ref().map_or(true, |(_, old, _)| sequence > *old)
+                    {
+                        best = Some((records, sequence, expires));
+                    }
+                }
+                if best.is_some() && search.is_idle() {
+                    break;
+                }
+            }
+            best
+        }
+    });
+    let mut searches: futures_util::stream::FuturesUnordered<_> = searches.collect();
+    let mut best = None;
+    let mut finish = deadline;
+    while !searches.is_empty() {
+        match tokio::time::timeout_at(finish.into(), searches.next()).await {
+            Ok(Some(Some(candidate))) => {
+                if best.is_none() {
+                    // A missing lane cannot impose its entire timeout after
+                    // another lane has supplied an authenticated answer.
+                    finish = deadline.min(Instant::now() + Duration::from_millis(150));
+                }
+                if best
+                    .as_ref()
+                    .map_or(true, |(_, sequence, _)| candidate.1 > *sequence)
+                {
+                    best = Some(candidate);
+                }
+            }
+            Ok(Some(None)) => {}
+            _ => break,
         }
     }
     let mut cache = node.tns_cache().lock().await;
-    match found {
-        Some((records, ttl)) if !records.is_empty() => {
-            let ttl = if ttl.is_zero() { Duration::from_secs(60) } else { ttl };
-            cache.insert(*zone, label.to_string(), records.clone(), ttl);
-            records
-        }
-        // No root, or the root lacks the label: remember it wasn't found.
-        _ => {
-            cache.insert_negative(*zone, label.to_string());
-            Vec::new()
+    if let Some((records, sequence, expires)) = best {
+        if cache.accept_version(*zone, label, sequence) {
+            let ttl = expires.saturating_duration_since(Instant::now());
+            if !ttl.is_zero() {
+                cache.insert(*zone, label.to_string(), records.clone(), ttl);
+                return records;
+            }
         }
     }
+    // A concurrent successful lookup may have filled the cache while this
+    // search only saw junk or an older version. Never overwrite that answer.
+    if let Some(records) = cache.get(zone, label) {
+        return records.clone();
+    }
+    cache.insert_negative(*zone, label.to_string());
+    Vec::new()
 }
 
-/// Open the **authenticated** zone root for `zone` among `records` and look
-/// up `label`. The DHT ingest gate already guarantees that any `ZoneRoot`
-/// record at the root key was signed by the zone key (self-address
-/// invariant); we re-derive the signer's ServiceId here too, because
-/// locally-trusted test fixtures bypass the gate. Among valid roots the
-/// highest sequence wins.
-///
-/// `None` if no valid root is among them. `Some((records, ttl))` once one is:
-/// `records` empty means the root does not carry this label (authoritative
-/// NotFound).
-fn open_root(zone: &ServiceId, label: &str, records: &[crate::dht::DhtRecord]) -> Option<(Vec<TnsRecord>, Duration)> {
-    let mut best: Option<(HashMap<[u8; 32], Vec<u8>>, u64, Duration)> = None;
-    for record in records {
-        if record.record_type != RecordType::ZoneRoot {
-            continue;
-        }
-        if ServiceId::from_signing_pubkey(&record.signer_pubkey) != *zone {
-            continue;
-        }
-        let map = match open_zone_root_value(zone, &record.value) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let remaining = record.remaining_ttl();
-        match &best {
-            Some((_, best_seq, _)) if *best_seq >= record.sequence => {}
-            _ => best = Some((map, record.sequence, remaining)),
-        }
+async fn fetch_zone_public_key(
+    node: &Node,
+    zone: &ServiceId,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    if let Some(pk) = node.tns_cache().lock().await.public_key(zone) {
+        return Some(pk);
     }
-    let (map, _seq, ttl) = best?;
-    let records = match map.get(&label_hash(zone, label)) {
-        Some(set_bytes) => deserialize_record_set(set_bytes).ok().unwrap_or_default(),
-        None => Vec::new(),
-    };
-    Some((records, ttl))
+    let mut search = node.dht_search(crate::dht::zone_key(zone), deadline).await;
+    while let Some(record) = search.next().await {
+        let rec = record.record();
+        if rec.record_type != RecordType::ZoneKey
+            || rec.value != publication::KEY_MARKER
+            || ServiceId::from_signing_pubkey(&rec.signer_pubkey) != *zone
+            || crate::dht::VerifiedRecord::verify_incoming(rec.clone()).is_err()
+        {
+            continue;
+        }
+        let pk = rec.signer_pubkey.clone();
+        node.tns_cache()
+            .lock()
+            .await
+            .remember_public_key(*zone, pk.clone());
+        return Some(pk);
+    }
+    None
 }
 
 /// Try to parse a label as a raw Crockford Base32-encoded ServiceId.
@@ -889,7 +988,7 @@ pub fn validate_alias_target(target: &str) -> Result<()> {
 ///   "entity or vhost?" — is rejected).
 /// - Alias targets must be valid (bare label or absolute).
 /// - Every length fits its u16 wire prefix, and so does the whole set (its
-///   length prefix inside the zone root), so nothing is silently truncated.
+///   record-set length prefix), so nothing is silently truncated.
 pub fn validate_records(records: &[TnsRecord]) -> Result<()> {
     if records.is_empty() {
         return Err(Error::Protocol("record set is empty".into()));
@@ -1031,177 +1130,319 @@ pub fn verify_peer_record(record: &TnsRecord, expected_service_id: &ServiceId) -
 
 // ── Publishing ──
 
-// ── Zone root (self-addressed, flood-proof publication) ──
-//
-// A single-owner TNS zone publishes its entire label set as ONE self-addressed
-// record at `zone_root_key(sid)`, signed by the zone key. The DHT ingest gate
-// enforces that only the zone-key holder can write there, so — unlike the old
-// per-label, disposable-key, name-addressed records — there is no foreign-signer
-// flood surface and no per-key eviction race (Finding 1 is structurally closed).
-//
-// The trade we accepted: the location is per-zone (not per-label), so the zone's
-// label set aggregates under one record. To keep that from handing enumeration
-// away for free, the root is sealed under a zone-derived key and labels are
-// indexed by `label_hash(sid, label)`, degrading enumeration to an offline
-// dictionary attack on label names rather than a plaintext listing. For a public
-// zone the seal key is derivable (the name is public), so this is obfuscation,
-// not confidentiality — exactly as intended.
+// ── Opaque per-label publication ──
 
-/// Context for the zone-root confidentiality seal.
-const ZONE_ROOT_ENC_LABEL: &str = "tarnet tns zone-root enc v1";
-/// Context binding a label name to its zone for the in-root index.
-const ZONE_ROOT_LABEL_CTX: &str = "tarnet tns zone-root label v1";
+/// Label and bootstrap-descriptor TTL. Owners refresh within this bound.
+pub const ZONE_ROOT_TTL: u32 = publication::TTL;
 
-/// Index key for a label inside a zone root: a zone-bound hash of the label, so
-/// an attacker who unseals a public root must dictionary-attack per zone rather
-/// than reuse one precomputed table across all zones.
-fn label_hash(sid: &ServiceId, label: &str) -> [u8; 32] {
-    let mut buf = Vec::with_capacity(32 + label.len());
-    buf.extend_from_slice(sid.as_bytes());
-    buf.extend_from_slice(label.as_bytes());
-    blake3::derive_key(ZONE_ROOT_LABEL_CTX, &buf)
+async fn publish_label_snapshot(
+    node: &Node,
+    owner: &Keypair,
+    label: &str,
+    set: Vec<u8>,
+    sequence: u64,
+    descriptor: bool,
+) -> Result<()> {
+    // Mining and private signing do not block the async executor. Bound the
+    // job to one label's four candidates; the zone map stays local.
+    let signer = {
+        let bytes = zeroize::Zeroizing::new(owner.to_full_bytes());
+        Keypair::from_full_bytes(&bytes).map_err(|e| Error::Crypto(e.into()))?
+    };
+    let label = label.to_string();
+    let records =
+        tokio::task::spawn_blocking(move || -> Result<Vec<crate::dht::VerifiedRecord>> {
+            let mut records = Vec::new();
+            if descriptor {
+                records.push(crate::dht::VerifiedRecord::new_zone_key(
+                    &signer,
+                    sequence,
+                    Duration::from_secs(publication::TTL as u64),
+                ));
+            }
+            for lane in 0..publication::LANES {
+                records.push(publication::build(&signer, &label, lane, sequence, &set)?);
+            }
+            Ok(records)
+        })
+        .await
+        .map_err(|e| Error::Crypto(format!("TNS publication worker failed: {e}")))??;
+    node.dht_publish_tns_batch(records).await
 }
 
-/// Seal a zone-root plaintext under the zone-derived key. `nonce(24) || ct+tag`.
-fn zone_root_seal(sid: &ServiceId, plaintext: &[u8]) -> Vec<u8> {
-    let key = blake3::derive_key(ZONE_ROOT_ENC_LABEL, sid.as_bytes());
-    let mut nonce = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    let ct = cipher
-        .encrypt((&nonce).into(), Payload { msg: plaintext, aad: b"" })
-        .expect("AEAD encryption should not fail");
-    let mut blob = Vec::with_capacity(24 + ct.len());
-    blob.extend_from_slice(&nonce);
-    blob.extend_from_slice(&ct);
-    blob
-}
-
-/// Reverse of [`zone_root_seal`].
-fn zone_root_unseal(sid: &ServiceId, blob: &[u8]) -> Result<Vec<u8>> {
-    if blob.len() < 24 + TNS_TAG_SIZE {
-        return Err(Error::Wire("zone root blob too short".into()));
-    }
-    let key = blake3::derive_key(ZONE_ROOT_ENC_LABEL, sid.as_bytes());
-    let cipher = XChaCha20Poly1305::new((&key).into());
-    cipher
-        .decrypt(blob[..24].into(), Payload { msg: &blob[24..], aad: b"" })
-        .map_err(|_| Error::Crypto("zone root AEAD decryption failed".into()))
-}
-
-/// Serialize + seal a zone root from `map` (`label → serialized TnsRecord set`).
-/// Wire (pre-seal): `u16 count || [ label_hash(32) || u16 set_len || set_bytes ]*`.
-fn build_zone_root_value(sid: &ServiceId, map: &std::collections::BTreeMap<String, Vec<u8>>) -> Vec<u8> {
-    let mut pt = Vec::new();
-    pt.extend_from_slice(&(map.len() as u16).to_be_bytes());
-    for (label, set_bytes) in map {
-        pt.extend_from_slice(&label_hash(sid, label));
-        pt.extend_from_slice(&(set_bytes.len() as u16).to_be_bytes());
-        pt.extend_from_slice(set_bytes);
-    }
-    zone_root_seal(sid, &pt)
-}
-
-/// Parse a sealed zone root into `label_hash → serialized TnsRecord set`.
-fn open_zone_root_value(sid: &ServiceId, blob: &[u8]) -> Result<HashMap<[u8; 32], Vec<u8>>> {
-    let pt = zone_root_unseal(sid, blob)?;
-    if pt.len() < 2 {
-        return Err(Error::Wire("zone root: truncated count".into()));
-    }
-    let count = u16::from_be_bytes([pt[0], pt[1]]) as usize;
-    let mut map = HashMap::with_capacity(count.min((pt.len() - 2) / (32 + 2)));
-    let mut off = 2;
-    for _ in 0..count {
-        if pt.len() < off + 32 + 2 {
-            return Err(Error::Wire("zone root: truncated entry".into()));
-        }
-        let mut lh = [0u8; 32];
-        lh.copy_from_slice(&pt[off..off + 32]);
-        off += 32;
-        let len = u16::from_be_bytes([pt[off], pt[off + 1]]) as usize;
-        off += 2;
-        if pt.len() < off + len {
-            return Err(Error::Wire("zone root: truncated set".into()));
-        }
-        map.insert(lh, pt[off..off + len].to_vec());
-        off += len;
-    }
-    Ok(map)
-}
-
-/// How long a published zone root lives. A zone root is one signed object
-/// holding every label, so it has one lifetime; the node refreshes it well
-/// within this (see `maintain_peer_records` and `maintain_hidden_services`).
-pub const ZONE_ROOT_TTL: u32 = 600;
-
-/// Re-sign and publish the zone root with its whole working set (see
-/// [`Node::zone_published_update`]). Owners call this on their refresh
-/// timer; [`publish`] and [`unpublish`] call it when a label changed.
+/// Refresh the local working set as independent label publications, including
+/// persistent tombstones. No uploaded object contains the whole zone.
 pub async fn refresh_zone(node: &Node, zone_keypair: &Keypair) -> Result<()> {
+    let _guard = node.zone_publication.lock().await;
     let sid = zone_keypair.identity.service_id();
     let (map, sequence) = node.zone_signing_snapshot(&sid).await;
-    let value = build_zone_root_value(&sid, &map);
-    node.dht_put_zone_root(zone_keypair, &value, sequence, ZONE_ROOT_TTL).await
+    if map.is_empty() {
+        return node
+            .dht_publish_tns_batch(vec![crate::dht::VerifiedRecord::new_zone_key(
+                zone_keypair,
+                sequence,
+                Duration::from_secs(publication::TTL as u64),
+            )])
+            .await;
+    }
+    for (index, (label, set)) in map.into_iter().enumerate() {
+        publish_label_snapshot(node, zone_keypair, &label, set, sequence, index == 0).await?;
+    }
+    Ok(())
 }
 
-/// Publish a TNS record set for a label in the given zone.
-///
-/// Upserts the label into the zone's published working set, then rebuilds and
-/// re-signs the whole zone root and stores it at the self-addressed location.
-/// Because the root is signed by the zone key at `zone_root_key(sid)`, only the
-/// owner can write there — the record cannot be flooded or squatted.
-///
-/// This is a pure mechanism: record-set validation (`validate_records`,
-/// `validate_published_aliases`) is the caller's responsibility, performed at the
-/// API boundary, so internal republish paths can re-emit whatever was accepted.
 pub async fn publish(
     node: &Node,
     zone_keypair: &Keypair,
     label: &str,
     records: &[TnsRecord],
 ) -> Result<()> {
-    set_zone_label(node, zone_keypair, label, Some(serialize_record_set(records))).await?;
+    // The API boundary validates record semantics. The publication builder
+    // independently bounds the complete serialized value before admission.
+    if !set_zone_label(
+        node,
+        zone_keypair,
+        label,
+        Some(serialize_record_set(records)),
+    )
+    .await?
+    {
+        let _guard = node.zone_publication.lock().await;
+        let (set, sequence) = node
+            .zone_label_signing_snapshot(&zone_keypair.identity.service_id(), label)
+            .await;
+        if let Some(set) = set {
+            publish_label_snapshot(node, zone_keypair, label, set, sequence, true).await?;
+        }
+    }
     Ok(())
 }
 
-/// Remove a label from the zone and republish the root without it (nothing,
-/// if the zone doesn't publish it). Copies of the old root out there keep
-/// the label until they expire; the root is no longer re-signed with it.
-pub async fn unpublish(
-    node: &Node,
-    zone_keypair: &Keypair,
-    label: &str,
-) -> Result<()> {
+pub async fn unpublish(node: &Node, zone_keypair: &Keypair, label: &str) -> Result<()> {
     set_zone_label(node, zone_keypair, label, None).await?;
     Ok(())
 }
 
-/// Set (`Some(serialized record set)`) or drop (`None`) one label of an owned
-/// zone and re-sign the root, if that changed anything; returns whether it
-/// did. All-or-nothing: if the new root can't be published (e.g. it outgrew
-/// the DHT value limit) the label is put back, so one bad label can't stop
-/// every later refresh and dark the whole zone.
+/// Update one published label. Size/capacity rejection publishes no partial
+/// lane set and restores the previous working value. Successful withdrawals
+/// remain signed empty record sets and survive restart.
 pub(crate) async fn set_zone_label(
     node: &Node,
     zone_keypair: &Keypair,
     label: &str,
     set: Option<Vec<u8>>,
 ) -> Result<bool> {
+    let _guard = node.zone_publication.lock().await;
     let sid = zone_keypair.identity.service_id();
     let Some(previous) = node.zone_published_update(&sid, label, set.clone()).await else {
+        // A previous publication may have succeeded while its durable intent
+        // write failed. Retrying withdrawal must retry that write as well.
+        if set.is_none() {
+            let (current, _) = node.zone_label_signing_snapshot(&sid, label).await;
+            if current.is_some() {
+                node.persist_zone_tombstone(&sid, label, true)?;
+            }
+        }
         return Ok(false);
     };
-    if let Err(e) = refresh_zone(node, zone_keypair).await {
-        node.zone_published_revert(&sid, label, set.as_deref(), previous).await;
+    let (snapshot, sequence) = node.zone_label_signing_snapshot(&sid, label).await;
+    let snapshot = snapshot.unwrap_or_else(|| serialize_record_set(&[]));
+    if let Err(e) =
+        publish_label_snapshot(node, zone_keypair, label, snapshot, sequence, true).await
+    {
+        node.zone_published_revert(&sid, label, set.as_deref(), previous)
+            .await;
         return Err(e);
     }
+    node.persist_zone_tombstone(&sid, label, set.is_none())?;
+    node.tns_cache().lock().await.forget(&sid, label);
     Ok(true)
+}
+
+/// Safety-sensitive withdrawal used for peer/intro lifecycle transitions.
+/// Keep withdrawal intent even if capacity or connectivity prevents publication.
+pub(crate) async fn retire_zone_label(
+    node: &Node,
+    zone_keypair: &Keypair,
+    label: &str,
+) -> Result<()> {
+    let _guard = node.zone_publication.lock().await;
+    let sid = zone_keypair.identity.service_id();
+    node.zone_published_update(&sid, label, None).await;
+    let (current, sequence) = node.zone_label_signing_snapshot(&sid, label).await;
+    if current.is_none() {
+        return Ok(());
+    }
+    node.persist_zone_tombstone(&sid, label, true)?;
+    publish_label_snapshot(
+        node,
+        zone_keypair,
+        label,
+        serialize_record_set(&[]),
+        sequence,
+        true,
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::identity::Keypair;
+
+    async fn held_label(node: &Node, owner: &Keypair, label: &str) -> Vec<TnsRecord> {
+        let sid = owner.identity.service_id();
+        let pk = owner.identity.signing.signing_pubkey_bytes();
+        let mut best = None;
+        for lane in 0..publication::LANES {
+            let (_, key) = publication::label_key(&pk, label, lane).unwrap();
+            for r in node.dht_held(&key).await {
+                if let Some((set, sequence)) = publication::open(&sid, &pk, label, lane, &r) {
+                    if best.as_ref().map_or(true, |(_, old)| sequence > *old) {
+                        best = Some((set, sequence));
+                    }
+                }
+            }
+        }
+        best.expect("held authenticated label").0
+    }
+
+    #[tokio::test]
+    async fn a_single_available_lane_resolves_without_waiting_for_missing_lanes() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let owner = Keypair::generate();
+        let sid = owner.identity.service_id();
+        let descriptor = crate::dht::VerifiedRecord::new_zone_key(
+            &owner,
+            1,
+            Duration::from_secs(publication::TTL as u64),
+        );
+        node.dht_publish(descriptor).await.unwrap();
+        let set = serialize_record_set(&[TnsRecord::Text("reachable".into())]);
+        let only_lane = publication::build(&owner, "ssh", 3, 1, &set).unwrap();
+        node.dht_publish(only_lane).await.unwrap();
+        let answer = tokio::time::timeout(Duration::from_secs(2), lookup_label(&node, &sid, "ssh"))
+            .await
+            .unwrap();
+        assert_eq!(answer, vec![TnsRecord::Text("reachable".into())]);
+    }
+
+    #[tokio::test]
+    async fn edits_leave_other_label_publications_unchanged_and_failed_batches_publish_nothing() {
+        let node = Node::new(Keypair::generate_ed25519());
+        let owner = Keypair::generate_ed25519();
+        publish(&node, &owner, "a", &[TnsRecord::Text("one".into())])
+            .await
+            .unwrap();
+        let (_, q) =
+            publication::label_key(&owner.identity.signing.signing_pubkey_bytes(), "a", 0).unwrap();
+        let before = node.dht_held(&q).await[0].clone();
+        publish(&node, &owner, "b", &[TnsRecord::Text("two".into())])
+            .await
+            .unwrap();
+        let after = node.dht_held(&q).await[0].clone();
+        assert_eq!(before.signer, after.signer);
+        assert_eq!(before.expires, after.expires);
+
+        let path = std::env::temp_dir().join(format!("tns-batch-{}.sqlite", rand::random::<u64>()));
+        let db = std::sync::Arc::new(crate::state::StateDb::open(&path).unwrap());
+        let mut limits = crate::state::StorageLimits::default();
+        limits.max_records = 4;
+        let small = Node::with_db(Keypair::generate_ed25519(), db.clone(), limits);
+        let rejected = Keypair::generate_ed25519();
+        assert!(publish(
+            &small,
+            &rejected,
+            "x",
+            &[TnsRecord::Text("too many lanes for this store".into())]
+        )
+        .await
+        .is_err());
+        assert!(small
+            .dht_held(&crate::dht::zone_key(&rejected.identity.service_id()))
+            .await
+            .is_empty());
+        for lane in 0..publication::LANES {
+            let (_, q) = publication::label_key(
+                &rejected.identity.signing.signing_pubkey_bytes(),
+                "x",
+                lane,
+            )
+            .unwrap();
+            assert!(small.dht_held(&q).await.is_empty());
+        }
+        assert!(small
+            .local_zone_label(&rejected.identity.service_id(), "x")
+            .await
+            .is_none());
+        assert!(db.load_dht_records().unwrap().is_empty());
+        drop(small);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn withdrawal_intent_survives_restart_and_overrides_stale_label_configuration() {
+        let path =
+            std::env::temp_dir().join(format!("tns-retire-{}.sqlite", rand::random::<u64>()));
+        let db = std::sync::Arc::new(crate::state::StateDb::open(&path).unwrap());
+        let owner = Keypair::generate_ed25519();
+        let sid = owner.identity.service_id();
+        let node = Node::with_db(
+            Keypair::generate_ed25519(),
+            db.clone(),
+            crate::state::StorageLimits::default(),
+        );
+        let key = tarnet_api::types::encode_base32(sid.as_bytes());
+        db.label_set(
+            &key,
+            "ssh",
+            &[tns_record_to_bytes(&TnsRecord::Text("old".into()))],
+            true,
+        )
+        .unwrap();
+        publish(&node, &owner, "ssh", &[TnsRecord::Text("old".into())])
+            .await
+            .unwrap();
+        unpublish(&node, &owner, "ssh").await.unwrap();
+        assert_eq!(db.tns_tombstones(&sid).unwrap(), vec!["ssh"]);
+        drop(node);
+        let restarted = Node::with_db(
+            Keypair::generate_ed25519(),
+            db.clone(),
+            crate::state::StorageLimits::default(),
+        );
+        refresh_zone(&restarted, &owner).await.unwrap();
+        assert!(held_label(&restarted, &owner, "ssh").await.is_empty());
+        publish(&restarted, &owner, "ssh", &[TnsRecord::Text("new".into())])
+            .await
+            .unwrap();
+        assert!(db.tns_tombstones(&sid).unwrap().is_empty());
+        assert_eq!(
+            held_label(&restarted, &owner, "ssh").await,
+            vec![TnsRecord::Text("new".into())]
+        );
+        drop(restarted);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn verified_version_floor_survives_answer_expiry_and_rejects_rollback() {
+        let sid = ServiceId([9; 32]);
+        let mut cache = TnsCache::new();
+        assert!(cache.accept_version(sid, "ssh", 7));
+        cache.insert(
+            sid,
+            "ssh".into(),
+            vec![TnsRecord::Text("new".into())],
+            Duration::ZERO,
+        );
+        assert!(cache.get(&sid, "ssh").is_none());
+        assert!(!cache.accept_version(sid, "ssh", 6));
+        assert!(cache.accept_version(sid, "ssh", 7));
+        assert!(cache.accept_version(sid, "ssh", 8));
+    }
 
     #[test]
     fn record_roundtrip_identity() {
@@ -1401,11 +1642,11 @@ mod tests {
     }
 
     #[test]
-    fn flood_at_zone_root_key_cannot_dark_a_name() {
+    fn flood_at_zone_key_cannot_dark_a_name() {
         // Finding 1, end to end: an attacker who knows the public name derives
-        // zone_root_key(zone) and floods it with many validly-signed (by their own
+        // zone_key(zone) and floods it with many validly-signed (by their own
         // disposable keys) junk records. None pass the self-address gate, so the
-        // legitimate zone root is never evicted and the name keeps resolving.
+        // legitimate zone publication is never evicted and the name keeps resolving.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let node = Node::new(Keypair::generate());
@@ -1417,19 +1658,19 @@ mod tests {
                 .await
                 .unwrap();
 
-            // Attacker floods the zone-root location with junk. Each junk record
-            // is a validly-signed ZoneRoot from a fresh key — but its signer's
+            // Attacker floods the descriptor location with junk. Each record
+            // is a validly-signed ZoneKey from a fresh key — but its signer's
             // ServiceId does not hash to this key, so the ingest gate drops it.
-            let root_key = crate::dht::zone_root_key(&zone_id);
+            let descriptor_key = crate::dht::zone_key(&zone_id);
             for _ in 0..64 {
                 let junk_kp = Keypair::generate();
-                let value = b"junk".to_vec();
+                let value = publication::KEY_MARKER.to_vec();
                 let seq = node.next_dht_sequence().await;
                 let expires = crate::dht::expires_in(Duration::from_secs(600));
-                // Build a ZoneRoot record at the VICTIM's root key, signed by junk_kp.
+                // Build a ZoneKey at the victim's descriptor key, signed by junk_kp.
                 let rec = crate::dht::DhtRecord {
-                    key: root_key,
-                    record_type: RecordType::ZoneRoot,
+                    key: descriptor_key,
+                    record_type: RecordType::ZoneKey,
                     sequence: seq,
                     signer: junk_kp.peer_id(),
                     signer_algo: junk_kp.identity.signing.algo() as u8,
@@ -1438,8 +1679,8 @@ mod tests {
                     expires,
                     stored_at: Instant::now(),
                     signature: junk_kp.sign(&crate::dht::record_signable(
-                        root_key.as_bytes(),
-                        RecordType::ZoneRoot,
+                        descriptor_key.as_bytes(),
+                        RecordType::ZoneKey,
                         seq,
                         &value,
                     )),
@@ -1459,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn unpublish_removes_label_from_root() {
+    fn unpublish_replaces_label_with_tombstone() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let node = Node::new(Keypair::generate());
@@ -1468,7 +1709,7 @@ mod tests {
             let a = ServiceId::from_signing_pubkey(&[0xA1; 32]);
             let b = ServiceId::from_signing_pubkey(&[0xB2; 32]);
 
-            // Two labels in one zone — both must resolve (exercises root accumulation).
+            // Two independently published labels in one zone must both resolve.
             publish(&node, &zone, "www", &[TnsRecord::Identity(a)])
                 .await
                 .unwrap();
@@ -2542,7 +2783,7 @@ mod tests {
 
     #[test]
     fn oversized_label_is_rolled_back_and_zone_keeps_publishing() {
-        // A label that pushes the zone root past the DHT value limit must fail
+        // A label that exceeds the encrypted value limit must fail
         // without poisoning the working set: later publishes and refreshes of
         // the same zone still succeed, and the label never resolves.
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -2643,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn zone_root_sequence_beats_held_root() {
+    fn label_sequence_beats_held_key_descriptor() {
         // A zone key moved to a node whose counter is lower (or a lost db):
         // the old, higher-sequence root is held here. Re-signing must climb
         // above it, or the local store refuses the new root and publish fails.
@@ -2652,17 +2893,15 @@ mod tests {
             let node = Node::new(Keypair::generate());
             let zone_id = node.default_service_id().await;
             let kp = node.keypair_for_service(&zone_id).await.unwrap();
-            let old = crate::dht::VerifiedRecord::new_zone_root(
+            let old = crate::dht::VerifiedRecord::new_zone_key(
                 &kp,
-                &build_zone_root_value(&zone_id, &Default::default()),
                 1_000_000,
                 Duration::from_secs(ZONE_ROOT_TTL as u64),
             );
             node.dht_store_insert_local_for_test(old.into_inner()).await;
 
             publish(&node, &kp, "www", &[TnsRecord::Text("new".into())]).await.unwrap();
-            let held = node.dht_held(&crate::dht::zone_root_key(&zone_id)).await;
-            let (records, _) = open_root(&zone_id, "www", &held).unwrap();
+            let records = held_label(&node, &kp, "www").await;
             assert_eq!(records, vec![TnsRecord::Text("new".into())]);
             assert!(node.next_dht_sequence().await > 1_000_000);
         });
@@ -2687,10 +2926,9 @@ mod tests {
 
             assert!(node.publish_hidden_service(zone_id, 3).await.is_err());
 
-            let held = node.dht_held(&crate::dht::zone_root_key(&zone_id)).await;
-            assert!(open_root(&zone_id, "intro", &held).unwrap().0.is_empty());
+            assert!(held_label(&node, &kp, "intro").await.is_empty());
             assert_eq!(
-                open_root(&zone_id, "blog", &held).unwrap().0,
+                held_label(&node, &kp, "blog").await,
                 vec![TnsRecord::Text("kept".into())]
             );
         });

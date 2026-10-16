@@ -75,7 +75,13 @@ impl DhtWalker {
     pub(super) async fn launch_put(&self, put: &DhtPutMsg) {
         let deadline = Instant::now() + Duration::from_secs(put.ttl as u64);
         let encoded = put.to_wire().encode();
-        let walks = self.first_hops().await.into_iter().map(|p| (p, encoded.clone())).collect();
+        let mut hops = self.first_hops().await;
+        if put.record_type == RecordType::TnsLabel {
+            // Four independent lanes each use half rho for PUT and GET:
+            // sum_i(rho/2 * rho/2) = rho^2, with twice the total traffic.
+            hops.truncate(hops.len().div_ceil(2));
+        }
+        let walks = hops.into_iter().map(|p| (p, encoded.clone())).collect();
         self.sender.batch_until(walks, deadline).await;
     }
 
@@ -89,11 +95,13 @@ impl DhtWalker {
         key: &[u8; 64],
         search: (&Arc<SearchRegistry>, &mpsc::Sender<VerifiedRecord>),
         deadline: Instant,
+        walk_divisor: usize,
     ) -> SearchRound {
         // Outbound work may not outlive either the search or the reverse path
         // authorizing its responses.
         let send_deadline = deadline.min(Instant::now() + QUERY_TOKEN_TTL);
-        let hops = self.first_hops().await;
+        let mut hops = self.first_hops().await;
+        hops.truncate(hops.len().div_ceil(walk_divisor));
         let count = hops.len();
         // Each token remembers the first hop it leaves through: responses
         // under it are taken only from there.
@@ -115,7 +123,11 @@ impl DhtWalker {
                 .collect()
         };
         if walks.len() < count {
-            log::debug!("DHT GET state full: launching {} of {} walks", walks.len(), count);
+            log::debug!(
+                "DHT GET state full: launching {} of {} walks",
+                walks.len(),
+                count
+            );
         }
         let tokens: Vec<[u8; 32]> = walks.iter().map(|(t, _)| *t).collect();
         {
@@ -394,17 +406,26 @@ impl Node {
     }
 
     /// Answer a GET with the records held here, along the reverse path. The
-    /// response must fit one message: owner-bound records (the zone root /
-    /// hello the key exists for) go first, then a random sample of the rest,
-    /// skipping any that would overflow. Junk piled onto a key can then never
-    /// push the real record out of the reply or make the reply unsendable.
+    /// response must fit one message. Owner-bound descriptors and hellos go
+    /// first, then a label bucket's expiring incumbent and other candidates,
+    /// then generic data. Skip entries that overflow the frame; a retained
+    /// label incumbent must not disappear from replies behind generic junk.
     async fn answer_dht_get(&self, to: &PeerId, get: &DhtGetMsg) {
         let records: Vec<DhtResponseRecord> = {
             use rand::seq::SliceRandom;
             let store = self.dht_store.lock().await;
             let mut records = store.get(&DhtId(get.key));
             records.shuffle(&mut rand::thread_rng());
-            records.sort_by_key(|r| !matches!(r.record_type, RecordType::Hello | RecordType::ZoneRoot));
+            let incumbent = records
+                .iter()
+                .filter(|r| r.record_type == RecordType::TnsLabel)
+                .min_by_key(|r| r.stored_at)
+                .map(|r| r.signer);
+            records.sort_by_key(|r| match r.record_type {
+                RecordType::Hello | RecordType::ZoneKey => (0, false),
+                RecordType::TnsLabel => (1, incumbent != Some(r.signer)),
+                _ => (2, false),
+            });
             let mut size = 32 + 64 + 2; // token + key + count
             let mut out = Vec::new();
             for r in records {
@@ -429,7 +450,10 @@ impl Node {
             records,
         };
         // A failed reply must not stop the query from travelling on.
-        if let Err(e) = self.send_to_peer_deferred(to, &response.to_wire().encode()).await {
+        if let Err(e) = self
+            .send_to_peer_deferred(to, &response.to_wire().encode())
+            .await
+        {
             log::debug!("DHT GET reply to {:?} failed: {}", to, e);
         }
     }
@@ -658,7 +682,10 @@ impl Node {
             .own_records()
             .into_iter()
             .filter(|r| match r.record_type {
-                RecordType::Hello => false,
+                RecordType::Hello
+                | RecordType::ZoneRoot
+                | RecordType::ZoneKey
+                | RecordType::TnsLabel => false,
                 RecordType::Content => true,
                 _ => r.signer == me,
             })
@@ -771,25 +798,33 @@ impl Node {
         Ok(())
     }
 
-    /// Publish a self-addressed TNS zone root: signed by the zone key at
-    /// `zone_root_key(zone_sid)`. Only the zone owner can write there (the ingest
-    /// gate enforces it), so the location carries no foreign-signer flood surface.
-    /// `value` is the caller's already-sealed root blob, stored verbatim.
-    pub async fn dht_put_zone_root(
+    /// Publish an atomically preflighted local batch before launching walks.
+    pub(crate) async fn dht_publish_tns_batch(&self, records: Vec<VerifiedRecord>) -> Result<()> {
+        {
+            let mut store = self.dht_store.lock().await;
+            if !store.put_tns_local_batch(&records) {
+                return Err(Error::Protocol(
+                    "TNS publication exceeds storage capacity or value limits".into(),
+                ));
+            }
+        }
+        for record in records {
+            let put = record.record().to_put_msg();
+            self.dht_put_seen(&put, Some(record), None).await;
+            self.dht_walker.launch_put(&put).await;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn persist_zone_tombstone(
         &self,
-        zone_keypair: &crate::identity::Keypair,
-        value: &[u8],
-        sequence: u64,
-        ttl_secs: u32,
+        sid: &tarnet_api::types::ServiceId,
+        label: &str,
+        retired: bool,
     ) -> Result<()> {
-        let record = VerifiedRecord::new_zone_root(
-            zone_keypair,
-            value,
-            sequence,
-            Duration::from_secs(ttl_secs as u64),
-        );
-        self.dht_publish(record).await?;
-        log::info!("TNS zone root put for {:?}", zone_keypair.identity.service_id());
+        if let Some(db) = &self.db {
+            db.set_tns_tombstone(sid, label, retired)?;
+        }
         Ok(())
     }
 
@@ -820,7 +855,12 @@ impl Node {
         let entry = map.get_mut(zone_sid).expect("loaded above");
         let previous = match records {
             Some(blob) => entry.insert(label.to_string(), blob),
-            None => entry.remove(label),
+            None => {
+                if !entry.contains_key(label) {
+                    return None;
+                }
+                entry.insert(label.to_string(), crate::tns::serialize_record_set(&[]))
+            }
         };
         (previous != entry.get(label).cloned()).then_some(previous)
     }
@@ -838,7 +878,8 @@ impl Node {
         let Some(entry) = map.get_mut(zone_sid) else {
             return;
         };
-        if entry.get(label).map(Vec::as_slice) != applied {
+        let tombstone = crate::tns::serialize_record_set(&[]);
+        if entry.get(label).map(Vec::as_slice) != Some(applied.unwrap_or(&tombstone)) {
             return;
         }
         match previous {
@@ -877,10 +918,10 @@ impl Node {
     /// set: concurrent publishers (a hidden service's "intro" and a user
     /// label) can't invert.
     ///
-    /// The sequence also beats any root of this zone held here. The counter
+    /// The sequence also beats any key descriptor held here. The counter
     /// is per node, so a zone key moved to another node (or a lost db)
     /// signs with a lower one, and stores refuse a lower sequence until the
-    /// old root expires. Copies held only elsewhere still win until then.
+    /// old descriptor expires. Copies held only elsewhere may still win.
     pub(crate) async fn zone_signing_snapshot(
         &self,
         zone_sid: &tarnet_api::types::ServiceId,
@@ -892,12 +933,40 @@ impl Node {
         }
         let snapshot = map[zone_sid].clone();
         let held = self
-            .dht_held(&crate::dht::zone_root_key(zone_sid))
+            .dht_held(&crate::dht::zone_key(zone_sid))
             .await
             .iter()
             .filter(|r| {
-                r.record_type == RecordType::ZoneRoot
+                r.record_type == RecordType::ZoneKey
                     && tarnet_api::types::ServiceId::from_signing_pubkey(&r.signer_pubkey) == *zone_sid
+            })
+            .map(|r| r.sequence)
+            .max()
+            .unwrap_or(0);
+        let sequence = self.next_signed_content_sequence_above(held).await;
+        (snapshot, sequence)
+    }
+
+    /// Snapshot one label and allocate its publication sequence under the same lock.
+    pub(crate) async fn zone_label_signing_snapshot(
+        &self,
+        zone_sid: &tarnet_api::types::ServiceId,
+        label: &str,
+    ) -> (Option<Vec<u8>>, u64) {
+        let mut map = self.zone_published.lock().await;
+        if !map.contains_key(zone_sid) {
+            let loaded = self.published_labels(zone_sid).await;
+            map.insert(*zone_sid, loaded);
+        }
+        let snapshot = map[zone_sid].get(label).cloned();
+        let held = self
+            .dht_held(&crate::dht::zone_key(zone_sid))
+            .await
+            .iter()
+            .filter(|r| {
+                r.record_type == RecordType::ZoneKey
+                    && tarnet_api::types::ServiceId::from_signing_pubkey(&r.signer_pubkey)
+                        == *zone_sid
             })
             .map(|r| r.sequence)
             .max()
@@ -926,6 +995,9 @@ impl Node {
                     .collect();
                 out.insert(label, crate::tns::serialize_record_set(&records));
             }
+        }
+        for label in db.tns_tombstones(zone_sid).unwrap_or_default() {
+            out.insert(label, crate::tns::serialize_record_set(&[]));
         }
         out
     }
@@ -1067,6 +1139,19 @@ impl Node {
     /// [`SEARCH_ROUNDS`] rounds (keys can hold several records, so finding one
     /// does not stop the rounds; dropping the search does).
     pub async fn dht_search(&self, key: DhtId, deadline: Instant) -> DhtSearch {
+        self.dht_search_with_divisor(key, deadline, 1).await
+    }
+
+    pub(crate) async fn dht_search_tns(&self, key: DhtId, deadline: Instant) -> DhtSearch {
+        self.dht_search_with_divisor(key, deadline, 2).await
+    }
+
+    async fn dht_search_with_divisor(
+        &self,
+        key: DhtId,
+        deadline: Instant,
+        walk_divisor: usize,
+    ) -> DhtSearch {
         let held: VecDeque<VerifiedRecord> = self
             .dht_store
             .lock()
@@ -1078,9 +1163,16 @@ impl Node {
         let (tx, rx) = mpsc::channel(SEARCH_BUFFER);
         // No time to wait: only what is held here.
         let tokens = if deadline > Instant::now() {
-            Some(self.dht_walker
-                .launch_get(key.as_bytes(), (&self.dht_searches, &tx), deadline)
-                .await)
+            Some(
+                self.dht_walker
+                    .launch_get(
+                        key.as_bytes(),
+                        (&self.dht_searches, &tx),
+                        deadline,
+                        walk_divisor,
+                    )
+                    .await,
+            )
         } else {
             None
         };
@@ -1094,10 +1186,14 @@ impl Node {
             rx,
             tx,
             key,
-            rounds: tokens.into_iter().filter(|round| !round.is_empty()).collect(),
+            rounds: tokens
+                .into_iter()
+                .filter(|round| !round.is_empty())
+                .collect(),
             deadline,
             rounds_left,
             next_round: Instant::now() + SEARCH_RELAUNCH_INTERVAL,
+            walk_divisor,
             seen: HashSet::new(),
             walker: self.dht_walker.clone(),
             registry: self.dht_searches.clone(),
@@ -1171,6 +1267,7 @@ pub struct DhtSearch {
     deadline: Instant,
     rounds_left: u32,
     next_round: Instant,
+    walk_divisor: usize,
     /// Records already yielded, so one delivered over several walks is
     /// surfaced once.
     seen: HashSet<(PeerId, u64, RecordType, [u8; 32])>,
@@ -1213,7 +1310,7 @@ impl DhtSearch {
                                 self.next_round = Instant::now() + SEARCH_RELAUNCH_INTERVAL;
                                 let tokens = self
                                     .walker
-                                    .launch_get(self.key.as_bytes(), (&self.registry, &self.tx), self.deadline)
+                                    .launch_get(self.key.as_bytes(), (&self.registry, &self.tx), self.deadline, self.walk_divisor)
                                     .await;
                                 if !tokens.is_empty() {
                                     self.rounds_left -= 1;

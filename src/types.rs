@@ -32,15 +32,12 @@ pub enum RecordType {
     /// Relays cannot verify — lowest trust. Self-authenticating for reader only.
     /// Single record per key (first write wins).
     Content,
-    /// Self-addressed, mutable TNS zone root. Stored at `zone_root_key(sid)` and
-    /// signed by the zone's own key; the ingest gate enforces that the storage
-    /// key equals `zone_root_key(ServiceId::from_signing_pubkey(signer_pubkey))`,
-    /// so ONLY the zone owner can write there. This is what makes a public TNS
-    /// name un-floodable and un-squattable — there are no foreign-signer records
-    /// to accumulate, so the per-key eviction race that plagues name-addressed
-    /// `SignedContent` does not exist. Replacement: same signer + higher sequence
-    /// wins (one signer per key, by the self-address invariant).
+    /// Reserved legacy whole-zone format. Rejected by the trust gate.
     ZoneRoot,
+    /// Identity-only bootstrap descriptor; contains no zone map.
+    ZoneKey,
+    /// Immutable opaque TNS candidate, admitted by a blinded ECC envelope.
+    TnsLabel,
     /// Unknown record type from a newer protocol version.
     /// Stored and relayed without validation.
     Unknown(u8),
@@ -53,6 +50,8 @@ impl RecordType {
             1 => Self::SignedContent,
             2 => Self::Content,
             3 => Self::ZoneRoot,
+            4 => Self::ZoneKey,
+            5 => Self::TnsLabel,
             _ => Self::Unknown(v),
         }
     }
@@ -63,6 +62,8 @@ impl RecordType {
             Self::SignedContent => 1,
             Self::Content => 2,
             Self::ZoneRoot => 3,
+            Self::ZoneKey => 4,
+            Self::TnsLabel => 5,
             Self::Unknown(v) => *v,
         }
     }
@@ -77,16 +78,16 @@ impl RecordType {
 
     /// Whether this record type supports mutable updates via sequence numbers.
     pub fn is_mutable(&self) -> bool {
-        matches!(self, Self::Hello | Self::ZoneRoot)
+        matches!(self, Self::Hello | Self::ZoneKey)
     }
 
     /// Whether the storage key must equal the hash of the record's own signer —
     /// i.e. the record is anchored at its writer's identity. The ingest gate
-    /// rejects such a record unless `key == zone_root_key(signer's ServiceId)`,
+    /// rejects such a record unless `key == zone_key(signer's ServiceId)`,
     /// which is what makes the location un-squattable (only the key-holder can
     /// write there) and un-floodable (no foreign signer can place a record).
     pub fn is_self_addressed(&self) -> bool {
-        matches!(self, Self::ZoneRoot)
+        matches!(self, Self::ZoneKey)
     }
 }
 
@@ -569,7 +570,9 @@ mod tests {
         assert_eq!(RecordType::from_u8(1), RecordType::SignedContent);
         assert_eq!(RecordType::from_u8(2), RecordType::Content);
         assert_eq!(RecordType::from_u8(3), RecordType::ZoneRoot);
-        assert_eq!(RecordType::from_u8(4), RecordType::Unknown(4));
+        assert_eq!(RecordType::from_u8(4), RecordType::ZoneKey);
+        assert_eq!(RecordType::from_u8(5), RecordType::TnsLabel);
+        assert_eq!(RecordType::from_u8(6), RecordType::Unknown(6));
         assert_eq!(RecordType::from_u8(255), RecordType::Unknown(255));
     }
 

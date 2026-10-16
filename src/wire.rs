@@ -1,9 +1,9 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
 /// Minimum wire protocol version this node supports.
-pub const WIRE_VERSION_MIN: u8 = 7;
+pub const WIRE_VERSION_MIN: u8 = 8;
 /// Maximum (current) wire protocol version this node supports.
-pub const WIRE_VERSION_MAX: u8 = 7;
+pub const WIRE_VERSION_MAX: u8 = 8;
 /// Current wire version used in outgoing messages.
 pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;

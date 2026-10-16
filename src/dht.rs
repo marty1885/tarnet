@@ -313,6 +313,32 @@ pub fn verify_incoming_record(
     signer_pubkey: &[u8],
     signature: &[u8],
 ) -> std::result::Result<(), &'static str> {
+    if record_type == RecordType::ZoneRoot {
+        return Err("legacy TNS zone roots are disabled");
+    }
+    if record_type == RecordType::TnsLabel {
+        if value.len() > crate::tns::publication::MAX_VALUE_BYTES {
+            return Err("TNS candidate exceeds the publication limit");
+        }
+        // Candidate ids name immutable ciphertext, not the signing key.
+        // Keep this exception confined to the explicit TNS admission gate.
+        let record = DhtRecord {
+            key: DhtId(*key),
+            record_type,
+            sequence,
+            signer: *signer,
+            signer_algo,
+            signer_pubkey: signer_pubkey.to_vec(),
+            value: value.to_vec(),
+            signature: signature.to_vec(),
+            expires: Instant::now(),
+            stored_at: Instant::now(),
+        };
+        return crate::tns::publication::verify_envelope(&record);
+    }
+    if record_type == RecordType::ZoneKey && value != crate::tns::publication::KEY_MARKER {
+        return Err("invalid TNS public key descriptor");
+    }
     if record_type == RecordType::Content {
         // These fields participate in storage identity and watch deduplication.
         // Unsigned content has exactly one canonical identity and version.
@@ -333,13 +359,13 @@ pub fn verify_incoming_record(
     if signer_pubkey.is_empty() {
         return Err("missing signer pubkey");
     }
-    // Self-addressed records (zone roots) must live at the hash of their own
+    // Public-key descriptors must live at the hash of their own
     // signer's ServiceId. This is the anti-flood / anti-squat invariant: a
-    // record at `zone_root_key(sid)` is accepted only if its signer's pubkey
+    // record at `zone_key(sid)` is accepted only if its signer's pubkey
     // hashes to `sid`, so only the zone-key holder can ever write there and no
     // foreign signer can pile junk at the location to evict the real record.
     if record_type.is_self_addressed() {
-        let expected = zone_root_key(&ServiceId::from_signing_pubkey(signer_pubkey));
+        let expected = zone_key(&ServiceId::from_signing_pubkey(signer_pubkey));
         if expected.as_bytes() != key {
             return Err("self-addressed record not stored at its own key");
         }
@@ -348,9 +374,7 @@ pub fn verify_incoming_record(
     // `identity_address_key(signer)`. Holding foreign hellos to the same rule
     // stops anyone stacking hellos at another peer's key to crowd its real one
     // out (the store also never evicts a hello for other records at its key).
-    if record_type == RecordType::Hello
-        && identity_address_key(signer).as_bytes() != key
-    {
+    if record_type == RecordType::Hello && identity_address_key(signer).as_bytes() != key {
         return Err("hello not stored at its signer's identity key");
     }
     let signable = record_signable(key, record_type, sequence, value);
@@ -473,28 +497,29 @@ impl VerifiedRecord {
         ))
     }
 
-    /// Mint a self-addressed TNS zone-root record. Stored at `zone_root_key(sid)`
-    /// where `sid` is `zone_keypair`'s ServiceId, and signed by `zone_keypair`
-    /// itself — so the ingest gate's self-address check passes only because the
-    /// signer's pubkey hashes to `sid`. `value` is the caller's already-sealed
-    /// zone-root blob (see the TNS layer); it is stored verbatim. Because the
-    /// key is fixed by `sid` and the signer is the zone key, only the zone owner
-    /// can ever write here — there is no foreign-signer flood surface.
-    pub fn new_zone_root(
-        zone_keypair: &Keypair,
-        value: &[u8],
-        sequence: u64,
-        ttl: Duration,
-    ) -> Self {
-        let key = zone_root_key(&zone_keypair.identity.service_id());
+    /// A small public-key bootstrap descriptor with no label data.
+    pub fn new_zone_key(zone_keypair: &Keypair, sequence: u64, ttl: Duration) -> Self {
+        let key = zone_key(&zone_keypair.identity.service_id());
         Self(sign_record(
             zone_keypair,
             key,
-            RecordType::ZoneRoot,
+            RecordType::ZoneKey,
             sequence,
-            value.to_vec(),
+            crate::tns::publication::KEY_MARKER.to_vec(),
             ttl,
         ))
+    }
+
+    /// Migration adapter: publishes ONLY the public-key marker. The former
+    /// whole-zone payload is deliberately discarded and is never uploaded.
+    #[deprecated(note = "whole-zone publication was removed; use new_zone_key for bootstrap and tns::publish for labels")]
+    pub fn new_zone_root(
+        zone_keypair: &Keypair,
+        _legacy_value: &[u8],
+        sequence: u64,
+        ttl: Duration,
+    ) -> Self {
+        Self::new_zone_key(zone_keypair, sequence, ttl)
     }
 
     /// Mint a Hello record at the identity-addressed key for `identity`. The
@@ -571,8 +596,8 @@ impl VerifiedRecord {
 
 /// Local DHT storage. Supports multiple records per key (supplemental).
 /// Who handed this node a stored record. Eviction is fair-shared across
-/// sources, so a flood arriving over one link can only displace that link's
-/// own share of the store, never everyone else's records.
+/// sources, so concentrated floods are preferentially charged to that link's
+/// share. Sybil sources and global capacity exhaustion remain possible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RecordSource {
     /// Minted by this node, or reloaded from its own database.
@@ -615,9 +640,9 @@ pub const MAX_HELLO_TTL: Duration = Duration::from_secs(3600);
 pub fn max_ttl(record_type: RecordType) -> Duration {
     match record_type {
         RecordType::Hello => MAX_HELLO_TTL,
-        // A zone root is re-signed well within its lifetime: a replayed old
-        // root can't be made to outlive it.
-        RecordType::ZoneRoot => Duration::from_secs(crate::tns::ZONE_ROOT_TTL as u64),
+        // TNS publications refresh well within this cap. A replay gains no
+        // extension at a node already holding the same immutable candidate.
+        RecordType::ZoneRoot | RecordType::ZoneKey | RecordType::TnsLabel => Duration::from_secs(crate::tns::publication::TTL as u64),
         _ => MAX_RECORD_TTL,
     }
 }
@@ -666,6 +691,155 @@ fn dead_id(record: &DhtRecord) -> [u8; 32] {
 }
 
 impl DhtStore {
+    /// Capacity preflight for a small local TNS batch. Called under the same
+    /// store lock as admission; foreign replicas can be evicted, pinned local
+    /// publications and owner-bound bootstrap records cannot.
+    pub(crate) fn can_publish_local_batch(&mut self, records: &[VerifiedRecord]) -> bool {
+        self.expire();
+        let incoming: Vec<_> = records
+            .iter()
+            .map(|r| StoredRecord::new(r.record().clone(), RecordSource::Local))
+            .collect();
+        let keys: std::collections::HashSet<_> = incoming.iter().map(|e| e.record.key).collect();
+        if keys.len() != incoming.len() {
+            return false;
+        }
+        if incoming.iter().any(|e| {
+            !matches!(
+                e.record.record_type,
+                RecordType::ZoneKey | RecordType::TnsLabel
+            ) || e.record.value.len() > self.limits.max_value_bytes
+                || e.record.is_expired()
+                || self.died_here(&e.record)
+        }) {
+            return false;
+        }
+        let replaced = |old: &StoredRecord| {
+            incoming.iter().any(|new| {
+                old.record.key == new.record.key
+                    && (old.record.signer == new.record.signer
+                        || (old.source == RecordSource::Local
+                            && old.record.record_type == RecordType::TnsLabel
+                            && new.record.record_type == RecordType::TnsLabel))
+            })
+        };
+        let pinned: Vec<_> = self
+            .records
+            .values()
+            .flatten()
+            .filter(|e| e.source == RecordSource::Local && !replaced(e))
+            .collect();
+        if pinned.len() + incoming.len() > self.limits.max_records
+            || pinned.iter().map(|e| e.cost).sum::<usize>()
+                + incoming.iter().map(|e| e.cost).sum::<usize>()
+                > self.limits.max_total_bytes
+        {
+            return false;
+        }
+        for new in &incoming {
+            let same_new: Vec<_> = incoming
+                .iter()
+                .filter(|e| e.record.key == new.record.key)
+                .collect();
+            let same_old: Vec<_> = self
+                .records
+                .get(new.record.key.as_bytes())
+                .into_iter()
+                .flatten()
+                .filter(|e| {
+                    !replaced(e)
+                        && (e.source == RecordSource::Local || is_owner_bound(e.record.record_type))
+                })
+                .collect();
+            if same_new.len() + same_old.len() > self.limits.max_records_per_key
+                || same_new.iter().map(|e| e.cost).sum::<usize>()
+                    + same_old.iter().map(|e| e.cost).sum::<usize>()
+                    > self.limits.max_bytes_per_key
+            {
+                return false;
+            }
+        }
+        // Replacements of owner-bound descriptors must actually advance.
+        incoming.iter().all(|new| {
+            self.records
+                .get(new.record.key.as_bytes())
+                .into_iter()
+                .flatten()
+                .filter(|old| old.record.signer == new.record.signer)
+                .all(|old| {
+                    new.record.sequence > old.record.sequence
+                        || (new.record.sequence == old.record.sequence
+                            && new.record.value == old.record.value)
+                })
+        })
+    }
+
+    /// Reserve all replaced local label slots before inserting the batch.
+    /// Otherwise a growing descriptor could temporarily exhaust capacity
+    /// before a later, shrinking label candidate releases its old slot.
+    pub(crate) fn put_tns_local_batch(&mut self, records: &[VerifiedRecord]) -> bool {
+        if !self.can_publish_local_batch(records) {
+            return false;
+        }
+        let snapshots: Vec<_> = records
+            .iter()
+            .map(|r| {
+                let key = *r.record().key.as_bytes();
+                (key, self.records.get(&key).cloned())
+            })
+            .collect();
+        let mut removed = Vec::new();
+        for incoming in records {
+            let new = incoming.record();
+            if new.record_type != RecordType::TnsLabel {
+                continue;
+            }
+            if let Some(entries) = self.records.get_mut(new.key.as_bytes()) {
+                entries.retain(|e| {
+                    let replace = e.source == RecordSource::Local
+                        && e.record.record_type == RecordType::TnsLabel
+                        && e.record.signer != new.signer;
+                    if replace {
+                        removed.push(e.record.clone());
+                    }
+                    !replace
+                });
+            }
+        }
+        for r in &removed {
+            self.mirror_delete(r.key.as_bytes(), r.signer.as_bytes());
+        }
+        for incoming in records {
+            if self
+                .put_record(incoming.clone(), RecordSource::Local)
+                .stored
+            {
+                continue;
+            }
+            // Defensive rollback, e.g. if a long system suspension expires
+            // a candidate between preflight and insertion. Unrelated cache
+            // evictions need not be resurrected; restore the affected slots.
+            for (key, old) in snapshots {
+                if let Some(current) = self.records.remove(&key) {
+                    for e in current {
+                        self.mirror_delete(&key, e.record.signer.as_bytes());
+                    }
+                }
+                if let Some(mut old) = old {
+                    old.retain(|e| !e.record.is_expired());
+                    for e in &old {
+                        self.mirror_put(e);
+                    }
+                    if !old.is_empty() {
+                        self.records.insert(key, old);
+                    }
+                }
+            }
+            return false;
+        }
+        true
+    }
+
     pub fn new(local_peer: &PeerId) -> Self {
         Self::with_limits(local_peer, StorageLimits::default())
     }
@@ -756,7 +930,14 @@ impl DhtStore {
                 v.iter()
                     .any(|e| e.record.signer == signer && e.source == RecordSource::Local)
             });
-        let replacing = |e: &&StoredRecord| e.record.key == record.key && e.record.signer == signer;
+        let replacing = |e: &&StoredRecord| {
+            e.record.key == record.key
+                && (e.record.signer == signer
+                    || (source == RecordSource::Local
+                        && record_type == RecordType::TnsLabel
+                        && e.source == RecordSource::Local
+                        && e.record.record_type == RecordType::TnsLabel))
+        };
         let pinned: Vec<&StoredRecord> = self
             .records
             .values()
@@ -797,21 +978,38 @@ impl DhtStore {
             .map(|e| e.record.sequence);
         // `SignedContent` and `Content` also accept a repeat of the version
         // held (it keeps the deadline held).
-        let allow_equal = matches!(record_type, RecordType::SignedContent | RecordType::Content);
+        let allow_equal = matches!(
+            record_type,
+            RecordType::SignedContent | RecordType::Content | RecordType::TnsLabel
+        );
         if !upsert_by_signer(entries, candidate, allow_equal) {
             self.records.retain(|_, v| !v.is_empty());
             return refused;
         }
-        let mut evicted = Vec::new();
+        let mut replaced_local = Vec::new();
+        if source == RecordSource::Local && record_type == RecordType::TnsLabel {
+            entries.retain(|e| {
+                let remove = e.source == RecordSource::Local
+                    && e.record.record_type == RecordType::TnsLabel
+                    && e.record.signer != signer;
+                if remove {
+                    replaced_local.push(e.record.clone());
+                }
+                !remove
+            });
+        }
+        let mut evicted = replaced_local;
         self.enforce_key_limits(&key, &mut evicted);
         self.enforce_global_limits(&mut evicted);
         for r in &evicted {
             self.mirror_delete(r.key.as_bytes(), r.signer.as_bytes());
         }
         let Some(e) = self.records.get(&key).and_then(|entries| {
-            entries
-                .iter()
-                .find(|e| e.record.signer == signer && e.record.sequence == sequence && e.record.record_type == record_type)
+            entries.iter().find(|e| {
+                e.record.signer == signer
+                    && e.record.sequence == sequence
+                    && e.record.record_type == record_type
+            })
         }) else {
             return refused;
         };
@@ -1017,7 +1215,7 @@ impl DhtStore {
     }
 
     /// Bring one key back within its record/byte budget. Owner-bound records
-    /// (a zone root, or a hello at its signer's own key — the only places those
+    /// (a key descriptor, or a hello at its signer's own key — the only places those
     /// types can be stored) are never evicted to make room for other records at
     /// the same key: they are the reason the key exists, and foreign records
     /// piling onto it must not be able to push them out.
@@ -1028,12 +1226,32 @@ impl DhtStore {
         if let Some(entries) = self.records.get_mut(key) {
             let mut byte_total: usize = entries.iter().map(|e| e.cost).sum();
             while entries.len() > max_records_per_key || byte_total > max_bytes_per_key {
-                let victim = fair_share_victim(
+                // Other record types cannot buy a TNS candidate's slot by
+                // choosing its key. Within a candidate bucket, retain one
+                // expiring incumbent while rotating the remaining history.
+                let has_labels = entries
+                    .iter()
+                    .any(|e| e.record.record_type == RecordType::TnsLabel);
+                let generic = entries.iter().any(|e| {
+                    !is_owner_bound(e.record.record_type)
+                        && e.record.record_type != RecordType::TnsLabel
+                        && e.source != RecordSource::Local
+                });
+                let incumbent = if !generic && has_labels && self.limits.max_records_per_key > 1 {
                     entries
                         .iter()
                         .enumerate()
-                        .filter(|(_, e)| !is_owner_bound(e.record.record_type)),
-                );
+                        .filter(|(_, e)| e.record.record_type == RecordType::TnsLabel)
+                        .min_by_key(|(_, e)| e.record.stored_at)
+                        .map(|(i, _)| i)
+                } else {
+                    None
+                };
+                let victim = fair_share_victim(entries.iter().enumerate().filter(|(i, e)| {
+                    !is_owner_bound(e.record.record_type)
+                        && (!has_labels || !generic || e.record.record_type != RecordType::TnsLabel)
+                        && incumbent != Some(*i)
+                }));
                 let Some(idx) = victim else {
                     break;
                 };
@@ -1084,7 +1302,7 @@ pub fn hello_from_record(peer: &PeerId, r: &DhtRecord) -> Option<crate::wire::He
 /// Record types that only the key's owner can write (enforced at ingest by
 /// [`verify_incoming_record`]).
 fn is_owner_bound(record_type: RecordType) -> bool {
-    matches!(record_type, RecordType::Hello | RecordType::ZoneRoot)
+    matches!(record_type, RecordType::Hello | RecordType::ZoneKey)
 }
 
 /// Pick the record to evict: the oldest record from whichever source holds the
@@ -1619,22 +1837,22 @@ pub fn identity_address_key(peer_id: &PeerId) -> DhtId {
     dht_id_from_peer_id(peer_id)
 }
 
-/// Self-addressed DHT key for a TNS zone root: a 64-byte XOF hash of a domain
-/// separator and the zone's ServiceId. A resolver computes this from the name's
-/// ServiceId alone; the ingest gate ([`verify_incoming_record`]) recomputes it
-/// from a record's signer pubkey and rejects any zone-root record not stored
-/// here, so the location is writable only by the holder of the zone key.
-///
-/// Domain-separated from per-label/content/identity keys so a zone root can
-/// never collide with another record class's location.
-pub fn zone_root_key(sid: &ServiceId) -> DhtId {
+/// Self-addressed public-key bootstrap location. Its descriptor carries no
+/// label directory or private record values. The complete signing public key
+/// must hash to the SID and its identity signature must verify.
+pub fn zone_key(sid: &ServiceId) -> DhtId {
     let mut out = [0u8; 64];
     blake3::Hasher::new()
-        .update(b"tarnet tns zone-root v1")
+        .update(b"tarnet tns zone-key v2")
         .update(sid.as_bytes())
         .finalize_xof()
         .fill(&mut out);
     DhtId(out)
+}
+
+/// Legacy spelling for callers migrating to the key-only bootstrap format.
+pub fn zone_root_key(sid: &ServiceId) -> DhtId {
+    zone_key(sid)
 }
 
 /// Encrypt the value of a signed or hello DHT record under a key derived from
@@ -1779,26 +1997,26 @@ mod tests {
 
     #[test]
     fn zone_root_accepts_owner_at_self_address() {
-        // A zone root signed by the zone key and stored at zone_root_key(its sid)
+        // A zone root signed by the zone key and stored at zone_key(its sid)
         // passes the gate — the legitimate publish path.
         let zone = Keypair::generate();
-        let key = zone_root_key(&zone.identity.service_id());
-        let rec = signed_record(&zone, key, RecordType::ZoneRoot, 1, b"root".to_vec());
+        let key = zone_key(&zone.identity.service_id());
+        let rec = signed_record(&zone, key, RecordType::ZoneKey, 1, crate::tns::publication::KEY_MARKER.to_vec());
         assert!(VerifiedRecord::verify_incoming(rec).is_ok());
     }
 
     #[test]
     fn zone_root_rejects_foreign_signer_flood() {
         // The anti-flood invariant: an attacker who knows the victim's zone sid
-        // computes zone_root_key(sid) and tries to plant junk there, signed by
+        // computes zone_key(sid) and tries to plant junk there, signed by
         // their OWN key. The gate rejects it — the location is writable only by
         // the holder of the zone key, so there is no foreign-signer record to
         // accumulate and no per-key eviction race (Finding 1, closed).
         let victim = Keypair::generate();
         let attacker = Keypair::generate();
-        let victim_root = zone_root_key(&victim.identity.service_id());
+        let victim_root = zone_key(&victim.identity.service_id());
         // Attacker signs a record for the victim's zone-root location.
-        let rec = signed_record(&attacker, victim_root, RecordType::ZoneRoot, 99, b"junk".to_vec());
+        let rec = signed_record(&attacker, victim_root, RecordType::ZoneKey, 99, crate::tns::publication::KEY_MARKER.to_vec());
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
             Some("self-addressed record not stored at its own key")
@@ -1835,9 +2053,9 @@ mod tests {
     #[test]
     fn owner_bound_record_survives_flood_at_its_key() {
         let owner = Keypair::generate();
-        let key = zone_root_key(&owner.identity.service_id());
+        let key = zone_key(&owner.identity.service_id());
         let mut store = DhtStore::with_limits(&PeerId([1; 32]), small_limits());
-        let root = signed_record(&owner, key, RecordType::ZoneRoot, 1, b"root".to_vec());
+        let root = signed_record(&owner, key, RecordType::ZoneKey, 1, crate::tns::publication::KEY_MARKER.to_vec());
         store.put_from(VerifiedRecord::verify_incoming(root).unwrap(), RecordSource::Peer(PeerId([2; 32])));
 
         // A flood of foreign SignedContent at the same key, each newer than the root.
@@ -1847,7 +2065,7 @@ mod tests {
         }
         let at_key = store.get(&key);
         assert_eq!(at_key.len(), 4);
-        assert!(at_key.iter().any(|r| r.record_type == RecordType::ZoneRoot));
+        assert!(at_key.iter().any(|r| r.record_type == RecordType::ZoneKey));
     }
 
     #[test]
@@ -1941,7 +2159,7 @@ mod tests {
         put.ttl = u32::MAX;
         let got = VerifiedRecord::from_put_msg(&put).unwrap();
         assert!(got.record().remaining_ttl() <= MAX_HELLO_TTL);
-        assert_eq!(clamp_ttl_secs(RecordType::ZoneRoot, u32::MAX), crate::tns::ZONE_ROOT_TTL);
+        assert_eq!(clamp_ttl_secs(RecordType::ZoneKey, u32::MAX), crate::tns::ZONE_ROOT_TTL);
         assert_eq!(clamp_ttl_secs(RecordType::SignedContent, u32::MAX), MAX_RECORD_TTL.as_secs() as u32);
         let minted = VerifiedRecord::new_hello(&kp, b"h", 2, Duration::from_secs(u32::MAX as u64));
         assert!(minted.record().remaining_ttl() <= MAX_HELLO_TTL);
@@ -1952,8 +2170,8 @@ mod tests {
         // Even the real zone key cannot place a zone root anywhere but its own
         // self-address — prevents a root from masquerading at another zone's slot.
         let zone = Keypair::generate();
-        let wrong = zone_root_key(&Keypair::generate().identity.service_id());
-        let rec = signed_record(&zone, wrong, RecordType::ZoneRoot, 1, b"root".to_vec());
+        let wrong = zone_key(&Keypair::generate().identity.service_id());
+        let rec = signed_record(&zone, wrong, RecordType::ZoneKey, 1, crate::tns::publication::KEY_MARKER.to_vec());
         assert_eq!(
             VerifiedRecord::verify_incoming(rec).err(),
             Some("self-addressed record not stored at its own key")

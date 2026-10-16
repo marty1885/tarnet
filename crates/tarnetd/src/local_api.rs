@@ -397,10 +397,8 @@ impl ServiceApi for LocalServiceApi {
         if publish {
             tns::validate_published_aliases(&records, &self.db, &id_key).map_err(map_err)?;
         }
-        // Published while marked so; a label marked private is no longer
-        // re-signed into the zone (copies already out there expire). Publish
-        // before storing: a label the zone root can't take is never stored
-        // as published, so it can't come back after a restart.
+        // Publish or withdraw before changing configuration. A capacity or
+        // size rejection must not persist a label the publisher cannot serve.
         let zone_keypair = self.keypair_for_identity(identity).await?;
         if publish {
             tns::publish(&self.node, &zone_keypair, label, &records)
@@ -456,14 +454,14 @@ impl ServiceApi for LocalServiceApi {
 
     async fn tns_remove_label(&self, identity: Option<&str>, label: &str) -> ApiResult<()> {
         let id_key = self.identity_db_key(identity).await?;
-        self.db.label_remove(&id_key, label).map_err(map_err)?;
-        // Drop the label from the zone root and republish it, so a removed name
-        // actually stops resolving (the root holds the zone's whole label set;
-        // it would otherwise persist until the root's TTL lapses).
+        // Withdraw while the configured label is still available to a cold
+        // working-set load. Deleting it first could turn withdrawal into a
+        // no-op and leave no persistent tombstone after restart.
         let zone_keypair = self.keypair_for_identity(identity).await?;
         tns::unpublish(&self.node, &zone_keypair, label)
             .await
             .map_err(map_err)?;
+        self.db.label_remove(&id_key, label).map_err(map_err)?;
         Ok(())
     }
 

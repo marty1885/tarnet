@@ -114,6 +114,23 @@ enum Input {
 }
 
 impl Input {
+    fn help(&self) -> &'static str {
+        match self {
+            Self::SetName(_) => "Give a Tarnet identity or service a name you can remember. A ServiceId is its long address; a zone is an identity's list of names.\nNames start from your selected identity's list, not a shared DNS root. Your alice can differ from someone else's alice.\nEnter one name, e.g. alice or ssh. Use @ for this identity itself.\nAn existing name's records will be replaced.",
+            Self::SetType { .. } => "Choose what you want this name to do:\nzone: save someone's address book; reach their names as ssh.alice.\nidentity: give an identity's long address a short name.\nvhost: name a hosted service, such as a website.\nalias: give an existing name another name.\ntext: save a note, not a connection address.\nExample: enter zone to add someone as alice.",
+            Self::SetValue { kind, .. } => match kind.to_ascii_lowercase().as_str() {
+                "identity" => "Use this for a direct nickname for one identity. It does not let you look up names inside that identity's zone; use zone for that.\nExample: label alice + this value makes alice resolve to that identity.\nFormat: paste its full 52-character ServiceId, without quotes. Find your own on the Node tab; ask the other person for theirs.\nExample: K8SGMKEVVV0R4C9SRFKN92RS4RTKWTTCTK146RYSQZEJ0K63AXSG",
+                "zone" => "Use this to reach names someone else manages.\nExample: label alice + Alice's ServiceId lets ssh.alice look up ssh in Alice's records. Alice must publish ssh for you to find it.\nThere is no global DNS root. a.b.c.d is read d -> c -> b -> a: adding d is not enough. d, c and b must each lead to a zone with the next record.\nalice alone looks for @ in Alice's zone; it does not create a service there.\nFormat: paste the other identity's full 52-character ServiceId, without quotes.\nExample: K8SGMKEVVV0R4C9SRFKN92RS4RTKWTTCTK146RYSQZEJ0K63AXSG",
+                "vhost" => "Use this to name a service hosted by an identity, such as blog.\nThe host must run a service configured for this exact record label. Adding the record does not start a server or expose a local port.\nAn alias can give it another name while keeping the original service destination.\nFormat: paste the hosting identity's full 52-character ServiceId, without quotes.\nExample: K8SGMKEVVV0R4C9SRFKN92RS4RTKWTTCTK146RYSQZEJ0K63AXSG",
+                "alias" => "Use this to give an existing name another name.\nExample: label blog + value @ sends blog to this zone's @ record. This is one-way: @ does not point back to blog.\nFormat: @, a name such as ssh.alice, or ssh.<ServiceId> to start in an explicit zone. Replace <ServiceId> with the full address; no quotes.\nTargets start in the alias's zone, not the caller's zone. You cannot jump back to a caller's private nicknames or a parent with '..'.\nNames to the left are kept: ssh.friend with friend -> alice becomes ssh.alice. The target must support that lookup.\nThe target must exist and be readable by the resolver. Publishing an alias does not publish its target; loops fail.",
+                "text" => "Use this for a note attached to a name, such as contact details. It does not make the name connect to a service.\nFormat: non-empty plain text. Spaces are allowed; do not add quotes.\nExample: contact=alice@example.com",
+                _ => "Choose identity, zone, vhost, alias, or text. Press Esc to cancel and start again.",
+            },
+            Self::SetPublic { .. } => "Should other people be able to look up this record?\ny or yes: save here and share through Tarnet's distributed network (DHT).\nn or blank: save only here. Useful for your own nicknames for other people.\nSharing does not reserve a global name. Others still need a path to your zone or your ServiceId. They also need access to each target record.\nAnyone who knows your ServiceId and guesses this label can read a shared record.",
+            _ => "",
+        }
+    }
+
     fn value_mut(&mut self) -> &mut String {
         match self {
             Self::Resolve(v)
@@ -311,6 +328,8 @@ impl App {
             if self.input.is_some() {
                 match key.code {
                     KeyCode::Esc => self.input = None,
+                    KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(3),
+                    KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(3),
                     KeyCode::Backspace => {
                         self.input.as_mut().unwrap().value_mut().pop();
                     }
@@ -356,6 +375,7 @@ impl App {
                     self.input = Some(Input::Resolve(String::new()));
                 }
                 KeyCode::Char('a') if self.tab == TNS => {
+                    self.detail_scroll = 0;
                     self.input = Some(Input::SetName(String::new()))
                 }
                 KeyCode::Char('d') if self.tab == TNS && self.selected < self.labels.len() => {
@@ -397,6 +417,7 @@ impl App {
     }
 
     async fn submit(&mut self) {
+        self.detail_scroll = 0;
         let input = self.input.take().unwrap();
         match input {
             Input::Resolve(name) if !name.trim().is_empty() => self.resolve(&name),

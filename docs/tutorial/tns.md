@@ -12,11 +12,28 @@ This makes names **subjective** - your `alice` and someone else's `alice` can po
 
 ## Privacy
 
-Both the DHT lookup key and the encryption key for a record are derived from the zone's ServiceId and the label name. This means you can only find and decrypt a record if you already know both the zone and the label you're looking for. An observer watching DHT traffic cannot see what names exist in a zone or what they resolve to.
+Published labels are stored as independent encrypted records in four DHT
+locations. Their outer signatures use blinded Ed25519 keys, so a node handling
+a label record does not receive its zone's public key, SID, label, or record
+values. Readers decrypt and check the full identity signature, including Falcon
+for hybrid identities. There is no uploaded directory of the zone's labels.
 
-Queries are also private: the DHT key sent in a lookup is an opaque hash, and reply routing uses ephemeral tokens so intermediary nodes never learn who originated the query. A node relaying your query sees a 64-byte hash but cannot reverse it to learn the zone or label.
+Your addresses remain `label.<ServiceId>`. On the first lookup in a zone, the
+resolver fetches a small public-key descriptor and checks that its complete key
+hashes to the SID. The descriptor's storage nodes learn that SID and can guess
+labels, just like anyone else who knows it. Public keys can then be cached.
 
-The tradeoff: if someone knows your ServiceId and can guess a label (e.g., `@`, `ssh`, `www`), they can look it up and decrypt it, and could correlate DHT queries to specific lookups. The records are private against enumeration, not against targeted guessing.
+Anyone who knows your SID and guesses a label such as `@`, `ssh`, or `www` can
+resolve and decrypt it. This is privacy from observers who do not already know
+the name, rather than access control for SID holders. Query locations are opaque
+hashes, but known names, publication timing, and traffic volume can correlate
+activity. Ephemeral reply-routing tokens do not conceal all traffic patterns.
+
+Storage checks a cheap ECC signature and a hash puzzle, and retains bounded
+candidate history. Independent placements and source budgets mitigate squatting
+and flooding. A quantum attacker who breaks ECC may disrupt availability;
+readers still reject records without the required Falcon signature. See the
+[TNS protocol](../spec/tns.md) for the security boundary.
 
 ## Record Types
 

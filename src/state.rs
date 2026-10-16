@@ -190,10 +190,19 @@ impl StateDb {
                  kind INTEGER NOT NULL,
                  key BLOB NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS tns_tombstones (
+                 sid BLOB NOT NULL,
+                 label TEXT NOT NULL,
+                 PRIMARY KEY (sid, label)
+             );
              DROP TABLE IF EXISTS tns_zone_records;",
         )
         .map_err(sqlite_err)?;
         ensure_dht_records_table(&conn).map_err(sqlite_err)?;
+        // Old roots exposed every record value to their storage nodes. Never
+        // reload or republish that cache after the opaque-label wire break.
+        conn.execute("DELETE FROM dht_records WHERE record_type = 3", [])
+            .map_err(sqlite_err)?;
 
         Ok(Self {
             conn: StdMutex::new(conn),
@@ -201,6 +210,41 @@ impl StateDb {
     }
 
     // ── Metadata ──
+
+    pub(crate) fn set_tns_tombstone(
+        &self,
+        sid: &tarnet_api::types::ServiceId,
+        label: &str,
+        retired: bool,
+    ) -> Result<()> {
+        let conn = self.lock()?;
+        if retired {
+            conn.execute(
+                "INSERT OR IGNORE INTO tns_tombstones(sid, label) VALUES(?1, ?2)",
+                params![sid.as_bytes().as_slice(), label],
+            )
+            .map_err(sqlite_err)?;
+        } else {
+            conn.execute(
+                "DELETE FROM tns_tombstones WHERE sid = ?1 AND label = ?2",
+                params![sid.as_bytes().as_slice(), label],
+            )
+            .map_err(sqlite_err)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn tns_tombstones(&self, sid: &tarnet_api::types::ServiceId) -> Result<Vec<String>> {
+        let conn = self.lock()?;
+        let mut stmt = conn
+            .prepare("SELECT label FROM tns_tombstones WHERE sid = ?1")
+            .map_err(sqlite_err)?;
+        let rows = stmt
+            .query_map(params![sid.as_bytes().as_slice()], |row| row.get(0))
+            .map_err(sqlite_err)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(sqlite_err)
+    }
 
     pub fn get_metadata(&self, key: &str) -> Result<Option<u64>> {
         let conn = self.lock()?;

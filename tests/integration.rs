@@ -1313,13 +1313,18 @@ async fn hidden_service_rendezvous() {
         "A should NOT be directly connected to C"
     );
 
-    // Simulate propagation by copying C's signed root. Signing C's zone on
-    // A would fork its owner sequence counter and race C's real publication.
-    let root_key = tarnet::dht::zone_root_key(&service_id_c);
-    let roots = node_c.dht_held(&root_key).await;
-    assert!(!roots.is_empty(), "C did not publish its introduction root");
-    for record in roots {
-        node_a.dht_store_insert_local_for_test(record).await;
+    // Copy the actual descriptor and independently encrypted intro lanes.
+    // Re-signing C's records on A would fork C's publication sequence.
+    let mut keys = vec![tarnet::dht::zone_key(&service_id_c)];
+    keys.extend(tarnet::tns::label_lookup_keys(
+        &default_kp_c.identity.signing.signing_pubkey_bytes(), "intro",
+    ).unwrap());
+    for key in keys {
+        let records = node_c.dht_held(&key).await;
+        assert!(!records.is_empty(), "C did not publish an intro lane or descriptor");
+        for record in records {
+            node_a.dht_store_insert_local_for_test(record).await;
+        }
     }
 
     // Verify TNS records are resolvable from A

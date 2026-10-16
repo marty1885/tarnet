@@ -45,7 +45,7 @@ pub(super) fn render(frame: &mut Frame, app: &App) {
     render_body(frame, app, sections[1]);
     render_footer(frame, app, sections[2]);
     if let Some(input) = &app.input {
-        render_input_popup(frame, input);
+        render_input_popup(frame, input, app.detail_scroll);
     }
 }
 
@@ -915,10 +915,21 @@ fn hint_line(items: &[(&str, &str)], width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-fn render_input_popup(frame: &mut Frame, input: &super::Input) {
+fn render_input_popup(frame: &mut Frame, input: &super::Input, help_scroll: u16) {
     let screen = frame.area();
     let width = screen.width.saturating_sub(4).min(80);
-    let height = screen.height.min(8);
+    let help = input.help();
+    let help_width = width.saturating_sub(4).max(1) as usize;
+    // Allow for word wrapping as well as explicit line breaks.
+    let help_height = if help.is_empty() {
+        0
+    } else {
+        help.lines()
+            .map(|line| line.chars().count() / help_width + 2)
+            .sum::<usize>() as u16
+            + 1
+    };
+    let height = screen.height.min(8 + help_height);
     let area = Rect::new(
         screen.x + (screen.width - width) / 2,
         screen.y + (screen.height - height) / 2,
@@ -967,16 +978,34 @@ fn render_input_popup(frame: &mut Frame, input: &super::Input) {
     );
     frame.set_cursor_position((field.x + used as u16, field.y));
     frame.render_widget(
-        Paragraph::new("Enter: confirm · Esc: cancel")
+        Paragraph::new(if help.is_empty() {
+            "Enter: confirm · Esc: cancel"
+        } else {
+            "Enter: confirm · Esc: cancel · PgUp/Dn: help"
+        })
             .style(Style::default().fg(MUTED))
             .wrap(Wrap { trim: false }),
         Rect::new(
             content.x,
             content.y + 4,
             content.width,
-            content.height.saturating_sub(4),
+            1,
         ),
     );
+    if !help.is_empty() && content.height > 6 {
+        frame.render_widget(
+            Paragraph::new(help)
+                .style(Style::default().fg(MUTED))
+                .scroll((help_scroll.min(help_height.saturating_sub(2)), 0))
+                .wrap(Wrap { trim: false }),
+            Rect::new(
+                content.x,
+                content.y + 6,
+                content.width,
+                content.height.saturating_sub(6),
+            ),
+        );
+    }
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -1025,6 +1054,33 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_value_popup_shows_example_and_controls() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        for kind in ["identity", "zone", "vhost", "alias", "text"] {
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let input = super::super::Input::SetValue {
+                name: "example".into(),
+                kind: kind.into(),
+                value: String::new(),
+            };
+            terminal
+                .draw(|frame| render_input_popup(frame, &input, 0))
+                .unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Example:"), "{kind}: {rendered}");
+            assert!(rendered.contains("Format:"), "{kind}: {rendered}");
+            assert!(rendered.contains("Enter: confirm"), "{kind}: {rendered}");
+        }
+    }
 
     #[test]
     fn panel_layout_uses_columns_when_wide_and_rows_when_narrow() {
