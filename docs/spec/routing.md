@@ -175,6 +175,19 @@ without reason:
 
 ## Link-aware timing (local policy, no wire change)
 
+Heartbeat and liveness scheduling sleeps until the earliest per-link
+heartbeat, transition to probing, or expiry deadline. Link additions and
+removals wake it; ordinary receive activity only postpones deadlines, which
+are rechecked when the current timer fires. An empty link table has no
+heartbeat timer. The existing Poisson heartbeat draws and quiet-link probe
+cadence are retained.
+
+Rekey maintenance belongs to each link's receive task. Crossing the traffic
+threshold in either direction, or explicitly requesting a rekey, wakes the
+initiator's driver. An unanswered request arms its retry deadline; completing
+the exchange cancels it. Removing the link cancels the driver with its reader.
+There is no global rekey sweep.
+
 * `Transport` gains a bandwidth hint (bytes/s, or unknown). The link measures
   RTT from keepalive probes and rekey exchanges.
 * Every retransmit timer (link handshake, rekey, tunnel key exchange, circuit
@@ -328,6 +341,13 @@ chain. Memory is not the constraint on a Pi (1024 routes are a few hundred
 KB); the slow-link constraint is handled by sending changes only.
 
 ### Updates and digests
+
+The scheduler wakes on routing or active-link changes, or the next batch,
+digest, feasibility-history expiry, landmark-penalty expiry, or starving-route
+retry deadline. The first pending change starts a 250 ms batch deadline;
+later changes do not extend it. Slow links retain a minimum two-second gap
+between updates. Digests wait for pending batches to finish. Bandwidth-limit
+reloads also wake routing because they can change a link's cost.
 
 * **Changes only.** Updates are sent when something changes, batched for a
   short delay and rate-limited per link. There is no periodic full dump.

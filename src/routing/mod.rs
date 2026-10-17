@@ -199,6 +199,7 @@ pub struct SeqnoRequest {
 }
 
 pub struct RoutingTable {
+    changed: std::sync::Arc<tokio::sync::Notify>,
     local: PeerId,
     seqno: u16,
     budget: usize,
@@ -235,6 +236,7 @@ impl RoutingTable {
 
     pub fn with_budget(local: PeerId, budget: usize) -> Self {
         let mut t = Self {
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             local,
             seqno: rand::random(),
             budget: budget.max(1),
@@ -257,6 +259,20 @@ impl RoutingTable {
     }
 
     // ── Lookups ──
+
+    pub(crate) fn changed_notify(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
+
+    /// Policy/history expiry and starving-route retries have actual
+    /// deadlines. Live feasibility distances do not need periodic GC.
+    pub(crate) fn next_deadline(&self) -> Option<Instant> {
+        self.fd.iter().filter(|(dest, _)| !self.selected.contains_key(dest))
+            .map(|(_, (_, _, at))| *at + FD_GC)
+            .chain(self.flags.values().filter_map(|state| state.ignored_until))
+            .chain(self.starving.iter().filter(|(dest, _)| self.fd.contains_key(dest)).map(|(_, (at, _))| *at))
+            .min()
+    }
 
     /// Whether the table holds every destination it hears of. Once it is
     /// at its budget it holds only the local area, which is no fair sample
@@ -476,6 +492,7 @@ impl RoutingTable {
     }
 
     fn topology_changed(&mut self) {
+        self.changed.notify_one();
         for nb in self.neighbours.values_mut() {
             nb.degree_dirty = true;
         }
@@ -654,6 +671,7 @@ impl RoutingTable {
     pub fn request_full_dump(&mut self, n: &PeerId) {
         if let Some(nb) = self.neighbours.get_mut(n) {
             nb.dump_due = true;
+            self.changed.notify_one();
         }
     }
 
@@ -806,6 +824,7 @@ impl RoutingTable {
             }
         }
         let pending_cap = self.advertised_capacity().saturating_mul(2);
+        self.changed.notify_one();
         for nb in self.neighbours.values_mut() {
             nb.queue(e, pending_cap);
         }
@@ -834,6 +853,7 @@ impl RoutingTable {
         let pending_cap = self.advertised_capacity().saturating_mul(2);
         if let Some(nb) = self.neighbours.get_mut(to) {
             nb.queue(e, pending_cap);
+            self.changed.notify_one();
         }
     }
 
@@ -908,6 +928,7 @@ impl RoutingTable {
     /// nearest destinations) plus every accepted landmark, and queue the
     /// differences to what we advertised.
     fn decide(&mut self) -> Vec<SeqnoRequest> {
+        self.changed.notify_one();
         let mut candidates: HashMap<PeerId, Vec<Route>> = HashMap::new();
         let mut infeasible: HashMap<PeerId, Vec<PeerId>> = HashMap::new();
         for (n, nb) in &self.neighbours {
@@ -1058,6 +1079,29 @@ mod tests {
 
     fn pid(b: u8) -> PeerId {
         PeerId([b; 32])
+    }
+
+    #[tokio::test]
+    async fn scheduler_notifications_cover_outboxes_and_expiry_deadlines() {
+        use futures_util::FutureExt;
+        let mut table = RoutingTable::new(pid(1));
+        let changed = table.changed_notify();
+        let _ = changed.notified().now_or_never();
+        assert!(table.next_deadline().is_none());
+        table.neighbour_up(pid(2), COST_FAST);
+        assert!(changed.notified().now_or_never().is_some());
+        assert!(table.has_pending(&pid(2)));
+        table.take_pending(&pid(2));
+        table.set_landmark(true);
+        assert!(changed.notified().now_or_never().is_some());
+        assert!(table.has_pending(&pid(2)));
+        let now = Instant::now();
+        table.fd.insert(pid(9), (1, 10, now));
+        assert_eq!(table.next_deadline(), Some(now + FD_GC));
+        table.starving.insert(pid(9), (now + STARVE_RETRY_MIN, STARVE_RETRY_MIN));
+        assert_eq!(table.next_deadline(), Some(now + STARVE_RETRY_MIN));
+        table.advance_time(now + FD_GC);
+        assert!(table.next_deadline().is_none());
     }
 
     fn entry(dest: u8, seqno: u16, metric: u16) -> RouteEntry {

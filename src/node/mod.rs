@@ -83,10 +83,6 @@ const NONCE_CACHE_TTL: Duration = Duration::from_secs(120);
 /// Most key exchanges remembered at once (see `kex_seen`).
 const MAX_KEX_SEEN: usize = 4096;
 
-/// How often the heartbeat / liveness scheduler wakes up. Fine enough that
-/// the Poisson heartbeat draws aren't quantised into visible buckets, and
-/// that a quiet link's liveness probes (every few seconds) go out on time.
-const HEARTBEAT_TICK: Duration = Duration::from_secs(1);
 /// Declare a link dead if no message received within this duration. A link
 /// quiet for `peer_transport::PROBE_AFTER` is pinged every few seconds, so a
 /// live link gets ~25 ping/pong chances in the remaining window: even with
@@ -98,8 +94,6 @@ const KEEPALIVE_DEAD_TIMEOUT: Duration = Duration::from_secs(180);
 /// the handshake is dropped: the initiator gave up
 /// (its handshake times out after 30s), the link only black-holes traffic.
 const UNCONFIRMED_LINK_TIMEOUT: Duration = Duration::from_secs(60);
-/// How often initiator links are checked for a due (or unanswered) rekey.
-const REKEY_SWEEP_TICK: Duration = Duration::from_millis(500);
 /// Maximum random padding bytes added to each heartbeat. The padding size
 /// is drawn uniformly from [0, this] so heartbeat packets don't form a
 /// fingerprintable fixed-size class on the wire.
@@ -458,6 +452,8 @@ enum ListenerDispatch {
 
 /// A tarnet node: manages transports, links, routing, tunnels, and channels.
 pub struct Node {
+    #[cfg(test)]
+    scheduler_passes: Arc<SchedulerPasses>,
     pub identity: Arc<Keypair>,
     /// Link limits. 0 = unlimited.
     max_inbound: usize,
@@ -599,6 +595,13 @@ pub struct Node {
     /// Each link peer's inbound queues (see [`PeerLanes`]). Created with the
     /// peer's first link, dropped with its last.
     peer_lanes: std::sync::Mutex<HashMap<PeerId, PeerLanes>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SchedulerPasses {
+    routing: std::sync::atomic::AtomicUsize,
+    heartbeat: std::sync::atomic::AtomicUsize,
 }
 
 /// How many of a peer's messages may wait in one of its lanes.
@@ -840,6 +843,8 @@ impl Node {
             sender: sender.clone(),
         };
         Self {
+            #[cfg(test)]
+            scheduler_passes: Arc::new(SchedulerPasses::default()),
             identity: Arc::new(identity),
             max_inbound: DEFAULT_MAX_INBOUND,
             max_outbound: DEFAULT_MAX_OUTBOUND,
@@ -1344,18 +1349,21 @@ impl Node {
         self.spawn_directory_task(node_arc.clone());
         self.spawn_search_gc(node_arc.clone());
 
-        // Per-link heartbeat / cover-traffic / liveness task. Every tick:
+        // Per-link heartbeat / cover-traffic / liveness task. At each deadline:
         //   1. Fire LinkDown for any link that hasn't received in DEAD_TIMEOUT.
         //   2. For each link whose Poisson-scheduled next-fire has elapsed,
         //      send a heartbeat with random padding (so heartbeats aren't a
         //      fixed-size class on the wire).
         let hb_links = self.links.clone();
         let hb_event_tx = self.lifecycle_tx.clone();
+        #[cfg(test)]
+        let hb_passes = self.scheduler_passes.clone();
         tokio::spawn(async move {
-            let mut interval = jittered_interval(HEARTBEAT_TICK);
+            let changed = hb_links.lock().await.maintenance_notify();
+            let mut reported = HashSet::new();
             loop {
-                interval.tick().await;
-
+                #[cfg(test)]
+                hb_passes.heartbeat.fetch_add(1, Ordering::Relaxed);
                 let (dead, unconfirmed, due) = {
                     let mut links = hb_links.lock().await;
                     let dead = links.dead_links(KEEPALIVE_DEAD_TIMEOUT);
@@ -1365,6 +1373,7 @@ impl Node {
                 };
 
                 for (peer, link_id) in unconfirmed {
+                    if !reported.insert((peer, link_id)) { continue; }
                     log::info!(
                         "Link to {:?} (link_id={}) never confirmed by the peer, dropping",
                         peer,
@@ -1374,6 +1383,7 @@ impl Node {
                 }
 
                 for (peer, link_id) in dead {
+                    if !reported.insert((peer, link_id)) { continue; }
                     log::info!(
                         "Link to {:?} (link_id={}) timed out (no recv for {}s), declaring dead",
                         peer,
@@ -1383,11 +1393,8 @@ impl Node {
                     let _ = hb_event_tx.send(NodeEvent::LinkDown(peer, link_id)).await;
                 }
 
-                if due.is_empty() {
-                    continue;
-                }
-
-                for (_peer, _link_id, link) in due {
+                for (peer, link_id, link) in due {
+                    if reported.contains(&(peer, link_id)) { continue; }
                     use rand::RngCore;
                     let pad_len = {
                         use rand::Rng;
@@ -1403,38 +1410,19 @@ impl Node {
                     let encoded = ka_msg.to_wire().encode();
                     let _ = link.send_deferred(&encoded).await;
                 }
-            }
-        });
-
-        // Rekey sweep: rotate session keys on any link that has carried
-        // REKEY_INTERVAL messages in either direction, giving long-lived links
-        // forward secrecy against key compromise. Only the link initiator
-        // drives this; the responder answers in-band. Runs on its own short
-        // tick because it also resends requests whose reply was lost.
-        let rk_links = self.links.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(REKEY_SWEEP_TICK);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let rekey_links: Vec<Arc<PeerLink>> = {
-                    let links = rk_links.lock().await;
-                    links
-                        .all_links()
-                        .into_iter()
-                        .filter(|l| l.is_initiator())
-                        .collect()
+                let at = {
+                    let links = hb_links.lock().await;
+                    reported.retain(|(peer, id)| links.get_link(peer, *id).is_some());
+                    links.next_maintenance_at(KEEPALIVE_DEAD_TIMEOUT, UNCONFIRMED_LINK_TIMEOUT, &reported)
                 };
-                for link in rekey_links {
-                    if link.needs_rekey().await {
-                        if let Err(e) = link.rekey_initiate().await {
-                            log::debug!(
-                                "Rekey initiate to {:?} failed: {}",
-                                link.remote_peer(),
-                                e
-                            );
+                tokio::select! {
+                    _ = changed.notified() => {}
+                    _ = async {
+                        match at {
+                            Some(at) => tokio::time::sleep_until(at.into()).await,
+                            None => std::future::pending::<()>().await,
                         }
-                    }
+                    } => {}
                 }
             }
         });
@@ -1553,9 +1541,10 @@ impl Node {
                         drop(circuits);
 
                         let encoded = encode_circuit_relay_cell(relay_cid, &cell);
-                        // Cover traffic shares the same link I/O budget.
+                        // Idle cover traffic may share a frame with other
+                        // maintenance instead of immediately flushing one.
                         let _ = ck_sender
-                            .to_peer(&first_hop, &encoded, sender::Queue::Data)
+                            .to_peer(&first_hop, &encoded, sender::Queue::Deferred)
                             .await;
                     }
                 }
@@ -2053,43 +2042,48 @@ impl Node {
         let remote = peer_id;
         let recv_link_id = link_id;
         let recv_task = tokio::spawn(async move {
-            loop {
-                match link.recv_message().await {
-                    Ok(data) => {
-                        match WireMessage::decode(&data) {
-                            Ok(msg) => {
-                                if event_tx
-                                    .send(NodeEvent::Message(remote, recv_link_id, msg))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
+            tokio::select! {
+                _ = link.drive_rekey() => {}
+                _ = async {
+                    loop {
+                        match link.recv_message().await {
+                            Ok(data) => {
+                                match WireMessage::decode(&data) {
+                                    Ok(msg) => {
+                                        if event_tx
+                                            .send(NodeEvent::Message(remote, recv_link_id, msg))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Wire decode error from {:?}: {}", remote, e);
+                                    }
                                 }
                             }
+                            // Frame-level failures must not kill the link. A stale frame
+                            // (deferred-queue coalescing can reorder past the replay
+                            // window under load) or an undecryptable frame (garbage
+                            // injection) costs only that frame; tearing down the link
+                            // would hand an attacker — or mere congestion — a kill
+                            // switch for every circuit on it. A genuinely desynced
+                            // link stops producing decryptable frames and is reaped
+                            // by the keepalive dead-timeout instead.
+                            Err(e @ (Error::Replay(_) | Error::Crypto(_))) => {
+                                log::debug!("dropping bad frame from {:?}: {}", remote, e);
+                            }
                             Err(e) => {
-                                log::warn!("Wire decode error from {:?}: {}", remote, e);
+                                log::info!("recv_message from {:?} failed, link down: {}", remote, e);
+                                let _ = lifecycle_tx
+                                    .send(NodeEvent::LinkDown(remote, recv_link_id))
+                                    .await;
+                                break;
                             }
                         }
                     }
-                    // Frame-level failures must not kill the link. A stale frame
-                    // (deferred-queue coalescing can reorder past the replay
-                    // window under load) or an undecryptable frame (garbage
-                    // injection) costs only that frame; tearing down the link
-                    // would hand an attacker — or mere congestion — a kill
-                    // switch for every circuit on it. A genuinely desynced
-                    // link stops producing decryptable frames and is reaped
-                    // by the keepalive dead-timeout instead.
-                    Err(e @ (Error::Replay(_) | Error::Crypto(_))) => {
-                        log::debug!("dropping bad frame from {:?}: {}", remote, e);
-                    }
-                    Err(e) => {
-                        log::info!("recv_message from {:?} failed, link down: {}", remote, e);
-                        let _ = lifecycle_tx
-                            .send(NodeEvent::LinkDown(remote, recv_link_id))
-                            .await;
-                        break;
-                    }
-                }
+                } => {}
             }
         });
         self.links
@@ -2784,6 +2778,7 @@ impl Node {
         self.bandwidth
             .update_rates(upload_rate, download_rate)
             .await;
+        self.links.lock().await.routing_notify().notify_one();
     }
 
     /// Set the global addresses this node advertises in hello records.

@@ -2,14 +2,76 @@
 use super::*;
 
 pub(super) struct StreamState {
+    #[cfg(test)]
+    sender_passes: std::sync::atomic::AtomicUsize,
     pub app_tx: mpsc::WeakSender<Vec<u8>>,
     pub channel: Mutex<Channel>,
     pub notify: tokio::sync::Notify,
-    pub outbound: bool,
     remote_fin: std::sync::Mutex<Option<u32>>,
     remote_closed: std::sync::atomic::AtomicBool,
-    /// Application messages arriving in several channel packets.
-    fragments: std::sync::Mutex<FragmentAssembler>,
+    /// Packet delivery runs separately from the circuit's receive/ACK lane.
+    delivery_tx: mpsc::Sender<Vec<Vec<u8>>>,
+    flow: std::sync::Mutex<FlowControl>,
+    closed: std::sync::atomic::AtomicBool,
+    delivery_cancel: tokio::sync::Notify,
+    /// ACKs may move retry deadlines or reveal a fast-retransmit hole.
+    retry_changed: std::sync::atomic::AtomicBool,
+}
+
+/// Initial and maximum undelivered packet credit (about 464 KiB). This
+/// matches the channel's existing send-window cap to retain bulk capacity.
+/// Released packets extend an absolute boundary, so reordered ACKs cannot reopen a
+/// stale window or spend the same credit twice.
+const RECEIVE_WINDOW: u32 = 1024;
+const ACK_DELAY: Duration = Duration::from_millis(5);
+const ACK_EVERY: u32 = 8;
+const PERSIST_INITIAL: Duration = Duration::from_secs(1);
+const PERSIST_MAX: Duration = Duration::from_secs(8);
+
+fn before(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+struct FlowControl {
+    peer_limit: u32,
+    receive_limit: u32,
+    ack_at: Option<tokio::time::Instant>,
+    ack_events: u32,
+}
+
+impl Default for FlowControl {
+    fn default() -> Self {
+        Self {
+            peer_limit: RECEIVE_WINDOW,
+            receive_limit: RECEIVE_WINDOW,
+            ack_at: None,
+            ack_events: 0,
+        }
+    }
+}
+
+impl FlowControl {
+    fn schedule_ack(&mut self, immediate: bool) {
+        let now = tokio::time::Instant::now();
+        self.ack_events = self.ack_events.saturating_add(1);
+        let at = if immediate || self.ack_events >= ACK_EVERY {
+            now
+        } else {
+            now + ACK_DELAY
+        };
+        self.ack_at = Some(self.ack_at.map_or(at, |old| old.min(at)));
+    }
+
+    fn release(&mut self) {
+        self.receive_limit = self.receive_limit.wrapping_add(1);
+        self.schedule_ack(false);
+    }
+
+    fn update_peer_limit(&mut self, limit: u32) {
+        if before(self.peer_limit, limit) {
+            self.peer_limit = limit;
+        }
+    }
 }
 
 // Channel packet kinds. A packet is `kind(u8) || body`.
@@ -20,6 +82,8 @@ const KIND_FIN: u8 = 1;
 /// Part of an application message too large for one cell:
 /// `msg_id(u16) || index(u16) || count(u16) || bytes`.
 const KIND_FRAGMENT: u8 = 2;
+/// Unsequenced persist probe. Does not occupy channel state or receive credit.
+const KIND_PROBE: u8 = 3;
 /// A fragment's fields after its kind byte: msg_id, index, count.
 const FRAGMENT_FIELDS: usize = 6;
 const FRAGMENT_HEADER: usize = 1 + FRAGMENT_FIELDS;
@@ -114,10 +178,13 @@ impl FragmentAssembler {
             self.drop_oldest();
         }
         let arrivals = self.arrivals;
-        let partial = self.partials.entry(msg_id).or_insert_with(|| PartialMessage {
-            first_arrival: arrivals,
-            frags: crate::link_frame::Fragments::new(count),
-        });
+        let partial = self
+            .partials
+            .entry(msg_id)
+            .or_insert_with(|| PartialMessage {
+                first_arrival: arrivals,
+                frags: crate::link_frame::Fragments::new(count),
+            });
         if partial.frags.count() != count {
             let p = self.partials.remove(&msg_id)?;
             self.bytes -= p.frags.bytes();
@@ -138,6 +205,8 @@ impl EndpointState {
         self.data_txs.lock().await.remove(&key);
         self.stream_owners.lock().await.remove(&key);
         if let Some(stream) = self.streams.lock().await.remove(&key) {
+            stream.closed.store(true, Ordering::Release);
+            stream.delivery_cancel.notify_waiters();
             stream.notify.notify_one();
         }
     }
@@ -196,7 +265,10 @@ impl Node {
         let reliable = mode != PortMode::UnreliableUnordered;
         let ordered = mode == PortMode::ReliableOrdered;
         let (app_tx, mut outgoing) = mpsc::channel::<Vec<u8>>(256);
+        let (delivery_tx, mut delivery_rx) = mpsc::channel::<Vec<Vec<u8>>>(RECEIVE_WINDOW as usize);
         let stream = Arc::new(StreamState {
+            #[cfg(test)]
+            sender_passes: std::sync::atomic::AtomicUsize::new(0),
             app_tx: app_tx.downgrade(),
             channel: Mutex::new(Channel::from_port_name(
                 key.circuit_id,
@@ -205,10 +277,13 @@ impl Node {
                 ordered,
             )),
             notify: tokio::sync::Notify::new(),
-            outbound,
             remote_fin: std::sync::Mutex::new(None),
             remote_closed: std::sync::atomic::AtomicBool::new(false),
-            fragments: Default::default(),
+            delivery_tx,
+            flow: Default::default(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            delivery_cancel: tokio::sync::Notify::new(),
+            retry_changed: std::sync::atomic::AtomicBool::new(false),
         });
         // Our link on this circuit is the slowest hop we know of: size
         // retransmission timeouts so packets queued on it aren't resent early.
@@ -231,6 +306,84 @@ impl Node {
             .lock()
             .await
             .insert(key, stream.clone());
+        let delivery_stream = stream.clone();
+        let delivery_endpoints = self.endpoints.clone();
+        tokio::spawn(async move {
+            let stream = delivery_stream;
+            let mut fragments = FragmentAssembler::default();
+            let mut fin_delivered = false;
+            'delivery: loop {
+                let cancelled = stream.delivery_cancel.notified();
+                tokio::pin!(cancelled);
+                cancelled.as_mut().enable();
+                if stream.closed.load(Ordering::Acquire) {
+                    break;
+                }
+                let batch = tokio::select! {
+                    _ = &mut cancelled => break,
+                    batch = delivery_rx.recv() => match batch {
+                        Some(batch) => batch,
+                        None => break,
+                    },
+                };
+                for payload in batch {
+                    let message = match payload[0] {
+                        KIND_DATA => Some(payload[1..].to_vec()),
+                        KIND_FRAGMENT => fragments.push(&payload[1..]),
+                        KIND_FIN => {
+                            fin_delivered = true;
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(message) = message {
+                        let tx = delivery_endpoints.data_txs.lock().await.get(&key).cloned();
+                        let Some(tx) = tx else { break 'delivery };
+                        if reliable {
+                            tokio::select! {
+                                _ = &mut cancelled => break 'delivery,
+                                result = tx.send(message) => if result.is_err() { break 'delivery; },
+                            }
+                        } else {
+                            // Best-effort delivery cannot backpressure the
+                            // remote sender. Drop at the full application
+                            // queue instead of accumulating another backlog
+                            // of stale datagrams in the delivery worker.
+                            match tx.try_send(message) {
+                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => break 'delivery,
+                            }
+                        }
+                    }
+                    if reliable {
+                        stream.flow.lock().unwrap().release();
+                        stream.notify.notify_one();
+                    }
+                }
+                if !reliable {
+                    continue;
+                }
+                // Unordered FIN must still wait for earlier sequence holes;
+                // ordered delivery naturally reaches this only after them.
+                let fin = *stream.remote_fin.lock().unwrap();
+                let ack = stream.channel.lock().await.generate_ack();
+                let receive_limit = stream.flow.lock().unwrap().receive_limit;
+                if fin_delivered
+                    && fin.zip(ack).is_some_and(|(fin, (ack, _))| {
+                        before(fin, ack) && before(fin.wrapping_add(RECEIVE_WINDOW), receive_limit)
+                    })
+                {
+                    delivery_endpoints.data_txs.lock().await.remove(&key);
+                    stream.flow.lock().unwrap().schedule_ack(true);
+                    stream.remote_closed.store(true, Ordering::Release);
+                    stream.notify.notify_one();
+                    break;
+                }
+            }
+            if !stream.remote_closed.load(Ordering::Acquire) {
+                delivery_endpoints.close_stream(key).await;
+            }
+        });
         let circuits = self.circuits.clone();
         let endpoints = self.endpoints.clone();
         let sender = self.sender.clone();
@@ -239,9 +392,13 @@ impl Node {
             let mut next_msg_id: u16 = 0;
             let mut closing = false;
             let mut fin_sent = false;
-            let mut tick = tokio::time::interval(Duration::from_millis(100));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut fin_sequence = None;
+            let mut retry_at: Option<Instant> = None;
+            let mut persist_at = None;
+            let mut persist_interval = PERSIST_INITIAL;
             'send: loop {
+                #[cfg(test)]
+                stream.sender_passes.fetch_add(1, Ordering::Relaxed);
                 let alive = if outbound {
                     circuits
                         .outbound
@@ -268,14 +425,91 @@ impl Node {
                 {
                     break;
                 }
-                let packet = {
+                let ack_limit = {
+                    let mut flow = stream.flow.lock().unwrap();
+                    if flow
+                        .ack_at
+                        .is_some_and(|at| at <= tokio::time::Instant::now())
+                    {
+                        flow.ack_at = None;
+                        flow.ack_events = 0;
+                        Some(flow.receive_limit)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(receive_limit) = ack_limit {
+                    let ack = stream.channel.lock().await.generate_ack();
+                    if let Some((ack_seq, selective_acks)) = ack {
+                        let data = StreamAckMsg {
+                            receive_limit,
+                            ack_seq,
+                            selective_acks,
+                        }
+                        .to_bytes();
+                        if send_cell(
+                            &circuits,
+                            &sender,
+                            key,
+                            outbound,
+                            RelayCellCommand::StreamAck,
+                            &data,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                // Check retries even while new packets can be sent. Doing
+                // this only in the idle select lets ACKs keep opening slots
+                // for fresh data while a hole holds up ordered delivery.
+                if stream.retry_changed.swap(false, Ordering::AcqRel) {
+                    retry_at = stream.channel.lock().await.next_retransmit_at();
+                }
+                if retry_at.is_some_and(|at| at <= Instant::now()) {
+                    let due = {
+                        let mut channel = stream.channel.lock().await;
+                        let due = channel.retransmit_due();
+                        retry_at = channel.next_retransmit_at();
+                        due
+                    };
+                    for (sequence, payload) in due {
+                        log::trace!("stream {:?}: retransmit seq {}", key.circuit_id, sequence);
+                        let mut data = sequence.to_be_bytes().to_vec();
+                        data.extend_from_slice(&payload);
+                        if send_cell(
+                            &circuits,
+                            &sender,
+                            key,
+                            outbound,
+                            RelayCellCommand::Data,
+                            &data,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break 'send;
+                        }
+                    }
+                }
+                let peer_limit = stream.flow.lock().unwrap().peer_limit;
+                let (packet, credit_blocked, next_sequence, waiting_fin_delivery) = {
                     let mut channel = stream.channel.lock().await;
                     if channel.is_dead() {
                         break;
                     }
                     // Half-close: our FIN only closes our sending direction.
                     // Keep receiving (and ACKing) until the peer also reaches EOF.
+                    // Receipt ACKs can precede application delivery. Do not
+                    // tear down the peer's delivery worker until its credit
+                    // proves it has handed off our FIN as well as our data.
+                    let waiting_fin_delivery = fin_sequence.is_some_and(|seq: u32| {
+                        !before(seq.wrapping_add(RECEIVE_WINDOW), peer_limit)
+                    });
                     if fin_sent
+                        && !waiting_fin_delivery
                         && channel.pending_retransmit().is_empty()
                         && stream
                             .remote_closed
@@ -283,16 +517,28 @@ impl Node {
                     {
                         break;
                     }
-                    if channel.can_send() {
+                    let next_sequence = channel.next_send_sequence();
+                    let credit_blocked = reliable && !before(next_sequence, peer_limit);
+                    let packet = if channel.can_send() && !credit_blocked {
                         pending.pop_front().map(|payload| {
                             fin_sent |= payload[0] == KIND_FIN;
-                            channel.prepare_send(payload).remove(0)
+                            if payload[0] == KIND_FIN {
+                                fin_sequence = Some(next_sequence);
+                            }
+                            let packet = channel.prepare_send(payload).remove(0);
+                            if let Some(at) = channel.packet_retransmit_at(packet.0) {
+                                retry_at = Some(retry_at.map_or(at, |old| old.min(at)));
+                            }
+                            packet
                         })
                     } else {
                         None
-                    }
+                    };
+                    (packet, credit_blocked, next_sequence, waiting_fin_delivery)
                 };
                 if let Some((sequence, payload)) = packet {
+                    persist_at = None;
+                    persist_interval = PERSIST_INITIAL;
                     log::trace!("stream {:?}: send seq {}", key.circuit_id, sequence);
                     let mut data = sequence.to_be_bytes().to_vec();
                     data.extend_from_slice(&payload);
@@ -311,6 +557,38 @@ impl Node {
                     }
                     continue;
                 }
+                if (credit_blocked && !pending.is_empty()) || waiting_fin_delivery {
+                    let at = persist_at
+                        .get_or_insert_with(|| tokio::time::Instant::now() + persist_interval);
+                    if *at <= tokio::time::Instant::now() {
+                        let mut data = next_sequence.to_be_bytes().to_vec();
+                        data.push(KIND_PROBE);
+                        if send_cell(
+                            &circuits,
+                            &sender,
+                            key,
+                            outbound,
+                            RelayCellCommand::Data,
+                            &data,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            break;
+                        }
+                        persist_interval = (persist_interval * 2).min(PERSIST_MAX);
+                        *at = tokio::time::Instant::now() + persist_interval;
+                    }
+                } else {
+                    persist_at = None;
+                    persist_interval = PERSIST_INITIAL;
+                }
+                let ack_at = stream.flow.lock().unwrap().ack_at;
+                let wake_at = ack_at
+                    .into_iter()
+                    .chain(persist_at)
+                    .chain(retry_at.map(tokio::time::Instant::from_std))
+                    .min();
                 tokio::select! {
                     data = outgoing.recv(), if pending.is_empty() && !closing => {
                         match data {
@@ -325,15 +603,12 @@ impl Node {
                         }
                     }
                     _ = stream.notify.notified() => {}
-                    _ = tick.tick() => {
-                        let due = stream.channel.lock().await.retransmit_due();
-                        for (sequence, payload) in due {
-                            log::trace!("stream {:?}: retransmit seq {}", key.circuit_id, sequence);
-                            let mut data = sequence.to_be_bytes().to_vec();
-                            data.extend_from_slice(&payload);
-                            if send_cell(&circuits, &sender, key, outbound, RelayCellCommand::Data, &data).await.is_err() { break 'send; }
+                    _ = async {
+                        match wake_at {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending::<()>().await,
                         }
-                    }
+                    } => {}
                 }
             }
             // Reliable FIN has been acknowledged, or the circuit is unusable.
@@ -362,8 +637,8 @@ impl Node {
     pub(super) async fn handle_stream_data(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
         let kind = SEQ_LEN;
         if data.len() < SEQ_LEN + 1
-            || data[kind] > KIND_FRAGMENT
-            || (data[kind] == KIND_FIN && data.len() != SEQ_LEN + 1)
+            || data[kind] > KIND_PROBE
+            || (matches!(data[kind], KIND_FIN | KIND_PROBE) && data.len() != SEQ_LEN + 1)
             || (data[kind] == KIND_FRAGMENT && data.len() < SEQ_LEN + FRAGMENT_HEADER)
         {
             return Err(Error::Wire("invalid stream DATA".into()));
@@ -373,60 +648,50 @@ impl Node {
             return Ok(());
         };
         let sequence = u32::from_be_bytes(data[..SEQ_LEN].try_into().unwrap());
-        let (ready, ack) = {
+        let reliable = stream.channel.lock().await.reliable;
+        if data[kind] == KIND_PROBE {
+            if reliable {
+                stream.flow.lock().unwrap().schedule_ack(true);
+                stream.notify.notify_one();
+            }
+            return Ok(());
+        }
+        if reliable && !before(sequence, stream.flow.lock().unwrap().receive_limit) {
+            // Ignore data outside granted credit, but repeat the current
+            // window in case the sender lost a window update.
+            stream.flow.lock().unwrap().schedule_ack(true);
+            stream.notify.notify_one();
+            return Ok(());
+        }
+        let (ready, immediate) = {
             let mut channel = stream.channel.lock().await;
+            let expected = channel.generate_ack().map(|(seq, _)| seq);
             let ready = channel.receive_data(sequence, data[SEQ_LEN..].to_vec());
-            (ready, channel.generate_ack())
+            let immediate = expected.is_some_and(|seq| seq != sequence) || data[kind] == KIND_FIN;
+            (ready, immediate)
         };
         if data[kind] == KIND_FIN {
             *stream.remote_fin.lock().unwrap() = Some(sequence);
         }
-        let messages: Vec<Vec<u8>> = ready
-            .into_iter()
-            .filter_map(|payload| match payload[0] {
-                KIND_DATA => Some(payload[1..].to_vec()),
-                KIND_FRAGMENT => stream.fragments.lock().unwrap().push(&payload[1..]),
-                _ => None,
-            })
-            .collect();
-        // Application backpressure must not hold a node-wide map lock.
-        for message in messages {
-            let tx = self.endpoints.data_txs.lock().await.get(&key).cloned();
-            if let Some(tx) = tx {
-                let _ = tx.send(message).await;
+        if !ready.is_empty() {
+            // Granted credit bounds outstanding packets across reordering
+            // and delivery. Never wait for the application in this lane:
+            // reverse-direction ACKs must keep making progress.
+            if stream.delivery_tx.try_send(ready).is_err() && reliable {
+                self.endpoints.close_stream(key).await;
+                return Err(Error::Protocol("stream delivery queue unavailable".into()));
             }
         }
-        if let Some((ack_seq, selective_acks)) = ack {
-            let data = ChannelAckMsg {
-                channel_id: 0,
-                ack_seq,
-                selective_acks,
-            }
-            .to_bytes();
-            send_cell(
-                &self.circuits,
-                &self.sender,
-                key,
-                stream.outbound,
-                RelayCellCommand::StreamAck,
-                &data,
-            )
-            .await?;
-            let fin = *stream.remote_fin.lock().unwrap();
-            if fin.is_some_and(|seq| ack_seq.wrapping_sub(seq) as i32 > 0) {
-                self.endpoints.data_txs.lock().await.remove(&key);
-                stream
-                    .remote_closed
-                    .store(true, std::sync::atomic::Ordering::Release);
-                stream.notify.notify_one();
-            }
+        if reliable {
+            stream.flow.lock().unwrap().schedule_ack(immediate);
+            stream.notify.notify_one();
         }
         Ok(())
     }
 
     pub(super) async fn handle_stream_ack(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
         // The decoder bounds the selective acks.
-        let ack = ChannelAckMsg::from_bytes(data)?;
+        let ack = StreamAckMsg::from_bytes(data)?;
         let stream = self.endpoints.streams.lock().await.get(&key).cloned();
         if let Some(stream) = stream {
             log::trace!(
@@ -440,6 +705,12 @@ impl Node {
                 .lock()
                 .await
                 .process_ack(ack.ack_seq, &ack.selective_acks);
+            stream.retry_changed.store(true, Ordering::Release);
+            stream
+                .flow
+                .lock()
+                .unwrap()
+                .update_peer_limit(ack.receive_limit);
             stream.notify.notify_one();
         }
         Ok(())
@@ -449,6 +720,476 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ack_batch_deadline_is_bounded_and_gaps_are_prompt() {
+        let mut flow = FlowControl::default();
+        flow.schedule_ack(false);
+        let first = flow.ack_at.unwrap();
+        for _ in 0..ACK_EVERY - 2 {
+            flow.schedule_ack(false);
+        }
+        assert_eq!(flow.ack_at, Some(first));
+        flow.schedule_ack(false);
+        assert!(flow.ack_at.unwrap() <= tokio::time::Instant::now());
+        let mut flow = FlowControl::default();
+        flow.schedule_ack(false);
+        flow.schedule_ack(true);
+        assert!(flow.ack_at.unwrap() <= tokio::time::Instant::now());
+    }
+
+    #[test]
+    fn receive_credit_is_monotonic_across_wrap_and_stale_updates() {
+        let mut flow = FlowControl::default();
+        flow.peer_limit = u32::MAX - 2;
+        flow.update_peer_limit(3);
+        assert_eq!(flow.peer_limit, 3);
+        flow.update_peer_limit(u32::MAX);
+        assert_eq!(flow.peer_limit, 3);
+        flow.receive_limit = u32::MAX;
+        flow.release();
+        assert_eq!(flow.receive_limit, 0);
+    }
+
+    async fn connected_pair(
+        mode: tarnet_api::service::PortMode,
+    ) -> (Arc<Node>, Arc<Node>, Connection, Connection) {
+        use crate::transport::tcp::TcpDiscovery;
+        let server = Arc::new(Node::new(Keypair::generate()));
+        let client = Arc::new(Node::new(Keypair::generate()));
+        let discovery = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+        let address = discovery.local_addrs()[0].to_string();
+        let listener = server
+            .circuit_listen(
+                tarnet_api::types::ServiceId::ALL,
+                mode,
+                "flow",
+                ListenerOptions::default(),
+            )
+            .await
+            .unwrap();
+        let node = server.clone();
+        tokio::spawn(async move {
+            node.run(Box::new(discovery), vec![], vec![]).await.unwrap();
+        });
+        let discovery = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
+        let node = client.clone();
+        tokio::spawn(async move {
+            node.run(Box::new(discovery), vec![address], vec![])
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !client.connected_peers().await.contains(&server.peer_id()) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let outgoing = client
+            .circuit_connect(
+                server.default_service_id().await,
+                mode,
+                "flow",
+                Some(server.peer_id()),
+                None,
+            )
+            .await
+            .unwrap();
+        let incoming = server.circuit_accept(listener.id).await.unwrap();
+        (client, server, outgoing, incoming)
+    }
+
+    async fn paused_sender(node: &Node, id: u32) -> Arc<StreamState> {
+        let stream = node
+            .endpoints
+            .streams
+            .lock()
+            .await
+            .iter()
+            .find(|(key, _)| key.circuit_id == id)
+            .unwrap()
+            .1
+            .clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let limit = stream.flow.lock().unwrap().peer_limit;
+                let paused = {
+                    let channel = stream.channel.lock().await;
+                    limit >= RECEIVE_WINDOW + 256
+                        && channel.next_send_sequence() == limit
+                        && channel.pending_retransmit().is_empty()
+                };
+                if paused {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sender did not stop cleanly at the receive window");
+        stream
+    }
+
+    #[tokio::test]
+    async fn unreliable_full_reader_drops_without_a_second_backlog() {
+        let (_client, server, _outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::UnreliableUnordered).await;
+        let key = *server.endpoints.streams.lock().await.keys().next().unwrap();
+        let stream = server.endpoints.streams.lock().await[&key].clone();
+        let (_tx, mut rx) = incoming.into_split();
+        // Inject a burst larger than the bounded application queue. Raw
+        // datagrams have no channel sequence state, ACKs, or credit returns.
+        for i in 0..400u32 {
+            let mut data = vec![0; SEQ_LEN];
+            data.push(KIND_DATA);
+            data.extend_from_slice(&i.to_be_bytes());
+            server.handle_stream_data(key, &data).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while rx.len() != 256
+                || stream.delivery_tx.capacity() != stream.delivery_tx.max_capacity()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("unreliable delivery blocked behind a full reader");
+        for i in 0..256u32 {
+            assert_eq!(rx.recv().await.unwrap(), i.to_be_bytes());
+        }
+        let mut fresh = vec![0; SEQ_LEN];
+        fresh.push(KIND_DATA);
+        fresh.extend_from_slice(b"fresh");
+        server.handle_stream_data(key, &fresh).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"fresh"
+        );
+        assert!(stream.flow.lock().unwrap().ack_at.is_none());
+        assert_eq!(stream.flow.lock().unwrap().receive_limit, RECEIVE_WINDOW);
+        assert!(stream.channel.lock().await.pending_retransmit().is_empty());
+    }
+
+    #[tokio::test]
+    async fn slow_reader_preserves_reverse_acks_and_half_close() {
+        let (client, server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let id = outgoing.id;
+        let (client_tx, mut client_rx) = outgoing.into_split();
+        let (server_tx, mut server_rx) = incoming.into_split();
+        let producer = tokio::spawn(async move {
+            for i in 0..2048u32 {
+                client_tx.send(i.to_be_bytes().to_vec()).await.unwrap();
+            }
+        });
+        let stream = paused_sender(&client, id).await;
+        assert_eq!(server_rx.len(), 256);
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(stream.channel.lock().await.pending_retransmit().is_empty());
+        server_tx.send(b"reverse".to_vec()).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client_rx.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"reverse"
+        );
+        // The reverse receipt ACK must arrive even while server_rx is full.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let stream = server
+                    .endpoints
+                    .streams
+                    .lock()
+                    .await
+                    .values()
+                    .next()
+                    .unwrap()
+                    .clone();
+                if stream.channel.lock().await.pending_retransmit().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reverse ACK blocked behind the slow reader");
+        drop(server_tx);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for i in 0..2048u32 {
+                assert_eq!(server_rx.recv().await.unwrap(), i.to_be_bytes());
+            }
+            assert!(server_rx.recv().await.is_none());
+            assert!(client_rx.recv().await.is_none());
+            producer.await.unwrap();
+        })
+        .await
+        .expect("flow-controlled data/FIN failed to drain");
+    }
+
+    #[tokio::test]
+    async fn persist_probe_recovers_a_lost_window_update() {
+        use crate::firewall::{Action, Firewall, Match};
+        let (client, _server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let id = outgoing.id;
+        let (client_tx, _client_rx) = outgoing.into_split();
+        let (_server_tx, mut server_rx) = incoming.into_split();
+        let producer = tokio::spawn(async move {
+            for i in 0..1792u32 {
+                client_tx.send(i.to_be_bytes().to_vec()).await.unwrap();
+            }
+        });
+        let stream = paused_sender(&client, id).await;
+        let old_limit = stream.flow.lock().unwrap().peer_limit;
+        let mut firewall = Firewall::default();
+        firewall.add_rule(Match::MsgType(MessageType::CircuitRelay), Action::Drop);
+        client.set_firewall(firewall).await;
+        let drain = tokio::spawn(async move {
+            for i in 0..1792u32 {
+                assert_eq!(server_rx.recv().await.unwrap(), i.to_be_bytes());
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(stream.flow.lock().unwrap().peer_limit, old_limit);
+        assert!(stream.channel.lock().await.pending_retransmit().is_empty());
+        client.set_firewall(Firewall::default()).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            drain.await.unwrap();
+            producer.await.unwrap();
+        })
+        .await
+        .expect("lost window update left the stream stuck");
+    }
+
+    #[tokio::test]
+    async fn unordered_fin_waits_for_queued_fragments() {
+        let (_client, server, _outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableUnordered).await;
+        let key = *server.endpoints.streams.lock().await.keys().next().unwrap();
+        let payload = vec![19; PACKET_MAX + 10];
+        let packets = packetize(&payload, &mut 0);
+        assert_eq!(packets.len(), 2);
+        // Receipt of the last missing fragment advances the channel's ACK
+        // past FIN before the separate delivery worker drains its queue.
+        for (sequence, packet) in [
+            (0u32, packets[0].clone()),
+            (2, vec![KIND_FIN]),
+            (1, packets[1].clone()),
+        ] {
+            let mut data = sequence.to_be_bytes().to_vec();
+            data.extend(packet);
+            server.handle_stream_data(key, &data).await.unwrap();
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), incoming.recv())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_message_larger_than_credit_makes_progress() {
+        let (_client, _server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let payload = vec![77; 3 * RECEIVE_WINDOW as usize * PACKET_MAX];
+        outgoing.send(&payload).await.unwrap();
+        drop(outgoing);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), incoming.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            payload
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+                .await
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tickless_stream_soak_with_loss_rekeys_and_idle_recovery() {
+        use crate::firewall::{Action, Firewall, Match};
+        let (client, server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let client_stream = client
+            .endpoints
+            .streams
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        let server_stream = server
+            .endpoints
+            .streams
+            .lock()
+            .await
+            .values()
+            .next()
+            .unwrap()
+            .clone();
+        for node in [&client, &server] {
+            let mut firewall = Firewall::default();
+            firewall.add_rule(
+                Match::All(vec![
+                    Match::MsgType(MessageType::CircuitRelay),
+                    Match::Probability(0.10),
+                ]),
+                Action::Drop,
+            );
+            node.set_firewall(firewall).await;
+        }
+        let rekey_node = client.clone();
+        let peer = server.peer_id();
+        let rekeys = tokio::spawn(async move {
+            for _ in 0..8 {
+                let before = rekey_node.link_key_epoch(&peer).await.unwrap();
+                rekey_node.request_link_rekey().await;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while rekey_node.link_key_epoch(&peer).await.unwrap() == before {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("rekey stalled during bidirectional traffic");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let payload = |round: u32, index: u32, direction: u8| {
+            let mut data = vec![direction; [64, 512, 2048, 8192][round as usize % 4]];
+            data[..4].copy_from_slice(&round.to_be_bytes());
+            data[4..8].copy_from_slice(&index.to_be_bytes());
+            data
+        };
+        let started = Instant::now();
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for round in 0..8 {
+                tokio::join!(
+                    async {
+                        for index in 0..64 {
+                            outgoing.send(&payload(round, index, 1)).await.unwrap();
+                        }
+                    },
+                    async {
+                        for index in 0..64 {
+                            incoming.send(&payload(round, index, 2)).await.unwrap();
+                        }
+                    },
+                    async {
+                        for index in 0..64 {
+                            assert_eq!(incoming.recv().await.unwrap(), payload(round, index, 1));
+                        }
+                    },
+                    async {
+                        for index in 0..64 {
+                            assert_eq!(outgoing.recv().await.unwrap(), payload(round, index, 2));
+                        }
+                    },
+                );
+            }
+            rekeys.await.unwrap();
+        })
+        .await
+        .expect("tickless data path stalled under loss and rekeys");
+        // Clear loss and wait for the final receipts/window updates before
+        // checking that the per-stream send tasks stop running altogether.
+        client.clear_firewall().await;
+        server.clear_firewall().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let a = client_stream
+                    .channel
+                    .lock()
+                    .await
+                    .pending_retransmit()
+                    .is_empty();
+                let b = server_stream
+                    .channel
+                    .lock()
+                    .await
+                    .pending_retransmit()
+                    .is_empty();
+                if a && b {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let a = client_stream.sender_passes.load(Ordering::Relaxed);
+        let b = server_stream.sender_passes.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        assert_eq!(
+            client_stream.sender_passes.load(Ordering::Relaxed),
+            a,
+            "client retained an idle retry timer"
+        );
+        assert_eq!(
+            server_stream.sender_passes.load(Ordering::Relaxed),
+            b,
+            "server retained an idle retry timer"
+        );
+        eprintln!("tickless stream soak: 2768896 verified bytes, 10% DATA/ACK loss each way, 8 rekeys, {:?}, 0 idle passes in 650 ms", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn burst_acks_use_fewer_frames_than_data_packets() {
+        use crate::stats::StatKey;
+        let (client, server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let id = outgoing.id;
+        let baseline = server.stats.read(&StatKey::PacketsUp).total;
+        for _ in 0..128 {
+            outgoing.send(&[1; 64]).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..128 {
+                assert_eq!(incoming.recv().await.unwrap(), vec![1; 64]);
+            }
+            loop {
+                let stream = client
+                    .endpoints
+                    .streams
+                    .lock()
+                    .await
+                    .iter()
+                    .find(|(key, _)| key.circuit_id == id)
+                    .unwrap()
+                    .1
+                    .clone();
+                if stream.channel.lock().await.pending_retransmit().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let frames = server.stats.read(&StatKey::PacketsUp).total - baseline;
+        assert!(
+            frames < 96,
+            "128 DATA packets generated {frames} reverse frames"
+        );
+    }
 
     fn roundtrip(len: usize, shuffle: bool) {
         let data: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();

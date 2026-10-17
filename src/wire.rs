@@ -1,9 +1,10 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
-/// Minimum wire protocol version this node supports.
-pub const WIRE_VERSION_MIN: u8 = 8;
+/// Minimum wire protocol version this node supports. Version 9 introduces
+/// stream receive credit and unsequenced stream window probes.
+pub const WIRE_VERSION_MIN: u8 = 9;
 /// Maximum (current) wire protocol version this node supports.
-pub const WIRE_VERSION_MAX: u8 = 8;
+pub const WIRE_VERSION_MAX: u8 = 9;
 /// Current wire version used in outgoing messages.
 pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
@@ -1914,6 +1915,36 @@ impl ChannelAckMsg {
     }
 }
 
+/// StreamAck (wire v9): receive_limit(u32) || ack_seq(u32) ||
+/// selective_count(u16) || selective_seqs(u32 each). `receive_limit` is an
+/// exclusive, wrapping sequence boundary for new DATA, independent of ACKs.
+#[derive(Debug, Clone)]
+pub struct StreamAckMsg {
+    pub receive_limit: u32,
+    pub ack_seq: u32,
+    pub selective_acks: Vec<u32>,
+}
+
+impl StreamAckMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        ChannelAckMsg {
+            channel_id: self.receive_limit,
+            ack_seq: self.ack_seq,
+            selective_acks: self.selective_acks.clone(),
+        }
+        .to_bytes()
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let ack = ChannelAckMsg::from_bytes(data)?;
+        Ok(Self {
+            receive_limit: ack.channel_id,
+            ack_seq: ack.ack_seq,
+            selective_acks: ack.selective_acks,
+        })
+    }
+}
+
 /// ChannelClose: channel_id(u32)
 #[derive(Debug, Clone)]
 pub struct ChannelCloseMsg {
@@ -2592,6 +2623,24 @@ mod tests {
         assert_eq!(decoded.channel_id, 5);
         assert_eq!(decoded.ack_seq, 100);
         assert_eq!(decoded.selective_acks, vec![102, 105]);
+    }
+
+    #[test]
+    fn stream_ack_preserves_credit_and_rejects_malformed_sacks() {
+        let ack = StreamAckMsg {
+            receive_limit: 7,
+            ack_seq: u32::MAX - 3,
+            selective_acks: vec![u32::MAX, 0, 2],
+        };
+        let bytes = ack.to_bytes();
+        let decoded = StreamAckMsg::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.receive_limit, 7);
+        assert_eq!(decoded.ack_seq, u32::MAX - 3);
+        assert_eq!(decoded.selective_acks, ack.selective_acks);
+        assert!(StreamAckMsg::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let mut oversized = bytes;
+        oversized[8..10].copy_from_slice(&((MAX_SELECTIVE_ACKS + 1) as u16).to_be_bytes());
+        assert!(StreamAckMsg::from_bytes(&oversized).is_err());
     }
 
     #[test]

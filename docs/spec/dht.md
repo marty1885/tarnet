@@ -1,4 +1,4 @@
-# DHT protocol (v1 messages over wire v8)
+# DHT protocol (v1 messages over wire v9)
 
 Status: wire format frozen with this revision. Everything under "Local policy"
 may change between releases without a compatibility break.

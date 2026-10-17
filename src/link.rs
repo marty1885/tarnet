@@ -413,6 +413,8 @@ struct LinkPipes {
     rtt: Arc<std::sync::Mutex<LinkRtt>>,
     outbound_tx: tokio::sync::mpsc::Sender<Outgoing>,
     reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
+    repair_notify: Arc<tokio::sync::Notify>,
+    rekey_notify: Arc<tokio::sync::Notify>,
     sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -677,6 +679,11 @@ pub struct PeerLink {
     /// Everything sent on the link, to the drain task.
     outbound_tx: tokio::sync::mpsc::Sender<Outgoing>,
     reassembler: Arc<std::sync::Mutex<crate::link_frame::Reassembler>>,
+    /// Receiving a fragment can arm repair polling on an otherwise idle link.
+    repair_notify: Arc<tokio::sync::Notify>,
+    /// Reused frame scratch space; large enough for any negotiated frame.
+    recv_buf: tokio::sync::Mutex<Vec<u8>>,
+    rekey_notify: Arc<tokio::sync::Notify>,
     /// Fragments recently sent, for NACK repair.
     sent_fragments: Arc<std::sync::Mutex<crate::link_frame::SentFragments>>,
     remote_peer: PeerId,
@@ -926,6 +933,9 @@ impl PeerLink {
             rtt: pipes.rtt,
             outbound_tx: pipes.outbound_tx,
             reassembler: pipes.reassembler,
+            repair_notify: pipes.repair_notify,
+            rekey_notify: pipes.rekey_notify,
+            recv_buf: tokio::sync::Mutex::new(Vec::new()),
             sent_fragments: pipes.sent_fragments,
             remote_peer,
             remote_signing_algo,
@@ -1132,6 +1142,9 @@ impl PeerLink {
             rtt: pipes.rtt,
             outbound_tx: pipes.outbound_tx,
             reassembler: pipes.reassembler,
+            repair_notify: pipes.repair_notify,
+            rekey_notify: pipes.rekey_notify,
+            recv_buf: tokio::sync::Mutex::new(Vec::new()),
             sent_fragments: pipes.sent_fragments,
             remote_peer,
             remote_signing_algo,
@@ -1231,9 +1244,14 @@ impl PeerLink {
         let rtt = Arc::new(std::sync::Mutex::new(LinkRtt::default()));
         let task_rtt = rtt.clone();
         let task_reassembler = reassembler.clone();
+        let repair_notify = Arc::new(tokio::sync::Notify::new());
+        let task_repair_notify = repair_notify.clone();
+        let rekey_notify = Arc::new(tokio::sync::Notify::new());
+        let task_rekey_notify = rekey_notify.clone();
         let task_sent = sent_fragments.clone();
         let task = tokio::spawn(async move {
             use crate::link_sched::Scheduler;
+            use futures_util::FutureExt;
             let mut sched = Scheduler::new(sched_cfg);
             // Records past the scheduler, packed into frames in order: at most
             // one frame's worth plus the rest of a fragmented message.
@@ -1248,7 +1266,7 @@ impl PeerLink {
             let mut ready: VecDeque<ReadyRecord> = VecDeque::new();
             let mut next_msg_id: u16 = 0;
             let mut reported_drops = 0;
-            let mut next_nack_poll = std::time::Instant::now();
+            let mut next_nack_poll = None;
 
             // Queue a wire message's records, remembering fragments for repair.
             // The next message starts in whatever room the frame being
@@ -1296,23 +1314,27 @@ impl PeerLink {
             };
 
             'drain: loop {
-                // Take in everything already waiting.
-                while let Ok(out) = rx.try_recv() {
+                // Bound admission work so continuously refilling producers
+                // cannot keep us in try_recv forever without sending a frame.
+                for _ in 0..OUTBOUND_QUEUE_SIZE {
+                    let Ok(out) = rx.try_recv() else { break };
                     take(&mut sched, &mut ready, out);
                 }
-                // NACK stalled partial messages, idle or busy.
+                // New fragments can move the next repair deadline earlier
+                // or later. Cache it between notifications rather than
+                // scanning partials or polling a fixed-rate timer.
                 let now = std::time::Instant::now();
-                if now >= next_nack_poll {
-                    next_nack_poll = now + stall / 2;
+                if task_repair_notify.notified().now_or_never().is_some()
+                    || next_nack_poll.is_some_and(|at| now >= at)
+                {
                     let mut r = task_reassembler.lock().unwrap();
-                    if !r.is_empty() {
-                        let repairs = r.poll(now);
-                        ready.extend(repairs.into_iter().map(|bytes| ReadyRecord {
-                            bytes,
-                            control: true,
-                            probe: None,
-                        }));
-                    }
+                    let repairs = r.poll(now);
+                    next_nack_poll = r.next_poll_at();
+                    ready.extend(repairs.into_iter().map(|bytes| ReadyRecord {
+                        bytes,
+                        control: true,
+                        probe: None,
+                    }));
                 }
 
                 if ready.is_empty() && sched.is_empty() {
@@ -1352,7 +1374,17 @@ impl PeerLink {
                                 sched.push(data, false, now);
                             }
                         }
-                        _ = tokio::time::sleep_until(next_nack_poll.into()) => {}
+                        _ = task_repair_notify.notified() => {
+                            // This select consumed the notification; force a
+                            // deadline refresh at the top of the next loop.
+                            next_nack_poll = Some(std::time::Instant::now());
+                        }
+                        _ = async {
+                            match next_nack_poll {
+                                Some(at) => tokio::time::sleep_until(at.into()).await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => {}
                     }
                     continue;
                 }
@@ -1382,7 +1414,13 @@ impl PeerLink {
                     // Everything popped was dropped by the scheduler.
                     continue;
                 };
-                let encrypted = crypto.lock().await.encrypt(&frame);
+                let encrypted = {
+                    let mut crypto = crypto.lock().await;
+                    let was_due = crypto.should_rekey();
+                    let encrypted = crypto.encrypt(&frame);
+                    if !was_due && crypto.should_rekey() { task_rekey_notify.notify_one(); }
+                    encrypted
+                };
                 if !probes.is_empty() {
                     let mut rtt = task_rtt.lock().unwrap();
                     let now = std::time::Instant::now();
@@ -1398,6 +1436,8 @@ impl PeerLink {
         });
         LinkPipes {
             rtt,
+            repair_notify,
+            rekey_notify,
             outbound_tx: tx,
             reassembler,
             sent_fragments,
@@ -1479,9 +1519,14 @@ impl PeerLink {
     }
 
     /// Enqueue a message, dropping it if the queue is full.
-    fn enqueue(&self, out: Outgoing) -> Result<()> {
-        match self.outbound_tx.try_send(out) {
-            Ok(()) => Ok(()),
+    fn enqueue(&self, data: &[u8]) -> Result<()> {
+        // Reserve before copying: congested links should not allocate and
+        // copy a message only to discard it at admission.
+        match self.outbound_tx.try_reserve() {
+            Ok(permit) => {
+                permit.send(Outgoing::Message(data.to_vec()));
+                Ok(())
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 log::trace!("outbound queue full to {:?}, dropping", self.remote_peer);
                 Ok(())
@@ -1498,7 +1543,7 @@ impl PeerLink {
     /// dropped — reliable end-to-end Channels handle recovery.
     pub async fn send_message(&self, data: &[u8]) -> Result<()> {
         self.outgoing(data)?;
-        self.enqueue(Outgoing::Message(data.to_vec()))
+        self.enqueue(data)
     }
 
     /// Send over the high-priority queue, awaiting capacity instead of
@@ -1511,10 +1556,12 @@ impl PeerLink {
     /// [`send_message`], where reliable Channels recover dropped packets.
     pub async fn send_message_critical(&self, data: &[u8]) -> Result<()> {
         self.outgoing(data)?;
-        self.outbound_tx
-            .send(Outgoing::Critical(data.to_vec()))
+        let permit = self.outbound_tx
+            .reserve()
             .await
-            .map_err(|_| Error::Wire("link closed".into()))
+            .map_err(|_| Error::Wire("link closed".into()))?;
+        permit.send(Outgoing::Critical(data.to_vec()));
+        Ok(())
     }
 
     /// Send a non-critical message via the deferred queue.
@@ -1525,9 +1572,11 @@ impl PeerLink {
     /// can see.
     pub async fn send_deferred(&self, data: &[u8]) -> Result<()> {
         self.outgoing(data)?;
-        self.outbound_tx
-            .try_send(Outgoing::Deferred(data.to_vec()))
-            .map_err(|e| Error::Wire(format!("deferred queue admission failed: {}", e)))
+        let permit = self.outbound_tx
+            .try_reserve()
+            .map_err(|e| Error::Wire(format!("deferred queue admission failed: {}", e)))?;
+        permit.send(Outgoing::Deferred(data.to_vec()));
+        Ok(())
     }
 
     /// Unpack a decrypted frame: queue its messages, reassemble fragments,
@@ -1553,6 +1602,7 @@ impl PeerLink {
                             .insert(msg_id, index, count, bytes, now);
                     inbox.extend(done);
                     repairs.extend(nacks);
+                    self.repair_notify.notify_one();
                 }
                 Record::Nack { msg_id, missing } => {
                     repairs.extend(self.sent_fragments.lock().unwrap().lookup(msg_id, &missing, now));
@@ -1572,9 +1622,18 @@ impl PeerLink {
             if let Some(msg) = self.inbox.lock().unwrap().pop_front() {
                 return Ok(msg);
             }
-            let mut buf = vec![0u8; MAX_LINK_FRAME];
+            let mut buf = self.recv_buf.lock().await;
+            if buf.is_empty() {
+                buf.resize(MAX_LINK_FRAME, 0);
+            }
             let n = self.transport.recv_frame(&mut buf).await?;
-            let result = self.crypto.lock().await.decrypt(&buf[..n]);
+            let result = {
+                let mut crypto = self.crypto.lock().await;
+                let was_due = crypto.should_rekey();
+                let result = crypto.decrypt(&buf[..n]);
+                if !was_due && crypto.should_rekey() { self.rekey_notify.notify_one(); }
+                result
+            };
             let tail = {
                 let mut tail = self.handshake_tail.lock().unwrap();
                 if result.is_ok() {
@@ -1587,6 +1646,7 @@ impl PeerLink {
                         .map(|(_, ours)| ours.clone())
                 }
             };
+            drop(buf);
             if let Some(our_confirm) = tail {
                 log::debug!("Handshake confirm from {:?} repeated, resending ours", self.remote_peer);
                 self.transport.send(&our_confirm).await?;
@@ -1704,18 +1764,48 @@ impl PeerLink {
             || self.crypto.lock().await.should_rekey()
     }
 
-    /// Ask for a rekey on the next sweep even if the message counts don't
-    /// call for one yet. Only meaningful on the initiator side.
+    /// Wake the rekey driver even if traffic has not reached the threshold.
+    /// Only meaningful on the initiator side.
     pub fn request_rekey(&self) {
         if self.is_initiator {
             self.force_rekey
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.rekey_notify.notify_one();
         }
     }
 
     /// Number of times this link's keys have been replaced since the handshake.
     pub async fn key_epoch(&self) -> u64 {
         self.crypto.lock().await.epoch
+    }
+
+    /// Owned by the node's link receive task, so link removal cancels both
+    /// I/O and maintenance. Quiet links have no rekey timer until the usage
+    /// threshold is crossed or a request is explicitly made.
+    pub(crate) async fn drive_rekey(&self) {
+        if !self.is_initiator { std::future::pending::<()>().await; }
+        loop {
+            let mut retry_at = None;
+            if self.needs_rekey().await {
+                if let Err(e) = self.rekey_initiate().await {
+                    log::debug!("Rekey initiate to {:?} failed: {}", self.remote_peer, e);
+                    retry_at = Some(std::time::Instant::now() + REKEY_RETRY_INTERVAL);
+                }
+            }
+            if let Some(pending) = self.pending_rekey.lock().await.as_ref() {
+                let at = pending.sent_at + REKEY_RETRY_INTERVAL;
+                retry_at = Some(retry_at.map_or(at, |old| old.min(at)));
+            }
+            tokio::select! {
+                _ = self.rekey_notify.notified() => {}
+                _ = async {
+                    match retry_at {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {}
+            }
+        }
     }
 
     /// Begin an in-band rekey by sending our ephemeral KEM public key, or
@@ -1768,6 +1858,7 @@ impl PeerLink {
             request: request.clone(),
             sent_at: std::time::Instant::now(),
         });
+        self.rekey_notify.notify_one();
         // Send while holding the pending lock so a concurrent caller can't slip
         // a second init in between.
         self.send_message(&request).await?;
@@ -1859,6 +1950,7 @@ impl PeerLink {
                 .install_rekey(&new_shared, self.is_initiator);
             self.force_rekey
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.rekey_notify.notify_one();
             log::debug!("Re-keyed link with {:?} (initiated)", self.remote_peer);
             Ok(())
         } else {
@@ -2321,6 +2413,88 @@ mod tests {
         assert!(link.send_deferred(&ping()).await.is_err());
         drop(_capacity);
         assert!(link.send_deferred(&ping()).await.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tickless_rekey_driver_quiesces_after_repeated_rotations() {
+        use std::{future::Future, pin::Pin, task::{Context, Poll}};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted<F> { future: Pin<Box<F>>, polls: Arc<AtomicUsize> }
+        impl<F: Future> Future for Counted<F> {
+            type Output = F::Output;
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+                let this = self.get_mut();
+                this.polls.fetch_add(1, Ordering::Relaxed);
+                this.future.as_mut().poll(cx)
+            }
+        }
+        let (a, b) = lossy_pair(&[], &[]);
+        let (a, b) = handshake_over(a, b).await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let driven = a.clone();
+        let task = tokio::spawn(Counted {
+            future: Box::pin(async move { driven.drive_rekey().await }),
+            polls: polls.clone(),
+        });
+        for epoch in 1..=32 {
+            a.request_rekey();
+            let request = WireMessage::decode(&recv_good(&b).await).unwrap();
+            b.handle_rekey_msg(&RekeyMsg::from_bytes(&request.payload).unwrap()).await.unwrap();
+            let reply = WireMessage::decode(&recv_good(&a).await).unwrap();
+            a.handle_rekey_msg(&RekeyMsg::from_bytes(&reply.payload).unwrap()).await.unwrap();
+            assert_eq!(a.key_epoch().await, epoch);
+            a.send_message(&ping()).await.unwrap();
+            assert_eq!(recv_good(&b).await, ping());
+            assert_eq!(b.key_epoch().await, epoch);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = polls.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1250)).await;
+        assert_eq!(polls.load(Ordering::Relaxed), before, "completed rekeys left a polling timer");
+        eprintln!("tickless rekey: 32 rotations, {before} driver polls, 0 idle polls in 1250 ms");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn rekey_driver_wakes_for_force_and_both_traffic_thresholds() {
+        for trigger in 0..3 {
+            let (a, b) = lossy_pair(&[], &[]);
+            let (a, b) = handshake_over(a, b).await;
+            let driver_link = a.clone();
+            let driver = tokio::spawn(async move { driver_link.drive_rekey().await; });
+            match trigger {
+                0 => a.request_rekey(),
+                1 => {
+                    a.crypto.lock().await.send_seq = REKEY_INTERVAL - 1;
+                    a.send_message(&ping()).await.unwrap();
+                    assert_eq!(recv_good(&b).await, ping());
+                }
+                _ => {
+                    b.crypto.lock().await.send_seq = REKEY_INTERVAL;
+                    b.send_message(&ping()).await.unwrap();
+                    assert_eq!(recv_good(&a).await, ping());
+                }
+            }
+            let request = recv_good(&b).await;
+            let decoded = WireMessage::decode(&request).unwrap();
+            assert_eq!(decoded.msg_type, MessageType::Rekey);
+            // Ignore a request, then ignore its first reply: the driver must
+            // retry on its one-shot deadline with no periodic node sweep.
+            assert_eq!(recv_good(&b).await, request);
+            let request = RekeyMsg::from_bytes(&decoded.payload).unwrap();
+            b.handle_rekey_msg(&request).await.unwrap();
+            let _lost_reply = recv_good(&a).await;
+            let retry = WireMessage::decode(&recv_good(&b).await).unwrap();
+            b.handle_rekey_msg(&RekeyMsg::from_bytes(&retry.payload).unwrap()).await.unwrap();
+            let reply = WireMessage::decode(&recv_good(&a).await).unwrap();
+            a.handle_rekey_msg(&RekeyMsg::from_bytes(&reply.payload).unwrap()).await.unwrap();
+            assert_eq!(a.key_epoch().await, 1);
+            assert!(!a.needs_rekey().await);
+            a.send_message(&ping()).await.unwrap();
+            assert_eq!(recv_good(&b).await, ping());
+            assert_eq!(b.key_epoch().await, 1);
+            driver.abort();
+        }
     }
 
     #[tokio::test]

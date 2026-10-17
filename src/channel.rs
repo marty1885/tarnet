@@ -112,6 +112,9 @@ struct ReliableState {
     // Sender
     send_seq: u32,
     send_window: u32,
+    /// Cumulative ACK frontier. Selective ACKs free retransmission storage,
+    /// but cannot move the receiver's bounded sequence window past a hole.
+    send_base: u32,
     /// AIMD congestion window in packets: grows per ACKed packet (doubling
     /// per RTT below `ssthresh`, one packet per RTT above it), halves on a
     /// loss. With a slow link dropping what queues too long in front of it,
@@ -163,6 +166,7 @@ impl ReliableState {
         Self {
             send_seq: 0,
             send_window: window,
+            send_base: 0,
             cwnd: INITIAL_CWND.min(window as f64),
             ssthresh: window as f64,
             recovery_until: None,
@@ -218,8 +222,15 @@ impl ReliableState {
     }
 
     /// Grow the congestion window for newly acknowledged packets.
-    fn on_acked(&mut self, packets: usize, ack_seq: u32) {
+    fn on_acked(&mut self, packets: usize, ack_seq: u32, flight: usize) {
         for _ in 0..packets {
+            // ACKs from an application-limited stream do not establish that
+            // the path can carry a larger window. Allow slow start up to
+            // twice the flight acknowledged here, but do not let occasional
+            // keystrokes accumulate a bulk-sized window over a long session.
+            if self.cwnd >= (2 * flight) as f64 {
+                break;
+            }
             if self.cwnd < self.ssthresh {
                 self.cwnd += 1.0;
             } else {
@@ -477,8 +488,12 @@ impl Channel {
         if seq_after(ack_seq, state.send_seq) {
             return acked;
         }
+        if seq_after(ack_seq, state.send_base) {
+            state.send_base = ack_seq;
+        }
         let now = Instant::now();
         let mut rtt_sample: Option<Duration> = None;
+        let flight = state.send_buf.len();
 
         // Cumulative ACK: everything before ack_seq is acknowledged
         // (wrapping-safe: ack_seq is strictly after seq)
@@ -515,7 +530,7 @@ impl Channel {
         if acked.is_empty() {
             return acked;
         }
-        state.on_acked(acked.len(), ack_seq);
+        state.on_acked(acked.len(), ack_seq, flight);
         state.last_ack_at = now;
         state.retries_since_ack = 0;
         if let Some(rtt) = rtt_sample {
@@ -598,12 +613,22 @@ impl Channel {
         }
     }
 
-    /// Check if the send window allows more data.
+    /// Sequence that will be assigned to the next new packet.
+    pub fn next_send_sequence(&self) -> u32 {
+        match &self.state {
+            ChannelState::RawDatagram => 0,
+            ChannelState::SequencedDatagram(state) => state.send_seq,
+            ChannelState::ReliableUnordered(state) | ChannelState::ReliableOrdered(state) => state.send_seq,
+        }
+    }
+
+    /// Check if the congestion and sequence windows allow more data.
     pub fn can_send(&self) -> bool {
         match self.state.reliable_state() {
             Some(state) => {
                 let window = (state.cwnd as u32).clamp(MIN_CWND as u32, state.send_window);
                 (state.send_buf.len() as u32) < window
+                    && state.send_seq.wrapping_sub(state.send_base) < state.send_window
             }
             None => true,
         }
@@ -713,6 +738,13 @@ impl Channel {
             .iter()
             .map(|(seq, &sent_at)| sent_at + Duration::from_millis(state.send_rtos[seq]))
             .min()
+    }
+
+    /// Deadline for one freshly prepared packet. Lets stream senders extend
+    /// their cached earliest deadline without scanning the entire flight.
+    pub(crate) fn packet_retransmit_at(&self, sequence: u32) -> Option<Instant> {
+        let state = self.state.reliable_state()?;
+        Some(*state.send_times.get(&sequence)? + Duration::from_millis(*state.send_rtos.get(&sequence)?))
     }
 
     /// Drain ready data (for application consumption).
@@ -1080,6 +1112,71 @@ mod reliability_tests {
             sent.push(c.prepare_send(vec![0; 10]).remove(0));
         }
         sent
+    }
+
+    #[test]
+    fn selective_acks_cannot_run_past_a_receive_window_hole() {
+        for ordered in [false, true] {
+            let mut sender = Channel::new(0, [0; 32], true, ordered);
+            let mut receiver = Channel::new(0, [0; 32], true, ordered);
+            // Also exercise sequence wrap, with an otherwise fresh channel.
+            let start = u32::MAX - 5;
+            let state = sender.state.reliable_state_mut().unwrap();
+            state.send_seq = start;
+            state.send_base = start;
+            receiver.state.reliable_state_mut().unwrap().recv_next = start;
+            let (hole, data) = sender.prepare_send(vec![1]).remove(0);
+            let mut sent = 1;
+            while sender.can_send() && sent <= DEFAULT_WINDOW_SIZE {
+                let (seq, payload) = sender.prepare_send(vec![2]).remove(0);
+                receiver.receive_data(seq, payload);
+                // A peer may report any received subset in its bounded SACK
+                // list; acknowledge the newest packet while the hole stays.
+                sender.process_ack(start, &[seq]);
+                sent += 1;
+            }
+            assert_eq!(sent, DEFAULT_WINDOW_SIZE);
+            assert!(!sender.can_send());
+            receiver.receive_data(hole, data);
+            let (ack, sack) = receiver.generate_ack().unwrap();
+            sender.process_ack(ack, &sack);
+            assert!(sender.can_send());
+            assert!(sender.pending_retransmit().is_empty());
+            // A reordered ACK cannot move the frontier backwards.
+            sender.process_ack(start, &[]);
+            assert!(sender.can_send());
+        }
+    }
+
+    #[test]
+    fn interactive_acks_do_not_inflate_the_window() {
+        for ordered in [false, true] {
+            let mut sender = Channel::new(0, [0; 32], true, ordered);
+            let mut receiver = Channel::new(0, [0; 32], true, ordered);
+            for _ in 0..4096 {
+                let (seq, data) = sender.prepare_send(vec![0; 10]).remove(0);
+                receiver.receive_data(seq, data);
+                let (ack, sack) = receiver.generate_ack().unwrap();
+                sender.process_ack(ack, &sack);
+            }
+            assert_eq!(cwnd(&sender), INITIAL_CWND);
+            assert_eq!(fill(&mut sender).len(), INITIAL_CWND as usize);
+        }
+    }
+
+    #[test]
+    fn bulk_window_grows_with_individual_acks() {
+        let mut sender = Channel::new(0, [0; 32], true, true);
+        let mut receiver = Channel::new(0, [0; 32], true, true);
+        for _ in 0..8 {
+            let before = cwnd(&sender);
+            for (seq, data) in fill(&mut sender) {
+                receiver.receive_data(seq, data);
+                let (ack, sack) = receiver.generate_ack().unwrap();
+                sender.process_ack(ack, &sack);
+            }
+            assert!(cwnd(&sender) > before);
+        }
     }
 
     #[test]

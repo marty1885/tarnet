@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -209,10 +209,10 @@ impl PeerTransport {
 
     /// Return link IDs that haven't received any message within `timeout`.
     fn dead_links(&self, timeout: Duration) -> Vec<LinkId> {
-        let cutoff = Instant::now() - timeout;
+        let now = Instant::now();
         self.links
             .iter()
-            .filter(|(_, sl)| sl.link.receive_activity().unwrap_or(sl.last_recv).max(sl.last_recv) < cutoff)
+            .filter(|(_, sl)| now.saturating_duration_since(sl.link.receive_activity().unwrap_or(sl.last_recv).max(sl.last_recv)) >= timeout)
             .map(|(&id, _)| id)
             .collect()
     }
@@ -342,6 +342,8 @@ pub struct PeerInfo {
 /// `HashMap<PeerId, Arc<PeerLink>>`. Callers get/iterate the *best* link
 /// per peer transparently. Only `insert` and `remove_link` differ.
 pub struct LinkTable {
+    maintenance_changed: Arc<tokio::sync::Notify>,
+    routing_changed: Arc<tokio::sync::Notify>,
     peers: HashMap<PeerId, PeerTransport>,
     /// Link ids are never reused, whatever peer they belong to: an event
     /// naming a link that is gone can't be mistaken for a newer link.
@@ -362,6 +364,8 @@ pub enum Removed {
 impl LinkTable {
     pub fn new() -> Self {
         Self {
+            maintenance_changed: Arc::new(tokio::sync::Notify::new()),
+            routing_changed: Arc::new(tokio::sync::Notify::new()),
             peers: HashMap::new(),
             next_id: 0,
         }
@@ -374,6 +378,8 @@ impl LinkTable {
         let pt = self.peers.entry(peer).or_insert_with(PeerTransport::new);
         let is_first = pt.is_empty();
         pt.add_link(link_id, link);
+        self.maintenance_changed.notify_one();
+        self.routing_changed.notify_one();
         (link_id, is_first)
     }
 
@@ -394,6 +400,8 @@ impl LinkTable {
             return Removed::Unknown;
         }
         pt.remove_link(link_id);
+        self.maintenance_changed.notify_one();
+        self.routing_changed.notify_one();
         if pt.is_empty() {
             self.peers.remove(peer);
             return Removed::Peer;
@@ -475,7 +483,9 @@ impl LinkTable {
     pub fn touch_recv(&mut self, peer: &PeerId, link_id: LinkId) -> bool {
         match self.peers.get_mut(peer) {
             Some(pt) if pt.links.contains_key(&link_id) => {
+                let active = pt.active;
                 pt.touch_recv(link_id);
+                if pt.active != active { self.routing_changed.notify_one(); }
                 true
             }
             _ => false,
@@ -515,6 +525,48 @@ impl LinkTable {
             }
         }
         result
+    }
+
+    pub(crate) fn maintenance_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.maintenance_changed.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reschedule_heartbeat_for_test(&mut self, peer: &PeerId, id: LinkId, at: Instant) {
+        self.peers.get_mut(peer).unwrap().links.get_mut(&id).unwrap().next_heartbeat_at = at;
+        self.maintenance_changed.notify_one();
+    }
+
+    pub(crate) fn routing_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.routing_changed.clone()
+    }
+
+    /// Earliest heartbeat, quiet-to-probing transition, or liveness expiry.
+    /// Activity only postpones these deadlines, so traffic need not wake the
+    /// scheduler: it can recompute when its previously scheduled timer fires.
+    pub(crate) fn next_maintenance_at(
+        &self,
+        dead_timeout: Duration,
+        unconfirmed_timeout: Duration,
+        reported: &HashSet<(PeerId, LinkId)>,
+    ) -> Option<Instant> {
+        let now = Instant::now();
+        self.peers.iter().flat_map(|(peer, pt)| {
+            pt.links.iter().filter_map(|(id, sl)| {
+                if reported.contains(&(*peer, *id)) { return None; }
+                let activity = sl.link.receive_activity();
+                let received = activity.unwrap_or(sl.last_recv).max(sl.last_recv);
+                let mut at = sl.next_heartbeat_at.min(received + dead_timeout);
+                let probe_at = received + PROBE_AFTER;
+                if probe_at > now { at = at.min(probe_at); }
+                if sl.link.awaiting_peer() {
+                    let expires = (sl.created_at + unconfirmed_timeout)
+                        .max(activity.map_or(sl.created_at, |at| at) + unconfirmed_timeout);
+                    at = at.min(expires);
+                }
+                Some(at)
+            })
+        }).min()
     }
 
     /// Count total inbound (responder) links across all peers.
@@ -680,6 +732,30 @@ mod tests {
         );
 
         (Arc::new(link_a.unwrap()), Arc::new(link_b.unwrap()))
+    }
+
+    #[tokio::test]
+    async fn maintenance_deadlines_cover_probe_transition_and_reported_links() {
+        let mut table = LinkTable::new();
+        let mut reported = HashSet::new();
+        let dead = Duration::from_secs(180);
+        let unconfirmed = Duration::from_secs(3600);
+        assert!(table.next_maintenance_at(dead, unconfirmed, &reported).is_none());
+        let (link, _remote) = make_test_link_pair().await;
+        let peer = link.remote_peer();
+        let (id, _) = table.insert(peer, link);
+        let now = Instant::now();
+        let sl = table.peers.get_mut(&peer).unwrap().links.get_mut(&id).unwrap();
+        sl.last_recv = now;
+        sl.next_heartbeat_at = now + HEARTBEAT_MAX;
+        assert_eq!(table.next_maintenance_at(dead, unconfirmed, &reported), Some(now + PROBE_AFTER));
+        table.peers.get_mut(&peer).unwrap().links.get_mut(&id).unwrap().last_recv = now - PROBE_AFTER;
+        table.heartbeat_due();
+        let next = table.next_maintenance_at(dead, unconfirmed, &reported).unwrap();
+        assert!(next > now);
+        assert!(next <= Instant::now() + PROBE_MAX);
+        reported.insert((peer, id));
+        assert!(table.next_maintenance_at(dead, unconfirmed, &reported).is_none());
     }
 
     /// Drive a full in-band rekey end-to-end over a real link pair and confirm

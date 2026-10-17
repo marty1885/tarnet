@@ -447,7 +447,7 @@ impl Reassembler {
         let expired: Vec<u16> = self
             .partials
             .iter()
-            .filter(|(_, p)| now.duration_since(p.started) > timeout)
+            .filter(|(_, p)| now.duration_since(p.started) >= timeout)
             .map(|(&id, _)| id)
             .collect();
         for id in expired {
@@ -456,7 +456,7 @@ impl Reassembler {
         }
         let mut nacks = Vec::new();
         for (&id, p) in self.partials.iter_mut() {
-            if p.nacks < MAX_NACKS_PER_MESSAGE && now.duration_since(p.last_rx) > p.nack_after {
+            if p.nacks < MAX_NACKS_PER_MESSAGE && now.duration_since(p.last_rx) >= p.nack_after {
                 let missing = p.frags.missing(p.frags.count());
                 if !missing.is_empty() {
                     p.nacks += 1;
@@ -470,6 +470,19 @@ impl Reassembler {
         nacks
     }
 
+    /// Next stall NACK or expiry. An empty reassembler needs no timer.
+    pub(crate) fn next_poll_at(&self) -> Option<Instant> {
+        self.partials.values().map(|p| {
+            let expires = p.started + self.timeout;
+            if p.nacks < MAX_NACKS_PER_MESSAGE {
+                expires.min(p.last_rx + p.nack_after)
+            } else {
+                expires
+            }
+        }).min()
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.partials.is_empty()
     }
@@ -708,6 +721,35 @@ mod tests {
             }
         }
         assert_eq!(done.unwrap(), data);
+    }
+
+    #[test]
+    fn repair_deadlines_cover_backoff_exhaustion_and_exact_expiry() {
+        let t0 = Instant::now();
+        let timeout = Duration::from_secs(60);
+        let mut r = Reassembler::new(8, timeout, Duration::from_millis(200));
+        assert!(r.next_poll_at().is_none());
+        r.insert(7, 0, 2, b"first", t0);
+        let mut last = t0;
+        for _ in 0..MAX_NACKS_PER_MESSAGE {
+            let at = r.next_poll_at().unwrap();
+            assert!(at > last);
+            assert!(!r.poll(at).is_empty(), "deadline did not produce a repair");
+            last = at;
+        }
+        // With no NACK budget left, wait directly for expiry rather than
+        // waking repeatedly on an already elapsed stall deadline.
+        assert_eq!(r.next_poll_at(), Some(t0 + timeout));
+        assert!(r.poll(t0 + timeout).is_empty());
+        assert!(r.next_poll_at().is_none());
+
+        let mut r = Reassembler::new(8, Duration::from_millis(10), Duration::from_secs(1));
+        r.insert(9, 0, 2, b"first", t0);
+        let at = r.next_poll_at().unwrap();
+        assert_eq!(at, t0 + Duration::from_millis(10));
+        assert!(r.poll(at).is_empty());
+        assert!(r.is_empty());
+        assert!(r.next_poll_at().is_none());
     }
 
     #[test]
