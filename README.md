@@ -23,6 +23,20 @@ cargo build --release
 
 Produces `tarnetd` (daemon) and `tarnet` (CLI) in `target/release/`.
 
+## Application connection quota
+
+`tarnetd` allows each local IPC application process up to 1,024 Tarnet
+connections, shared across all its IPC sessions. Outgoing and accepted
+connections count toward the same quota; pending connect and accept requests
+reserve slots. Requests beyond the quota fail with
+`application connection quota exceeded (1024)`. Closing a connection or
+disconnecting its IPC session releases its slots.
+
+Applications are identified by the Unix socket peer UID and PID. On platforms
+without peer PID support, sessions from the same UID share the quota. This
+quota applies to IPC clients; it does not attribute SOCKS proxy traffic to
+individual application processes. Listener handles are not counted.
+
 ## Quick start
 
 Start a node:

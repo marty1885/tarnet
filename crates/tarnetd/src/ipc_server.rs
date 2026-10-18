@@ -2,17 +2,39 @@
 //! requests to the ServiceApi. Each client gets its own task with auto-subscribed events.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use rand::Rng;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 
 use tarnet_api::error::ApiResult;
 use tarnet_api::ipc::*;
 use tarnet_api::service::{Connection, Listener, ListenerOptions, NodeEvent, PortMode, ServiceApi};
 use tarnet_api::types::{ContentHandle, DhtId, IdentityScheme, PeerId, PrivacyLevel, ServiceId};
+
+/// Shared across all IPC sessions belonging to one local process.
+const MAX_CONNECTIONS_PER_APPLICATION: usize = 1024;
+
+#[derive(Default)]
+struct ApplicationQuotas {
+    processes: HashMap<(u32, Option<i32>), Weak<Semaphore>>,
+}
+
+impl ApplicationQuotas {
+    fn for_process(&mut self, uid: u32, pid: Option<i32>) -> Arc<Semaphore> {
+        self.processes.retain(|_, quota| quota.strong_count() > 0);
+        let key = (uid, pid);
+        if let Some(quota) = self.processes.get(&key).and_then(Weak::upgrade) {
+            return quota;
+        }
+        // Platforms without peer PIDs conservatively share a quota per UID.
+        let quota = Arc::new(Semaphore::new(MAX_CONNECTIONS_PER_APPLICATION));
+        self.processes.insert(key, Arc::downgrade(&quota));
+        quota
+    }
+}
 
 /// A registered IPC connection plus the abort handle of its recv-relay task.
 /// Holding the relay handle lets `METHOD_CONN_CLOSE` stop the relay so the last
@@ -20,6 +42,7 @@ use tarnet_api::types::{ContentHandle, DhtId, IdentityScheme, PeerId, PrivacyLev
 struct ConnEntry {
     conn: Arc<Connection>,
     relay: tokio::task::AbortHandle,
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Per-client connection table: maps conn_id -> ConnEntry.
@@ -55,6 +78,7 @@ fn allocate_client_listener_id(listeners: &HashMap<u32, Listener>) -> u32 {
 async fn register_connection(
     conns: &ConnTable,
     conn: Connection,
+    permit: OwnedSemaphorePermit,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
 ) -> ConnectResp {
     let internal_conn_id = conn.id;
@@ -75,6 +99,7 @@ async fn register_connection(
             ConnEntry {
                 conn: conn.clone(),
                 relay,
+                _permit: permit,
             },
         );
         client_conn_id
@@ -147,15 +172,30 @@ pub async fn run_ipc_server(
     let listener = UnixListener::bind(&socket_path)?;
     log::info!("IPC listening on {}", socket_path.display());
 
+    let mut quotas = ApplicationQuotas::default();
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
+                let credentials = match stream.peer_cred() {
+                    Ok(credentials) => credentials,
+                    Err(e) => {
+                        log::warn!("Cannot identify IPC client: {}", e);
+                        continue;
+                    }
+                };
+                let quota = quotas.for_process(credentials.uid(), credentials.pid());
                 let client_api = api.clone();
                 let client_reload = reload_notify.clone();
                 let client_expose_reload = expose_reload_tx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_client(stream, client_api, client_reload, client_expose_reload).await
+                    if let Err(e) = handle_client(
+                        stream,
+                        client_api,
+                        client_reload,
+                        client_expose_reload,
+                        quota,
+                    )
+                    .await
                     {
                         log::debug!("IPC client disconnected: {}", e);
                     }
@@ -175,6 +215,7 @@ async fn handle_client(
     api: Arc<dyn ServiceApi>,
     reload_notify: Arc<tokio::sync::Notify>,
     expose_reload_tx: Option<tarnet_expose::expose::ReloadSender>,
+    quota: Arc<Semaphore>,
 ) -> ApiResult<()> {
     // Version handshake before splitting the stream
     let _negotiated_version = tarnet_api::ipc::handshake_server(&mut stream).await?;
@@ -211,7 +252,9 @@ async fn handle_client(
         });
     }
 
+    let mut requests = tokio::task::JoinSet::new();
     let result: ApiResult<()> = loop {
+        while requests.try_join_next().is_some() {}
         let frame = match recv_frame(&mut reader).await {
             Ok(frame) => frame,
             Err(e) => break Err(e),
@@ -332,10 +375,11 @@ async fn handle_client(
                         let published = published.clone();
                         // Handle each request concurrently so one slow DHT lookup
                         // doesn't block quick peer_id queries.
-                        tokio::spawn(async move {
+                        let quota = quota.clone();
+                        requests.spawn(async move {
                             let response = dispatch_request(
                                 &*api, method, &payload, request_id, &writer, &conns, &listeners,
-                                &published,
+                                &published, &quota,
                             )
                             .await;
                             let mut w = writer.lock().await;
@@ -352,10 +396,19 @@ async fn handle_client(
         }
     };
 
+    requests.abort_all();
+    while requests.join_next().await.is_some() {}
+    for (_, entry) in conns.lock().await.drain() {
+        entry.relay.abort();
+    }
     close_client_listeners(&*api, &listeners).await;
     for (identity, label) in published.lock().await.drain(..) {
         if let Err(e) = api.tns_withdraw(identity.as_deref(), &label).await {
-            log::debug!("Failed to withdraw '{}' after its client left: {}", label, e);
+            log::debug!(
+                "Failed to withdraw '{}' after its client left: {}",
+                label,
+                e
+            );
         }
     }
     result
@@ -394,6 +447,7 @@ fn spawn_conn_recv_relay(
                 }
             }
         }
+        conns.lock().await.remove(&conn_id);
     })
     .abort_handle()
 }
@@ -408,7 +462,18 @@ async fn dispatch_request(
     conns: &ConnTable,
     listeners: &ListenerTable,
     published: &PublishedTable,
+    quota: &Arc<Semaphore>,
 ) -> IpcFrame {
+    let permit = if matches!(method, METHOD_CONNECT | METHOD_CONNECT_TO | METHOD_ACCEPT) {
+        match quota.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                return err_response(request_id, "application connection quota exceeded (1024)")
+            }
+        }
+    } else {
+        None
+    };
     match method {
         METHOD_GET_PEER_ID => {
             let pid = api.peer_id();
@@ -553,10 +618,7 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            match api
-                .tns_publish(identity.as_deref(), &label, records)
-                .await
-            {
+            match api.tns_publish(identity.as_deref(), &label, records).await {
                 Ok(()) => {
                     let mut published = published.lock().await;
                     let entry = (identity, label);
@@ -686,7 +748,9 @@ async fn dispatch_request(
             };
             match api.connect(sid, mode, &port).await {
                 Ok(conn) => {
-                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
+                    let resp = encode_payload(
+                        &register_connection(conns, conn, permit.unwrap(), writer).await,
+                    );
                     ok_response(request_id, &resp)
                 }
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -708,7 +772,9 @@ async fn dispatch_request(
             };
             match api.accept(&listener).await {
                 Ok(conn) => {
-                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
+                    let resp = encode_payload(
+                        &register_connection(conns, conn, permit.unwrap(), writer).await,
+                    );
                     ok_response(request_id, &resp)
                 }
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -852,7 +918,9 @@ async fn dispatch_request(
             };
             match api.connect_to(&target, mode, &port).await {
                 Ok(conn) => {
-                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
+                    let resp = encode_payload(
+                        &register_connection(conns, conn, permit.unwrap(), writer).await,
+                    );
                     ok_response(request_id, &resp)
                 }
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -860,11 +928,11 @@ async fn dispatch_request(
         }
 
         METHOD_POOL_JOIN => {
-            let (name, kind): (String, tarnet_api::service::PoolKind) = match decode_payload(payload)
-            {
-                Ok(v) => v,
-                Err(e) => return err_response(request_id, &e.to_string()),
-            };
+            let (name, kind): (String, tarnet_api::service::PoolKind) =
+                match decode_payload(payload) {
+                    Ok(v) => v,
+                    Err(e) => return err_response(request_id, &e.to_string()),
+                };
             match api.pool_join(&name, kind).await {
                 Ok(root) => ok_response(request_id, &encode_payload(&root)),
                 Err(e) => err_response(request_id, &e.to_string()),
@@ -971,6 +1039,68 @@ fn err_response(request_id: u32, msg: &str) -> IpcFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn application_quota_is_shared_and_released() {
+        let mut quotas = ApplicationQuotas::default();
+        let first_session = quotas.for_process(1000, Some(42));
+        let second_session = quotas.for_process(1000, Some(42));
+        let other_process = quotas.for_process(1000, Some(43));
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_APPLICATION {
+            permits.push(first_session.clone().try_acquire_owned().unwrap());
+        }
+        assert!(second_session.clone().try_acquire_owned().is_err());
+        assert!(other_process.clone().try_acquire_owned().is_ok());
+        permits.pop();
+        let permit = second_session.clone().try_acquire_owned().unwrap();
+
+        // A real registered connection owns the slot until close/EOF cleanup.
+        let (server, _client) = UnixStream::pair().unwrap();
+        let (_, writer) = server.into_split();
+        let writer = Arc::new(Mutex::new(writer));
+        let conns = Arc::new(Mutex::new(HashMap::new()));
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(1);
+        let conn = Connection::new(
+            ServiceId::LOCAL,
+            PortMode::ReliableOrdered,
+            "test".into(),
+            1,
+            tokio::sync::mpsc::channel(1).0,
+            incoming_rx,
+        );
+        let response = register_connection(&conns, conn, permit, &writer).await;
+        assert!(second_session.clone().try_acquire_owned().is_err());
+        let entry = conns.lock().await.remove(&response.conn_id).unwrap();
+        entry.relay.abort();
+        drop(entry);
+        assert!(second_session.clone().try_acquire_owned().is_ok());
+        drop(incoming_tx);
+        drop(permits);
+        assert_eq!(
+            first_session.available_permits(),
+            MAX_CONNECTIONS_PER_APPLICATION
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_cannot_overrun_application_quota() {
+        let quota = ApplicationQuotas::default().for_process(1000, Some(42));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..1100 {
+            let quota = quota.clone();
+            requests.spawn(async move { quota.try_acquire_owned().ok() });
+        }
+        let mut permits = Vec::new();
+        while let Some(result) = requests.join_next().await {
+            if let Some(permit) = result.unwrap() {
+                permits.push(permit);
+            }
+        }
+        assert_eq!(permits.len(), MAX_CONNECTIONS_PER_APPLICATION);
+        drop(permits);
+        assert_eq!(quota.available_permits(), MAX_CONNECTIONS_PER_APPLICATION);
+    }
 
     #[test]
     fn allocated_client_conn_ids_are_nonzero_and_unique() {
