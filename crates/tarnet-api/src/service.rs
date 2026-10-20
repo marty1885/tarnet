@@ -322,6 +322,37 @@ impl MessageStream for Connection {
 
 /// The one API. Everyone uses this — daemon internals, IPC clients, tests.
 ///
+/// A signature made by an identity under the application domain: the
+/// identity's key bundle and its signature (see `identity_sign`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSignature {
+    #[serde(with = "serde_bytes")]
+    pub bundle: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Options for a throwaway identity (see `create_ephemeral_identity`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EphemeralOptions {
+    /// Hidden (the default) or Public.
+    pub privacy: crate::types::PrivacyLevel,
+    /// Circuit length. Hidden throwaways get at least 3.
+    pub outbound_hops: u8,
+    /// Hybrid (the default) or Ed25519-only.
+    pub scheme: crate::types::IdentityScheme,
+}
+
+impl Default for EphemeralOptions {
+    fn default() -> Self {
+        Self {
+            privacy: crate::types::PrivacyLevel::Hidden { intro_points: 3 },
+            outbound_hops: 3,
+            scheme: crate::types::IdentityScheme::DEFAULT,
+        }
+    }
+}
+
 /// Two implementations exist:
 /// - `LocalServiceApi` (in tarnetd): wraps `Node` directly, zero-copy
 /// - `IpcServiceApi` (in tarnet-client): serializes over Unix socket
@@ -441,9 +472,69 @@ pub trait ServiceApi: Send + Sync {
 
     // ── Event stream ──
 
-    /// Subscribe to all daemon events (data, tunnels, watches, disconnects).
+    /// Subscribe to daemon events. Over IPC a client receives watch events
+    /// for the keys it watches, and raw overlay events (`Data`, `Tunnel`)
+    /// only once it subscribes; other clients' events never reach it.
     /// Each call creates a new independent subscription.
     async fn subscribe_events(&self) -> ApiResult<mpsc::Receiver<NodeEvent>>;
+
+    // ── Identity-bound crypto (see docs/spec/identity.md, "Application API") ──
+
+    /// Sign `msg` as `identity`. The daemon signs `"tarnet app sig v2" ||
+    /// len(context) || context || msg`, never raw bytes, so an application
+    /// can't obtain a signature on a daemon message.
+    async fn identity_sign(&self, identity: ServiceId, context: &[u8], msg: &[u8]) -> ApiResult<AppSignature> {
+        let _ = (identity, context, msg);
+        Err(ApiError::Protocol("identity_sign not supported".into()))
+    }
+
+    /// Check a signature from [`identity_sign`](Self::identity_sign).
+    async fn identity_verify(
+        &self,
+        identity: ServiceId,
+        context: &[u8],
+        msg: &[u8],
+        signature: &AppSignature,
+    ) -> ApiResult<bool> {
+        let _ = (identity, context, msg, signature);
+        Err(ApiError::Protocol("identity_verify not supported".into()))
+    }
+
+    /// Decapsulate a hybrid KEM ciphertext to `identity`'s static key. The
+    /// secret is returned only after a KDF bound to `context`.
+    async fn identity_kem_decap(&self, identity: ServiceId, context: &[u8], ciphertext: &[u8]) -> ApiResult<[u8; 32]> {
+        let _ = (identity, context, ciphertext);
+        Err(ApiError::Protocol("identity_kem_decap not supported".into()))
+    }
+
+    /// `identity`'s static hybrid KEM public key.
+    async fn identity_kem_pubkey(&self, identity: ServiceId) -> ApiResult<Vec<u8>> {
+        let _ = identity;
+        Err(ApiError::Protocol("identity_kem_pubkey not supported".into()))
+    }
+
+    /// [`dht_put_signed`](Self::dht_put_signed) signed by `identity`.
+    async fn dht_put_signed_as(&self, identity: ServiceId, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
+        let _ = (identity, value, ttl_secs);
+        Err(ApiError::Protocol("dht_put_signed_as not supported".into()))
+    }
+
+    // ── Throwaway identities ──
+
+    /// Create a throwaway identity: memory only, owned by the caller (over
+    /// IPC, the client connection), gone when dropped, when the owner
+    /// disconnects, or when the daemon restarts.
+    async fn create_ephemeral_identity(&self, options: EphemeralOptions) -> ApiResult<ServiceId> {
+        let _ = options;
+        Err(ApiError::Protocol("throwaway identities not supported".into()))
+    }
+
+    /// Drop a throwaway identity: its connections and listeners close, its
+    /// keys are erased.
+    async fn drop_ephemeral_identity(&self, identity: ServiceId) -> ApiResult<()> {
+        let _ = identity;
+        Err(ApiError::Protocol("throwaway identities not supported".into()))
+    }
 
     // ── TNS: Tarnet Name System ──
 
@@ -563,6 +654,21 @@ pub trait ServiceApi: Send + Sync {
     /// - TNS name (petname or dotted name)
     /// Then builds a circuit to the resolved ServiceId.
     async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection>;
+
+    /// [`connect_to`](Self::connect_to) as `source` (its SID is what the
+    /// host sees); `None` is the default identity.
+    async fn connect_to_as(
+        &self,
+        target: &str,
+        mode: PortMode,
+        port: &str,
+        source: Option<ServiceId>,
+    ) -> ApiResult<Connection> {
+        match source {
+            None => self.connect_to(target, mode, port).await,
+            Some(_) => Err(ApiError::Protocol("connecting as an identity not supported".into())),
+        }
+    }
 
     // ── Low-level overlay/tunnel (advanced use only) ──
 

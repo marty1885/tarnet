@@ -120,6 +120,22 @@ impl Node {
         intro_points: &[(PeerId, u8, Vec<u8>)],
         hops: usize,
     ) -> Result<tarnet_api::service::Connection> {
+        let source = self.identity_store.lock().await.default_identity().keypair.clone();
+        self.connect_via_rendezvous_as(service_id, mode, port, intro_points, hops, &source)
+            .await
+    }
+
+    /// [`connect_via_rendezvous`](Self::connect_via_rendezvous) as `source`,
+    /// whose SID the service learns (and verifies) from READY.
+    pub async fn connect_via_rendezvous_as(
+        &self,
+        service_id: tarnet_api::types::ServiceId,
+        mode: tarnet_api::service::PortMode,
+        port: &str,
+        intro_points: &[(PeerId, u8, Vec<u8>)],
+        hops: usize,
+        source: &Keypair,
+    ) -> Result<tarnet_api::service::Connection> {
         if intro_points.is_empty() {
             return Err(Error::Protocol(
                 "no introduction points for rendezvous".into(),
@@ -129,7 +145,7 @@ impl Node {
         let mut last_err = Error::Protocol("no rendezvous point available".into());
         for _ in 0..RENDEZVOUS_ATTEMPTS {
             match self
-                .try_rendezvous(service_id, mode, port, intro_points, hops, &mut tried)
+                .try_rendezvous(service_id, mode, port, intro_points, hops, &mut tried, source)
                 .await
             {
                 Ok(conn) => return Ok(conn),
@@ -150,6 +166,7 @@ impl Node {
         intro_points: &[(PeerId, u8, Vec<u8>)],
         hops: usize,
         tried: &mut Vec<PeerId>,
+        source: &Keypair,
     ) -> Result<tarnet_api::service::Connection> {
         use rand::seq::SliceRandom;
         let (intro_peer, kem_algo_byte, kem_pubkey) = intro_points
@@ -220,7 +237,7 @@ impl Node {
             client_kem_algo: client_kex.algo_byte(),
             client_eph_pk: client_kex.pubkey_bytes(),
         };
-        let sealed = build_introduce_payload(&introduction, &kem_ciphertext, &static_secret);
+        let sealed = build_introduce_payload(&introduction, &kem_ciphertext, &static_secret, &service_id);
 
         // Register receivers before sending: replies may be immediate.
         let (joined_tx, joined_rx) = oneshot::channel();
@@ -265,7 +282,7 @@ impl Node {
         // The service proves it read the introduction and answered our key.
         let (join_ct, confirm) = crate::circuit::parse_join(&join)?;
         let eph_secret = Zeroizing::new(client_kex.complete(join_ct)?);
-        let (e2e, expected) =
+        let (e2e, expected, rendezvous_transcript) =
             crate::circuit::rendezvous_keys(&static_secret, &eph_secret, &sealed, join_ct);
         if !bool::from(subtle::ConstantTimeEq::ct_eq(&confirm[..], &expected[..])) {
             return Err(Error::Crypto("rendezvous confirmation failed".into()));
@@ -277,6 +294,7 @@ impl Node {
                 .ok_or_else(|| Error::Protocol("rendezvous circuit disappeared".into()))?;
             // The end-to-end layer rides inside every hop's layer.
             circuit.layers.push(e2e);
+            circuit.rekey = crate::circuit::LayerRekeyState::initiator(rendezvous_transcript);
         }
         log::info!(
             "Rendezvous established for {:?} on circuit_id={}",
@@ -287,12 +305,11 @@ impl Node {
         let conn = self
             .circuit_connection(service_id, mode, port, rend_circuit_id)
             .await;
-        self.wait_stream_connected(
-            rend_circuit_id,
-            RelayCellCommand::RendezvousReady,
-            Vec::new(),
-        )
-        .await?;
+        // READY carries our proof, bound to this rendezvous.
+        let client_auth =
+            crate::circuit::build_client_auth(source, &rendezvous_transcript, &service_id, mode, port);
+        self.wait_stream_connected(rend_circuit_id, RelayCellCommand::RendezvousReady, client_auth)
+            .await?;
         // The introduction circuit is only needed for the handshake.
         if let Some(intro_circuit_id) = intro_circuit_id {
             self.destroy_circuit(intro_circuit_id).await?;
@@ -445,7 +462,7 @@ impl Node {
             let kp = is
                 .keypair_for(&service_id)
                 .ok_or_else(|| Error::Protocol("no keypair for hidden service".into()))?;
-            crate::identity::Keypair::from_full_bytes(&Zeroizing::new(kp.to_full_bytes())).unwrap()
+            kp.clone()
         };
         // A Hidden identity has no peer record. Drop it before anything can
         // fail, and re-sign at once, so a root naming this host is never
@@ -626,7 +643,7 @@ impl Node {
         let zone_keypair = {
             let is = self.identity_store.lock().await;
             match is.keypair_for(&service_id) {
-                Some(kp) => crate::identity::Keypair::from_full_bytes(&Zeroizing::new(kp.to_full_bytes())).unwrap(),
+                Some(kp) => kp.clone(),
                 None => {
                     return Err(Error::Protocol("no keypair found for service".into()));
                 }
@@ -877,7 +894,7 @@ impl Node {
         let service_keypair = {
             let is = self.identity_store.lock().await;
             match is.keypair_for(&service_sid) {
-                Some(kp) => crate::identity::Keypair::from_full_bytes(&Zeroizing::new(kp.to_full_bytes())).unwrap(),
+                Some(kp) => kp.clone(),
                 None => {
                     log::debug!(
                         "No keypair for hidden service {:?}, dropping INTRODUCE",
@@ -894,7 +911,7 @@ impl Node {
             return;
         }
         let (intro, static_secret) =
-            match parse_introduce_payload(payload, &service_keypair.identity.kem) {
+            match parse_introduce_payload(payload, &service_keypair.identity.kem, &service_sid) {
                 Ok(v) => v,
                 Err(e) => {
                     log::debug!("Failed to parse INTRODUCE at service: {}", e);
@@ -919,7 +936,7 @@ impl Node {
             return;
         };
         let eph_secret = Zeroizing::new(eph_secret);
-        let (e2e, confirm) =
+        let (e2e, confirm, rendezvous_transcript) =
             crate::circuit::rendezvous_keys(&static_secret, &eph_secret, payload, &join_ct);
 
         // The client may have picked our host as rendezvous point without
@@ -966,10 +983,11 @@ impl Node {
                 return;
             };
             circuit.layers.push(e2e.responder());
+            circuit.rekey = crate::circuit::LayerRekeyState::responder(rendezvous_transcript);
             sealed
         };
         let (mode, port) = (intro.mode, intro.port);
-        let conn = self
+        let mut conn = self
             .circuit_connection(service_sid, mode, &port, circuit_id)
             .await;
         let (fh, cid, cells) = sealed_join;
@@ -984,12 +1002,27 @@ impl Node {
         }
 
         // Do not expose the backend until the client has installed e2e keys
-        // and its receive channel. Ready is retried and acknowledged by the client.
-        if !matches!(
-            tokio::time::timeout(Duration::from_secs(60), ready_rx).await,
-            Ok(Ok(_))
-        ) {
+        // and its receive channel, and proved which SID it is. READY is
+        // retried by the client and carries the proof.
+        let Ok(Ok(client_auth)) = tokio::time::timeout(Duration::from_secs(60), ready_rx).await else {
             log::debug!("Hidden-service client did not become ready");
+            return;
+        };
+        match crate::circuit::verify_client_auth(&client_auth, &rendezvous_transcript, &service_sid, mode, &port) {
+            Ok(client) => conn.remote_service_id = client,
+            Err(e) => {
+                log::debug!("Hidden-service client refused: {}", e);
+                let _ = self
+                    .send_circuit_data_cmd(circuit_id, RelayCellCommand::StreamRefused, &[])
+                    .await;
+                return;
+            }
+        }
+        if self
+            .send_circuit_data_cmd(circuit_id, RelayCellCommand::StreamConnected, &[])
+            .await
+            .is_err()
+        {
             return;
         }
         attempt.armed = false;
@@ -1092,11 +1125,11 @@ mod tests {
 
         let node = Node::new(Keypair::generate());
         let hidden = node
-            .create_identity("h", PrivacyLevel::Hidden { intro_points: 1 }, 1, IdentityScheme::Ed25519)
+            .create_identity("h", PrivacyLevel::Hidden { intro_points: 1 }, 1, IdentityScheme::DEFAULT)
             .await
             .unwrap();
         let public = node
-            .create_identity("p", PrivacyLevel::Public, 1, IdentityScheme::Ed25519)
+            .create_identity("p", PrivacyLevel::Public, 1, IdentityScheme::DEFAULT)
             .await
             .unwrap();
         let hidden_kp = node.keypair_for_service(&hidden).await.unwrap();

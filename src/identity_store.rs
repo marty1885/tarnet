@@ -16,7 +16,13 @@ pub struct Identity {
     pub keypair: Keypair,
     pub privacy: PrivacyLevel,
     pub outbound_hops: u8,
+    /// A throwaway: memory only, never persisted, gone on drop or restart
+    /// (`docs/spec/identity.md`, "Throwaway identities").
+    pub ephemeral: bool,
 }
+
+/// Labels of throwaway identities start with this; persistent ones may not.
+pub const EPHEMERAL_LABEL_PREFIX: char = '~';
 
 impl Identity {
     pub fn service_id(&self) -> ServiceId {
@@ -69,6 +75,7 @@ impl IdentityStore {
             keypair,
             privacy,
             outbound_hops,
+            ephemeral: false,
         };
         self.by_service_id.insert(sid, label.to_string());
         self.identities.insert(label.to_string(), identity);
@@ -86,8 +93,35 @@ impl IdentityStore {
         if self.identities.contains_key(label) {
             return Err("label already exists");
         }
+        if label.starts_with(EPHEMERAL_LABEL_PREFIX) {
+            return Err("labels starting with '~' are reserved for throwaway identities");
+        }
+        // Persistent identities are hybrid; Ed25519-only is for throwaways.
+        if scheme != IdentityScheme::FalconEd25519 {
+            return Err("persistent identities must use the hybrid scheme");
+        }
         let kp = Keypair::generate_with_scheme(scheme);
         Ok(self.insert_identity(label, kp, privacy, outbound_hops))
+    }
+
+    /// Add a throwaway identity. Its label is derived from its ServiceId.
+    pub fn insert_ephemeral(&mut self, keypair: Keypair, privacy: PrivacyLevel, outbound_hops: u8) -> ServiceId {
+        let sid = keypair.identity.service_id();
+        let label = format!(
+            "{}{}",
+            EPHEMERAL_LABEL_PREFIX,
+            &tarnet_api::types::encode_base32(sid.as_bytes())[..12]
+        );
+        let sid = self.insert_identity(&label, keypair, privacy, outbound_hops);
+        if let Some(id) = self.identities.get_mut(&label) {
+            id.ephemeral = true;
+        }
+        sid
+    }
+
+    /// Whether `sid` is a throwaway identity held here.
+    pub fn is_ephemeral(&self, sid: &ServiceId) -> bool {
+        self.get_by_service_id(sid).is_some_and(|id| id.ephemeral)
     }
 
     pub fn get(&self, label: &str) -> Option<&Identity> {
@@ -199,7 +233,7 @@ impl IdentityStore {
 
     /// Export a single identity as (label, full_key_material, privacy, outbound_hops).
     pub fn export(&self, label: &str) -> Option<(String, Vec<u8>, PrivacyLevel, u8)> {
-        self.identities.get(label).map(|id| {
+        self.identities.get(label).filter(|id| !id.ephemeral).map(|id| {
             (
                 id.label.clone(),
                 id.keypair.to_full_bytes(),
@@ -224,20 +258,14 @@ impl IdentityStore {
         Ok(self.insert_identity(label, kp, privacy, outbound_hops))
     }
 
-    /// Import from a 32-byte Ed25519 seed (v1 migration).
-    pub fn import_legacy_seed(
-        &mut self,
-        label: &str,
-        seed: [u8; 32],
-        privacy: PrivacyLevel,
-        outbound_hops: u8,
-    ) -> Result<ServiceId, &'static str> {
-        if self.identities.contains_key(label) {
-            return Err("label already exists");
-        }
-        #[allow(deprecated)] // Intentional: v1 migration from bare Ed25519 seed
-        let kp = Keypair::from_bytes(seed);
-        Ok(self.insert_identity(label, kp, privacy, outbound_hops))
+    /// DHT signers (identity key bundles hashed in the PeerId domain) whose
+    /// records the node republishes for them: persistent Public identities.
+    pub fn republishing_signers(&self) -> Vec<crate::types::PeerId> {
+        self.identities
+            .values()
+            .filter(|id| matches!(id.privacy, PrivacyLevel::Public) && !id.ephemeral)
+            .map(|id| id.keypair.peer_id())
+            .collect()
     }
 
     /// Export all identities for persistence.
@@ -245,6 +273,7 @@ impl IdentityStore {
         let mut identities: Vec<_> = self
             .identities
             .values()
+            .filter(|id| !id.ephemeral)
             .map(|id| {
                 (
                     id.label.clone(),

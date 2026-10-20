@@ -140,7 +140,7 @@ impl LocalRuntime {
                 .map(|peer| self.addrs[peer].clone())
                 .collect::<Vec<_>>();
 
-            let node = Arc::new(Node::new(Keypair::generate_ed25519()));
+            let node = Arc::new(Node::new(Keypair::generate()));
             if let Some(budget) = self.route_budget {
                 node.set_route_budget(budget).await;
                 node.set_landmark_config(tarnet::node::LandmarkConfig {

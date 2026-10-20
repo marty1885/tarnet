@@ -30,6 +30,52 @@ type ListenerTable = Arc<Mutex<HashMap<u32, Listener>>>;
 /// a name doesn't outlive the process that serves it.
 type PublishedTable = Arc<Mutex<Vec<(Option<String>, String)>>>;
 
+/// State shared by every IPC client of the daemon.
+#[derive(Default)]
+struct Shared {
+    /// How many clients watch each DHT key: the node-wide watch is dropped
+    /// only when the last one lets go.
+    watch_counts: std::sync::Mutex<HashMap<DhtId, usize>>,
+    /// Throwaway identities by owning client.
+    ephemeral_owner: std::sync::Mutex<HashMap<ServiceId, u64>>,
+    next_client: std::sync::atomic::AtomicU64,
+}
+
+/// One IPC client's view: the events meant for it and what it owns.
+struct ClientState {
+    id: u64,
+    /// Opted in to raw overlay events (`Data`, `Tunnel`).
+    raw: std::sync::atomic::AtomicBool,
+    /// DHT keys this client watches; it hears only their notifications.
+    watched: std::sync::Mutex<std::collections::HashSet<DhtId>>,
+    /// Throwaway identities this client created.
+    ephemerals: std::sync::Mutex<std::collections::HashSet<ServiceId>>,
+}
+
+impl ClientState {
+    /// Whether this client may act as `sid`: any identity but another
+    /// client's throwaway.
+    fn may_use(&self, shared: &Shared, sid: &ServiceId) -> bool {
+        shared
+            .ephemeral_owner
+            .lock()
+            .unwrap()
+            .get(sid)
+            .map_or(true, |owner| *owner == self.id)
+    }
+
+    /// Whether `event` is meant for this client.
+    fn wants(&self, event: &NodeEvent) -> bool {
+        match event {
+            NodeEvent::Data { .. } | NodeEvent::Tunnel { .. } => {
+                self.raw.load(std::sync::atomic::Ordering::Relaxed)
+            }
+            NodeEvent::Watch(w) => self.watched.lock().unwrap().contains(&w.key),
+            NodeEvent::PeerDisconnected(_) => false,
+        }
+    }
+}
+
 /// Allocate an opaque client-local handle ID for a connection.
 /// The handle space is scoped to a single Unix socket connection.
 fn allocate_client_conn_id<V>(conns: &HashMap<u32, V>) -> u32 {
@@ -136,26 +182,49 @@ pub async fn run_ipc_server(
     reload_notify: Arc<tokio::sync::Notify>,
     expose_reload_tx: Option<tarnet_expose::expose::ReloadSender>,
 ) -> ApiResult<()> {
-    // Ensure parent directory exists
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // The socket's directory and the socket are the daemon user's alone.
     if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
 
     // Remove stale socket
     let _ = std::fs::remove_file(&socket_path);
 
     let listener = UnixListener::bind(&socket_path)?;
+    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+    // We just created the socket, so its owner is the daemon's uid.
+    let daemon_uid = std::fs::metadata(&socket_path)?.uid();
     log::info!("IPC listening on {}", socket_path.display());
+    let shared = Arc::new(Shared::default());
 
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
+                // Only processes of the daemon's own user. This separates
+                // applications; it is no boundary against a hostile process
+                // running as that user.
+                match stream.peer_cred() {
+                    Ok(cred) if cred.uid() == daemon_uid => {}
+                    Ok(cred) => {
+                        log::warn!("IPC connection from uid {} refused", cred.uid());
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("IPC connection refused: no peer credentials ({})", e);
+                        continue;
+                    }
+                }
                 let client_api = api.clone();
                 let client_reload = reload_notify.clone();
                 let client_expose_reload = expose_reload_tx.clone();
+                let shared = shared.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_client(stream, client_api, client_reload, client_expose_reload).await
+                        handle_client(stream, client_api, client_reload, client_expose_reload, shared).await
                     {
                         log::debug!("IPC client disconnected: {}", e);
                     }
@@ -175,7 +244,14 @@ async fn handle_client(
     api: Arc<dyn ServiceApi>,
     reload_notify: Arc<tokio::sync::Notify>,
     expose_reload_tx: Option<tarnet_expose::expose::ReloadSender>,
+    shared: Arc<Shared>,
 ) -> ApiResult<()> {
+    let client = Arc::new(ClientState {
+        id: shared.next_client.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        raw: Default::default(),
+        watched: Default::default(),
+        ephemerals: Default::default(),
+    });
     // Version handshake before splitting the stream
     let _negotiated_version = tarnet_api::ipc::handshake_server(&mut stream).await?;
 
@@ -185,11 +261,16 @@ async fn handle_client(
     let listeners: ListenerTable = Arc::new(Mutex::new(HashMap::new()));
     let published: PublishedTable = Arc::new(Mutex::new(Vec::new()));
 
-    // Auto-subscribe: start relaying all events to this client immediately.
+    // Relay the events meant for this client: watch notifications for keys
+    // it watches, raw overlay events once it opts in. Nothing else.
     if let Ok(mut rx) = api.subscribe_events().await {
         let w = writer.clone();
+        let client = client.clone();
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
+                if !client.wants(&event) {
+                    continue;
+                }
                 let (event_type, payload) = match &event {
                     NodeEvent::Data { .. } => (EVENT_DATA, encode_payload(&event)),
                     NodeEvent::Tunnel { .. } => (EVENT_TUNNEL, encode_payload(&event)),
@@ -330,12 +411,14 @@ async fn handle_client(
                         let conns = conns.clone();
                         let listeners = listeners.clone();
                         let published = published.clone();
+                        let client = client.clone();
+                        let shared = shared.clone();
                         // Handle each request concurrently so one slow DHT lookup
                         // doesn't block quick peer_id queries.
                         tokio::spawn(async move {
                             let response = dispatch_request(
                                 &*api, method, &payload, request_id, &writer, &conns, &listeners,
-                                &published,
+                                &published, &client, &shared,
                             )
                             .await;
                             let mut w = writer.lock().await;
@@ -353,12 +436,43 @@ async fn handle_client(
     };
 
     close_client_listeners(&*api, &listeners).await;
+    // Its watches: the node-wide watch goes with the last watcher.
+    let watched: Vec<DhtId> = client.watched.lock().unwrap().drain().collect();
+    for key in watched {
+        if release_watch(&shared, &key) {
+            api.dht_unwatch(&key).await;
+        }
+    }
+    // Its throwaway identities die with it.
+    let owned: Vec<ServiceId> = client.ephemerals.lock().unwrap().drain().collect();
+    for sid in owned {
+        shared.ephemeral_owner.lock().unwrap().remove(&sid);
+        if let Err(e) = api.drop_ephemeral_identity(sid).await {
+            log::debug!("Failed to drop a throwaway identity after its client left: {}", e);
+        }
+    }
     for (identity, label) in published.lock().await.drain(..) {
         if let Err(e) = api.tns_withdraw(identity.as_deref(), &label).await {
             log::debug!("Failed to withdraw '{}' after its client left: {}", label, e);
         }
     }
     result
+}
+
+/// One watcher fewer for `key`; true when it was the last.
+fn release_watch(shared: &Shared, key: &DhtId) -> bool {
+    let mut counts = shared.watch_counts.lock().unwrap();
+    match counts.get_mut(key) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            false
+        }
+        Some(_) => {
+            counts.remove(key);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Spawn a task that relays conn.recv() -> EVENT_CONN_DATA / EVENT_CONN_CLOSED to the client.
@@ -408,7 +522,17 @@ async fn dispatch_request(
     conns: &ConnTable,
     listeners: &ListenerTable,
     published: &PublishedTable,
+    client: &ClientState,
+    shared: &Shared,
 ) -> IpcFrame {
+    // Another client's throwaway identity can't be used here.
+    macro_rules! owned_or_refuse {
+        ($sid:expr) => {
+            if !client.may_use(shared, &$sid) {
+                return err_response(request_id, "identity not found");
+            }
+        };
+    }
     match method {
         METHOD_GET_PEER_ID => {
             let pid = api.peer_id();
@@ -516,6 +640,9 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
+            if client.watched.lock().unwrap().insert(key) {
+                *shared.watch_counts.lock().unwrap().entry(key).or_insert(0) += 1;
+            }
             api.dht_watch(&key, expiry).await;
             ok_response(request_id, &[])
         }
@@ -525,8 +652,135 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
-            api.dht_unwatch(&key).await;
+            // Only this client's interest goes; others watching keep theirs.
+            if client.watched.lock().unwrap().remove(&key) && release_watch(shared, &key) {
+                api.dht_unwatch(&key).await;
+            }
             ok_response(request_id, &[])
+        }
+
+        METHOD_SUBSCRIBE_RAW => {
+            client.raw.store(true, std::sync::atomic::Ordering::Relaxed);
+            ok_response(request_id, &[])
+        }
+
+        METHOD_CONNECT_AS => {
+            let req: ConnectAsReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            owned_or_refuse!(req.source);
+            match api.connect_as(req.service_id, req.mode, &req.port, Some(req.source)).await {
+                Ok(conn) => {
+                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
+                    ok_response(request_id, &resp)
+                }
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_CONNECT_TO_AS => {
+            let req: ConnectToAsReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            owned_or_refuse!(req.source);
+            match api.connect_to_as(&req.target, req.mode, &req.port, Some(req.source)).await {
+                Ok(conn) => {
+                    let resp = encode_payload(&register_connection(conns, conn, writer).await);
+                    ok_response(request_id, &resp)
+                }
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_IDENTITY_SIGN => {
+            let req: IdentitySignReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            owned_or_refuse!(req.identity);
+            match api.identity_sign(req.identity, &req.context, &req.msg).await {
+                Ok(sig) => ok_response(request_id, &encode_payload(&sig)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_IDENTITY_VERIFY => {
+            let req: IdentityVerifyReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.identity_verify(req.identity, &req.context, &req.msg, &req.signature).await {
+                Ok(valid) => ok_response(request_id, &encode_payload(&valid)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_IDENTITY_KEM_DECAP => {
+            let req: IdentityKemDecapReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            owned_or_refuse!(req.identity);
+            match api.identity_kem_decap(req.identity, &req.context, &req.ciphertext).await {
+                Ok(secret) => ok_response(request_id, &encode_payload(&secret)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_IDENTITY_KEM_PUBKEY => {
+            let identity: ServiceId = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            owned_or_refuse!(identity);
+            match api.identity_kem_pubkey(identity).await {
+                Ok(pk) => ok_response(request_id, &encode_payload(&serde_bytes::ByteBuf::from(pk))),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_DHT_PUT_SIGNED_AS => {
+            let req: DhtPutSignedAsReq = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            owned_or_refuse!(req.identity);
+            match api.dht_put_signed_as(req.identity, &req.value, req.ttl_secs).await {
+                Ok(handle) => ok_response(request_id, &encode_payload(&handle)),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_CREATE_EPHEMERAL => {
+            let options: tarnet_api::service::EphemeralOptions = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            match api.create_ephemeral_identity(options).await {
+                Ok(sid) => {
+                    shared.ephemeral_owner.lock().unwrap().insert(sid, client.id);
+                    client.ephemerals.lock().unwrap().insert(sid);
+                    ok_response(request_id, &encode_payload(&sid))
+                }
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
+        }
+
+        METHOD_DROP_EPHEMERAL => {
+            let sid: ServiceId = match decode_payload(payload) {
+                Ok(v) => v,
+                Err(e) => return err_response(request_id, &e.to_string()),
+            };
+            if !client.ephemerals.lock().unwrap().remove(&sid) {
+                return err_response(request_id, "not a throwaway identity of this client");
+            }
+            shared.ephemeral_owner.lock().unwrap().remove(&sid);
+            match api.drop_ephemeral_identity(sid).await {
+                Ok(()) => ok_response(request_id, &[]),
+                Err(e) => err_response(request_id, &e.to_string()),
+            }
         }
 
         METHOD_CONNECTED_PEERS => {
@@ -667,6 +921,7 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
+            owned_or_refuse!(req.service_id);
             match api
                 .listen(req.service_id, req.mode, &req.port, req.options)
                 .await
@@ -738,6 +993,7 @@ async fn dispatch_request(
                 Ok(v) => v,
                 Err(e) => return err_response(request_id, &e.to_string()),
             };
+            owned_or_refuse!(req.service_id);
             match api
                 .listen_hidden(
                     req.service_id,
@@ -788,8 +1044,10 @@ async fn dispatch_request(
 
         METHOD_LIST_IDENTITIES => match api.list_identities().await {
             Ok(entries) => {
+                // Other clients' throwaway identities are invisible.
                 let ipc_entries: Vec<IdentityEntry> = entries
                     .into_iter()
+                    .filter(|e| client.may_use(shared, &e.1))
                     .map(
                         |(
                             label,
@@ -971,6 +1229,58 @@ fn err_response(request_id: u32, msg: &str) -> IpcFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client(id: u64) -> ClientState {
+        ClientState {
+            id,
+            raw: Default::default(),
+            watched: Default::default(),
+            ephemerals: Default::default(),
+        }
+    }
+
+    #[test]
+    fn clients_hear_only_their_own_events() {
+        let a = client(1);
+        let b = client(2);
+        let key = DhtId([7; 64]);
+        a.watched.lock().unwrap().insert(key);
+        let watch = NodeEvent::Watch(tarnet_api::service::WatchEvent {
+            key,
+            signer: PeerId([0; 32]),
+            value: Vec::new(),
+        });
+        assert!(a.wants(&watch));
+        assert!(!b.wants(&watch));
+        let data = NodeEvent::Data {
+            peer: PeerId([0; 32]),
+            payload: Vec::new(),
+        };
+        assert!(!a.wants(&data), "raw events are opt-in");
+        a.raw.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(a.wants(&data));
+        assert!(!b.wants(&data));
+    }
+
+    #[test]
+    fn a_watch_is_dropped_only_by_its_last_watcher() {
+        let shared = Shared::default();
+        let key = DhtId([9; 64]);
+        *shared.watch_counts.lock().unwrap().entry(key).or_insert(0) += 2;
+        assert!(!release_watch(&shared, &key), "another client still watches");
+        assert!(release_watch(&shared, &key));
+        assert!(!release_watch(&shared, &key), "nothing left to release");
+    }
+
+    #[test]
+    fn another_clients_throwaway_is_off_limits() {
+        let shared = Shared::default();
+        let sid = ServiceId([3; 32]);
+        shared.ephemeral_owner.lock().unwrap().insert(sid, 1);
+        assert!(client(1).may_use(&shared, &sid));
+        assert!(!client(2).may_use(&shared, &sid));
+        assert!(client(2).may_use(&shared, &ServiceId([4; 32])), "ordinary identities are shared");
+    }
 
     #[test]
     fn allocated_client_conn_ids_are_nonzero_and_unique() {

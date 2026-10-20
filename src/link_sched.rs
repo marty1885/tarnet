@@ -194,10 +194,23 @@ pub(crate) struct Scheduler {
     low_credit: f64,
     cfg: SchedConfig,
     dropped: u64,
+    /// Bytes each data flow sent lately (decaying, see [`SPARSE_DECAY`]),
+    /// kept after its queue empties: a bulk stream sending one message per
+    /// ACK empties its queue between messages, and is not sparse for that.
+    recent: HashMap<u64, (f64, Instant)>,
 }
 
 /// Flow key for data without one of its own.
 const ANONYMOUS_FLOW: u64 = 0;
+
+/// Time constant of a flow's recent-bytes count.
+const SPARSE_DECAY: Duration = Duration::from_secs(1);
+/// A flow that sent less than this lately is sparse (interactive): it goes
+/// ahead of backlogged flows. About three circuit cells, so a reply and its
+/// ACK both go ahead.
+const SPARSE_BYTES: f64 = 1600.0;
+/// Flows whose recent bytes are remembered.
+const RECENT_FLOWS: usize = 256;
 
 impl Scheduler {
     pub(crate) fn new(cfg: SchedConfig) -> Self {
@@ -213,7 +226,31 @@ impl Scheduler {
             low_credit: 0.0,
             cfg,
             dropped: 0,
+            recent: HashMap::new(),
         }
+    }
+
+    /// `key`'s recent bytes, decayed to `now`.
+    fn recent_bytes(&self, key: u64, now: Instant) -> f64 {
+        self.recent.get(&key).map_or(0.0, |&(bytes, at)| {
+            let dt = now.saturating_duration_since(at).as_secs_f64();
+            bytes * (-dt / SPARSE_DECAY.as_secs_f64()).exp()
+        })
+    }
+
+    fn note_sent(&mut self, key: u64, len: usize, now: Instant) {
+        let bytes = self.recent_bytes(key, now) + len as f64;
+        if self.recent.len() >= RECENT_FLOWS && !self.recent.contains_key(&key) {
+            // Forget the flow that has been quiet longest.
+            if let Some(&oldest) = self.recent.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| k) {
+                self.recent.remove(&oldest);
+            }
+        }
+        self.recent.insert(key, (bytes, now));
+    }
+
+    fn is_sparse(&self, key: u64, now: Instant) -> bool {
+        self.recent_bytes(key, now) < SPARSE_BYTES
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -252,9 +289,17 @@ impl Scheduler {
             return;
         }
         let key = flow.unwrap_or(ANONYMOUS_FLOW);
+        let sparse = self.is_sparse(key, now);
         let (flow, _) = self.flows.entry(key).or_insert_with(|| {
-            self.new_flows.push_back(key);
-            (Flow::default(), FlowList::New)
+            // A flow that sent a lot lately queues with the backlogged ones
+            // even when its queue had just run empty.
+            if sparse {
+                self.new_flows.push_back(key);
+                (Flow::default(), FlowList::New)
+            } else {
+                self.old_flows.push_back(key);
+                (Flow::default(), FlowList::Old)
+            }
         });
         flow.bytes += len;
         flow.queue.push_back(queued);
@@ -326,6 +371,24 @@ impl Scheduler {
         Some(data)
     }
 
+    /// Next message other than background: what may go between the
+    /// fragments of a background message being sent. On a slow link a DHT
+    /// record (2 KB with its signature) holds the line for a second; a
+    /// keystroke shouldn't wait for all of it. Background messages are the
+    /// only ones split this way, so no flow's messages are reordered.
+    pub(crate) fn pop_foreground(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let data = self
+            .pop_fifo(Class::Control, now)
+            .or_else(|| self.pop_fifo(Class::CircuitControl, now))
+            .or_else(|| self.pop_data(now))?;
+        if !self.fifo[Class::Background as usize].is_empty() {
+            self.low_credit = (self.low_credit
+                + data.len() as f64 * LOW_CLASS_SHARE / (1.0 - LOW_CLASS_SHARE))
+                .min(MAX_LOW_CREDIT);
+        }
+        Some(data)
+    }
+
     fn pop_fifo(&mut self, class: Class, now: Instant) -> Option<Vec<u8>> {
         loop {
             let q = self.fifo[class as usize].pop_front()?;
@@ -353,33 +416,47 @@ impl Scheduler {
                 None => (self.old_flows.pop_front()?, false),
             };
             let cfg = self.cfg.clone();
-            let (flow, list) = self.flows.get_mut(&key).expect("listed flow exists");
+            let (flow, _) = self.flows.get_mut(&key).expect("listed flow exists");
             let mut out = None;
+            let mut freed = (0usize, 0usize, 0u64);
             while let Some(q) = flow.queue.pop_front() {
                 flow.bytes -= q.data.len();
-                self.total_bytes -= q.data.len();
-                self.total_msgs -= 1;
+                freed.0 += q.data.len();
+                freed.1 += 1;
                 let sojourn = now.saturating_duration_since(q.at);
                 if flow.codel.should_drop(sojourn, flow.bytes, now, &cfg) {
-                    self.dropped += 1;
+                    freed.2 += 1;
                     continue;
                 }
                 out = Some(q.data);
                 break;
             }
-            if flow.queue.is_empty() {
+            let empty = flow.queue.is_empty();
+            let short = flow.queue.len() <= 1;
+            self.total_bytes -= freed.0;
+            self.total_msgs -= freed.1;
+            self.dropped += freed.2;
+            if let Some(data) = &out {
+                self.note_sent(key, data.len(), now);
+            }
+            if empty {
                 self.flows.remove(&key);
+            } else if from_new && short && self.is_sparse(key, now) {
+                // A sparse flow with one message left (a reply and its ACK)
+                // stays with the sparse flows; a standing queue is backlog.
+                self.new_flows.push_back(key);
             } else {
                 // A flow that still has data after its turn is backlogged.
+                let (_, list) = self.flows.get_mut(&key).expect("still queued");
                 *list = FlowList::Old;
                 self.old_flows.push_back(key);
             }
-            let _ = from_new;
             if out.is_some() {
                 return out;
             }
         }
     }
+
 }
 
 #[cfg(test)]
@@ -441,6 +518,55 @@ mod tests {
         assert_eq!(classify(&cell(7, 0)).0, Class::Data);
         assert_eq!(classify(&dht()).0, Class::Background);
         assert_ne!(classify(&cell(7, 0)).1, classify(&cell(8, 0)).1, "circuits are separate flows");
+    }
+
+    #[test]
+    fn foreground_pop_never_returns_background() {
+        let mut s = Scheduler::new(cfg());
+        let now = Instant::now();
+        s.push(dht(), false, now);
+        assert!(s.pop_foreground(now).is_none());
+        s.push(cell(1, 1), false, now);
+        s.push(keepalive(), false, now);
+        assert_eq!(s.pop_foreground(now), Some(keepalive()));
+        assert_eq!(s.pop_foreground(now), Some(cell(1, 1)));
+        assert!(s.pop_foreground(now).is_none());
+        assert_eq!(s.pop(now), Some(dht()));
+    }
+
+    #[test]
+    fn a_flow_that_sent_a_lot_lately_is_not_sparse_when_its_queue_empties() {
+        // A window-limited bulk stream: one big message at a time.
+        let big = || encode_circuit_relay_cell(1, &[7; 500]);
+        let mut s = Scheduler::new(cfg());
+        let now = Instant::now();
+        for _ in 0..4 {
+            s.push(big(), false, now);
+            assert!(s.pop(now).is_some());
+        }
+        // Its queue is empty again; a new message and a keystroke arrive.
+        s.push(big(), false, now);
+        s.push(cell(2, 0xEE), false, now);
+        assert_eq!(s.pop(now).unwrap(), cell(2, 0xEE), "the keystroke goes first");
+        // After a quiet while the bulk flow counts as sparse again.
+        let bulk = classify(&big()).1.unwrap();
+        assert!(!s.is_sparse(bulk, now));
+        assert!(s.is_sparse(bulk, now + 5 * SPARSE_DECAY));
+    }
+
+    #[test]
+    fn a_reply_and_its_ack_both_go_ahead_of_backlog() {
+        let mut s = Scheduler::new(cfg());
+        let now = Instant::now();
+        for i in 0..6 {
+            s.push(cell(1, i), false, now);
+        }
+        assert_eq!(s.pop(now).unwrap(), cell(1, 0));
+        s.push(cell(2, 0xA), false, now);
+        s.push(cell(2, 0xB), false, now);
+        assert_eq!(s.pop(now).unwrap(), cell(2, 0xA));
+        assert_eq!(s.pop(now).unwrap(), cell(2, 0xB));
+        assert_eq!(s.pop(now).unwrap(), cell(1, 1));
     }
 
     #[test]

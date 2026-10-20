@@ -70,12 +70,9 @@ pub fn location(blinded_pk: &[u8; 32]) -> DhtId {
 }
 
 pub fn label_key(pk: &[u8], label: &str, lane: u8) -> Result<([u8; 32], DhtId)> {
-    let point = CompressedEdwardsY(
-        pk.get(..32)
-            .ok_or_else(|| Error::Crypto("short TNS key".into()))?
-            .try_into()
-            .unwrap(),
-    )
+    let ed = crate::identity::bundle_ed25519(pk)
+        .ok_or_else(|| Error::Crypto("invalid TNS identity key bundle".into()))?;
+    let point = CompressedEdwardsY(ed)
     .decompress()
     .ok_or_else(|| Error::Crypto("invalid TNS Ed25519 point".into()))?;
     if !point.is_torsion_free() || point.is_small_order() {

@@ -38,7 +38,7 @@ impl Node {
             _ => store.default_identity(),
         };
         // Keypair is not Clone (holds secret material); reconstruct from bytes.
-        Keypair::from_full_bytes(&id.keypair.to_full_bytes()).ok()
+        Some(id.keypair.clone())
     }
 
     /// Import a pool under a local name (persisted). Returns the pool root.

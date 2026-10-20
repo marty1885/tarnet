@@ -5,17 +5,6 @@ use tarnet::dht::{DhtStore, VerifiedRecord};
 use tarnet::identity::{peer_id_from_signing_pubkey, verify_with_pubkey, KemKeypair, Keypair};
 
 #[test]
-fn audit_low_order_x25519_is_rejected() {
-    let key = KemKeypair::generate_ephemeral(KemAlgo::X25519);
-    for first_byte in [0, 1] {
-        let mut low_order = [0; 32];
-        low_order[0] = first_byte;
-        assert!(KemKeypair::encapsulate_to(&low_order, KemAlgo::X25519).is_err());
-        assert!(key.decapsulate(&low_order).is_err());
-    }
-}
-
-#[test]
 fn audit_hybrid_kem_rejects_low_order_classical_component() {
     let key = KemKeypair::generate_ephemeral(KemAlgo::MlkemX25519);
     let mut public = key.kem_pubkey_bytes();
@@ -32,7 +21,7 @@ fn audit_hybrid_kem_rejects_low_order_classical_component() {
 
 #[test]
 fn audit_kem_rejects_truncated_and_extended_inputs() {
-    for algo in [KemAlgo::X25519, KemAlgo::MlkemX25519] {
+    for algo in [KemAlgo::MlkemX25519] {
         let key = KemKeypair::generate_ephemeral(algo);
         let public = key.kem_pubkey_bytes();
         let (_, ciphertext) = KemKeypair::encapsulate_to(&public, algo).unwrap();
@@ -63,13 +52,13 @@ fn audit_identity_point_signature_is_rejected() {
 
 #[test]
 fn audit_expired_zone_root_can_be_replayed_to_fresh_store() {
-    let owner = Keypair::generate_classic();
+    let owner = Keypair::generate();
     let original = VerifiedRecord::new_zone_root(&owner, b"old root", 1, Duration::from_secs(1));
     let mut replay = original.into_inner();
     // The relay replaces the unsigned remaining TTL, after the original expired.
     replay.expires = Instant::now() + Duration::from_secs(24 * 3600);
     let verified = VerifiedRecord::verify_incoming(replay).unwrap();
-    let mut fresh_store = DhtStore::new(&Keypair::generate_classic().peer_id());
+    let mut fresh_store = DhtStore::new(&Keypair::generate().peer_id());
     assert!(fresh_store.put(verified));
 }
 
@@ -85,7 +74,7 @@ fn audit_content_dictionary_guess_recovers_handle() {
 
 #[test]
 fn audit_storage_node_can_decrypt_hello_wrapper() {
-    let owner = Keypair::generate_classic();
+    let owner = Keypair::generate();
     let record = VerifiedRecord::new_hello(&owner, b"transport addresses", 1, Duration::from_secs(60));
     let stored = record.record();
     assert_eq!(

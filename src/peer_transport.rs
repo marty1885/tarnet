@@ -881,8 +881,8 @@ mod tests {
         let (a, b) = mem_transport_pair();
         let budget = Arc::new(BandwidthLimiter::new(0, 0));
         let b = MeteredTransport::wrap(Box::new(b), budget.clone(), Arc::new(StatsRegistry::new()));
-        let ka = Keypair::generate_ed25519();
-        let kb = Keypair::generate_ed25519();
+        let ka = Keypair::generate();
+        let kb = Keypair::generate();
         let (a, b) = tokio::join!(PeerLink::initiator(Box::new(a), &ka, None), PeerLink::responder(b, &kb));
         let a = a.unwrap();
         let b = Arc::new(b.unwrap());

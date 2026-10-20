@@ -314,8 +314,8 @@ mod tests {
         let (a, b) = pair();
         let a = MeteredTransport::wrap(a, Arc::new(BandwidthLimiter::new(0, 0)), stats_a.clone());
         let b = MeteredTransport::wrap(b, Arc::new(BandwidthLimiter::new(0, 0)), stats_b.clone());
-        let ka = Keypair::generate_ed25519();
-        let kb = Keypair::generate_ed25519();
+        let ka = Keypair::generate();
+        let kb = Keypair::generate();
         let (a, b) = tokio::join!(
             PeerLink::initiator(a, &ka, None),
             PeerLink::responder(b, &kb)

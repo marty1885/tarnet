@@ -45,7 +45,7 @@ struct Opts {
 }
 
 async fn spawn(budget: usize, bootstrap: Vec<String>, opts: Opts) -> Spawned {
-    let node = Arc::new(Node::new(Keypair::generate_ed25519()));
+    let node = Arc::new(Node::new(Keypair::generate()));
     node.set_route_budget(budget).await;
     let mut config = opts.landmarks.unwrap_or_else(fast_landmarks);
     if opts.no_landmarks {

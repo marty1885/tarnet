@@ -106,6 +106,8 @@ DhtNeighbor    (0x0205)  dht_version(u8) || flags(u8)   bit0 STORES; sent on lin
 sequence(u64) || signer(32) || ttl(u32) || value_len(u16) || value ||
 sig_len(u16) || signature || signer_algo(u8) || pk_len(u16) || signer_pubkey`.
 `ttl` is the lifetime left, in seconds; it is not signed (see below).
+Wire v10 replaces `signer_algo || pk_len || signer_pubkey` and the signature
+with an identity v2 key bundle and a policy signature; see [identity v2](identity.md).
 
 Messages with an unknown `dht_version` are dropped. There is no hop counter,
 originator-set hop limit, or replication count on the wire: a neighbour cannot
@@ -232,7 +234,7 @@ is a secret, so it is never logged.
 | d | number of direct links |
 | GET rounds | a search launches ρ fresh walks every 1.5 s, 3 rounds in total (keys can hold several records); dropping the search stops it |
 | Originator walks | spread over distinct random neighbours, cycling if ρ > d |
-| Republish | owners republish their own records: hello every 5 min; a zone's descriptor and independent label candidates every 4 min for a Public identity, with each intro refresh (every 200–300 s) for a Hidden one; other records signed by the node's own key every 30 min. TNS records are republished only by their identity timers, including the node identity's zone. Hello + other own records republished and watches relaunched 1–3 s after links come or go, at most once per 60 s: changes inside that window are folded into one republish at its end |
+| Republish | owners republish their own records: hello every 5 min; a zone's descriptor and independent label candidates every 4 min for a Public identity, with each intro refresh (every 200–300 s) for a Hidden one; other records signed by the node's own key, and signed content of its persistent Public identities, every 30 min (Hidden and throwaway identities republish their own). TNS records are republished only by their identity timers, including the node identity's zone. Hello + other own records republished and watches relaunched 1–3 s after links come or go, at most once per 60 s: changes inside that window are folded into one republish at its end |
 | Watches | the watcher relaunches its watch walks every 60 s until the requested expiry, each walk registering for 120 s; unwatch only drops local state, registrations along old walks expire. The app hears of each record version once, and never of one older than it was told |
 | Store caps | 4096 records / 16 MB (full encoded size), fair-share eviction by source, TTL caps |
 | DHT budget | per link: 256 queries (GET, WATCH) per window, plus the phase 1 ingest budget for records |

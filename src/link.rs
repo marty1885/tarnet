@@ -4,16 +4,16 @@ use rand::RngCore;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use std::time::Duration;
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519Public};
 
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::crypto::kdf;
+use crate::crypto::{kdf, Ratchet};
 use crate::identity::{self, peer_id_from_signing_pubkey, KemKeypair, Keypair};
 use crate::transport::Transport;
 use crate::types::{Error, PeerId, Result};
 use crate::wire::{
-    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, MessageType, RekeyMsg, WireMessage,
+    HandshakeAuth, HandshakeConfirmMsg, HandshakeHello, HandshakeResponse, MessageType, RekeyMsg,
+    WireMessage,
     HEADER_SIZE,
     MAX_PAYLOAD, WIRE_VERSION_MAX, WIRE_VERSION_MIN,
 };
@@ -34,7 +34,13 @@ const FAST_FRAME_PLAIN: usize = 1452;
 const _: () = assert!(FAST_FRAME_PLAIN >= HEADER_SIZE + 4 + crate::circuit::CELL_SIZE + 3);
 
 /// Frame plaintext size on slow links: 256 bytes on the wire with seq and tag.
+/// Frames sized to split a cell evenly (three of 207 B) cut an isolated
+/// cell's airtime by a fifth, but lose more for bulk: with 256 B frames the
+/// next cell starts in the room the last fragment leaves, about 2.25 frames
+/// per cell when backlogged.
 const SLOW_FRAME_PLAIN: usize = 256 - SEQ_SIZE - TAG_SIZE;
+/// A circuit cell as a wire message: nearly all slow-link traffic.
+const CELL_MESSAGE: usize = HEADER_SIZE + 4 + crate::circuit::CELL_SIZE;
 /// Links whose transport reports less bandwidth than this (bytes/s) are slow.
 const SLOW_LINK_BPS: u64 = 100_000;
 
@@ -66,15 +72,21 @@ pub const REKEY_INTERVAL: u64 = 65536;
 /// receiving anything from the peer; see [`handshake_deadline`].
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Approximate total size of a handshake, for scaling its deadline to slow links.
-const HANDSHAKE_BYTES: u64 = 12 * 1024;
+const HANDSHAKE_BYTES: u64 = 6 * 1024;
 /// A handshake that keeps trickling bytes is still cut off after this many
 /// deadlines, so a peer can't hold a handshake slot open forever.
 const HANDSHAKE_HARD_CAP_FACTOR: u32 = 10;
-/// Session keys for bidirectional encrypted communication.
+/// Rekey after this long even on a quiet link (`docs/spec/identity.md`, "Key
+/// lifetime"), measured on the local monotonic clock.
+pub const REKEY_MAX_AGE: Duration = Duration::from_secs(3600);
+
+/// Session keys for bidirectional encrypted communication. Each direction's
+/// key runs under the symmetric epoch ratchet ([`Ratchet`]); rekeys replace
+/// the base keys with fresh KEM-derived ones.
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct LinkCrypto {
-    send_enc_key: [u8; 32],
-    recv_enc_key: [u8; 32],
+    send: Ratchet,
+    recv: Ratchet,
     /// Previous recv key, retained across a rekey so in-flight frames the peer
     /// sent under the old key still decrypt. Held until the *next* rekey rotates
     /// it out (see [`install_rekey`]), not dropped on the first new-key frame —
@@ -83,7 +95,7 @@ struct LinkCrypto {
     /// for the whole epoch makes decryption independent of transport ordering
     /// (needed for datagram transports such as UDP); replay is still caught
     /// per-key by `prev_recv_window`/`prev_recv_bitmap`.
-    prev_recv_key: Option<[u8; 32]>,
+    prev_recv: Option<Ratchet>,
     #[zeroize(skip)]
     send_seq: u64,
     #[zeroize(skip)]
@@ -100,6 +112,8 @@ struct LinkCrypto {
     /// the way back costs nothing — the initiator retries and we resend it.
     pending_send: Option<[u8; 32]>,
     pending_recv: Option<[u8; 32]>,
+    /// The chain secret those pending keys came from.
+    pending_chain: Option<[u8; 32]>,
     /// Identifies the request `pending_*` answers (hash of its KEM pubkey).
     #[zeroize(skip)]
     pending_tag: Option<[u8; 32]>,
@@ -110,23 +124,36 @@ struct LinkCrypto {
     /// Number of key installs on this link (0 = handshake keys).
     #[zeroize(skip)]
     epoch: u64,
+    /// Secret each rekey mixes into the next one (the session secret, then
+    /// each rekey's result), so a rekey's keys depend on every earlier one.
+    chain_secret: [u8; 32],
+    /// Hash of the handshake transcript, bound into every rekey.
+    #[zeroize(skip)]
+    transcript: [u8; 32],
+    /// When the current keys were installed (local monotonic clock).
+    #[zeroize(skip)]
+    installed_at: std::time::Instant,
 }
 
 impl LinkCrypto {
+    fn directional(shared_secret: &[u8; 32], is_initiator: bool) -> ([u8; 32], [u8; 32]) {
+        let i2r = kdf(shared_secret, "tarnet link i2r_enc");
+        let r2i = kdf(shared_secret, "tarnet link r2i_enc");
+        if is_initiator {
+            (i2r, r2i)
+        } else {
+            (r2i, i2r)
+        }
+    }
+
     /// Derive session keys from shared secret. Initiator and responder derive
     /// complementary key pairs (initiator's send = responder's recv).
     fn derive(shared_secret: &[u8; 32], is_initiator: bool) -> Self {
-        let mut send_enc = Zeroizing::new(kdf(shared_secret, "tarnet link i2r_enc"));
-        let mut recv_enc = Zeroizing::new(kdf(shared_secret, "tarnet link r2i_enc"));
-
-        if !is_initiator {
-            std::mem::swap(&mut send_enc, &mut recv_enc);
-        }
-
+        let (send, recv) = Self::directional(shared_secret, is_initiator);
         Self {
-            send_enc_key: *send_enc,
-            recv_enc_key: *recv_enc,
-            prev_recv_key: None,
+            send: Ratchet::new(send),
+            recv: Ratchet::new(recv),
+            prev_recv: None,
             send_seq: 0,
             recv_window: 0,
             recv_bitmap: 0,
@@ -134,69 +161,101 @@ impl LinkCrypto {
             prev_recv_bitmap: 0,
             pending_send: None,
             pending_recv: None,
+            pending_chain: None,
             pending_tag: None,
             completed_tag: None,
             epoch: 0,
+            chain_secret: *shared_secret,
+            transcript: [0; 32],
+            installed_at: std::time::Instant::now(),
         }
+    }
+
+    /// Record the handshake's session secret and transcript for rekeys.
+    fn with_chain(mut self, session: &[u8; 32], transcript: [u8; 32]) -> Self {
+        self.chain_secret = *session;
+        self.transcript = transcript;
+        self
+    }
+
+    /// The secret a rekey installs: the previous chain secret, the rekey's
+    /// KEM secret, and a hash binding the handshake transcript, the target
+    /// epoch and the exchanged key and ciphertext.
+    fn rekey_secret(&self, epoch: u64, kem_ss: &[u8; 32], kem_pk: &[u8], kem_ct: &[u8]) -> Zeroizing<[u8; 32]> {
+        let binding = blake3::Hasher::new_derive_key("tarnet link v2 rekey binding")
+            .update(&self.transcript)
+            .update(&epoch.to_be_bytes())
+            .update(&(kem_pk.len() as u32).to_be_bytes())
+            .update(kem_pk)
+            .update(&(kem_ct.len() as u32).to_be_bytes())
+            .update(kem_ct)
+            .finalize();
+        Zeroizing::new(
+            blake3::Hasher::new_derive_key("tarnet link v2 rekey")
+                .update(&self.chain_secret)
+                .update(kem_ss)
+                .update(binding.as_bytes())
+                .finalize()
+                .into(),
+        )
     }
 
     /// Install freshly-rekeyed session keys derived from `new_shared`.
     ///
-    /// The current recv key is retained as `prev_recv_key` so frames the peer
+    /// The current recv key is retained as `prev_recv` so frames the peer
     /// already put on the wire under the old key keep decrypting. It is held for
-    /// the whole new epoch and only rotated out here at the *next* rekey (the
-    /// `prev_recv_key.take()` below zeroizes the key from two epochs ago), so at
+    /// the whole new epoch and only rotated out here at the *next* rekey, so at
     /// most one previous epoch is ever live. The send key flips immediately; the
     /// peer tolerates the overlap symmetrically via its own retained previous key.
     fn install_rekey(&mut self, new_shared: &[u8; 32], is_initiator: bool) {
-        let fresh = Self::derive(new_shared, is_initiator);
-        self.install_keys(fresh.send_enc_key, fresh.recv_enc_key);
-        // `fresh` drops here; ZeroizeOnDrop wipes its own key copies.
+        let (send, recv) = Self::directional(new_shared, is_initiator);
+        self.install_keys(send, recv, *new_shared);
     }
 
-    fn install_keys(&mut self, send: [u8; 32], recv: [u8; 32]) {
-        if let Some(mut old) = self.prev_recv_key.take() {
-            old.zeroize();
-        }
-        self.prev_recv_key = Some(self.recv_enc_key);
+    fn install_keys(&mut self, send: [u8; 32], recv: [u8; 32], chain: [u8; 32]) {
+        let old_recv = std::mem::replace(&mut self.recv, Ratchet::new(recv));
+        self.prev_recv = Some(old_recv);
         self.prev_recv_window = self.recv_window;
         self.prev_recv_bitmap = self.recv_bitmap;
 
-        self.send_enc_key = send;
-        self.recv_enc_key = recv;
+        self.send = Ratchet::new(send);
+        self.chain_secret = chain;
         self.send_seq = 0;
         self.recv_window = 0;
         self.recv_bitmap = 0;
         self.epoch += 1;
+        self.installed_at = std::time::Instant::now();
     }
 
     /// Responder: hold the keys for an answered rekey request until the
     /// initiator proves it has them (see `pending_recv`). A newer request
     /// replaces an unconfirmed older one.
     fn stage_rekey(&mut self, new_shared: &[u8; 32], is_initiator: bool, tag: [u8; 32]) {
-        let fresh = Self::derive(new_shared, is_initiator);
+        let (send, recv) = Self::directional(new_shared, is_initiator);
         self.clear_pending();
-        self.pending_send = Some(fresh.send_enc_key);
-        self.pending_recv = Some(fresh.recv_enc_key);
+        self.pending_send = Some(send);
+        self.pending_recv = Some(recv);
+        self.pending_chain = Some(*new_shared);
         self.pending_tag = Some(tag);
     }
 
     fn clear_pending(&mut self) {
-        if let Some(mut k) = self.pending_send.take() {
-            k.zeroize();
-        }
-        if let Some(mut k) = self.pending_recv.take() {
-            k.zeroize();
+        for k in [&mut self.pending_send, &mut self.pending_recv, &mut self.pending_chain] {
+            if let Some(mut k) = k.take() {
+                k.zeroize();
+            }
         }
         self.pending_tag = None;
     }
 
     /// True once either direction has sent/received enough messages to warrant
-    /// a rekey. Checking `recv_window` (the highest seq seen from the peer)
-    /// means a link whose heavy direction is inbound still rotates keys, even
-    /// if our own send side is mostly idle.
+    /// a rekey, or the keys are an hour old. Checking `recv_window` (the
+    /// highest seq seen from the peer) means a link whose heavy direction is
+    /// inbound still rotates keys, even if our own send side is mostly idle.
     fn should_rekey(&self) -> bool {
-        self.send_seq >= REKEY_INTERVAL || self.recv_window >= REKEY_INTERVAL
+        self.send_seq >= REKEY_INTERVAL
+            || self.recv_window >= REKEY_INTERVAL
+            || self.installed_at.elapsed() >= REKEY_MAX_AGE
     }
 
     /// Frame nonce: 16 zero bytes followed by the frame's `seq`. Safe because
@@ -214,7 +273,8 @@ impl LinkCrypto {
         self.send_seq += 1;
         let seq_bytes = seq.to_be_bytes();
 
-        let cipher = XChaCha20Poly1305::new((&self.send_enc_key).into());
+        let key = Zeroizing::new(self.send.send_key(seq));
+        let cipher = XChaCha20Poly1305::new((&*key).into());
         let ciphertext = cipher
             .encrypt(
                 (&Self::frame_nonce(seq)).into(),
@@ -231,12 +291,17 @@ impl LinkCrypto {
         out
     }
 
-    /// AEAD-open `data` under `key`, returning (payload, seq).
-    /// Does not run replay detection — the caller picks the matching window.
-    fn aead_open(key: &[u8; 32], data: &[u8]) -> Result<(Vec<u8>, u64)> {
+    /// AEAD-open `data` with the key `ratchet` gives its seq, returning
+    /// (payload, seq). Changes nothing; the caller commits on success.
+    fn aead_open(ratchet: &Ratchet, data: &[u8]) -> Result<(Vec<u8>, u64)> {
         let seq_bytes: [u8; SEQ_SIZE] = data[..SEQ_SIZE].try_into().unwrap();
         let seq = u64::from_be_bytes(seq_bytes);
-        let cipher = XChaCha20Poly1305::new(key.into());
+        let key = Zeroizing::new(
+            ratchet
+                .recv_candidate(seq)
+                .ok_or_else(|| Error::Crypto("frame outside the key's epochs".into()))?,
+        );
+        let cipher = XChaCha20Poly1305::new((&*key).into());
         let plaintext = cipher
             .decrypt(
                 (&Self::frame_nonce(seq)).into(),
@@ -255,9 +320,10 @@ impl LinkCrypto {
         }
 
         // Try the current recv key first.
-        match Self::aead_open(&self.recv_enc_key, data) {
+        match Self::aead_open(&self.recv, data) {
             Ok((plaintext, seq)) => {
                 Self::check_replay_at(&mut self.recv_window, &mut self.recv_bitmap, seq)?;
+                self.recv.commit(seq);
                 // Keep the previous-epoch key until the next rekey rotates it
                 // out: a straggler the peer sent under the old key may still
                 // arrive *after* this new-key frame on a reordering transport.
@@ -267,24 +333,28 @@ impl LinkCrypto {
                 // The initiator's first frame under keys we staged for its
                 // rekey: that confirms it installed them, so switch over.
                 if let Some(pending) = self.pending_recv {
-                    if let Ok((plaintext, seq)) = Self::aead_open(&pending, data) {
+                    let staged = Ratchet::new(pending);
+                    if let Ok((plaintext, seq)) = Self::aead_open(&staged, data) {
                         let send = self.pending_send.take().expect("staged with recv");
+                        let chain = self.pending_chain.take().expect("staged with recv");
                         self.pending_recv = None;
                         self.completed_tag = self.pending_tag.take();
-                        self.install_keys(send, pending);
+                        self.install_keys(send, pending, chain);
                         Self::check_replay_at(&mut self.recv_window, &mut self.recv_bitmap, seq)?;
+                        self.recv.commit(seq);
                         return Ok(plaintext);
                     }
                 }
                 // During a rekey overlap, the peer may still be sending under
                 // the old key. Fall back to it before declaring failure.
-                if let Some(prev) = self.prev_recv_key {
-                    if let Ok((plaintext, seq)) = Self::aead_open(&prev, data) {
+                if let Some(prev) = self.prev_recv.as_mut() {
+                    if let Ok((plaintext, seq)) = Self::aead_open(prev, data) {
                         Self::check_replay_at(
                             &mut self.prev_recv_window,
                             &mut self.prev_recv_bitmap,
                             seq,
                         )?;
+                        prev.commit(seq);
                         return Ok(plaintext);
                     }
                 }
@@ -422,6 +492,8 @@ struct LinkPipes {
 /// Initiator-side state of a rekey awaiting its reply.
 struct PendingRekey {
     eph_kem: KemKeypair,
+    /// The key epoch the request installs.
+    epoch: u64,
     /// The encoded request. A retry resends exactly this, never a fresh
     /// ephemeral key: every reply in flight then decapsulates to the same
     /// secret, so a late or duplicated reply can never install the wrong keys.
@@ -445,6 +517,119 @@ fn compute_confirm_hash(shared_secret: &[u8; 32], is_initiator: bool) -> [u8; 32
         "tarnet link confirm responder"
     };
     blake3::derive_key(context, shared_secret)
+}
+
+/// Keys and first transcript hash of a v2 link handshake (see
+/// `docs/spec/identity.md`, "Link"). `th1` covers the initiator's hello and
+/// the responder's version, nonce and KEM ciphertext; the two handshake keys
+/// seal the identities, each used once.
+struct HandshakeKeys {
+    th1: [u8; 32],
+    responder: Zeroizing<[u8; 32]>,
+    initiator: Zeroizing<[u8; 32]>,
+}
+
+impl HandshakeKeys {
+    fn new(ss: &[u8; 32], hello: &[u8], resp: &HandshakeResponse) -> Self {
+        let header = resp.header_bytes();
+        let th1: [u8; 32] = blake3::Hasher::new_derive_key("tarnet link v2 th1")
+            .update(&(hello.len() as u32).to_be_bytes())
+            .update(hello)
+            .update(&(header.len() as u32).to_be_bytes())
+            .update(&header)
+            .finalize()
+            .into();
+        let key = |label: &str| {
+            Zeroizing::new(
+                blake3::Hasher::new_derive_key(label)
+                    .update(ss)
+                    .update(&th1)
+                    .finalize()
+                    .into(),
+            )
+        };
+        Self {
+            th1,
+            responder: key("tarnet link v2 handshake responder"),
+            initiator: key("tarnet link v2 handshake initiator"),
+        }
+    }
+}
+
+/// Next transcript hash: the previous one, then a side's bundle and signature.
+fn transcript_step(label: &str, prev: &[u8; 32], bundle: &[u8], sig: &[u8]) -> [u8; 32] {
+    blake3::Hasher::new_derive_key(label)
+        .update(prev)
+        .update(&(bundle.len() as u32).to_be_bytes())
+        .update(bundle)
+        .update(&(sig.len() as u32).to_be_bytes())
+        .update(sig)
+        .finalize()
+        .into()
+}
+
+fn signed_message(label: &[u8], th: &[u8; 32], bundle: &[u8]) -> Vec<u8> {
+    let mut msg = label.to_vec();
+    msg.extend_from_slice(th);
+    msg.extend_from_slice(blake3::hash(bundle).as_bytes());
+    msg
+}
+
+fn responder_signed(th1: &[u8; 32], bundle: &[u8]) -> Vec<u8> {
+    signed_message(b"tarnet link responder v2", th1, bundle)
+}
+
+fn initiator_signed(th2: &[u8; 32], bundle: &[u8]) -> Vec<u8> {
+    signed_message(b"tarnet link initiator v2", th2, bundle)
+}
+
+/// The link's session secret, from the KEM secret and the whole transcript.
+fn session_secret(ss: &[u8; 32], th3: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(
+        blake3::Hasher::new_derive_key("tarnet link v2 session")
+            .update(ss)
+            .update(th3)
+            .finalize()
+            .into(),
+    )
+}
+
+/// Encrypt a side's `bundle || signature` under its single-use handshake key.
+fn seal_identity(key: &[u8; 32], th: &[u8; 32], bundle: &[u8], sig: &[u8]) -> Vec<u8> {
+    let mut plain = Zeroizing::new(Vec::with_capacity(4 + bundle.len() + sig.len()));
+    plain.extend_from_slice(&(bundle.len() as u16).to_be_bytes());
+    plain.extend_from_slice(bundle);
+    plain.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+    plain.extend_from_slice(sig);
+    XChaCha20Poly1305::new(key.into())
+        .encrypt((&[0u8; 24]).into(), Payload { msg: &plain, aad: th })
+        .expect("AEAD encryption should not fail")
+}
+
+fn open_identity(key: &[u8; 32], th: &[u8; 32], sealed: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    let plain = XChaCha20Poly1305::new(key.into())
+        .decrypt((&[0u8; 24]).into(), Payload { msg: sealed, aad: th })
+        .map_err(|_| Error::Crypto("handshake identity failed to decrypt".into()))?;
+    let mut r = crate::codec::Reader::new(&plain);
+    let len = r.read_u16()? as usize;
+    let bundle = r.read_bytes(len)?;
+    let len = r.read_u16()? as usize;
+    let sig = r.read_bytes(len)?;
+    r.finish()?;
+    Ok((bundle, sig))
+}
+
+/// A peer's handshake identity: a hybrid bundle (nodes must be hybrid)
+/// whose policy signature covers the transcript. Returns its class.
+fn check_peer(bundle: &[u8], sig: &[u8], signed: &[u8]) -> Result<SigningAlgo> {
+    if !identity::is_hybrid(bundle) {
+        return Err(Error::Crypto("peer is not a hybrid identity".into()));
+    }
+    // The peer is whoever holds the key (its id is derived from it).
+    if !identity::verify_signed(identity::SignedBy::AnyPeer, None, bundle, signed, sig) {
+        return Err(Error::Crypto("peer handshake signature invalid".into()));
+    }
+    Ok(SigningAlgo::FalconEd25519)
 }
 
 /// Negotiate the wire protocol version from both sides' supported ranges.
@@ -487,8 +672,8 @@ fn sched_config(transport: &dyn Transport, frame_plain: usize) -> crate::link_sc
     match transport.bandwidth_hint() {
         Some(bps) if bps < SLOW_LINK_BPS => {
             // A full relay cell spans several slow-link frames.
-            let cell_msg = HEADER_SIZE + 4 + crate::circuit::CELL_SIZE + 3;
-            let frames_per_cell = cell_msg.div_ceil(frame_plain.saturating_sub(9).max(1));
+            let frames_per_cell = CELL_MESSAGE
+                .div_ceil(frame_plain.saturating_sub(crate::link_frame::FRAGMENT_HEADER).max(1));
             let cell_time = tx_time(transport, (frames_per_cell * (frame_plain + SEQ_SIZE + TAG_SIZE)) as u64);
             let target = cell_time * 2;
             SchedConfig {
@@ -742,134 +927,35 @@ impl PeerLink {
         expected_peer: Option<PeerId>,
         progress: HandshakeProgress,
     ) -> Result<Self> {
-        let mut rng = rand::rngs::OsRng;
-        let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
-        let eph_public = X25519Public::from(&eph_secret);
-
-        // Generate ephemeral KEM keypair for PQ forward secrecy
-        let my_kem_algo = identity.identity.kem.algo();
-        let eph_kem = KemKeypair::generate_ephemeral(my_kem_algo);
-
-        let mut challenge = [0u8; 32];
-        rng.fill_bytes(&mut challenge);
-
-        // Send our hello
-        let my_hello = HandshakeHello {
-            ephemeral_pubkey: eph_public.to_bytes(),
-            signing_algo: identity.identity.signing.algo() as u8,
-            signing_pubkey: identity.identity.signing.signing_pubkey_bytes(),
-            kem_algo: my_kem_algo as u8,
-            kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
-            challenge,
-            eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
+        let eph_kem = KemKeypair::generate_ephemeral(KemAlgo::MlkemX25519);
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let hello = HandshakeHello {
             min_version: WIRE_VERSION_MIN,
             max_version: WIRE_VERSION_MAX,
+            nonce,
+            eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
         };
+        let hello_bytes = hello.to_bytes();
         let mut io = HandshakeIo::new(transport.as_ref(), true, progress);
-        io.send(my_hello.to_wire().encode()).await?;
+        io.send(hello.to_wire().encode()).await?;
 
-        // Receive peer hello
-        let wire = io.expect(MessageType::HandshakeHello).await?;
-        let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
-
-        // Negotiate wire protocol version
-        let negotiated_version = negotiate_version(
-            WIRE_VERSION_MIN,
-            WIRE_VERSION_MAX,
-            peer_hello.min_version,
-            peer_hello.max_version,
-        )?;
-
-
-        // Compute X25519 ephemeral shared secret
-        let peer_eph = X25519Public::from(peer_hello.ephemeral_pubkey);
-        let x25519_shared = eph_secret.diffie_hellman(&peer_eph);
-        if !x25519_shared.was_contributory() {
-            return Err(Error::Crypto("non-contributory X25519 input".into()));
-        }
-
-        // KEM encapsulate to responder's static KEM pubkey (identity binding)
-        let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
-            .map_err(|e| Error::Crypto(format!("unknown KEM algo: {}", e)))?;
-        let (static_kem_ss, static_kem_ct) =
-            KemKeypair::encapsulate_to(&peer_hello.kem_pubkey, remote_kem_algo)
-                .map_err(|e| Error::Crypto(format!("KEM encapsulate (static) failed: {}", e)))?;
-
-        let static_kem_ss = Zeroizing::new(static_kem_ss);
-
-        // KEM encapsulate to responder's ephemeral KEM pubkey (PQ forward secrecy)
-        let (eph_kem_ss, eph_kem_ct) =
-            KemKeypair::encapsulate_to(&peer_hello.eph_kem_pubkey, remote_kem_algo)
-                .map_err(|e| Error::Crypto(format!("KEM encapsulate (ephemeral) failed: {}", e)))?;
-
-        let eph_kem_ss = Zeroizing::new(eph_kem_ss);
-
-        // Combine: ss = BLAKE3("tarnet link", x25519_ss || static_kem_ss || eph_kem_ss)
-        let shared_bytes = Zeroizing::new({
-            let mut combined = Zeroizing::new(Vec::with_capacity(96));
-            combined.extend_from_slice(&x25519_shared.to_bytes());
-            combined.extend_from_slice(&*static_kem_ss);
-            combined.extend_from_slice(&*eph_kem_ss);
-            blake3::derive_key("tarnet link", &combined)
-        });
-
-        // Derive session keys
-        let crypto = LinkCrypto::derive(&shared_bytes, true);
-
-        // Sign transcript (includes both KEM ciphertexts and version ranges)
-        let my_ver = (WIRE_VERSION_MIN, WIRE_VERSION_MAX);
-        let peer_ver = (peer_hello.min_version, peer_hello.max_version);
-        let transcript = Self::compute_transcript(
-            &my_hello.ephemeral_pubkey,
-            &peer_hello.ephemeral_pubkey,
-            &shared_bytes,
-            true,
-            &my_hello.challenge,
-            &peer_hello.challenge,
-            &static_kem_ct,
-            &eph_kem_ct,
-            my_ver,
-            peer_ver,
-        );
-        let sig = identity.sign(&transcript);
-        let auth = HandshakeAuth {
-            signature: sig,
-            kem_ciphertext: static_kem_ct,
-            eph_kem_ciphertext: eph_kem_ct,
-        };
-        io.send(auth.to_wire().encode()).await?;
-
-        // Receive and verify peer auth
         let wire = io.expect(MessageType::HandshakeAuth).await?;
-        let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
-
-        let peer_transcript = Self::compute_transcript(
-            &peer_hello.ephemeral_pubkey,
-            &my_hello.ephemeral_pubkey,
-            &shared_bytes,
-            false,
-            &peer_hello.challenge,
-            &my_hello.challenge,
-            &[], // responder's auth has no KEM ciphertext
-            &[], // responder's auth has no ephemeral KEM ciphertext
-            peer_ver,
-            my_ver,
-        );
-        let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
-            .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
-        let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
-        // The peer is whoever holds the key (its id is derived from it).
-        if !identity::verify_signed(
-            identity::SignedBy::AnyPeer,
-            Some(remote_signing_algo as u8),
-            &peer_hello.signing_pubkey,
-            &peer_transcript,
-            &peer_auth.signature,
-        ) {
-            return Err(Error::Crypto("peer auth signature invalid".into()));
+        let resp = HandshakeResponse::from_bytes(&wire.payload)?;
+        let negotiated_version =
+            negotiate_version(WIRE_VERSION_MIN, WIRE_VERSION_MAX, resp.min_version, resp.max_version)?;
+        if resp.version != negotiated_version {
+            return Err(Error::Wire("responder chose a version outside the negotiation".into()));
         }
-
-        // Verify we connected to the peer we intended
+        let ss = Zeroizing::new(
+            eph_kem
+                .decapsulate(&resp.kem_ciphertext)
+                .map_err(|e| Error::Crypto(format!("handshake KEM decapsulate failed: {e}")))?,
+        );
+        let hs = HandshakeKeys::new(&ss, &hello_bytes, &resp);
+        let (bundle_r, sig_r) = open_identity(&hs.responder, &hs.th1, &resp.sealed)?;
+        let remote_signing_algo = check_peer(&bundle_r, &sig_r, &responder_signed(&hs.th1, &bundle_r))?;
+        let remote_peer = peer_id_from_signing_pubkey(&bundle_r);
         if let Some(expected) = expected_peer {
             if remote_peer != expected {
                 return Err(Error::Crypto(format!(
@@ -879,10 +965,14 @@ impl PeerLink {
             }
         }
 
-        // Key confirmation: send initiator confirm hash
-        let confirm_hash = compute_confirm_hash(&shared_bytes, true);
-        let confirm = HandshakeConfirmMsg { confirm_hash };
-        io.send(confirm.to_wire().encode()).await?;
+        let th2 = transcript_step("tarnet link v2 th2", &hs.th1, &bundle_r, &sig_r);
+        let bundle_i = identity.identity.signing.signing_pubkey_bytes();
+        let sig_i = identity.sign(&initiator_signed(&th2, &bundle_i));
+        let sealed = seal_identity(&hs.initiator, &th2, &bundle_i, &sig_i);
+        io.send(HandshakeAuth { sealed }.to_wire().encode()).await?;
+        let th3 = transcript_step("tarnet link v2 th3", &th2, &bundle_i, &sig_i);
+        let session = session_secret(&ss, &th3);
+        let crypto = LinkCrypto::derive(&session, true).with_chain(&session, th3);
 
         // Receive and verify the responder's confirm. Any frame that decrypts
         // under the session keys proves the responder holds them just as well
@@ -890,7 +980,7 @@ impl PeerLink {
         // the handshake — the confirm may have been lost or overtaken.
         let mut crypto = crypto;
         let mut early_frames = std::collections::VecDeque::new();
-        let expected_peer_confirm = compute_confirm_hash(&shared_bytes, false);
+        let expected_peer_confirm = compute_confirm_hash(&session, false);
         loop {
             let raw = io.recv_raw().await?;
             if raw.len() >= SEQ_SIZE + TAG_SIZE {
@@ -939,16 +1029,14 @@ impl PeerLink {
             sent_fragments: pipes.sent_fragments,
             remote_peer,
             remote_signing_algo,
-            remote_signing_pubkey: peer_hello.signing_pubkey,
+            remote_signing_pubkey: bundle_r,
             is_initiator: true,
-            rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
+            rekey_kem_algo: KemAlgo::MlkemX25519,
             pending_rekey: tokio::sync::Mutex::new(None),
             rekey_reply: tokio::sync::Mutex::new(None),
             force_rekey: std::sync::atomic::AtomicBool::new(false),
             negotiated_version,
-            identity: std::sync::Arc::new(
-                Keypair::from_full_bytes(&Zeroizing::new(identity.to_full_bytes())).unwrap(),
-            ),
+            identity: std::sync::Arc::new(identity.clone()),
             _drain_task: pipes.task,
             transport_name,
             inbox: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -974,157 +1062,50 @@ impl PeerLink {
         identity: &Keypair,
         progress: HandshakeProgress,
     ) -> Result<Self> {
-        let mut rng = rand::rngs::OsRng;
-        let eph_secret = EphemeralSecret::random_from_rng(&mut rng);
-        let eph_public = X25519Public::from(&eph_secret);
-
-        // Generate ephemeral KEM keypair for PQ forward secrecy
-        let my_kem_algo = identity.identity.kem.algo();
-        let eph_kem = KemKeypair::generate_ephemeral(my_kem_algo);
-
-        // Receive peer hello
         let mut io = HandshakeIo::new(transport.as_ref(), false, progress);
         let wire = io.expect(MessageType::HandshakeHello).await?;
-        let peer_hello = HandshakeHello::from_bytes(&wire.payload)?;
+        let hello = HandshakeHello::from_bytes(&wire.payload)?;
+        let hello_bytes = wire.payload;
+        let negotiated_version =
+            negotiate_version(WIRE_VERSION_MIN, WIRE_VERSION_MAX, hello.min_version, hello.max_version)?;
 
-        // Negotiate wire protocol version
-        let negotiated_version = negotiate_version(
-            WIRE_VERSION_MIN,
-            WIRE_VERSION_MAX,
-            peer_hello.min_version,
-            peer_hello.max_version,
-        )?;
-
-
-        let mut challenge = [0u8; 32];
-        rng.fill_bytes(&mut challenge);
-
-        // Send our hello
-        let my_hello = HandshakeHello {
-            ephemeral_pubkey: eph_public.to_bytes(),
-            signing_algo: identity.identity.signing.algo() as u8,
-            signing_pubkey: identity.identity.signing.signing_pubkey_bytes(),
-            kem_algo: my_kem_algo as u8,
-            kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
-            challenge,
-            eph_kem_pubkey: eph_kem.kem_pubkey_bytes(),
+        let (ss, kem_ciphertext) = KemKeypair::encapsulate_to(&hello.eph_kem_pubkey, KemAlgo::MlkemX25519)
+            .map_err(|e| Error::Crypto(format!("handshake KEM encapsulate failed: {e}")))?;
+        let ss = Zeroizing::new(ss);
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let mut resp = HandshakeResponse {
+            version: negotiated_version,
             min_version: WIRE_VERSION_MIN,
             max_version: WIRE_VERSION_MAX,
+            nonce,
+            kem_ciphertext,
+            sealed: Vec::new(),
         };
-        io.send(my_hello.to_wire().encode()).await?;
+        let hs = HandshakeKeys::new(&ss, &hello_bytes, &resp);
+        let bundle_r = identity.identity.signing.signing_pubkey_bytes();
+        let sig_r = identity.sign(&responder_signed(&hs.th1, &bundle_r));
+        resp.sealed = seal_identity(&hs.responder, &hs.th1, &bundle_r, &sig_r);
+        io.send(resp.to_wire().encode()).await?;
 
-        // Compute X25519 ephemeral shared secret
-        let peer_eph = X25519Public::from(peer_hello.ephemeral_pubkey);
-        let x25519_shared = eph_secret.diffie_hellman(&peer_eph);
-        if !x25519_shared.was_contributory() {
-            return Err(Error::Crypto("non-contributory X25519 input".into()));
-        }
-
-        // Receive peer auth (contains both static + ephemeral KEM ciphertexts)
         let wire = io.expect(MessageType::HandshakeAuth).await?;
-        let peer_auth = HandshakeAuth::from_bytes(&wire.payload)?;
+        let auth_frame = std::mem::take(&mut io.last_received);
+        let auth = HandshakeAuth::from_bytes(&wire.payload)?;
+        let th2 = transcript_step("tarnet link v2 th2", &hs.th1, &bundle_r, &sig_r);
+        let (bundle_i, sig_i) = open_identity(&hs.initiator, &th2, &auth.sealed)?;
+        let remote_signing_algo = check_peer(&bundle_i, &sig_i, &initiator_signed(&th2, &bundle_i))?;
+        let remote_peer = peer_id_from_signing_pubkey(&bundle_i);
+        let th3 = transcript_step("tarnet link v2 th3", &th2, &bundle_i, &sig_i);
+        let session = session_secret(&ss, &th3);
+        let crypto = LinkCrypto::derive(&session, false).with_chain(&session, th3);
 
-        // KEM decapsulate static: recover shared secret from initiator's ciphertext
-        let static_kem_ss = identity
-            .identity
-            .kem
-            .decapsulate(&peer_auth.kem_ciphertext)
-            .map_err(|e| Error::Crypto(format!("KEM decapsulate (static) failed: {}", e)))?;
-
-        let static_kem_ss = Zeroizing::new(static_kem_ss);
-
-        // KEM decapsulate ephemeral: recover shared secret using our ephemeral KEM key
-        let eph_kem_ss = eph_kem
-            .decapsulate(&peer_auth.eph_kem_ciphertext)
-            .map_err(|e| Error::Crypto(format!("KEM decapsulate (ephemeral) failed: {}", e)))?;
-
-        let eph_kem_ss = Zeroizing::new(eph_kem_ss);
-
-        // Combine: ss = BLAKE3("tarnet link", x25519_ss || static_kem_ss || eph_kem_ss)
-        let shared_bytes = Zeroizing::new({
-            let mut combined = Zeroizing::new(Vec::with_capacity(96));
-            combined.extend_from_slice(&x25519_shared.to_bytes());
-            combined.extend_from_slice(&*static_kem_ss);
-            combined.extend_from_slice(&*eph_kem_ss);
-            blake3::derive_key("tarnet link", &combined)
-        });
-
-        // Derive session keys
-        let crypto = LinkCrypto::derive(&shared_bytes, false);
-
-        // Verify peer auth signature (transcript includes KEM ciphertexts + version ranges)
-        let peer_ver = (peer_hello.min_version, peer_hello.max_version);
-        let my_ver = (WIRE_VERSION_MIN, WIRE_VERSION_MAX);
-        let peer_transcript = Self::compute_transcript(
-            &peer_hello.ephemeral_pubkey,
-            &my_hello.ephemeral_pubkey,
-            &shared_bytes,
-            true,
-            &peer_hello.challenge,
-            &my_hello.challenge,
-            &peer_auth.kem_ciphertext,
-            &peer_auth.eph_kem_ciphertext,
-            peer_ver,
-            my_ver,
-        );
-        let remote_signing_algo = SigningAlgo::from_u8(peer_hello.signing_algo)
-            .map_err(|e| Error::Crypto(format!("unknown signing algo: {}", e)))?;
-        let remote_kem_algo = KemAlgo::from_u8(peer_hello.kem_algo)
-            .map_err(|e| Error::Crypto(format!("unknown KEM algo: {}", e)))?;
-        let remote_peer = peer_id_from_signing_pubkey(&peer_hello.signing_pubkey);
-        // The peer is whoever holds the key (its id is derived from it).
-        if !identity::verify_signed(
-            identity::SignedBy::AnyPeer,
-            Some(remote_signing_algo as u8),
-            &peer_hello.signing_pubkey,
-            &peer_transcript,
-            &peer_auth.signature,
-        ) {
-            return Err(Error::Crypto("peer auth signature invalid".into()));
+        let our_confirm = HandshakeConfirmMsg {
+            confirm_hash: compute_confirm_hash(&session, false),
         }
-
-        // Sign transcript and send auth (no KEM ciphertext from responder)
-        let transcript = Self::compute_transcript(
-            &my_hello.ephemeral_pubkey,
-            &peer_hello.ephemeral_pubkey,
-            &shared_bytes,
-            false,
-            &my_hello.challenge,
-            &peer_hello.challenge,
-            &[], // responder's auth has no KEM ciphertext
-            &[], // responder's auth has no ephemeral KEM ciphertext
-            my_ver,
-            peer_ver,
-        );
-        let sig = identity.sign(&transcript);
-        let auth = HandshakeAuth {
-            signature: sig,
-            kem_ciphertext: Vec::new(),
-            eph_kem_ciphertext: Vec::new(),
-        };
-        io.send(auth.to_wire().encode()).await?;
-
-        // Key confirmation: receive and verify peer's (initiator) confirm
-        let wire = io.expect(MessageType::HandshakeConfirm).await?;
-        let peer_confirm_frame = std::mem::take(&mut io.last_received);
-        let peer_confirm = HandshakeConfirmMsg::from_bytes(&wire.payload)?;
-
-        let expected_peer_confirm = compute_confirm_hash(&shared_bytes, true);
-        if peer_confirm
-            .confirm_hash
-            .ct_eq(&expected_peer_confirm)
-            .unwrap_u8()
-            == 0
-        {
-            return Err(Error::Crypto("key confirmation failed".into()));
-        }
-
-        // Send our (responder) confirm
-        let confirm_hash = compute_confirm_hash(&shared_bytes, false);
-        let confirm = HandshakeConfirmMsg { confirm_hash };
-        let our_confirm = confirm.to_wire().encode();
+        .to_wire()
+        .encode();
         io.send(our_confirm.clone()).await?;
-        let handshake_tail = Some((peer_confirm_frame, our_confirm));
+        let handshake_tail = Some((auth_frame, our_confirm));
 
         log::info!(
             "Link established (responder) with {:?}, wire v{}",
@@ -1148,16 +1129,14 @@ impl PeerLink {
             sent_fragments: pipes.sent_fragments,
             remote_peer,
             remote_signing_algo,
-            remote_signing_pubkey: peer_hello.signing_pubkey,
+            remote_signing_pubkey: bundle_i,
             is_initiator: false,
-            rekey_kem_algo: KemAlgo::negotiate_rekey(my_kem_algo, remote_kem_algo),
+            rekey_kem_algo: KemAlgo::MlkemX25519,
             pending_rekey: tokio::sync::Mutex::new(None),
             rekey_reply: tokio::sync::Mutex::new(None),
             force_rekey: std::sync::atomic::AtomicBool::new(false),
             negotiated_version,
-            identity: std::sync::Arc::new(
-                Keypair::from_full_bytes(&Zeroizing::new(identity.to_full_bytes())).unwrap(),
-            ),
+            identity: std::sync::Arc::new(identity.clone()),
             _drain_task: pipes.task,
             transport_name,
             inbox: std::sync::Mutex::new(std::collections::VecDeque::new()),
@@ -1165,42 +1144,6 @@ impl PeerLink {
             sent_categories: std::sync::atomic::AtomicU8::new(0),
         };
         Ok(link)
-    }
-
-    /// Compute handshake transcript for signing.
-    ///
-    /// Includes both static and ephemeral KEM ciphertexts to bind the PQ key
-    /// exchanges to the authenticated transcript, preventing stripping/downgrade.
-    fn compute_transcript(
-        my_eph: &[u8; 32],
-        peer_eph: &[u8; 32],
-        shared_secret: &[u8; 32],
-        is_initiator: bool,
-        my_challenge: &[u8; 32],
-        peer_challenge: &[u8; 32],
-        kem_ciphertext: &[u8],
-        eph_kem_ciphertext: &[u8],
-        my_ver_range: (u8, u8),
-        peer_ver_range: (u8, u8),
-    ) -> Vec<u8> {
-        let label = if is_initiator {
-            b"tarnet-handshake-initiator"
-        } else {
-            b"tarnet-handshake-responder"
-        };
-        let hash = blake3::Hasher::new()
-            .update(label.as_slice())
-            .update(my_eph)
-            .update(peer_eph)
-            .update(shared_secret)
-            .update(my_challenge)
-            .update(peer_challenge)
-            .update(kem_ciphertext)
-            .update(eph_kem_ciphertext)
-            .update(&[my_ver_range.0, my_ver_range.1])
-            .update(&[peer_ver_range.0, peer_ver_range.1])
-            .finalize();
-        hash.as_bytes().to_vec()
     }
 
     /// Spawn the background drain task that packs queued messages into
@@ -1264,6 +1207,12 @@ impl PeerLink {
                 fn as_ref(&self) -> &[u8] { &self.bytes }
             }
             let mut ready: VecDeque<ReadyRecord> = VecDeque::new();
+            // The remaining fragments (a frame each) of the background
+            // message being sent. Foreground messages go between them, one
+            // per fragment, so a large DHT record can't hold the line.
+            let mut background_rest: VecDeque<ReadyRecord> = VecDeque::new();
+            // Whether a foreground message went since the last fragment.
+            let mut interleaved = false;
             let mut next_msg_id: u16 = 0;
             let mut reported_drops = 0;
             let mut next_nack_poll = None;
@@ -1271,8 +1220,9 @@ impl PeerLink {
             // Queue a wire message's records, remembering fragments for repair.
             // The next message starts in whatever room the frame being
             // filled has left.
-            let mut enqueue = |ready: &mut VecDeque<ReadyRecord>, data: Vec<u8>| {
-                let control = crate::link_sched::classify(&data).0 == crate::link_sched::Class::Control;
+            let mut enqueue = |ready: &mut VecDeque<ReadyRecord>, background_rest: &mut VecDeque<ReadyRecord>, data: Vec<u8>| {
+                let class = crate::link_sched::classify(&data).0;
+                let control = class == crate::link_sched::Class::Control;
                 let used = ready.iter().map(|r| r.bytes.len()).sum::<usize>() % frame_plain;
                 let room = if ready.is_empty() { frame_plain } else { frame_plain - used };
                 let records = encode_message_into(&data, frame_plain, room, &mut next_msg_id);
@@ -1286,24 +1236,33 @@ impl PeerLink {
                     .filter(|ka| ka.ping_id.is_some())
                     .and_then(|ka| ka.probe_nonce);
                 let last = records.len().saturating_sub(1);
-                ready.extend(
-                    records
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, bytes)| ReadyRecord {
-                            bytes,
-                            control,
-                            probe: if i == last { probe } else { None },
-                        }),
-                );
+                let defer = class == crate::link_sched::Class::Background;
+                for (i, bytes) in records.into_iter().enumerate() {
+                    let rec = ReadyRecord {
+                        bytes,
+                        control,
+                        probe: if i == last { probe } else { None },
+                    };
+                    if defer && i > 0 {
+                        background_rest.push_back(rec);
+                    } else {
+                        ready.push_back(rec);
+                    }
+                }
             };
             // Messages go to the scheduler; repair records skip it.
-            let take = |sched: &mut Scheduler, ready: &mut VecDeque<ReadyRecord>, out: Outgoing| {
+            let take = |sched: &mut Scheduler, ready: &mut VecDeque<ReadyRecord>, background_rest: &VecDeque<ReadyRecord>, out: Outgoing| {
                 let now = std::time::Instant::now();
                 match out {
                     Outgoing::Message(data) | Outgoing::Deferred(data) => sched.push(data, false, now),
                     Outgoing::Critical(data) => sched.push(data, true, now),
                     Outgoing::Repair(rec) => {
+                        // A fragment still queued goes out anyway: the peer
+                        // NACKed it only because a pause looked like loss.
+                        let queued = |q: &VecDeque<ReadyRecord>| q.iter().any(|r| r.bytes == rec);
+                        if queued(background_rest) || queued(ready) {
+                            return;
+                        }
                         ready.push_front(ReadyRecord {
                             bytes: rec,
                             control: true,
@@ -1318,7 +1277,7 @@ impl PeerLink {
                 // cannot keep us in try_recv forever without sending a frame.
                 for _ in 0..OUTBOUND_QUEUE_SIZE {
                     let Ok(out) = rx.try_recv() else { break };
-                    take(&mut sched, &mut ready, out);
+                    take(&mut sched, &mut ready, &background_rest, out);
                 }
                 // New fragments can move the next repair deadline earlier
                 // or later. Cache it between notifications rather than
@@ -1337,12 +1296,12 @@ impl PeerLink {
                     }));
                 }
 
-                if ready.is_empty() && sched.is_empty() {
+                if ready.is_empty() && sched.is_empty() && background_rest.is_empty() {
                     tokio::select! {
                         out = rx.recv() => {
                             let Some(out) = out else { break };
                             let Outgoing::Deferred(first) = out else {
-                                take(&mut sched, &mut ready, out);
+                                take(&mut sched, &mut ready, &background_rest, out);
                                 continue;
                             };
                             // Wait briefly for a message that isn't deferred
@@ -1362,7 +1321,7 @@ impl PeerLink {
                                         None => break 'drain,
                                         Some(Outgoing::Deferred(data)) => held.push(data),
                                         Some(out) => {
-                                            take(&mut sched, &mut ready, out);
+                                            take(&mut sched, &mut ready, &background_rest, out);
                                             break;
                                         }
                                     },
@@ -1389,10 +1348,26 @@ impl PeerLink {
                     continue;
                 }
 
-                // Fill the frame from the scheduler, highest class first.
+                // Fill the frame from the scheduler, highest class first. While
+                // a background message is part-way out, foreground messages and
+                // its fragments alternate.
                 while ready.iter().map(|r| r.bytes.len()).sum::<usize>() < frame_plain {
+                    if !background_rest.is_empty() {
+                        if !interleaved {
+                            if let Some(data) = sched.pop_foreground(now) {
+                                interleaved = true;
+                                enqueue(&mut ready, &mut background_rest, data);
+                                continue;
+                            }
+                        }
+                        if ready.is_empty() {
+                            ready.push_back(background_rest.pop_front().expect("checked non-empty"));
+                            interleaved = false;
+                        }
+                        break;
+                    }
                     let Some(data) = sched.pop(now) else { break };
-                    enqueue(&mut ready, data);
+                    enqueue(&mut ready, &mut background_rest, data);
                 }
                 if sched.dropped() > reported_drops {
                     log::trace!(
@@ -1780,8 +1755,8 @@ impl PeerLink {
     }
 
     /// Owned by the node's link receive task, so link removal cancels both
-    /// I/O and maintenance. Quiet links have no rekey timer until the usage
-    /// threshold is crossed or a request is explicitly made.
+    /// I/O and maintenance. Rekeys when traffic crosses the usage threshold,
+    /// when the keys reach [`REKEY_MAX_AGE`], or on request.
     pub(crate) async fn drive_rekey(&self) {
         if !self.is_initiator { std::future::pending::<()>().await; }
         loop {
@@ -1796,6 +1771,9 @@ impl PeerLink {
                 let at = pending.sent_at + REKEY_RETRY_INTERVAL;
                 retry_at = Some(retry_at.map_or(at, |old| old.min(at)));
             }
+            // Quiet links still rekey when their keys turn an hour old.
+            let aged = self.crypto.lock().await.installed_at + REKEY_MAX_AGE;
+            retry_at = Some(retry_at.map_or(aged, |old| old.min(aged)));
             tokio::select! {
                 _ = self.rekey_notify.notified() => {}
                 _ = async {
@@ -1845,16 +1823,22 @@ impl PeerLink {
         }
 
         let eph_kem = KemKeypair::generate_ephemeral(self.rekey_kem_algo);
+        let (epoch, transcript) = {
+            let c = self.crypto.lock().await;
+            (c.epoch + 1, c.transcript)
+        };
         let mut rekey_msg = RekeyMsg {
+            epoch,
             kem_algo: self.rekey_kem_algo as u8,
             kem_pubkey: eph_kem.kem_pubkey_bytes(),
             kem_ciphertext: Vec::new(),
             signature: Vec::new(),
         };
-        rekey_msg.signature = self.identity.sign(&rekey_msg.signable_bytes());
+        rekey_msg.signature = self.identity.sign(&rekey_msg.signable_bytes(&transcript));
         let request = rekey_msg.to_wire().encode();
         *pending = Some(PendingRekey {
             eph_kem,
+            epoch,
             request: request.clone(),
             sent_at: std::time::Instant::now(),
         });
@@ -1876,16 +1860,20 @@ impl PeerLink {
     pub async fn handle_rekey_msg(&self, peer_rekey: &RekeyMsg) -> Result<()> {
         // Authenticate against the peer's static signing key. (The frame is
         // already link-authenticated by AEAD; this binds it to the peer's
-        // long-term identity, matching the handshake.)
+        // long-term identity and to this link's handshake, so an attacker
+        // holding only session keys can't take the rekey over.)
+        let transcript = self.crypto.lock().await.transcript;
         if !identity::verify_signed(
             identity::SignedBy::BoundKey,
             Some(self.remote_signing_algo as u8),
             &self.remote_signing_pubkey,
-            &peer_rekey.signable_bytes(),
+            &peer_rekey.signable_bytes(&transcript),
             &peer_rekey.signature,
         ) {
             return Err(Error::Crypto("rekey signature invalid".into()));
         }
+        KemAlgo::from_u8(peer_rekey.kem_algo)
+            .map_err(|e| Error::Crypto(format!("unknown rekey KEM algo: {}", e)))?;
 
         if !peer_rekey.kem_pubkey.is_empty() {
             let tag = rekey_tag(&peer_rekey.kem_pubkey);
@@ -1902,28 +1890,33 @@ impl PeerLink {
                     return self.send_message_critical(&reply).await;
                 }
             }
+            let current = self.crypto.lock().await.epoch;
+            if peer_rekey.epoch != current + 1 {
+                return Err(Error::Crypto(format!(
+                    "rekey for epoch {} while at {}",
+                    peer_rekey.epoch, current
+                )));
+            }
 
-            let peer_kem_algo = KemAlgo::from_u8(peer_rekey.kem_algo)
-                .map_err(|e| Error::Crypto(format!("unknown rekey KEM algo: {}", e)))?;
             let (kem_ss, kem_ct) =
-                KemKeypair::encapsulate_to(&peer_rekey.kem_pubkey, peer_kem_algo)
+                KemKeypair::encapsulate_to(&peer_rekey.kem_pubkey, self.rekey_kem_algo)
                     .map_err(|e| Error::Crypto(format!("rekey KEM encapsulate failed: {}", e)))?;
+            let kem_ss = Zeroizing::new(kem_ss);
 
             let mut reply = RekeyMsg {
+                epoch: peer_rekey.epoch,
                 kem_algo: self.rekey_kem_algo as u8,
                 kem_pubkey: Vec::new(),
                 kem_ciphertext: kem_ct,
                 signature: Vec::new(),
             };
-            reply.signature = self.identity.sign(&reply.signable_bytes());
+            reply.signature = self.identity.sign(&reply.signable_bytes(&transcript));
+            let mut crypto = self.crypto.lock().await;
+            let new_shared =
+                crypto.rekey_secret(peer_rekey.epoch, &kem_ss, &peer_rekey.kem_pubkey, &reply.kem_ciphertext);
+            crypto.stage_rekey(&new_shared, self.is_initiator, tag);
+            drop(crypto);
             let reply = reply.to_wire().encode();
-
-            let kem_ss = Zeroizing::new(kem_ss);
-            let new_shared = Zeroizing::new(blake3::derive_key("tarnet rekey", &*kem_ss));
-            self.crypto
-                .lock()
-                .await
-                .stage_rekey(&new_shared, self.is_initiator, tag);
             *cached = Some((tag, reply.clone()));
             drop(cached);
             // Goes out under the current key, which stays our send key until
@@ -1933,21 +1926,31 @@ impl PeerLink {
             Ok(())
         } else if !peer_rekey.kem_ciphertext.is_empty() {
             // Response to a rekey we initiated.
-            let Some(pending) = self.pending_rekey.lock().await.take() else {
+            let mut pending_slot = self.pending_rekey.lock().await;
+            let Some(pending) = pending_slot.as_ref() else {
                 // A duplicate reply to a retried request we already completed.
                 log::trace!("Ignoring duplicate rekey reply from {:?}", self.remote_peer);
                 return Ok(());
             };
+            if peer_rekey.epoch != pending.epoch {
+                return Err(Error::Crypto("rekey reply for another epoch".into()));
+            }
+            let pending = pending_slot.take().expect("checked above");
+            drop(pending_slot);
             let kem_ss = pending
                 .eph_kem
                 .decapsulate(&peer_rekey.kem_ciphertext)
                 .map_err(|e| Error::Crypto(format!("rekey KEM decapsulate failed: {}", e)))?;
             let kem_ss = Zeroizing::new(kem_ss);
-            let new_shared = Zeroizing::new(blake3::derive_key("tarnet rekey", &*kem_ss));
-            self.crypto
-                .lock()
-                .await
-                .install_rekey(&new_shared, self.is_initiator);
+            let mut crypto = self.crypto.lock().await;
+            let new_shared = crypto.rekey_secret(
+                pending.epoch,
+                &kem_ss,
+                &pending.eph_kem.kem_pubkey_bytes(),
+                &peer_rekey.kem_ciphertext,
+            );
+            crypto.install_rekey(&new_shared, self.is_initiator);
+            drop(crypto);
             self.force_rekey
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             self.rekey_notify.notify_one();
@@ -2582,7 +2585,8 @@ mod tests {
         let (mut a, _b) = lossy_pair(&[], &[]);
         assert_eq!(handshake_deadline(&a), HANDSHAKE_TIMEOUT);
         a.bps = Some(500);
-        assert!(handshake_deadline(&a) >= Duration::from_secs(70));
+        // ~6 KB at 500 B/s, three times over.
+        assert!(handshake_deadline(&a) >= Duration::from_secs(36));
     }
 
     async fn handshake_over(a: LossyMem, b: LossyMem) -> (Arc<PeerLink>, Arc<PeerLink>) {
@@ -2598,38 +2602,92 @@ mod tests {
         (Arc::new(la.unwrap()), Arc::new(lb.unwrap()))
     }
 
+    /// A hybrid KEM key or ciphertext whose X25519 half is a low-order point.
+    fn low_order(mut bytes: Vec<u8>, first_byte: u8) -> Vec<u8> {
+        bytes[..32].fill(0);
+        bytes[0] = first_byte;
+        bytes
+    }
+
     #[tokio::test]
-    async fn handshake_rejects_low_order_ephemeral_in_both_roles() {
-        for is_initiator in [true, false] {
-            for first_byte in [0, 1] {
-                let (a, b) = lossy_pair(&[], &[]);
-                let identity = Keypair::generate();
-                let mut ephemeral_pubkey = [0; 32];
-                ephemeral_pubkey[0] = first_byte;
-                let hello = HandshakeHello {
-                    ephemeral_pubkey,
-                    signing_algo: identity.identity.signing_algo() as u8,
-                    signing_pubkey: identity.identity.signing.signing_pubkey_bytes(),
-                    kem_algo: identity.identity.kem_algo() as u8,
-                    kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
-                    challenge: [42; 32],
-                    eph_kem_pubkey: identity.identity.kem.kem_pubkey_bytes(),
-                    min_version: WIRE_VERSION_MIN,
-                    max_version: WIRE_VERSION_MAX,
-                };
-                b.send(&hello.to_wire().encode()).await.unwrap();
-                let result = tokio::time::timeout(Duration::from_secs(2), async {
-                    if is_initiator {
-                        PeerLink::initiator(Box::new(a), &identity, None).await
-                    } else {
-                        PeerLink::responder(Box::new(a), &identity).await
-                    }
-                })
+    async fn handshake_rejects_low_order_x25519_in_both_roles() {
+        for first_byte in [0, 1] {
+            // Responder: the initiator's ephemeral KEM key.
+            let (a, b) = lossy_pair(&[], &[]);
+            let identity = Keypair::generate();
+            let eph = KemKeypair::generate_ephemeral(KemAlgo::MlkemX25519);
+            let hello = HandshakeHello {
+                min_version: WIRE_VERSION_MIN,
+                max_version: WIRE_VERSION_MAX,
+                nonce: [42; 32],
+                eph_kem_pubkey: low_order(eph.kem_pubkey_bytes(), first_byte),
+            };
+            b.send(&hello.to_wire().encode()).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(2), PeerLink::responder(Box::new(a), &identity))
                 .await
-                .expect("invalid DH must fail before waiting for authentication");
-                assert!(matches!(result, Err(Error::Crypto(ref e)) if e == "non-contributory X25519 input"));
-            }
+                .expect("invalid KEM key must fail at once");
+            assert!(matches!(result, Err(Error::Crypto(ref e)) if e.contains("non-contributory")));
+
+            // Initiator: the responder's ciphertext.
+            let (a, b) = lossy_pair(&[], &[]);
+            let (_, ct) = KemKeypair::encapsulate_to(&eph.kem_pubkey_bytes(), KemAlgo::MlkemX25519).unwrap();
+            let resp = HandshakeResponse {
+                version: WIRE_VERSION_MAX,
+                min_version: WIRE_VERSION_MIN,
+                max_version: WIRE_VERSION_MAX,
+                nonce: [7; 32],
+                kem_ciphertext: low_order(ct, first_byte),
+                sealed: vec![0; 64],
+            };
+            b.send(&resp.to_wire().encode()).await.unwrap();
+            let result =
+                tokio::time::timeout(Duration::from_secs(2), PeerLink::initiator(Box::new(a), &identity, None))
+                    .await
+                    .expect("invalid ciphertext must fail at once");
+            assert!(matches!(result, Err(Error::Crypto(ref e)) if e.contains("non-contributory")));
         }
+    }
+
+    /// Nodes must be hybrid: either side refuses an Ed25519-only peer.
+    #[tokio::test]
+    async fn handshake_refuses_ecc_peers_in_both_roles() {
+        for ecc_initiates in [true, false] {
+            let (a, b) = lossy_pair(&[], &[]);
+            let (hybrid, ecc) = (Keypair::generate(), Keypair::generate_ed25519());
+            let (ia, ib) = if ecc_initiates { (&ecc, &hybrid) } else { (&hybrid, &ecc) };
+            let (la, lb) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    r = PeerLink::initiator(Box::new(a), ia, None) => (Some(r), None),
+                    r = PeerLink::responder(Box::new(b), ib) => (None, Some(r)),
+                }
+            })
+            .await
+            .expect("handshake hung");
+            // The hybrid side is the one that notices and refuses.
+            let refused = if ecc_initiates { lb } else { la };
+            assert!(
+                matches!(refused, Some(Err(Error::Crypto(ref e))) if e.contains("not a hybrid identity")),
+                "ecc_initiates={ecc_initiates}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn initiator_pins_the_expected_peer() {
+        let (a, b) = lossy_pair(&[], &[]);
+        let (ia, ib) = (Keypair::generate(), Keypair::generate());
+        let wrong = Keypair::generate().peer_id();
+        let (la, _lb) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                PeerLink::initiator(Box::new(a), &ia, Some(wrong)),
+                async {
+                    let _ = tokio::time::timeout(Duration::from_secs(2), PeerLink::responder(Box::new(b), &ib)).await;
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(matches!(la, Err(Error::Crypto(ref e)) if e.contains("expected")));
     }
 
     fn ping() -> Vec<u8> {
@@ -2663,20 +2721,40 @@ mod tests {
         recv_good(a).await;
     }
 
+    #[test]
+    fn rekey_is_due_by_age_and_chains_secrets() {
+        let mut c = LinkCrypto::derive(&[1; 32], true).with_chain(&[1; 32], [2; 32]);
+        assert!(!c.should_rekey());
+        c.installed_at = std::time::Instant::now() - REKEY_MAX_AGE;
+        assert!(c.should_rekey());
+        // The new secret depends on the old chain secret, the epoch and the
+        // exchanged values, not only on the KEM secret.
+        let a = *c.rekey_secret(1, &[9; 32], b"pk", b"ct");
+        assert_ne!(a, *c.rekey_secret(2, &[9; 32], b"pk", b"ct"));
+        assert_ne!(a, *c.rekey_secret(1, &[9; 32], b"pk", b"cu"));
+        let other = LinkCrypto::derive(&[3; 32], true).with_chain(&[3; 32], [2; 32]);
+        assert_ne!(a, *other.rekey_secret(1, &[9; 32], b"pk", b"ct"));
+        c.install_rekey(&a, true);
+        assert!(!c.should_rekey());
+        assert_eq!(c.chain_secret, a);
+    }
+
     /// Losing any single handshake message (and a few combinations) on a
     /// lossy transport only delays the handshake.
     #[tokio::test]
     async fn handshake_survives_lost_messages() {
-        // Sends per side: 0 = Hello, 1 = Auth, 2 = Confirm (then retransmits).
+        // Sends per side (then retransmits): initiator 0 = Hello, 1 = Auth;
+        // responder 0 = its Auth (the response), 1 = Confirm.
+        // Losing the responder's final Confirm needs its receive loop running
+        // (see `lost_final_confirm_is_answered_by_established_responder`).
         let cases: &[(&[usize], &[usize])] = &[
             (&[0], &[]),
             (&[1], &[]),
-            (&[2], &[]),
             (&[], &[0]),
-            (&[], &[1]),
             (&[0, 1, 2], &[]),
             (&[], &[0, 1]),
-            (&[1], &[1]),
+            (&[0], &[0]),
+            (&[1], &[0]),
         ];
         for (drop_a, drop_b) in cases {
             let (ta, tb) = lossy_pair(drop_a, drop_b);
@@ -2691,7 +2769,7 @@ mod tests {
     /// responder with a link nobody is on.
     #[tokio::test]
     async fn lost_final_confirm_is_answered_by_established_responder() {
-        let (ta, tb) = lossy_pair(&[], &[2]);
+        let (ta, tb) = lossy_pair(&[], &[1]);
         let (ia, ib) = (Keypair::generate(), Keypair::generate());
         let responder = tokio::spawn(async move {
             let b = Arc::new(PeerLink::responder(Box::new(tb), &ib).await.unwrap());
@@ -2728,7 +2806,7 @@ mod tests {
     /// first link frame completes the initiator's handshake and is delivered.
     #[tokio::test]
     async fn link_frame_before_confirm_completes_initiator() {
-        let (ta, tb) = lossy_pair(&[], &[2]);
+        let (ta, tb) = lossy_pair(&[], &[1]);
         let (ia, ib) = (Keypair::generate(), Keypair::generate());
         let responder = tokio::spawn(async move {
             let b = PeerLink::responder(Box::new(tb), &ib).await.unwrap();

@@ -2,9 +2,11 @@
 
 Identities can be thought of as different names for your tarnet instance, similar to an IP address on the network. Identities can sign their own data, be listened on, and connect to other identities.
 
-Each identity is associated with a public/private key pair and a ServiceId derived from the public key. The cryptographic scheme is pluggable - the default `falcon_ed25519` is a hybrid post-quantum scheme, but the protocol does not assume any specific algorithm. A pure `ed25519` scheme is available and has better performance, but should be avoided as it offers no post-quantum protection.
+Each identity is a set of keys derived from one secret seed, and its ServiceId is a hash over its public keys. Identities are hybrid post-quantum: they sign with Ed25519 and Falcon-512, and their ServiceId also commits to backup ML-DSA and SLH-DSA keys. If Falcon ever has to be retired, a software update switches the signatures to a backup and every ServiceId stays the same. The KEM is ML-KEM-768 combined with X25519.
 
 A node can have multiple identities - for example, separate identities for different services or contexts, each with its own privacy level. Connecting or publishing records as one identity reveals nothing about your other identities.
+
+Every connection carries the connecting identity's ServiceId, proven with a signature, so a service always knows which ServiceId is calling: think of it as the caller's IP address. A connection comes from your `default` identity unless the application picks another. To stay anonymous, connect from a throwaway identity (below) that leads back to nobody, over enough hops that the service can't see your node.
 
 The `default` identity is created automatically on first run and cannot be deleted.
 
@@ -31,13 +33,30 @@ Created identity 'alice': Y8VQVBC11TYHCHAJP1HG3ZAAVQ5GDT4CWKG4H7G86AKD3XKWRR0G
   Outbound hops: 1
 ```
 
-And `identity delete` removes an identity permanently.
+And `identity delete` removes an identity permanently, along with everything filed under it: its TNS labels, its published records and its listeners. A new identity created later under the same name starts empty.
 
 ```plaintext
 tarnet identity delete alice
 Delete identity 'alice'? This is irreversible. [N/y] y
 Deleted identity 'alice'.
 ```
+
+## Throwaway identities
+
+An application can ask the daemon for a throwaway identity: a fresh ServiceId that lives only in the daemon's memory and belongs to that application's connection. It can connect out and listen like any identity. It is gone when the application drops it, when the application disconnects, or when the daemon restarts, and nothing of it is ever written to disk. A throwaway is Hidden by default, with at least 3 hops. It can be Public when you only want a new name and don't need to hide where it runs. It can't own TNS labels set by applications: anything that needs a lasting name should use an ordinary identity.
+
+Applications get them through the API (`create_ephemeral_identity`). From the command line, `--ephemeral` gives `listen` and `connect` a fresh Hidden throwaway for as long as the command runs:
+
+```plaintext
+$ tarnet listen --ephemeral --port hello
+Publishing intro points for throwaway identity WCM0FGX0QSKSGH2YEH6SMCTD9QDG8NKKWJ5RBW8F445ZN9AK9N90...
+Listening on WCM0FGX0QSKSGH2YEH6SMCTD9QDG8NKKWJ5RBW8F445ZN9AK9N90 mode ReliableOrdered port 'hello'.
+
+$ tarnet connect --ephemeral --port hello WCM0FGX0QSKSGH2YEH6SMCTD9QDG8NKKWJ5RBW8F445ZN9AK9N90
+Connecting as throwaway identity QMEC9NVN45X0DMM3ADW2W9F55RZVP97EASXC7TY0HBHE6HDBGNSG.
+```
+
+The listener sees the connection come from `QMEC9…`, not from your `default` identity. Both identities are erased when their command exits.
 
 ## Privacy
 

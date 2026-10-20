@@ -142,6 +142,12 @@ struct ReliableState {
     fast_due: BTreeSet<u32>,
     /// Smoothed RTT and its variance (RFC 6298), once sampled.
     srtt: Option<Duration>,
+    /// Backed-off timeout that new packets keep after a retransmission
+    /// timeout, until a valid RTT sample arrives (RFC 6298 5.5–5.7). Without
+    /// it, a path slower than the initial timeout retransmits every packet
+    /// spuriously, Karn's rule then never yields a sample, and the timeout
+    /// never adapts. 0 = none.
+    rto_floor_ms: u64,
     rttvar: Duration,
     /// Last time we received any ACK (for death detection).
     last_ack_at: Instant,
@@ -177,6 +183,7 @@ impl ReliableState {
             retransmitted: HashSet::new(),
             fast_due: BTreeSet::new(),
             srtt: None,
+            rto_floor_ms: 0,
             rttvar: Duration::ZERO,
             last_ack_at: now,
             retries_since_ack: 0,
@@ -194,10 +201,11 @@ impl ReliableState {
 impl ReliableState {
     /// RTO for a packet's first retry: RFC 6298 `srtt + 4·rttvar`, clamped.
     fn base_rto_ms(&self) -> u64 {
-        match self.srtt {
+        let computed = match self.srtt {
             Some(srtt) => ((srtt + self.rttvar * 4).as_millis() as u64).clamp(MIN_RTO_MS, MAX_RTO_MS),
             None => INITIAL_RTO_MS,
-        }
+        };
+        computed.max(self.rto_floor_ms).min(MAX_RTO_MS)
     }
 
     /// Timeout for a packet with `queued` packets (itself included) in
@@ -208,6 +216,8 @@ impl ReliableState {
     }
 
     fn sample_rtt(&mut self, rtt: Duration) {
+        // A valid sample: the estimator takes over from the backed-off floor.
+        self.rto_floor_ms = 0;
         match self.srtt {
             None => {
                 self.srtt = Some(rtt);
@@ -446,6 +456,11 @@ impl Channel {
 
     /// Generate an ACK message for the current receive state.
     /// Returns None for unreliable channels.
+    /// Smoothed round-trip time, once a valid sample exists.
+    pub fn srtt(&self) -> Option<Duration> {
+        self.state.reliable_state().and_then(|s| s.srtt)
+    }
+
     pub fn generate_ack(&self) -> Option<(u32, Vec<u32>)> {
         match &self.state {
             ChannelState::ReliableUnordered(state) => {
@@ -479,6 +494,19 @@ impl Channel {
     /// below the highest selectively acknowledged sequence are marked for
     /// immediate retransmission (see [`has_fast_retransmit`](Self::has_fast_retransmit)).
     pub fn process_ack(&mut self, ack_seq: u32, selective_acks: &[u32]) -> Vec<u32> {
+        self.process_ack_timed(ack_seq, selective_acks, None)
+    }
+
+    /// Process an ACK that may carry `echo_rtt`, the round trip of the
+    /// transmission whose timestamp it echoed. An echoed sample is valid
+    /// even for a retransmitted packet, so the timeout adapts under loss
+    /// where Karn's rule would leave it backed off.
+    pub fn process_ack_timed(
+        &mut self,
+        ack_seq: u32,
+        selective_acks: &[u32],
+        echo_rtt: Option<Duration>,
+    ) -> Vec<u32> {
         let channel_id = self.channel_id;
         let state = match self.state.reliable_state_mut() {
             Some(s) => s,
@@ -527,6 +555,10 @@ impl Channel {
             }
         }
 
+        if let Some(rtt) = echo_rtt.filter(|rtt| rtt.as_millis() as u64 <= MAX_RTO_MS) {
+            state.sample_rtt(rtt);
+            rtt_sample = None;
+        }
         if acked.is_empty() {
             return acked;
         }
@@ -645,6 +677,7 @@ impl Channel {
         let now = Instant::now();
         let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
         let fast: Vec<u32> = state.fast_due.iter().copied().collect();
+        let fast_count = fast.len();
         for seq in fast {
             if due.len() >= MAX_RETRANSMIT_BATCH {
                 break;
@@ -681,10 +714,15 @@ impl Channel {
         let backoff_cap = state
             .rto_with_queue_ms(state.send_buf.len())
             .max(MAX_BACKOFF_MS);
-        for &(seq, _) in &due {
+        for (i, &(seq, _)) in due.iter().enumerate() {
             // Exponential backoff with jitter (±25%) to desynchronize
             // retransmits across channels/nodes that hit the same loss event.
             let base = state.send_rtos[&seq] * 2;
+            if i >= fast_count.min(due.len()) {
+                // A timeout (not a fast retransmit): new packets keep the
+                // backed-off timeout until an RTT sample is valid again.
+                state.rto_floor_ms = state.rto_floor_ms.max(base.min(backoff_cap));
+            }
             let jitter_range = base / 4;
             let jittered = if jitter_range > 0 {
                 let offset = rand::thread_rng().gen_range(0..=jitter_range * 2);
@@ -1095,10 +1133,70 @@ mod reliability_tests {
         let rto_before = channel.state.reliable_state().unwrap().send_rtos[&first.0];
         // Two doublings with ±25% jitter: at least 1000 · 1.5 · 1.5 = 2250 ms.
         assert!(rto_before > 2 * INITIAL_RTO_MS);
-        // The second arrives: the path is alive, so the first's backoff resets.
+        // The second arrives, but it was retransmitted: its ACK is no RTT
+        // sample (Karn), so the backed-off timeout stays as a floor for the
+        // first and for new packets (RFC 6298 5.5–5.7). The per-packet
+        // doubling is gone.
         channel.process_ack(0, &[1]);
+        let floor = channel.state.reliable_state().unwrap().rto_floor_ms;
+        assert!(floor > INITIAL_RTO_MS);
+        assert!(channel.state.reliable_state().unwrap().send_rtos[&first.0] <= rto_before.max(floor));
+        let third = channel.prepare_send(vec![3]).remove(0);
+        assert!(channel.state.reliable_state().unwrap().send_rtos[&third.0] >= floor);
+        // A fresh packet's ACK is a valid sample: the estimator takes over and
+        // the backoff is gone.
+        channel.process_ack(0, &[third.0]);
         let state = channel.state.reliable_state().unwrap();
+        assert_eq!(state.rto_floor_ms, 0);
         assert!(state.send_rtos[&first.0] <= INITIAL_RTO_MS);
+    }
+
+    /// A path slower than the initial timeout: without the RFC 6298 floor,
+    /// every packet would be retransmitted spuriously, Karn's rule would
+    /// never yield a sample, and the timeout would never adapt.
+    #[test]
+    fn a_slow_path_stops_spurious_retransmits_after_one_timeout() {
+        let mut channel = Channel::new(0, [0; 32], true, true);
+        let slow = Duration::from_millis(INITIAL_RTO_MS + 500);
+        // First packet: the ACK takes longer than the initial timeout.
+        let p1 = channel.prepare_send(vec![1]).remove(0);
+        age_all(&mut channel, slow);
+        assert_eq!(channel.retransmit_due().len(), 1, "one spurious retransmit");
+        channel.process_ack(p1.0.wrapping_add(1), &[]);
+        // The next packet waits for the backed-off timeout: no retransmit at
+        // the same delay, so its ACK is a valid sample.
+        let p2 = channel.prepare_send(vec![2]).remove(0);
+        age_all(&mut channel, slow);
+        assert!(channel.retransmit_due().is_empty());
+        channel.process_ack(p2.0.wrapping_add(1), &[]);
+        let state = channel.state.reliable_state().unwrap();
+        assert!(state.srtt.is_some(), "the estimator got its sample");
+        assert_eq!(state.rto_floor_ms, 0);
+    }
+
+    /// Heavy random loss: every packet that gets through was retransmitted,
+    /// so Karn's rule never yields a sample. The echoed timestamp times the
+    /// copy that arrived, and the backed-off floor goes.
+    #[test]
+    fn an_echoed_timestamp_times_a_retransmitted_packet() {
+        let mut channel = Channel::new(0, [0; 32], true, true);
+        let p = channel.prepare_send(vec![1]).remove(0);
+        for _ in 0..3 {
+            age_all(&mut channel, Duration::from_secs(10));
+            assert_eq!(channel.retransmit_due().len(), 1);
+        }
+        channel.process_ack(p.0.wrapping_add(1), &[]);
+        assert!(channel.state.reliable_state().unwrap().rto_floor_ms > 2 * INITIAL_RTO_MS);
+        let q = channel.prepare_send(vec![2]).remove(0);
+        age_all(&mut channel, Duration::from_secs(10));
+        assert_eq!(channel.retransmit_due().len(), 1);
+        channel.process_ack_timed(q.0.wrapping_add(1), &[], Some(Duration::from_millis(40)));
+        let state = channel.state.reliable_state().unwrap();
+        assert_eq!(state.rto_floor_ms, 0);
+        assert_eq!(state.srtt, Some(Duration::from_millis(40)));
+        // An implausible echo is ignored.
+        channel.process_ack_timed(q.0.wrapping_add(1), &[], Some(Duration::from_secs(60)));
+        assert_eq!(channel.state.reliable_state().unwrap().srtt, Some(Duration::from_millis(40)));
     }
 
     fn cwnd(c: &Channel) -> f64 {

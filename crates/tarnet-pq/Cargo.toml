@@ -1,0 +1,11 @@
+[package]
+name = "tarnet-pq"
+version = "0.1.0"
+edition = "2021"
+description = "Non-generic wrappers over the post-quantum primitives tarnet uses, so they compile optimised in every profile"
+
+[dependencies]
+ml-kem = { version = "0.3.3", features = ["zeroize", "hazmat"] }
+ml-dsa = "0.1.1"
+slh-dsa = "=0.2.0-rc.5"
+zeroize = "1"

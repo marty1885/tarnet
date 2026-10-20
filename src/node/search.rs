@@ -277,7 +277,7 @@ mod response_regressions {
 
     #[tokio::test]
     async fn invalid_first_answers_do_not_consume_local_or_relay_requests() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let from = PeerId([1; 32]);
         let target = PeerId([2; 32]);
         let nonce = [3; 16];
@@ -318,7 +318,7 @@ mod response_regressions {
 
     #[tokio::test]
     async fn unusable_answer_does_not_consume_the_waiter() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let from = PeerId([1; 32]);
         let target = PeerId([2; 32]);
         let nonce = [3; 16];
@@ -338,7 +338,7 @@ mod response_regressions {
 
     #[tokio::test]
     async fn offline_search_does_not_start_the_target_cooldown() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let target = PeerId([9; 32]);
         assert_eq!(node.route_search(&target).await, None);
         assert!(!node.search.last_search.lock().await.contains_key(&target));

@@ -1,3 +1,4 @@
+pub mod bundle;
 pub mod error;
 pub mod ipc;
 pub mod service;

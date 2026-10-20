@@ -105,23 +105,32 @@ impl Node {
         let (shared_bytes, reply_ciphertext) = kex_accept(offer_algo, &ke.ephemeral_pubkey)?;
         let shared_bytes = Zeroizing::new(shared_bytes);
 
-        // The initiator may be beyond our local area: reach it by its address.
-        let hints = self.address_hints(&ke.initiator_peer_id).await;
-        let mut tunnel = Tunnel::new(ke.initiator_peer_id, &shared_bytes, false);
-        tunnel.hints = hints.clone();
-        {
-            let mut table = self.tunnel_table.lock().await;
-            if let Some(old) = table.get(&ke.initiator_peer_id) {
-                tunnel.kex_nonces = old.kex_nonces.clone();
-            }
-            tunnel.remember_kex(ke.nonce);
-            table.add(tunnel);
-        }
-
         // Generate our own nonce for the response
         let mut rng = rand::rngs::OsRng;
         let mut resp_nonce = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rng, &mut resp_nonce);
+
+        // The initiator may be beyond our local area: reach it by its address.
+        let hints = self.address_hints(&ke.initiator_peer_id).await;
+        let transcript = crate::tunnel::kex_transcript(
+            &ke.initiator_peer_id,
+            &self.peer_id(),
+            ke.kem_algo,
+            &ke.ephemeral_pubkey,
+            &reply_ciphertext,
+            &ke.nonce,
+            &resp_nonce,
+        );
+        let mut tunnel = Tunnel::new(ke.initiator_peer_id, &shared_bytes, &transcript, false);
+        tunnel.hints = hints.clone();
+        {
+            let mut table = self.tunnel_table.lock().await;
+            if let Some(old) = table.remove(&ke.initiator_peer_id) {
+                tunnel.succeed(old);
+            }
+            tunnel.remember_kex(ke.nonce);
+            table.add(tunnel);
+        }
 
         let mut response = TunnelKeyResponseMsg {
             kem_algo: ke.kem_algo,
@@ -216,6 +225,15 @@ impl Node {
             }
 
             let shared_bytes = Zeroizing::new(kex.complete(&kr.ciphertext)?);
+            let transcript = crate::tunnel::kex_transcript(
+                &self.peer_id(),
+                &dest,
+                kr.kem_algo,
+                &kex.pubkey_bytes(),
+                &kr.ciphertext,
+                &kr.initiator_nonce,
+                &kr.nonce,
+            );
 
             // Authentication and decapsulation both succeeded.  Only now is it
             // safe to consume the one-shot state and notifier.
@@ -225,9 +243,14 @@ impl Node {
             };
             drop(pending);
 
-            let mut tunnel = Tunnel::new(dest, &shared_bytes, true);
+            let mut tunnel = Tunnel::new(dest, &shared_bytes, &transcript, true);
             tunnel.hints = self.known_hints(&dest).await;
-            self.tunnel_table.lock().await.add(tunnel);
+            let mut table = self.tunnel_table.lock().await;
+            if let Some(old) = table.remove(&dest) {
+                tunnel.succeed(old);
+            }
+            table.add(tunnel);
+            drop(table);
 
             log::info!("Tunnel established (initiator) with {:?}", dest);
             let _ = notifier.send(dest);
@@ -574,6 +597,32 @@ impl Node {
 
         log::info!("Tunnel key exchange initiated to {:?}", dest);
         Ok(rx)
+    }
+
+    /// Start a fresh key exchange for every tunnel we initiated that is due
+    /// for one (an hour old, or 65536 messages sent) and has none in flight.
+    /// The new tunnel replaces the old one; the old receive keys stay usable,
+    /// so nothing in flight is lost.
+    pub(super) async fn rekey_tunnels(self: &Arc<Self>) {
+        let due = self.tunnel_table.lock().await.rekey_due();
+        for dest in due {
+            let in_flight = self
+                .pending_key_exchanges
+                .lock()
+                .await
+                .iter()
+                .any(|(_, (_, _, d))| *d == dest);
+            if in_flight {
+                continue;
+            }
+            let node = self.clone();
+            tokio::spawn(async move {
+                match node.create_tunnel(dest).await {
+                    Ok(_) => log::debug!("Tunnel rekey to {:?} started", dest),
+                    Err(e) => log::debug!("Tunnel rekey to {:?} failed: {}", dest, e),
+                }
+            });
+        }
     }
 
     /// Take the application data receiver (for consuming delivered messages).

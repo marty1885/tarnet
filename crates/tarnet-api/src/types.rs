@@ -3,12 +3,16 @@ use std::fmt;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Identity scheme identifier.
+/// Identity scheme. The byte values are identity v2's (wire v10); v1 values
+/// are rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum IdentityScheme {
-    Ed25519 = 0x01,
-    FalconEd25519 = 0x02,
+    /// Ed25519 only. Throwaway identities only: persistent identities and
+    /// PeerIds are hybrid.
+    Ed25519 = 0x11,
+    /// Ed25519 + Falcon-512 active, committing to ML-DSA-44 and SLH-DSA backups.
+    FalconEd25519 = 0x12,
 }
 
 impl IdentityScheme {
@@ -16,8 +20,8 @@ impl IdentityScheme {
 
     pub fn from_u8(v: u8) -> Result<Self, &'static str> {
         match v {
-            0x01 => Ok(Self::Ed25519),
-            0x02 => Ok(Self::FalconEd25519),
+            0x11 => Ok(Self::Ed25519),
+            0x12 => Ok(Self::FalconEd25519),
             _ => Err("unknown identity scheme"),
         }
     }
@@ -29,11 +33,9 @@ impl IdentityScheme {
         }
     }
 
+    /// Every identity's static KEM is hybrid.
     pub fn kem_algo(self) -> KemAlgo {
-        match self {
-            Self::Ed25519 => KemAlgo::X25519,
-            Self::FalconEd25519 => KemAlgo::MlkemX25519,
-        }
+        KemAlgo::MlkemX25519
     }
 }
 
@@ -46,19 +48,20 @@ impl fmt::Display for IdentityScheme {
     }
 }
 
-/// Signing algorithm identifier.
+/// Identity class of a signer, carried on the wire next to its key bundle.
+/// It must match the bundle's committed set (see [`crate::bundle`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SigningAlgo {
-    Ed25519 = 0x01,
-    FalconEd25519 = 0x02,
+    Ed25519 = 0x11,
+    FalconEd25519 = 0x12,
 }
 
 impl SigningAlgo {
     pub fn from_u8(v: u8) -> Result<Self, &'static str> {
         match v {
-            0x01 => Ok(Self::Ed25519),
-            0x02 => Ok(Self::FalconEd25519),
+            0x11 => Ok(Self::Ed25519),
+            0x12 => Ok(Self::FalconEd25519),
             _ => Err("unknown signing algorithm"),
         }
     }
@@ -73,36 +76,20 @@ impl fmt::Display for SigningAlgo {
     }
 }
 
-/// KEM (Key Encapsulation Mechanism) algorithm identifier.
+/// KEM algorithm. Every KEM is the hybrid ML-KEM-768 (FIPS 203) + X25519
+/// combination; the byte stays on the wire for future versions, and each
+/// version accepts exactly one value (no negotiation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum KemAlgo {
-    X25519 = 0x01,
-    MlkemX25519 = 0x02,
+    MlkemX25519 = 0x03,
 }
 
 impl KemAlgo {
     pub fn from_u8(v: u8) -> Result<Self, &'static str> {
         match v {
-            0x01 => Ok(Self::X25519),
-            0x02 => Ok(Self::MlkemX25519),
+            0x03 => Ok(Self::MlkemX25519),
             _ => Err("unknown KEM algorithm"),
-        }
-    }
-
-    /// Negotiate the KEM algorithm to use for rekey given both sides' identity
-    /// KEM algorithms. Returns the strongest algorithm both sides can perform.
-    ///
-    /// Each pair of algorithms requires an explicit match arm — the numeric
-    /// values carry no ordering, so adding a new variant forces the compiler
-    /// to handle every combination.
-    pub fn negotiate_rekey(my: Self, peer: Self) -> Self {
-        match (my, peer) {
-            (Self::X25519, Self::X25519) => Self::X25519,
-            (Self::MlkemX25519, Self::MlkemX25519) => Self::MlkemX25519,
-            (Self::MlkemX25519, Self::X25519) | (Self::X25519, Self::MlkemX25519) => Self::X25519,
-            // Future variants: add explicit arms here.
-            // The compiler will enforce exhaustiveness.
         }
     }
 }
@@ -110,7 +97,6 @@ impl KemAlgo {
 impl fmt::Display for KemAlgo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::X25519 => write!(f, "x25519"),
             Self::MlkemX25519 => write!(f, "mlkem_x25519"),
         }
     }
@@ -194,10 +180,14 @@ impl ServiceId {
         &self.0
     }
 
-    /// Construct from a signing public key (any length — hashed).
+    /// The SID of an identity v2 key bundle. Bytes that aren't a canonical
+    /// bundle get a hash under a separate domain, which matches no identity:
+    /// signature checks reject them anyway.
     pub fn from_signing_pubkey(pubkey: &[u8]) -> Self {
-        let hash = blake3::derive_key("tarnet service-id", pubkey);
-        ServiceId(hash)
+        match crate::bundle::Bundle::parse(pubkey) {
+            Some(b) => b.service_id(),
+            None => ServiceId(blake3::derive_key("tarnet invalid identity v2", pubkey)),
+        }
     }
 
     /// Whether this is the wildcard ServiceId.
@@ -610,11 +600,11 @@ mod tests {
     #[test]
     fn identity_scheme_roundtrip() {
         assert_eq!(
-            IdentityScheme::from_u8(0x01).unwrap(),
+            IdentityScheme::from_u8(0x11).unwrap(),
             IdentityScheme::Ed25519
         );
         assert_eq!(
-            IdentityScheme::from_u8(0x02).unwrap(),
+            IdentityScheme::from_u8(0x12).unwrap(),
             IdentityScheme::FalconEd25519
         );
     }
@@ -622,7 +612,7 @@ mod tests {
     #[test]
     fn identity_scheme_maps_to_algos() {
         assert_eq!(IdentityScheme::Ed25519.signing_algo(), SigningAlgo::Ed25519);
-        assert_eq!(IdentityScheme::Ed25519.kem_algo(), KemAlgo::X25519);
+        assert_eq!(IdentityScheme::Ed25519.kem_algo(), KemAlgo::MlkemX25519);
         assert_eq!(
             IdentityScheme::FalconEd25519.signing_algo(),
             SigningAlgo::FalconEd25519
@@ -672,9 +662,9 @@ mod tests {
 
     #[test]
     fn signing_algo_roundtrip() {
-        assert_eq!(SigningAlgo::from_u8(0x01).unwrap(), SigningAlgo::Ed25519);
+        assert_eq!(SigningAlgo::from_u8(0x11).unwrap(), SigningAlgo::Ed25519);
         assert_eq!(
-            SigningAlgo::from_u8(0x02).unwrap(),
+            SigningAlgo::from_u8(0x12).unwrap(),
             SigningAlgo::FalconEd25519
         );
     }
@@ -682,20 +672,21 @@ mod tests {
     #[test]
     fn signing_algo_rejects_unknown() {
         assert!(SigningAlgo::from_u8(0x00).is_err());
-        assert!(SigningAlgo::from_u8(0x03).is_err());
+        assert!(SigningAlgo::from_u8(0x01).is_err());
+        assert!(SigningAlgo::from_u8(0x02).is_err());
         assert!(SigningAlgo::from_u8(0xFF).is_err());
     }
 
     #[test]
     fn kem_algo_roundtrip() {
-        assert_eq!(KemAlgo::from_u8(0x01).unwrap(), KemAlgo::X25519);
-        assert_eq!(KemAlgo::from_u8(0x02).unwrap(), KemAlgo::MlkemX25519);
+        assert_eq!(KemAlgo::from_u8(0x03).unwrap(), KemAlgo::MlkemX25519);
     }
 
     #[test]
     fn kem_algo_rejects_unknown() {
         assert!(KemAlgo::from_u8(0x00).is_err());
-        assert!(KemAlgo::from_u8(0x03).is_err());
+        assert!(KemAlgo::from_u8(0x01).is_err());
+        assert!(KemAlgo::from_u8(0x02).is_err());
         assert!(KemAlgo::from_u8(0xFF).is_err());
     }
 }

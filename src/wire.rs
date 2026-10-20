@@ -1,10 +1,10 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
-/// Minimum wire protocol version this node supports. Version 9 introduces
-/// stream receive credit and unsequenced stream window probes.
-pub const WIRE_VERSION_MIN: u8 = 9;
+/// Minimum wire protocol version this node supports. Version 10 is identity
+/// and cryptography v2 (`docs/spec/identity.md`), a hard break.
+pub const WIRE_VERSION_MIN: u8 = 10;
 /// Maximum (current) wire protocol version this node supports.
-pub const WIRE_VERSION_MAX: u8 = 9;
+pub const WIRE_VERSION_MAX: u8 = 10;
 /// Current wire version used in outgoing messages.
 pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
@@ -143,82 +143,105 @@ impl WireMessage {
 
 // ── Specific message payload structs ──
 
-/// HandshakeHello: ephemeral(32) || signing_algo(u8) || signing_pk_len(u16 BE) || signing_pk || kem_algo(u8) || kem_pk_len(u16 BE) || kem_pk || challenge(32) || eph_kem_pk_len(u16 BE) || eph_kem_pk || min_version(u8) || max_version(u8)
+/// HandshakeHello, initiator → responder (link handshake v2, see
+/// `docs/spec/identity.md`): `min_version(u8) || max_version(u8) ||
+/// nonce(32) || eph_kem_pk_len(u16) || eph_kem_pk`. The KEM key is the hybrid
+/// one; no identity travels in the clear.
 #[derive(Debug, Clone)]
 pub struct HandshakeHello {
-    pub ephemeral_pubkey: [u8; 32],
-    pub signing_algo: u8,
-    pub signing_pubkey: Vec<u8>,
-    pub kem_algo: u8,
-    pub kem_pubkey: Vec<u8>,
-    pub challenge: [u8; 32],
-    /// Ephemeral KEM public key for per-session PQ forward secrecy.
-    pub eph_kem_pubkey: Vec<u8>,
-    /// Minimum wire protocol version this node supports.
     pub min_version: u8,
-    /// Maximum wire protocol version this node supports.
     pub max_version: u8,
+    pub nonce: [u8; 32],
+    pub eph_kem_pubkey: Vec<u8>,
 }
 
 impl HandshakeHello {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let len = 32
-            + 1
-            + 2
-            + self.signing_pubkey.len()
-            + 1
-            + 2
-            + self.kem_pubkey.len()
-            + 32
-            + 2
-            + self.eph_kem_pubkey.len()
-            + 2;
-        let mut buf = Vec::with_capacity(len);
-        buf.extend_from_slice(&self.ephemeral_pubkey);
-        buf.push(self.signing_algo);
-        buf.extend_from_slice(&(self.signing_pubkey.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signing_pubkey);
-        buf.push(self.kem_algo);
-        buf.extend_from_slice(&(self.kem_pubkey.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.kem_pubkey);
-        buf.extend_from_slice(&self.challenge);
-        buf.extend_from_slice(&(self.eph_kem_pubkey.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.eph_kem_pubkey);
+        let mut buf = Vec::with_capacity(2 + 32 + 2 + self.eph_kem_pubkey.len());
         buf.push(self.min_version);
         buf.push(self.max_version);
+        buf.extend_from_slice(&self.nonce);
+        buf.extend_from_slice(&(self.eph_kem_pubkey.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.eph_kem_pubkey);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        // Minimum: 32 + 1 + 2 + 0 + 1 + 2 + 0 + 32 + 2 + 0 = 72
         let mut r = Reader::new(data);
-        let ephemeral_pubkey = r.read_array::<32>()?;
-        let signing_algo = r.read_u8()?;
-        let signing_pk_len = r.read_u16()? as usize;
-        let signing_pubkey = r.read_bytes(signing_pk_len)?;
-        let kem_algo = r.read_u8()?;
-        let kem_pk_len = r.read_u16()? as usize;
-        let kem_pubkey = r.read_bytes(kem_pk_len)?;
-        let challenge = r.read_array::<32>()?;
-        let eph_kem_pk_len = r.read_u16()? as usize;
-        let eph_kem_pubkey = r.read_bytes(eph_kem_pk_len)?;
         let (min_version, max_version) = (r.read_u8()?, r.read_u8()?);
+        let nonce = r.read_array::<32>()?;
+        let len = r.read_u16()? as usize;
+        let eph_kem_pubkey = r.read_bytes(len)?;
         r.finish()?;
         Ok(Self {
-            ephemeral_pubkey,
-            signing_algo,
-            signing_pubkey,
-            kem_algo,
-            kem_pubkey,
-            challenge,
-            eph_kem_pubkey,
             min_version,
             max_version,
+            nonce,
+            eph_kem_pubkey,
         })
     }
 
     pub fn to_wire(&self) -> WireMessage {
         WireMessage::new(MessageType::HandshakeHello, self.to_bytes())
+    }
+}
+
+/// The responder's HandshakeAuth: `version(u8) || min_version(u8) ||
+/// max_version(u8) || nonce(32) || ct_len(u16) || kem_ct || sealed_len(u16)
+/// || sealed`, where `sealed` is the responder's bundle and signature
+/// encrypted under the handshake key.
+#[derive(Debug, Clone)]
+pub struct HandshakeResponse {
+    pub version: u8,
+    pub min_version: u8,
+    pub max_version: u8,
+    pub nonce: [u8; 32],
+    pub kem_ciphertext: Vec<u8>,
+    pub sealed: Vec<u8>,
+}
+
+impl HandshakeResponse {
+    /// Everything before `sealed`: what the first transcript hash covers.
+    pub fn header_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(3 + 32 + 2 + self.kem_ciphertext.len());
+        buf.push(self.version);
+        buf.push(self.min_version);
+        buf.push(self.max_version);
+        buf.extend_from_slice(&self.nonce);
+        buf.extend_from_slice(&(self.kem_ciphertext.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.kem_ciphertext);
+        buf
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.header_bytes();
+        buf.extend_from_slice(&(self.sealed.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.sealed);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(data);
+        let version = r.read_u8()?;
+        let (min_version, max_version) = (r.read_u8()?, r.read_u8()?);
+        let nonce = r.read_array::<32>()?;
+        let len = r.read_u16()? as usize;
+        let kem_ciphertext = r.read_bytes(len)?;
+        let len = r.read_u16()? as usize;
+        let sealed = r.read_bytes(len)?;
+        r.finish()?;
+        Ok(Self {
+            version,
+            min_version,
+            max_version,
+            nonce,
+            kem_ciphertext,
+            sealed,
+        })
+    }
+
+    pub fn to_wire(&self) -> WireMessage {
+        WireMessage::new(MessageType::HandshakeAuth, self.to_bytes())
     }
 }
 
@@ -245,28 +268,29 @@ impl HandshakeConfirmMsg {
     }
 }
 
-/// RekeyMsg: kem_algo(u8) || kem_pk_len(u16 BE) || kem_pubkey || kem_ct_len(u16 BE) || kem_ciphertext || sig_len(u16 BE) || signature
+/// RekeyMsg: `epoch(u64) || kem_algo(u8) || kem_pk_len(u16) || kem_pubkey ||
+/// kem_ct_len(u16) || kem_ciphertext || sig_len(u16) || signature`.
 ///
-/// The KEM type owns the entire key exchange. For X25519, the KEM pubkey *is*
-/// the ephemeral X25519 public key. For hybrid (MlkemX25519), it contains
-/// both the X25519 and ML-KEM public keys.
+/// A request carries the initiator's ephemeral hybrid KEM key, a reply the
+/// ciphertext to it. `epoch` is the key epoch the exchange installs.
 #[derive(Debug, Clone)]
 pub struct RekeyMsg {
-    /// KEM algorithm for this rekey exchange.
+    pub epoch: u64,
     pub kem_algo: u8,
-    /// Ephemeral KEM public key (sent by initiator for responder to encapsulate to).
     pub kem_pubkey: Vec<u8>,
-    /// KEM ciphertext (sent by responder, encapsulated to initiator's kem_pubkey).
     pub kem_ciphertext: Vec<u8>,
     pub signature: Vec<u8>,
 }
 
 impl RekeyMsg {
-    /// Bytes covered by the signature: a domain label, then kem_algo and the
-    /// KEM pubkey and ciphertext, each length-prefixed (a request's key and
-    /// a response's ciphertext with the same bytes sign differently).
-    pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut buf = b"tarnet link rekey v1".to_vec();
+    /// Bytes covered by the signature: a domain label, the link's handshake
+    /// transcript, the epoch, kem_algo, and the KEM pubkey and ciphertext,
+    /// each length-prefixed (a request's key and a reply's ciphertext with
+    /// the same bytes sign differently).
+    pub fn signable_bytes(&self, transcript: &[u8; 32]) -> Vec<u8> {
+        let mut buf = b"tarnet link rekey v2".to_vec();
+        buf.extend_from_slice(transcript);
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.push(self.kem_algo);
         for field in [&self.kem_pubkey, &self.kem_ciphertext] {
             buf.extend_from_slice(&(field.len() as u32).to_be_bytes());
@@ -277,13 +301,9 @@ impl RekeyMsg {
 
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(
-            1 + 2
-                + self.kem_pubkey.len()
-                + 2
-                + self.kem_ciphertext.len()
-                + 2
-                + self.signature.len(),
+            8 + 1 + 2 + self.kem_pubkey.len() + 2 + self.kem_ciphertext.len() + 2 + self.signature.len(),
         );
+        buf.extend_from_slice(&self.epoch.to_be_bytes());
         buf.push(self.kem_algo);
         buf.extend_from_slice(&(self.kem_pubkey.len() as u16).to_be_bytes());
         buf.extend_from_slice(&self.kem_pubkey);
@@ -295,8 +315,8 @@ impl RekeyMsg {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        // Minimum: 1 + 2 + 0 + 2 + 0 + 2 + 0 = 7
         let mut r = Reader::new(data);
+        let epoch = r.read_u64()?;
         let kem_algo = r.read_u8()?;
         let kem_pk_len = r.read_u16()? as usize;
         let kem_pubkey = r.read_bytes(kem_pk_len)?;
@@ -306,6 +326,7 @@ impl RekeyMsg {
         let signature = r.read_bytes(sig_len)?;
         r.finish()?;
         Ok(Self {
+            epoch,
             kem_algo,
             kem_pubkey,
             kem_ciphertext,
@@ -388,51 +409,27 @@ impl KeepaliveMsg {
     }
 }
 
-/// HandshakeAuth: sig_len(u16 BE) || signature || kem_ct_len(u16 BE) || kem_ciphertext || eph_kem_ct_len(u16 BE) || eph_kem_ciphertext
+/// The initiator's HandshakeAuth: `sealed_len(u16) || sealed`, its bundle and
+/// signature encrypted under the handshake key.
 #[derive(Debug, Clone)]
 pub struct HandshakeAuth {
-    pub signature: Vec<u8>,
-    /// KEM ciphertext from initiator→responder static KEM encapsulation.
-    /// Empty for the responder's Auth message.
-    pub kem_ciphertext: Vec<u8>,
-    /// KEM ciphertext from initiator→responder ephemeral KEM encapsulation.
-    /// Provides PQ forward secrecy. Empty for the responder's Auth message.
-    pub eph_kem_ciphertext: Vec<u8>,
+    pub sealed: Vec<u8>,
 }
 
 impl HandshakeAuth {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(
-            2 + self.signature.len()
-                + 2
-                + self.kem_ciphertext.len()
-                + 2
-                + self.eph_kem_ciphertext.len(),
-        );
-        buf.extend_from_slice(&(self.signature.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.signature);
-        buf.extend_from_slice(&(self.kem_ciphertext.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.kem_ciphertext);
-        buf.extend_from_slice(&(self.eph_kem_ciphertext.len() as u16).to_be_bytes());
-        buf.extend_from_slice(&self.eph_kem_ciphertext);
+        let mut buf = Vec::with_capacity(2 + self.sealed.len());
+        buf.extend_from_slice(&(self.sealed.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&self.sealed);
         buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
         let mut r = Reader::new(data);
-        let sig_len = r.read_u16()? as usize;
-        let signature = r.read_bytes(sig_len)?;
-        // Both ciphertexts are always encoded (possibly empty).
-        let ct_len = r.read_u16()? as usize;
-        let kem_ciphertext = r.read_bytes(ct_len)?;
-        let ct_len = r.read_u16()? as usize;
-        let eph_kem_ciphertext = r.read_bytes(ct_len)?;
+        let len = r.read_u16()? as usize;
+        let sealed = r.read_bytes(len)?;
         r.finish()?;
-        Ok(Self {
-            signature,
-            kem_ciphertext,
-            eph_kem_ciphertext,
-        })
+        Ok(Self { sealed })
     }
 
     pub fn to_wire(&self) -> WireMessage {
@@ -1923,24 +1920,47 @@ pub struct StreamAckMsg {
     pub receive_limit: u32,
     pub ack_seq: u32,
     pub selective_acks: Vec<u32>,
+    /// The send timestamp of the last DATA packet that arrived since the
+    /// previous ACK, echoed so the sender can time that transmission even
+    /// when it was a retransmission.
+    pub echo: Option<u16>,
 }
 
 impl StreamAckMsg {
+    /// Encoded size with no selective acks and no echo.
+    pub const MIN_LEN: usize = 10;
+
+    /// `receive_limit(u32) || ack_seq(u32) || count(u16) || count × seq(u32)
+    /// [|| echo(u16)]`
     pub fn to_bytes(&self) -> Vec<u8> {
-        ChannelAckMsg {
+        let mut buf = ChannelAckMsg {
             channel_id: self.receive_limit,
             ack_seq: self.ack_seq,
             selective_acks: self.selective_acks.clone(),
         }
-        .to_bytes()
+        .to_bytes();
+        if let Some(echo) = self.echo {
+            buf.extend_from_slice(&echo.to_be_bytes());
+        }
+        buf
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        let ack = ChannelAckMsg::from_bytes(data)?;
+        let count = data
+            .get(8..10)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]) as usize)
+            .ok_or_else(|| Error::Wire("StreamAck truncated".into()))?;
+        let base = 10 + count.min(MAX_SELECTIVE_ACKS + 1) * 4;
+        let (ack, echo) = match data.len().checked_sub(base) {
+            Some(2) => (&data[..base], Some(u16::from_be_bytes([data[base], data[base + 1]]))),
+            _ => (data, None),
+        };
+        let ack = ChannelAckMsg::from_bytes(ack)?;
         Ok(Self {
             receive_limit: ack.channel_id,
             ack_seq: ack.ack_seq,
             selective_acks: ack.selective_acks,
+            echo,
         })
     }
 }
@@ -2561,54 +2581,40 @@ mod tests {
     }
 
     #[test]
-    fn handshake_hello_roundtrip() {
+    fn handshake_messages_roundtrip_exactly() {
         let hello = HandshakeHello {
-            ephemeral_pubkey: [42u8; 32],
-            signing_algo: 1,
-            signing_pubkey: vec![99u8; 32],
-            kem_algo: 2,
-            kem_pubkey: vec![88u8; 1184],
-            challenge: [0xAB; 32],
+            min_version: 10,
+            max_version: 11,
+            nonce: [0xAB; 32],
             eph_kem_pubkey: vec![77u8; 1216],
-            min_version: 2,
-            max_version: 3,
         };
-        let bytes = hello.to_bytes();
-        let decoded = HandshakeHello::from_bytes(&bytes).unwrap();
-        assert_eq!(decoded.ephemeral_pubkey, hello.ephemeral_pubkey);
-        assert_eq!(decoded.signing_algo, 1);
-        assert_eq!(decoded.signing_pubkey, vec![99u8; 32]);
-        assert_eq!(decoded.kem_algo, 2);
-        assert_eq!(decoded.kem_pubkey, vec![88u8; 1184]);
-        assert_eq!(decoded.challenge, [0xAB; 32]);
+        let decoded = HandshakeHello::from_bytes(&hello.to_bytes()).unwrap();
+        assert_eq!((decoded.min_version, decoded.max_version), (10, 11));
+        assert_eq!(decoded.nonce, [0xAB; 32]);
         assert_eq!(decoded.eph_kem_pubkey, vec![77u8; 1216]);
-        assert_eq!(decoded.min_version, 2);
-        assert_eq!(decoded.max_version, 3);
-    }
-
-    #[test]
-    fn handshake_hello_is_exact() {
-        let hello = HandshakeHello {
-            ephemeral_pubkey: [42u8; 32],
-            signing_algo: 1,
-            signing_pubkey: vec![99u8; 32],
-            kem_algo: 2,
-            kem_pubkey: vec![88u8; 32],
-            challenge: [0xAB; 32],
-            eph_kem_pubkey: vec![77u8; 32],
-            min_version: 2,
-            max_version: 2,
-        };
-        let mut bytes = hello.to_bytes();
-        assert_eq!(HandshakeHello::from_bytes(&bytes).unwrap().max_version, 2);
-        // The version fields are required (the fallback for peers without
-        // them could never negotiate a supported version anyway)...
-        bytes.truncate(bytes.len() - 2);
-        assert!(HandshakeHello::from_bytes(&bytes).is_err());
-        // ...and nothing may follow them.
         let mut long = hello.to_bytes();
         long.push(0);
         assert!(HandshakeHello::from_bytes(&long).is_err());
+        let bytes = hello.to_bytes();
+        assert!(HandshakeHello::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+
+        let resp = HandshakeResponse {
+            version: 10,
+            min_version: 10,
+            max_version: 10,
+            nonce: [1; 32],
+            kem_ciphertext: vec![2; 1120],
+            sealed: vec![3; 1800],
+        };
+        let decoded = HandshakeResponse::from_bytes(&resp.to_bytes()).unwrap();
+        assert_eq!(decoded.header_bytes(), resp.header_bytes());
+        assert_eq!(decoded.sealed, resp.sealed);
+
+        let auth = HandshakeAuth { sealed: vec![4; 1700] };
+        assert_eq!(HandshakeAuth::from_bytes(&auth.to_bytes()).unwrap().sealed, auth.sealed);
+        let mut long = auth.to_bytes();
+        long.push(0);
+        assert!(HandshakeAuth::from_bytes(&long).is_err());
     }
 
     #[test]
@@ -2631,13 +2637,23 @@ mod tests {
             receive_limit: 7,
             ack_seq: u32::MAX - 3,
             selective_acks: vec![u32::MAX, 0, 2],
+            echo: None,
         };
         let bytes = ack.to_bytes();
         let decoded = StreamAckMsg::from_bytes(&bytes).unwrap();
         assert_eq!(decoded.receive_limit, 7);
         assert_eq!(decoded.ack_seq, u32::MAX - 3);
         assert_eq!(decoded.selective_acks, ack.selective_acks);
+        assert_eq!(decoded.echo, None);
         assert!(StreamAckMsg::from_bytes(&bytes[..bytes.len() - 1]).is_err());
+        let echoed = StreamAckMsg {
+            echo: Some(0xfffe),
+            ..ack.clone()
+        };
+        assert_eq!(StreamAckMsg::from_bytes(&echoed.to_bytes()).unwrap().echo, Some(0xfffe));
+        let mut odd = echoed.to_bytes();
+        odd.push(0);
+        assert!(StreamAckMsg::from_bytes(&odd).is_err());
         let mut oversized = bytes;
         oversized[8..10].copy_from_slice(&((MAX_SELECTIVE_ACKS + 1) as u16).to_be_bytes());
         assert!(StreamAckMsg::from_bytes(&oversized).is_err());

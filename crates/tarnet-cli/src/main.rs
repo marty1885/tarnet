@@ -68,10 +68,15 @@ enum Command {
         /// Port name to connect to
         #[arg(long, default_value = "80")]
         port: String,
+        /// Connect as a fresh throwaway identity instead of the default one;
+        /// it is erased when this command exits
+        #[arg(long)]
+        ephemeral: bool,
     },
     /// Listen for incoming connections (netcat-like I/O)
     Listen {
         /// Identity to listen on (label or ServiceId; defaults to default identity)
+        #[arg(conflicts_with = "ephemeral")]
         identity: Option<String>,
         /// Delivery mode: reliable-ordered, reliable-unordered, or unreliable-unordered
         #[arg(long, default_value = "reliable-ordered")]
@@ -79,6 +84,10 @@ enum Command {
         /// Port name to listen on
         #[arg(long, default_value = "80")]
         port: String,
+        /// Listen on a fresh Hidden throwaway identity; it is erased when
+        /// this command exits
+        #[arg(long)]
+        ephemeral: bool,
     },
     /// Run a command with traffic routed through tarnet
     #[command(arg_required_else_help = true)]
@@ -318,7 +327,8 @@ enum IdentityCommand {
         /// Number of outbound hops
         #[arg(long, default_value_t = 1)]
         outbound_hops: u8,
-        /// Key scheme: falcon_ed25519 (default, post-quantum) or ed25519
+        /// Key scheme. Persistent identities are hybrid post-quantum
+        /// (falcon_ed25519); Ed25519-only keys exist for throwaways only.
         #[arg(long, default_value = "falcon_ed25519")]
         scheme: String,
     },
@@ -388,12 +398,18 @@ async fn main() {
         Command::Dht { command } => cmd_dht(&cli, command).await,
         Command::Tns { command } => cmd_tns(&cli, command).await,
         Command::Identity { command } => cmd_identity(&cli, command).await,
-        Command::Connect { target, mode, port } => cmd_connect(&cli, target, mode, port).await,
+        Command::Connect {
+            target,
+            mode,
+            port,
+            ephemeral,
+        } => cmd_connect(&cli, target, mode, port, *ephemeral).await,
         Command::Listen {
             identity,
             mode,
             port,
-        } => cmd_listen(&cli, identity, mode, port).await,
+            ephemeral,
+        } => cmd_listen(&cli, identity, mode, port, *ephemeral).await,
         Command::Tarify { identity, command } => {
             cmd_tarify(&cli, identity.as_deref(), command).await
         }
@@ -1243,16 +1259,38 @@ fn parse_port_mode(mode: &str) -> PortMode {
     }
 }
 
-async fn cmd_connect(cli: &Cli, target: &str, mode: &str, port: &str) {
+/// A throwaway identity owned by this command's daemon connection: the
+/// daemon erases it when the command exits.
+async fn create_throwaway(client: &IpcServiceApi) -> ServiceId {
+    match client
+        .create_ephemeral_identity(tarnet_api::service::EphemeralOptions::default())
+        .await
+    {
+        Ok(sid) => sid,
+        Err(e) => {
+            eprintln!("Failed to create a throwaway identity: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_connect(cli: &Cli, target: &str, mode: &str, port: &str, ephemeral: bool) {
     let client = connect_daemon(cli).await;
     let mode = parse_port_mode(mode);
+    let source = if ephemeral {
+        let sid = create_throwaway(&client).await;
+        eprintln!("Connecting as throwaway identity {}.", sid);
+        Some(sid)
+    } else {
+        None
+    };
 
     eprintln!(
         "Connecting to {} mode {:?} port '{}'...",
         target, mode, port
     );
 
-    let conn = match client.connect_to(target, mode, port).await {
+    let conn = match client.connect_to_as(target, mode, port, source).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Connection failed: {}", e);
@@ -1270,23 +1308,42 @@ async fn cmd_connect(cli: &Cli, target: &str, mode: &str, port: &str) {
     stdio_bridge(&conn, &mut disconnect_rx).await;
 }
 
-async fn cmd_listen(cli: &Cli, identity: &Option<String>, mode: &str, port: &str) {
+async fn cmd_listen(cli: &Cli, identity: &Option<String>, mode: &str, port: &str, ephemeral: bool) {
     let client = connect_daemon(cli).await;
     let mode = parse_port_mode(mode);
 
-    let id_str = identity.as_deref().unwrap_or("default");
-    let service_id = match client.resolve_identity(id_str).await {
-        Ok(sid) => sid,
-        Err(e) => {
-            eprintln!("Failed to resolve identity '{}': {}", id_str, e);
-            std::process::exit(1);
+    let service_id = if ephemeral {
+        create_throwaway(&client).await
+    } else {
+        let id_str = identity.as_deref().unwrap_or("default");
+        match client.resolve_identity(id_str).await {
+            Ok(sid) => sid,
+            Err(e) => {
+                eprintln!("Failed to resolve identity '{}': {}", id_str, e);
+                std::process::exit(1);
+            }
         }
     };
 
-    let listener = match client
-        .listen(service_id, mode, port, ListenerOptions::default())
-        .await
-    {
+    // `connect` derives the wire port from the label it resolved and the
+    // port name; a bare ServiceId is the apex, "@".
+    let wire_port = vhost_wire_port("@", port);
+    // A Hidden throwaway is unreachable until its intro points are up.
+    let listening = if ephemeral {
+        eprintln!("Publishing intro points for throwaway identity {}...", service_id);
+        let intro_points = match tarnet_api::service::EphemeralOptions::default().privacy {
+            tarnet_api::types::PrivacyLevel::Hidden { intro_points } => intro_points as usize,
+            tarnet_api::types::PrivacyLevel::Public => 0,
+        };
+        client
+            .listen_hidden(service_id, mode, &wire_port, intro_points, ListenerOptions::default())
+            .await
+    } else {
+        client
+            .listen(service_id, mode, &wire_port, ListenerOptions::default())
+            .await
+    };
+    let listener = match listening {
         Ok(listener) => listener,
         Err(e) => {
             eprintln!("Listen failed: {}", e);

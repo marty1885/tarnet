@@ -611,6 +611,8 @@ async fn public_identity_explicit_listener() {
         .await
         .unwrap()
         .unwrap();
+    // The host learns the client's (verified) SID, not its own.
+    assert_eq!(conn_b.remote_service_id, a.default_service_id().await);
 
     // Verify data flows
     conn_a.send(b"hello blog").await.unwrap();
@@ -654,7 +656,9 @@ async fn signed_content_cross_node() {
 
     let results = c.dht_get_signed_content(&inner_hash, Duration::from_secs(6)).await;
     assert_eq!(results.len(), 1, "Node C should find signed content from Node A");
-    assert_eq!(results[0].0, a.peer_id());
+    // Signed by A's default identity, never its node key.
+    let signer = a.keypair_for_service(&a.default_service_id().await).await.unwrap().peer_id();
+    assert_eq!(results[0].0, signer);
     assert_eq!(results[0].1, topic);
 }
 
@@ -1150,9 +1154,13 @@ async fn circuit_layers_only_at_waypoints() {
 /// A hidden service and its client both use two-hop circuits: intro and
 /// rendezvous circuits cross waypoints, the rendezvous point swaps its layers,
 /// and the end-to-end layer rides inside them.
-#[tokio::test]
-async fn hidden_service_multi_hop_rendezvous() {
-    init_log();
+/// A five-node chain with a Hidden service on the last node and the first
+/// connected to it over two-hop circuits.
+async fn hidden_chain_connection() -> (
+    Vec<TestNode>,
+    tarnet_api::service::Connection,
+    tarnet_api::service::Connection,
+) {
     let nodes = spawn_chain(5).await;
     let (client, host) = (&nodes[0].node, &nodes[4].node);
     for n in &nodes[..4] {
@@ -1204,7 +1212,16 @@ async fn hidden_service_multi_hop_rendezvous() {
     .expect("connect timed out")
     .expect("connect failed");
     let served = accept.await.unwrap();
+    assert_eq!(served.remote_service_id, client.default_service_id().await);
 
+    (nodes, conn, served)
+}
+
+#[tokio::test]
+async fn hidden_service_multi_hop_rendezvous() {
+    init_log();
+    let (nodes, conn, served) = hidden_chain_connection().await;
+    let (client, host) = (&nodes[0].node, &nodes[4].node);
     conn.send(b"to the service").await.unwrap();
     let got = tokio::time::timeout(Duration::from_secs(10), served.recv())
         .await
@@ -1217,6 +1234,65 @@ async fn hidden_service_multi_hop_rendezvous() {
         .unwrap()
         .unwrap();
     assert_eq!(got, b"to the client");
+
+    // Rekey the client's end-to-end layer and the host's intro circuit; the
+    // connection carries on under the new keys both ways.
+    for round in 0..3u8 {
+        assert!(client.rekey_circuits_now().await.unwrap() >= 1);
+        assert!(host.rekey_circuits_now().await.unwrap() >= 1);
+        conn.send(&[round; 300]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(10), served.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, [round; 300]);
+        served.send(&[round + 100; 300]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(10), conn.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, [round + 100; 300]);
+    }
+}
+
+/// The end-to-end rekey of a rendezvous connection under loss: failed
+/// tries are retried with the same key, both ends' chains stay in step, and
+/// the connection carries on throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rendezvous_rekeys_under_loss() {
+    init_log();
+    let (nodes, conn, served) = hidden_chain_connection().await;
+    let (client, host) = (nodes[0].node.clone(), nodes[4].node.clone());
+    for node in [&client, &host] {
+        let mut firewall = Firewall::default();
+        firewall.add_rule(
+            Match::All(vec![
+                Match::MsgType(MessageType::CircuitRelay),
+                Match::Probability(0.10),
+            ]),
+            Action::Drop,
+        );
+        node.set_firewall(firewall).await;
+    }
+    for round in 0..4u8 {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while client.rekey_circuits_now().await.is_err() {}
+        })
+        .await
+        .expect("rendezvous rekey never completed");
+        conn.send(&[round; 300]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(30), served.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, [round; 300]);
+        served.send(&[round + 100; 300]).await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(30), conn.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, [round + 100; 300]);
+    }
 }
 
 /// Relay sampling on a chain: every sample is another node, its hints are
@@ -1331,17 +1407,15 @@ async fn hidden_service_with_sampled_relays() {
     assert_eq!(got, b"to the client");
 }
 
-// ── Cross-algorithm interop tests ──
+// ── Identity classes ──
 //
-// The network MUST work with mixed algorithms. A falcon_ed25519 identity
-// must be able to talk to an ed25519 identity seamlessly.
+// Nodes are hybrid. Ed25519-only keys exist only as throwaway identities.
 
-async fn spawn_node_with_algo(
+async fn spawn_node_with_scheme(
     bootstrap: Vec<String>,
-    signing: tarnet_api::types::SigningAlgo,
-    kem: tarnet_api::types::KemAlgo,
+    scheme: tarnet_api::types::IdentityScheme,
 ) -> TestNode {
-    let node = Arc::new(Node::new(Keypair::generate_with(signing, kem)));
+    let node = Arc::new(Node::new(Keypair::generate_with_scheme(scheme)));
     let disc = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
     let addr = disc.local_addrs()[0].to_string();
     let n = node.clone();
@@ -1352,380 +1426,22 @@ async fn spawn_node_with_algo(
     TestNode { node, addr }
 }
 
-/// Classic ed25519 node ↔ PQ falcon_ed25519 node: full link handshake + circuit.
+/// PeerIds must be hybrid: a node with an Ed25519-only key is refused at the
+/// link handshake, in both directions.
 #[tokio::test]
-async fn cross_algo_link_handshake() {
-    use tarnet_api::types::{KemAlgo, SigningAlgo};
+async fn ecc_node_is_refused() {
+    use tarnet_api::types::IdentityScheme;
     init_log();
 
-    // A = classic ed25519, B = PQ falcon_ed25519
-    let a = spawn_node_with_algo(vec![], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let b = spawn_node_with_algo(
-        vec![a.addr.clone()],
-        SigningAlgo::FalconEd25519,
-        KemAlgo::MlkemX25519,
-    )
-    .await;
+    let a = spawn_node_with_scheme(vec![], IdentityScheme::Ed25519).await;
+    let b = spawn_node_with_scheme(vec![a.addr.clone()], IdentityScheme::FalconEd25519).await;
+    let c = spawn_node_with_scheme(vec![b.addr.clone()], IdentityScheme::Ed25519).await;
 
-    // Wait for link establishment
-    let connected = wait_for(Duration::from_secs(5), || {
-        let a = a.node.clone();
-        let pid_b = b.node.peer_id();
-        async move { a.connected_peers().await.contains(&pid_b) }
-    })
-    .await;
-    assert!(connected, "ed25519 node should link to falcon_ed25519 node");
-
-    // Verify both directions
-    assert!(
-        b.node.connected_peers().await.contains(&a.node.peer_id()),
-        "falcon_ed25519 node should see ed25519 peer"
-    );
-}
-
-/// Circuit through mixed-algo nodes: ed25519 client → falcon_ed25519 relay → ed25519 service.
-#[tokio::test]
-async fn cross_algo_circuit_through_relay() {
-    use tarnet_api::types::{KemAlgo, SigningAlgo};
-    init_log();
-
-    let a = spawn_node_with_algo(vec![], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let b = spawn_node_with_algo(
-        vec![a.addr.clone()],
-        SigningAlgo::FalconEd25519,
-        KemAlgo::MlkemX25519,
-    )
-    .await;
-    let c = spawn_node_with_algo(vec![b.addr.clone()], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-
-    // Wait for A to have route to C
-    let has_route = wait_for(Duration::from_secs(5), || {
-        let a = a.node.clone();
-        let pid_c = c.node.peer_id();
-        async move {
-            a.routing_entries()
-                .await
-                .iter()
-                .any(|(dest, _, _)| *dest == pid_c)
-        }
-    })
-    .await;
-    assert!(
-        has_route,
-        "ed25519 node A should have route to ed25519 node C through falcon relay B"
-    );
-
-    // Build circuit A → B → C
-    let circuit_id = tokio::time::timeout(
-        Duration::from_secs(5),
-        a.node
-            .build_circuit(b.node.peer_id(), vec![c.node.peer_id()]),
-    )
-    .await
-    .expect("circuit build timed out")
-    .expect("circuit build failed");
-
-    assert!(circuit_id > 0);
-    a.node.destroy_circuit(circuit_id).await.unwrap();
-}
-
-/// PQ client connects to classic hidden service via rendezvous.
-#[tokio::test]
-async fn cross_algo_connect_pq_to_classic() {
-    use tarnet_api::types::{KemAlgo, SigningAlgo};
-    init_log();
-
-    // B = relay (PQ), A = client (PQ), C = service (classic)
-    let b = spawn_node_with_algo(vec![], SigningAlgo::FalconEd25519, KemAlgo::MlkemX25519).await;
-    let a = spawn_node_with_algo(
-        vec![b.addr.clone()],
-        SigningAlgo::FalconEd25519,
-        KemAlgo::MlkemX25519,
-    )
-    .await;
-    let c = spawn_node_with_algo(vec![b.addr.clone()], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-
-    // Wait for links
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // C listens
-    let listener_c = c
-        .node
-        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
-        .await
-        .unwrap();
-
-    // Use C's default identity (from identity store) — this is what
-    // handle_introduce_at_service uses, not the transport identity.
-    let service_id_c = c.node.default_service_id().await;
-    let default_kp_c = c.node.keypair_for_service(&service_id_c).await.unwrap();
-
-    // C owns the zone and its sequence; publish from C.
-    let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
-        relay_peer_id: b.node.peer_id(),
-        kem_algo: default_kp_c.identity.kem_algo() as u8,
-        kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
-    }];
-    tarnet::tns::publish(&*c.node, &default_kp_c, "intro", &intro_records)
-        .await
-        .unwrap();
-
-    // C registers intro point
-    c.node
-        .publish_hidden_service(service_id_c, 1)
-        .await
-        .expect("publish_hidden_service failed");
-    for record in held_label_records(&c.node, &default_kp_c, "intro").await {
-        a.node.dht_store_insert_local_for_test(record).await;
-    }
-
-    // C accepts in background
-    let node_c_accept = c.node.clone();
-    let accept_handle = tokio::spawn(async move {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            node_c_accept.circuit_accept(listener_c.id),
-        )
-        .await
-        .expect("accept timed out")
-        .expect("accept failed")
-    });
-
-    // A (PQ) connects to C (classic) via rendezvous
-    let kem_algo = default_kp_c.identity.kem_algo() as u8;
-    let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
-    // The intro points C actually registered at.
-    let intro_points: Vec<_> = c
-        .node
-        .hidden_intro_peers(&service_id_c)
-        .await
-        .into_iter()
-        .map(|p| (p, kem_algo, kem_pubkey.clone()))
-        .collect();
-    let client_conn = tokio::time::timeout(
-        Duration::from_secs(10),
-        a.node
-            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points, 1),
-    )
-    .await
-    .expect("connect timed out")
-    .expect("connect failed");
-
-    assert_eq!(client_conn.port, "80");
-
-    let service_conn = accept_handle.await.expect("accept task panicked");
-
-    // Bidirectional data exchange
-    client_conn.send(b"hello from PQ client").await.unwrap();
-    let received = service_conn.recv().await.unwrap();
-    assert_eq!(received, b"hello from PQ client");
-
-    service_conn
-        .send(b"hello from classic service")
-        .await
-        .unwrap();
-    let received = client_conn.recv().await.unwrap();
-    assert_eq!(received, b"hello from classic service");
-}
-
-/// Classic ed25519 client connects to PQ falcon_ed25519 hidden service via rendezvous.
-#[tokio::test]
-async fn cross_algo_connect_classic_to_pq() {
-    use tarnet_api::types::{KemAlgo, SigningAlgo};
-    init_log();
-
-    // B = relay (classic), A = client (classic), C = service (PQ)
-    let b = spawn_node_with_algo(vec![], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let a = spawn_node_with_algo(vec![b.addr.clone()], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let c = spawn_node_with_algo(
-        vec![b.addr.clone()],
-        SigningAlgo::FalconEd25519,
-        KemAlgo::MlkemX25519,
-    )
-    .await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // C (PQ) listens
-    let listener_c = c
-        .node
-        .circuit_listen(ServiceId::ALL, TEST_MODE, "80", ListenerOptions::default())
-        .await
-        .unwrap();
-
-    // Use C's default identity (from identity store) — this is what
-    // handle_introduce_at_service uses, not the transport identity.
-    let service_id_c = c.node.default_service_id().await;
-    let default_kp_c = c.node.keypair_for_service(&service_id_c).await.unwrap();
-
-    // C owns the zone and its sequence; publish from C.
-    let intro_records = vec![tarnet::tns::TnsRecord::IntroductionPoint {
-        relay_peer_id: b.node.peer_id(),
-        kem_algo: default_kp_c.identity.kem_algo() as u8,
-        kem_pubkey: default_kp_c.identity.kem.kem_pubkey_bytes(),
-    }];
-    tarnet::tns::publish(&*c.node, &default_kp_c, "intro", &intro_records)
-        .await
-        .unwrap();
-
-    c.node
-        .publish_hidden_service(service_id_c, 1)
-        .await
-        .expect("publish_hidden_service failed");
-    for record in held_label_records(&c.node, &default_kp_c, "intro").await {
-        a.node.dht_store_insert_local_for_test(record).await;
-    }
-
-    let node_c_accept = c.node.clone();
-    let accept_handle = tokio::spawn(async move {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            node_c_accept.circuit_accept(listener_c.id),
-        )
-        .await
-        .expect("accept timed out")
-        .expect("accept failed")
-    });
-
-    // A (classic) connects to C (PQ) via rendezvous
-    let kem_algo = default_kp_c.identity.kem_algo() as u8;
-    let kem_pubkey = default_kp_c.identity.kem.kem_pubkey_bytes();
-    // The intro points C actually registered at.
-    let intro_points: Vec<_> = c
-        .node
-        .hidden_intro_peers(&service_id_c)
-        .await
-        .into_iter()
-        .map(|p| (p, kem_algo, kem_pubkey.clone()))
-        .collect();
-    let client_conn = tokio::time::timeout(
-        Duration::from_secs(10),
-        a.node
-            .connect_via_rendezvous(service_id_c, TEST_MODE, "80", &intro_points, 1),
-    )
-    .await
-    .expect("connect timed out")
-    .expect("connect failed");
-
-    assert_eq!(client_conn.port, "80");
-
-    let service_conn = accept_handle.await.expect("accept task panicked");
-
-    // Bidirectional data
-    client_conn
-        .send(b"hello from classic client")
-        .await
-        .unwrap();
-    let received = service_conn.recv().await.unwrap();
-    assert_eq!(received, b"hello from classic client");
-
-    service_conn.send(b"hello from PQ service").await.unwrap();
-    let received = client_conn.recv().await.unwrap();
-    assert_eq!(received, b"hello from PQ service");
-}
-
-/// DHT: falcon_ed25519 node verifies record signed by ed25519 node (and reverse).
-#[tokio::test]
-async fn cross_algo_dht_signed_records() {
-    use tarnet_api::types::{KemAlgo, SigningAlgo};
-    init_log();
-
-    let a = spawn_node_with_algo(vec![], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let b = spawn_node_with_algo(
-        vec![a.addr.clone()],
-        SigningAlgo::FalconEd25519,
-        KemAlgo::MlkemX25519,
-    )
-    .await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // A (ed25519) publishes signed content
-    let value = b"signed by classic ed25519";
-    let hash = a.node.dht_put_signed_content(value, 600).await.unwrap();
-
-    // B (falcon_ed25519) should be able to retrieve and verify it
-    let result = search_signed_content(&b.node, &hash, Duration::from_secs(6)).await;
-    assert!(
-        result,
-        "falcon_ed25519 node should verify ed25519-signed DHT record"
-    );
-
-    // B (falcon_ed25519) publishes signed content
-    let value2 = b"signed by PQ falcon_ed25519";
-    let hash2 = b.node.dht_put_signed_content(value2, 600).await.unwrap();
-
-    // A (ed25519) should be able to retrieve and verify it
-    let result2 = search_signed_content(&a.node, &hash2, Duration::from_secs(6)).await;
-    assert!(
-        result2,
-        "ed25519 node should verify falcon_ed25519-signed DHT record"
-    );
-}
-
-/// TNS: falcon_ed25519 zone resolved by ed25519 node (and reverse).
-#[tokio::test]
-async fn cross_algo_tns_resolution() {
-    use tarnet_api::types::{KemAlgo, SigningAlgo};
-    init_log();
-
-    let a = spawn_node_with_algo(vec![], SigningAlgo::Ed25519, KemAlgo::X25519).await;
-    let b = spawn_node_with_algo(
-        vec![a.addr.clone()],
-        SigningAlgo::FalconEd25519,
-        KemAlgo::MlkemX25519,
-    )
-    .await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // A (ed25519) publishes TNS record
-    let zone_a_sid = a.node.identity.identity.service_id();
-    let record_a = tarnet::tns::TnsRecord::Identity(zone_a_sid);
-    tarnet::tns::publish(&*a.node, &a.node.identity, "www", &[record_a.clone()])
-        .await
-        .unwrap();
-
-    // B (falcon_ed25519) resolves A's zone
-
-    let resolution = wait_for(Duration::from_secs(10), || {
-        let b = b.node.clone();
-        async move {
-            match tarnet::tns::resolve(&*b, zone_a_sid, "www").await {
-                tarnet::tns::TnsResolution::Records(r) => !r.is_empty(),
-                _ => false,
-            }
-        }
-    })
-    .await;
-    assert!(
-        resolution,
-        "falcon_ed25519 node should resolve ed25519 zone"
-    );
-
-    // B (falcon_ed25519) publishes TNS record
-    let zone_b_sid = b.node.identity.identity.service_id();
-    let record_b = tarnet::tns::TnsRecord::Identity(zone_b_sid);
-    tarnet::tns::publish(&*b.node, &b.node.identity, "api", &[record_b.clone()])
-        .await
-        .unwrap();
-
-    // A (ed25519) resolves B's zone
-
-    let resolution_b = wait_for(Duration::from_secs(10), || {
-        let a = a.node.clone();
-        async move {
-            match tarnet::tns::resolve(&*a, zone_b_sid, "api").await {
-                tarnet::tns::TnsResolution::Records(r) => !r.is_empty(),
-                _ => false,
-            }
-        }
-    })
-    .await;
-    assert!(
-        resolution_b,
-        "ed25519 node should resolve falcon_ed25519 zone"
-    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!b.node.connected_peers().await.contains(&a.node.peer_id()));
+    assert!(!a.node.connected_peers().await.contains(&b.node.peer_id()));
+    assert!(!b.node.connected_peers().await.contains(&c.node.peer_id()));
+    assert!(!c.node.connected_peers().await.contains(&b.node.peer_id()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2614,9 +2330,11 @@ async fn firewall_slow_link_keeps_interactive_latency_under_bulk() {
     let goodput = received.load(std::sync::atomic::Ordering::Relaxed);
     log::info!("slow link: worst keystroke RTT {:?}, bulk received {} B", worst, goodput);
 
-    assert!(goodput > 4_000, "bulk transfer starved: {} B", goodput);
+    // About 9 KB: ACKs ride on the interactive replies, so the line goes to
+    // data rather than separate ACK cells.
+    assert!(goodput > 6_000, "bulk transfer starved: {} B", goodput);
     assert!(
-        worst < Duration::from_secs(3),
+        worst < Duration::from_secs(2),
         "keystroke RTT {:?} behind bulk traffic on a 2 KB/s line",
         worst
     );
@@ -2624,4 +2342,148 @@ async fn firewall_slow_link_keeps_interactive_latency_under_bulk() {
     bulk_sender.abort();
     echo.abort();
     bulk_reader.abort();
+}
+
+// ── Throwaway identities ──
+
+/// An Ed25519 throwaway connects out: the host sees (and verified) the
+/// throwaway's SID, not the node's default one.
+#[tokio::test]
+async fn throwaway_client_is_the_sid_the_host_sees() {
+    use tarnet_api::service::EphemeralOptions;
+    init_log();
+    let b = spawn_node(vec![]).await;
+    let a = spawn_node(vec![b.addr.clone()]).await;
+    assert!(wait_route(&a.node, b.node.peer_id(), Duration::from_secs(10)).await);
+    let sid = b.node.default_service_id().await;
+    let listener = b
+        .node
+        .circuit_listen(sid, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    let eph = a
+        .node
+        .create_ephemeral_identity(EphemeralOptions {
+            privacy: PrivacyLevel::Public,
+            outbound_hops: 1,
+            scheme: IdentityScheme::Ed25519,
+        })
+        .await
+        .unwrap();
+    let bn = b.node.clone();
+    let accept = tokio::spawn(async move { bn.circuit_accept(listener.id).await.unwrap() });
+    let conn = tokio::time::timeout(
+        Duration::from_secs(20),
+        a.node.circuit_connect(sid, TEST_MODE, "80", Some(b.node.peer_id()), Some(eph)),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let served = tokio::time::timeout(Duration::from_secs(10), accept).await.unwrap().unwrap();
+    assert_eq!(served.remote_service_id, eph);
+    assert_ne!(served.remote_service_id, a.node.default_service_id().await);
+    conn.send(b"from a throwaway").await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), served.recv()).await.unwrap().unwrap(),
+        b"from a throwaway"
+    );
+}
+
+/// A Hidden throwaway serves over rendezvous, and once dropped it is gone:
+/// its intro points stop answering.
+#[tokio::test]
+async fn hidden_throwaway_serves_until_dropped() {
+    use tarnet_api::service::EphemeralOptions;
+    init_log();
+    let nodes = spawn_chain(4).await;
+    let (client, host) = (&nodes[0].node, &nodes[3].node);
+    for n in &nodes[..3] {
+        assert!(wait_route(host, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+    for n in &nodes[1..] {
+        assert!(wait_route(client, n.node.peer_id(), Duration::from_secs(10)).await);
+    }
+    let sid = host
+        .create_ephemeral_identity(EphemeralOptions {
+            privacy: PrivacyLevel::Hidden { intro_points: 1 },
+            outbound_hops: 1, // raised to 3 for a Hidden throwaway
+            scheme: IdentityScheme::DEFAULT,
+        })
+        .await
+        .unwrap();
+    let listener = host
+        .circuit_listen(sid, TEST_MODE, "80", ListenerOptions::default())
+        .await
+        .unwrap();
+    host.publish_hidden_service(sid, 1).await.expect("publish_hidden_service failed");
+    let kp = host.keypair_for_service(&sid).await.unwrap();
+    let intro_points: Vec<_> = host
+        .hidden_intro_peers(&sid)
+        .await
+        .into_iter()
+        .map(|p| (p, kp.identity.kem_algo() as u8, kp.identity.kem.kem_pubkey_bytes()))
+        .collect();
+    assert!(!intro_points.is_empty());
+
+    let accepting = host.clone();
+    let accept = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(60), accepting.circuit_accept(listener.id))
+            .await
+            .expect("accept timed out")
+            .expect("accept failed")
+    });
+    let conn = tokio::time::timeout(
+        Duration::from_secs(60),
+        client.connect_via_rendezvous(sid, TEST_MODE, "80", &intro_points, 1),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    let served = accept.await.unwrap();
+    assert_eq!(served.remote_service_id, client.default_service_id().await);
+    conn.send(b"hello throwaway").await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), served.recv()).await.unwrap().unwrap(),
+        b"hello throwaway"
+    );
+
+    host.drop_ephemeral_identity(&sid).await.unwrap();
+    assert!(host.hidden_intro_peers(&sid).await.is_empty());
+    // The client gives up only after its rendezvous retries, each waiting
+    // for an introduction that is never answered.
+    let after = tokio::time::timeout(
+        Duration::from_secs(180),
+        client.connect_via_rendezvous(sid, TEST_MODE, "80", &intro_points, 1),
+    )
+    .await
+    .expect("connect after drop hung");
+    assert!(after.is_err(), "a dropped throwaway must be unreachable");
+}
+
+/// Signed content published as an identity (here an Ed25519 throwaway)
+/// verifies on another node; it never carried the publishing node's key.
+#[tokio::test]
+async fn identity_signed_dht_records_verify_across_nodes() {
+    use tarnet_api::service::EphemeralOptions;
+    init_log();
+    let a = spawn_node(vec![]).await;
+    let b = spawn_node(vec![a.addr.clone()]).await;
+    assert!(wait_route(&b.node, a.node.peer_id(), Duration::from_secs(10)).await);
+    let eph = a
+        .node
+        .create_ephemeral_identity(EphemeralOptions {
+            privacy: PrivacyLevel::Public,
+            outbound_hops: 1,
+            scheme: IdentityScheme::Ed25519,
+        })
+        .await
+        .unwrap();
+    let kp = a.node.keypair_for_service(&eph).await.unwrap();
+    let handle = a.node.dht_put_signed_content_as(&kp, b"by a throwaway", 600).await.unwrap();
+    let got = b.node.dht_get_signed_content(&handle, Duration::from_secs(6)).await;
+    assert!(got.iter().any(|(signer, v)| *signer == kp.peer_id() && v == b"by a throwaway"));
+    assert!(got.iter().all(|(signer, _)| *signer != a.node.peer_id()), "the node key never signs it");
+    // The default identity's put isn't signed by the node key either.
+    let handle = a.node.dht_put_signed_content(b"by the default", 600).await.unwrap();
+    assert!(search_signed_content(&b.node, &handle, Duration::from_secs(6)).await);
 }

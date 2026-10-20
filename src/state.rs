@@ -124,6 +124,31 @@ pub struct PersistedIdentity {
     pub is_default: bool,
 }
 
+impl PersistedIdentity {
+    /// The row for an identity: its whole v2 key material in
+    /// `signing_key_material` (`kem_key_material` stays empty; the static KEM
+    /// key derives from the seed).
+    pub fn from_keypair(
+        label: &str,
+        kp: &crate::identity::Keypair,
+        privacy: PrivacyLevel,
+        outbound_hops: u8,
+        is_default: bool,
+    ) -> Self {
+        Self {
+            label: label.to_string(),
+            scheme: kp.scheme() as u8,
+            signing_key_material: kp.to_full_bytes(),
+            kem_key_material: Vec::new(),
+            signing_algo: kp.identity.signing_algo() as u8,
+            kem_algo: kp.identity.kem_algo() as u8,
+            privacy,
+            outbound_hops,
+            is_default,
+        }
+    }
+}
+
 /// Pure write-through persistent storage.
 ///
 /// Every mutation is a single atomic SQL statement — no transactions,
@@ -244,6 +269,97 @@ impl StateDb {
             .map_err(sqlite_err)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sqlite_err)
+    }
+
+    /// Delete everything filed under identity `sid`: its TNS labels and
+    /// records (filed under its base32 ServiceId) and its tombstones.
+    pub fn delete_identity_state(&self, sid: &tarnet_api::types::ServiceId) -> Result<()> {
+        let key = tarnet_api::types::encode_base32(sid.as_bytes());
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM tns_records WHERE identity = ?1", params![key])
+            .map_err(sqlite_err)?;
+        conn.execute("DELETE FROM tns_labels WHERE identity = ?1", params![key])
+            .map_err(sqlite_err)?;
+        conn.execute("DELETE FROM tns_tombstones WHERE sid = ?1", params![sid.as_bytes().as_slice()])
+            .map_err(sqlite_err)?;
+        Ok(())
+    }
+
+    /// Startup sweep: delete identity-bound rows whose identity no longer
+    /// exists (a crash mid-delete, or a write path that missed a check), and
+    /// this node's own signed records whose signer is gone. `live` are the
+    /// identities held; `own_signers` the DHT signers that are this node's
+    /// (the node key and every live identity). Returns rows deleted.
+    pub fn sweep_orphans(
+        &self,
+        live: &[tarnet_api::types::ServiceId],
+        own_signers: &[PeerId],
+    ) -> Result<usize> {
+        let keys: std::collections::HashSet<String> =
+            live.iter().map(|s| tarnet_api::types::encode_base32(s.as_bytes())).collect();
+        let sids: std::collections::HashSet<[u8; 32]> = live.iter().map(|s| s.0).collect();
+        let signers: std::collections::HashSet<[u8; 32]> = own_signers.iter().map(|p| p.0).collect();
+        let conn = self.lock()?;
+        let mut deleted = 0;
+        // Labels: "" files the default identity's (it can't be deleted).
+        let label_keys: Vec<String> = conn
+            .prepare("SELECT DISTINCT identity FROM tns_labels")
+            .map_err(sqlite_err)?
+            .query_map([], |row| row.get(0))
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sqlite_err)?;
+        for key in label_keys.iter().filter(|k| !k.is_empty() && !keys.contains(*k)) {
+            conn.execute("DELETE FROM tns_records WHERE identity = ?1", params![key])
+                .map_err(sqlite_err)?;
+            deleted += conn
+                .execute("DELETE FROM tns_labels WHERE identity = ?1", params![key])
+                .map_err(sqlite_err)?;
+        }
+        let tomb_sids: Vec<Vec<u8>> = conn
+            .prepare("SELECT DISTINCT sid FROM tns_tombstones")
+            .map_err(sqlite_err)?
+            .query_map([], |row| row.get(0))
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sqlite_err)?;
+        for sid in tomb_sids.iter().filter(|s| <[u8; 32]>::try_from(s.as_slice()).map_or(true, |a| !sids.contains(&a))) {
+            deleted += conn
+                .execute("DELETE FROM tns_tombstones WHERE sid = ?1", params![sid])
+                .map_err(sqlite_err)?;
+        }
+        // Own signed records (not replicas, not unsigned content, not the
+        // disposable-key TNS and pool candidates, which expire in minutes).
+        let own_rows: Vec<(Vec<u8>, Vec<u8>, i64)> = conn
+            .prepare("SELECT key, signer, record_type FROM dht_records WHERE source IS NULL")
+            .map_err(sqlite_err)?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(sqlite_err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sqlite_err)?;
+        for (key, signer, record_type) in own_rows {
+            let identity_bound = matches!(
+                RecordType::from_u8(record_type as u8),
+                RecordType::SignedContent | RecordType::ZoneKey | RecordType::Hello
+            );
+            let gone = <[u8; 32]>::try_from(signer.as_slice()).map_or(true, |s| !signers.contains(&s));
+            if identity_bound && gone {
+                deleted += conn
+                    .execute("DELETE FROM dht_records WHERE key = ?1 AND signer = ?2", params![key, signer])
+                    .map_err(sqlite_err)?;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Every table in the database, for the schema registry test.
+    #[cfg(test)]
+    pub fn table_names(&self) -> Vec<String> {
+        let conn = self.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |row| row.get(0)).unwrap().map(|r| r.unwrap()).collect()
     }
 
     pub fn get_metadata(&self, key: &str) -> Result<Option<u64>> {
@@ -901,7 +1017,7 @@ mod tests {
         use crate::wire::DhtPutMsg;
         use tarnet_api::types::SigningAlgo;
 
-        let kp = Keypair::generate_classic();
+        let kp = Keypair::generate();
         let peer_id = kp.peer_id();
         let signer = peer_id;
         let key = [0xABu8; 64];

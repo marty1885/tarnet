@@ -126,6 +126,11 @@ impl TnsCache {
         self.entries.remove(&(*zone, label.to_string()));
     }
 
+    /// Forget everything cached for `zone`.
+    pub fn forget_zone(&mut self, zone: &ServiceId) {
+        self.entries.retain(|(z, _), _| z != zone);
+    }
+
     /// Insert a negative cache entry (name not found).
     pub fn insert_negative(&mut self, zone: ServiceId, label: String) {
         self.insert(zone, label, Vec::new(), NEGATIVE_CACHE_TTL);
@@ -500,7 +505,7 @@ pub use tarnet_api::service::vhost_wire_port;
 /// per publish; republishes therefore land in new slots (bounded by TTL/LRU) and
 /// readers dedup by author taking the max sequence.
 pub(crate) fn disposable_record_key() -> Keypair {
-    Keypair::generate()
+    Keypair::generate_disposable()
 }
 
 // ── Confidentiality layer (seal/unseal) ──
@@ -1145,10 +1150,7 @@ async fn publish_label_snapshot(
 ) -> Result<()> {
     // Mining and private signing do not block the async executor. Bound the
     // job to one label's four candidates; the zone map stays local.
-    let signer = {
-        let bytes = zeroize::Zeroizing::new(owner.to_full_bytes());
-        Keypair::from_full_bytes(&bytes).map_err(|e| Error::Crypto(e.into()))?
-    };
+    let signer = owner.clone();
     let label = label.to_string();
     let records =
         tokio::task::spawn_blocking(move || -> Result<Vec<crate::dht::VerifiedRecord>> {
@@ -1167,7 +1169,8 @@ async fn publish_label_snapshot(
         })
         .await
         .map_err(|e| Error::Crypto(format!("TNS publication worker failed: {e}")))??;
-    node.dht_publish_tns_batch(records).await
+    node.dht_publish_tns_batch(&owner.identity.service_id(), records)
+        .await
 }
 
 /// Refresh the local working set as independent label publications, including
@@ -1178,7 +1181,7 @@ pub async fn refresh_zone(node: &Node, zone_keypair: &Keypair) -> Result<()> {
     let (map, sequence) = node.zone_signing_snapshot(&sid).await;
     if map.is_empty() {
         return node
-            .dht_publish_tns_batch(vec![crate::dht::VerifiedRecord::new_zone_key(
+            .dht_publish_tns_batch(&sid, vec![crate::dht::VerifiedRecord::new_zone_key(
                 zone_keypair,
                 sequence,
                 Duration::from_secs(publication::TTL as u64),
@@ -1240,7 +1243,7 @@ pub(crate) async fn set_zone_label(
         if set.is_none() {
             let (current, _) = node.zone_label_signing_snapshot(&sid, label).await;
             if current.is_some() {
-                node.persist_zone_tombstone(&sid, label, true)?;
+                node.persist_zone_tombstone(&sid, label, true).await?;
             }
         }
         return Ok(false);
@@ -1254,7 +1257,7 @@ pub(crate) async fn set_zone_label(
             .await;
         return Err(e);
     }
-    node.persist_zone_tombstone(&sid, label, set.is_none())?;
+    node.persist_zone_tombstone(&sid, label, set.is_none()).await?;
     node.tns_cache().lock().await.forget(&sid, label);
     Ok(true)
 }
@@ -1273,7 +1276,7 @@ pub(crate) async fn retire_zone_label(
     if current.is_none() {
         return Ok(());
     }
-    node.persist_zone_tombstone(&sid, label, true)?;
+    node.persist_zone_tombstone(&sid, label, true).await?;
     publish_label_snapshot(
         node,
         zone_keypair,
@@ -1309,7 +1312,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_single_available_lane_resolves_without_waiting_for_missing_lanes() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let owner = Keypair::generate();
         let sid = owner.identity.service_id();
         let descriptor = crate::dht::VerifiedRecord::new_zone_key(
@@ -1329,7 +1332,7 @@ mod tests {
 
     #[tokio::test]
     async fn edits_leave_other_label_publications_unchanged_and_failed_batches_publish_nothing() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let owner = Keypair::generate_ed25519();
         publish(&node, &owner, "a", &[TnsRecord::Text("one".into())])
             .await
@@ -1348,7 +1351,7 @@ mod tests {
         let db = std::sync::Arc::new(crate::state::StateDb::open(&path).unwrap());
         let mut limits = crate::state::StorageLimits::default();
         limits.max_records = 4;
-        let small = Node::with_db(Keypair::generate_ed25519(), db.clone(), limits);
+        let small = Node::with_db(Keypair::generate(), db.clone(), limits);
         let rejected = Keypair::generate_ed25519();
         assert!(publish(
             &small,
@@ -1389,7 +1392,7 @@ mod tests {
         let owner = Keypair::generate_ed25519();
         let sid = owner.identity.service_id();
         let node = Node::with_db(
-            Keypair::generate_ed25519(),
+            Keypair::generate(),
             db.clone(),
             crate::state::StorageLimits::default(),
         );
@@ -1408,7 +1411,7 @@ mod tests {
         assert_eq!(db.tns_tombstones(&sid).unwrap(), vec!["ssh"]);
         drop(node);
         let restarted = Node::with_db(
-            Keypair::generate_ed25519(),
+            Keypair::generate(),
             db.clone(),
             crate::state::StorageLimits::default(),
         );

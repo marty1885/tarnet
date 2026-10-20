@@ -25,7 +25,7 @@ const REC_FRAGMENT: u8 = 0x02;
 const REC_NACK: u8 = 0x03;
 
 const MESSAGE_HEADER: usize = 1 + 2;
-const FRAGMENT_HEADER: usize = 1 + 2 + 2 + 2 + 2;
+pub(crate) const FRAGMENT_HEADER: usize = 1 + 2 + 2 + 2 + 2;
 /// Most indices one NACK record carries.
 const NACK_MAX_INDICES: usize = 255;
 

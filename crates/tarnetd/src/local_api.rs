@@ -97,23 +97,17 @@ impl LocalServiceApi {
 }
 
 impl LocalServiceApi {
-    /// Resolve an identity option to a DB key string.
-    /// None or "default" → the default identity's label (or "" if unnamed).
+    /// The key an identity's labels are filed under: its base32 ServiceId,
+    /// never its name, so a new identity reusing a deleted one's name can't
+    /// inherit its labels. Throwaway identities have no labels.
     async fn identity_db_key(&self, identity: Option<&str>) -> ApiResult<String> {
-        match identity {
-            Some(id_str) if !id_str.is_empty() && id_str != "default" => Ok(id_str.to_string()),
-            _ => {
-                // Find the default identity's label.
-                let sid = self.node.default_service_id().await;
-                let identities = self.node.list_identities().await;
-                for (label, s, _, _, _, _, _) in &identities {
-                    if *s == sid {
-                        return Ok(label.clone());
-                    }
-                }
-                Ok(String::new())
-            }
+        let sid = self.resolve_identity(identity.unwrap_or("")).await?;
+        if self.node.is_ephemeral_identity(&sid).await {
+            return Err(ApiError::Service(
+                "throwaway identities have no TNS labels; use a pseudonym".into(),
+            ));
         }
+        Ok(tarnet_api::types::encode_base32(sid.as_bytes()))
     }
 
     /// Get the keypair for the given identity (or the default).
@@ -289,6 +283,76 @@ impl ServiceApi for LocalServiceApi {
     async fn dht_put_signed(&self, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
         self.node
             .dht_put_signed_content(value, ttl_secs)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
+    }
+
+    async fn dht_put_signed_as(&self, identity: ServiceId, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
+        let signer = self
+            .node
+            .keypair_for_service(&identity)
+            .await
+            .ok_or_else(|| ApiError::Service("unknown identity".into()))?;
+        self.node
+            .dht_put_signed_content_as(&signer, value, ttl_secs)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
+    }
+
+    async fn identity_sign(
+        &self,
+        identity: ServiceId,
+        context: &[u8],
+        msg: &[u8],
+    ) -> ApiResult<tarnet_api::service::AppSignature> {
+        let (bundle, signature) = self
+            .node
+            .identity_sign(&identity, context, msg)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))?;
+        Ok(tarnet_api::service::AppSignature { bundle, signature })
+    }
+
+    async fn identity_verify(
+        &self,
+        identity: ServiceId,
+        context: &[u8],
+        msg: &[u8],
+        signature: &tarnet_api::service::AppSignature,
+    ) -> ApiResult<bool> {
+        Ok(tarnet::node::verify_app_signature(
+            &identity,
+            context,
+            msg,
+            &signature.bundle,
+            &signature.signature,
+        ))
+    }
+
+    async fn identity_kem_decap(&self, identity: ServiceId, context: &[u8], ciphertext: &[u8]) -> ApiResult<[u8; 32]> {
+        self.node
+            .identity_kem_decap(&identity, context, ciphertext)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
+    }
+
+    async fn create_ephemeral_identity(&self, options: tarnet_api::service::EphemeralOptions) -> ApiResult<ServiceId> {
+        self.node
+            .create_ephemeral_identity(options)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
+    }
+
+    async fn drop_ephemeral_identity(&self, identity: ServiceId) -> ApiResult<()> {
+        self.node
+            .drop_ephemeral_identity(&identity)
+            .await
+            .map_err(|e| ApiError::Service(e.to_string()))
+    }
+
+    async fn identity_kem_pubkey(&self, identity: ServiceId) -> ApiResult<Vec<u8>> {
+        self.node
+            .identity_kem_pubkey(&identity)
             .await
             .map_err(|e| ApiError::Service(e.to_string()))
     }
@@ -533,6 +597,16 @@ impl ServiceApi for LocalServiceApi {
     }
 
     async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection> {
+        self.connect_to_as(target, mode, port, None).await
+    }
+
+    async fn connect_to_as(
+        &self,
+        target: &str,
+        mode: PortMode,
+        port: &str,
+        source: Option<ServiceId>,
+    ) -> ApiResult<Connection> {
         // The single connect chokepoint. The wire port is always *derived* from a
         // canonical label + the supplied port — there is no verbatim-port path.
         // `port` is the connector's supplied port (a URL u16 stringified, or a
@@ -541,7 +615,7 @@ impl ServiceApi for LocalServiceApi {
         // 1. Bare ServiceId: the un-petnamed apex form. Canonical label is "@".
         if let Ok(sid) = ServiceId::parse(target) {
             let wire = tns::vhost_wire_port("@", port);
-            return self.connect(sid, mode, &wire).await;
+            return self.connect_as(sid, mode, &wire, source).await;
         }
 
         // 2. Resolve via TNS (local labels, dotted names, raw-SID suffixes).
@@ -553,14 +627,14 @@ impl ServiceApi for LocalServiceApi {
                 canonical_label,
             } => {
                 let wire = tns::vhost_wire_port(&canonical_label, port);
-                self.connect(serving, mode, &wire).await
+                self.connect_as(serving, mode, &wire, source).await
             }
             // 2b. Plain Identity (apex / petname → @): canonical label is "@".
             TnsResolution::Records(records) => {
                 for rec in &records {
                     if let TnsRecord::Identity(sid) = rec {
                         let wire = tns::vhost_wire_port("@", port);
-                        return self.connect(*sid, mode, &wire).await;
+                        return self.connect_as(*sid, mode, &wire, source).await;
                     }
                 }
                 Err(ApiError::Service(format!(

@@ -20,7 +20,6 @@ pub mod node;
 pub mod onion;
 pub mod peer_transport;
 pub mod pool;
-pub mod pubkey_cache;
 pub mod routing;
 pub mod state;
 pub mod stats;

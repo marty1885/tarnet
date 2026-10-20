@@ -684,6 +684,9 @@ pub struct DhtStore {
     /// unless its owner signs a higher sequence. Remembered for the type's
     /// TTL cap, the longest any copy could claim to live.
     dead: crate::bounded::BoundedMap<([u8; 64], [u8; 32]), u64>,
+    /// Records (key, signer) that must never reach the database: a
+    /// throwaway identity's. They live in memory only.
+    memory_only: std::collections::HashSet<([u8; 64], [u8; 32])>,
 }
 
 fn dead_id(record: &DhtRecord) -> [u8; 32] {
@@ -851,6 +854,7 @@ impl DhtStore {
             limits,
             db: None,
             dead: crate::bounded::BoundedMap::new(limits.max_records.saturating_mul(2), MAX_RECORD_TTL),
+            memory_only: std::collections::HashSet::new(),
         }
     }
 
@@ -870,6 +874,12 @@ impl DhtStore {
 
     fn mirror_put(&self, e: &StoredRecord) {
         let Some(db) = &self.db else { return };
+        if self
+            .memory_only
+            .contains(&(*e.record.key.as_bytes(), *e.record.signer.as_bytes()))
+        {
+            return;
+        }
         if let Some(row) = PersistedRecord::from_stored(&e.record, e.source) {
             if let Err(err) = db.upsert_dht_record(&row) {
                 log::warn!("Failed to persist DHT record: {}", err);
@@ -882,6 +892,44 @@ impl DhtStore {
         if let Err(e) = db.delete_dht_record(key, signer) {
             log::warn!("Failed to delete DHT record: {}", e);
         }
+    }
+
+    /// Keep a record that is about to be published only in memory: it never
+    /// reaches the database (a throwaway identity's).
+    pub fn mark_memory_only(&mut self, key: &[u8; 64], signer: &[u8; 32]) {
+        self.memory_only.insert((*key, *signer));
+    }
+
+    /// Forget this node's own record at (key, signer): it stops being
+    /// republished and is gone from the database. Copies already in the
+    /// network run out their TTL. Returns whether one was held.
+    pub fn forget_local(&mut self, key: &[u8; 64], signer: &[u8; 32]) -> bool {
+        self.memory_only.remove(&(*key, *signer));
+        let mut found = false;
+        if let Some(entries) = self.records.get_mut(key) {
+            entries.retain(|e| {
+                let mine = e.source == RecordSource::Local && e.record.signer.as_bytes() == signer;
+                found |= mine;
+                !mine
+            });
+            if entries.is_empty() {
+                self.records.remove(key);
+            }
+        }
+        if found {
+            self.mirror_delete(key, signer);
+        }
+        found
+    }
+
+    /// This node's own records signed by `signer`, as (key, signer).
+    pub fn local_records_by(&self, signer: &PeerId) -> Vec<([u8; 64], [u8; 32])> {
+        self.records
+            .values()
+            .flatten()
+            .filter(|e| e.source == RecordSource::Local && e.record.signer == *signer)
+            .map(|e| (*e.record.key.as_bytes(), *e.record.signer.as_bytes()))
+            .collect()
     }
 
     /// Store a record this node minted itself. See [`put_record`](Self::put_record).

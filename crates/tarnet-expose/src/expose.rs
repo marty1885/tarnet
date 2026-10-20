@@ -1193,7 +1193,7 @@ mod tests {
             2,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let svc = make_service("myblog", Some("hidden-blog"), None);
@@ -1225,7 +1225,7 @@ mod tests {
             1,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let svc = make_service("mysite", None, None);
@@ -1253,7 +1253,7 @@ mod tests {
             1,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let svc = make_service("blog", None, Some("blog"));
@@ -1274,7 +1274,7 @@ mod tests {
             1,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let mut svc = make_service("blog", None, Some("blog"));
@@ -1301,7 +1301,7 @@ mod tests {
             1,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let svc = make_service("blog", None, Some("blog"));
@@ -1326,7 +1326,7 @@ mod tests {
             1,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let mut svc = make_service("relay", None, Some("relay"));
@@ -1358,7 +1358,7 @@ mod tests {
                 1,
                 IdentityScheme::Ed25519,
                 SigningAlgo::Ed25519,
-                KemAlgo::X25519,
+                KemAlgo::MlkemX25519,
             ),
             (
                 "secret".into(),
@@ -1367,7 +1367,7 @@ mod tests {
                 3,
                 IdentityScheme::Ed25519,
                 SigningAlgo::Ed25519,
-                KemAlgo::X25519,
+                KemAlgo::MlkemX25519,
             ),
         ]));
 
@@ -1397,7 +1397,7 @@ mod tests {
             1,
             IdentityScheme::Ed25519,
             SigningAlgo::Ed25519,
-            KemAlgo::X25519,
+            KemAlgo::MlkemX25519,
         )]));
 
         let mut svc = make_service("nopub", None, None);

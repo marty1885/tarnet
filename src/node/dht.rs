@@ -655,14 +655,15 @@ impl Node {
 
     // ── Publishing ──
 
-    /// Republish the records this node signed itself, and unsigned content
-    /// it published. Owners republishing is what keeps records alive; there
-    /// is no replication sweep. Hellos have their own timer, and records
-    /// signed by any other key (identities, zones, disposable label keys)
-    /// are republished by their owners' own timers. That keeps a Hidden
-    /// identity's records out of this republish, which runs on link-up and
-    /// alongside the node's own records: a watcher could otherwise open a
-    /// link to a suspected host and see the hidden service's re-PUT follow.
+    /// Republish the records this node signed itself, the signed content
+    /// its persistent Public identities published, and unsigned content it
+    /// published. Owners republishing is what keeps records alive; there is
+    /// no replication sweep. Hellos have their own timer, and zones and
+    /// disposable label keys are republished by their owners' own timers.
+    /// Hidden and throwaway identities' records stay out of this republish,
+    /// which runs on link-up and alongside the node's own records: a watcher
+    /// could otherwise open a link to a suspected host and see the hidden
+    /// service's re-PUT follow. Their owners republish them.
     pub(crate) async fn dht_republish_own(&self) {
         let records = self.own_records_to_republish().await;
         for record in &records {
@@ -675,7 +676,13 @@ impl Node {
 
     /// The records [`dht_republish_own`](Self::dht_republish_own) sends.
     pub(super) async fn own_records_to_republish(&self) -> Vec<DhtRecord> {
-        let me = self.peer_id();
+        let mut signers = vec![self.peer_id()];
+        signers.extend(
+            self.identity_store
+                .lock()
+                .await
+                .republishing_signers(),
+        );
         self.dht_store
             .lock()
             .await
@@ -687,7 +694,7 @@ impl Node {
                 | RecordType::ZoneKey
                 | RecordType::TnsLabel => false,
                 RecordType::Content => true,
-                _ => r.signer == me,
+                _ => signers.contains(&r.signer),
             })
             .cloned()
             .collect()
@@ -697,6 +704,19 @@ impl Node {
     /// persisted so it survives restart.
     async fn next_signed_content_sequence(&self) -> u64 {
         self.next_signed_content_sequence_above(0).await
+    }
+
+    /// Next publication sequence for records owned by identity `owner`,
+    /// above `floor`: the persisted node-wide counter, except for a
+    /// throwaway identity, whose counter lives in memory.
+    pub(crate) async fn sequence_for(&self, owner: &tarnet_api::types::ServiceId, floor: u64) -> u64 {
+        if self.identity_store.lock().await.is_ephemeral(owner) {
+            let mut seqs = self.ephemeral_sequences.lock().unwrap();
+            let seq = seqs.entry(*owner).or_insert(0);
+            *seq = (*seq).max(floor) + 1;
+            return *seq;
+        }
+        self.next_signed_content_sequence_above(floor).await
     }
 
     /// Next signed-content sequence, and above `floor` (persisted like any).
@@ -753,14 +773,30 @@ impl Node {
     /// hash (storage nodes see an opaque blob), signed, and published. Each
     /// signer's record at a content key is kept independently. Returns the
     /// content handle needed for retrieval.
+    ///
+    /// Signed by the default identity, never the node key: a signed put must
+    /// not tie published content to the host.
     pub async fn dht_put_signed_content(&self, value: &[u8], ttl_secs: u32) -> Result<ContentHandle> {
-        let sequence = self.next_signed_content_sequence().await;
+        let signer = self.identity_store.lock().await.default_identity().keypair.clone();
+        self.dht_put_signed_content_as(&signer, value, ttl_secs).await
+    }
+
+    /// [`dht_put_signed_content`](Self::dht_put_signed_content) signed by `signer`.
+    pub async fn dht_put_signed_content_as(
+        &self,
+        signer: &crate::identity::Keypair,
+        value: &[u8],
+        ttl_secs: u32,
+    ) -> Result<ContentHandle> {
+        let sequence = self.sequence_for(&signer.identity.service_id(), 0).await;
         let (record, inner_hash) = VerifiedRecord::new_signed_content(
-            &self.identity,
+            signer,
             value,
             sequence,
             Duration::from_secs(ttl_secs as u64),
         );
+        self.note_owned_records(&signer.identity.service_id(), &[record.record()])
+            .await;
         self.dht_publish(record).await?;
         log::info!("DHT signed content put");
         Ok(inner_hash)
@@ -799,7 +835,13 @@ impl Node {
     }
 
     /// Publish an atomically preflighted local batch before launching walks.
-    pub(crate) async fn dht_publish_tns_batch(&self, records: Vec<VerifiedRecord>) -> Result<()> {
+    pub(crate) async fn dht_publish_tns_batch(
+        &self,
+        owner: &tarnet_api::types::ServiceId,
+        records: Vec<VerifiedRecord>,
+    ) -> Result<()> {
+        let held: Vec<&DhtRecord> = records.iter().map(|r| r.record()).collect();
+        self.note_owned_records(owner, &held).await;
         {
             let mut store = self.dht_store.lock().await;
             if !store.put_tns_local_batch(&records) {
@@ -816,16 +858,47 @@ impl Node {
         Ok(())
     }
 
-    pub(crate) fn persist_zone_tombstone(
+    pub(crate) async fn persist_zone_tombstone(
         &self,
         sid: &tarnet_api::types::ServiceId,
         label: &str,
         retired: bool,
     ) -> Result<()> {
-        if let Some(db) = &self.db {
+        // A throwaway's intent dies with it: nothing of it reaches disk.
+        if let Some(db) = self.db_for(sid).await {
             db.set_tns_tombstone(sid, label, retired)?;
         }
         Ok(())
+    }
+
+    /// The database for state bound to identity `sid`: none for a throwaway
+    /// identity, whose state lives in memory only. Every identity-bound
+    /// write goes through here.
+    pub(crate) async fn db_for(
+        &self,
+        sid: &tarnet_api::types::ServiceId,
+    ) -> Option<&Arc<crate::state::StateDb>> {
+        if self.identity_store.lock().await.is_ephemeral(sid) {
+            return None;
+        }
+        self.db.as_ref()
+    }
+
+    /// Before publishing records owned by identity `owner`: a throwaway's
+    /// are kept in memory only and remembered, so dropping it forgets them.
+    pub(crate) async fn note_owned_records(&self, owner: &tarnet_api::types::ServiceId, records: &[&DhtRecord]) {
+        if !self.identity_store.lock().await.is_ephemeral(owner) {
+            return;
+        }
+        let ids: Vec<([u8; 64], [u8; 32])> =
+            records.iter().map(|r| (*r.key.as_bytes(), *r.signer.as_bytes())).collect();
+        {
+            let mut store = self.dht_store.lock().await;
+            for (key, signer) in &ids {
+                store.mark_memory_only(key, signer);
+            }
+        }
+        self.ephemeral_records.lock().await.entry(*owner).or_default().extend(ids);
     }
 
     /// Update one label in an owned zone's published working set
@@ -943,7 +1016,7 @@ impl Node {
             .map(|r| r.sequence)
             .max()
             .unwrap_or(0);
-        let sequence = self.next_signed_content_sequence_above(held).await;
+        let sequence = self.sequence_for(zone_sid, held).await;
         (snapshot, sequence)
     }
 
@@ -971,7 +1044,7 @@ impl Node {
             .map(|r| r.sequence)
             .max()
             .unwrap_or(0);
-        let sequence = self.next_signed_content_sequence_above(held).await;
+        let sequence = self.sequence_for(zone_sid, held).await;
         (snapshot, sequence)
     }
 
@@ -1005,16 +1078,12 @@ impl Node {
     /// The label-table keys an owned zone's labels are filed under: the
     /// identity's name, or the ServiceId it was named by; the default
     /// identity's also under "".
-    async fn zone_label_keys(&self, zone_sid: &tarnet_api::types::ServiceId) -> Vec<String> {
+    pub(super) async fn zone_label_keys(&self, zone_sid: &tarnet_api::types::ServiceId) -> Vec<String> {
+        // Never the identity's name: a new identity reusing a deleted one's
+        // name must not inherit its labels.
         let mut keys = vec![tarnet_api::types::encode_base32(zone_sid.as_bytes())];
-        let default_sid = self.default_service_id().await;
-        for (name, sid, ..) in self.list_identities().await {
-            if sid == *zone_sid {
-                if sid == default_sid {
-                    keys.push(String::new());
-                }
-                keys.push(name);
-            }
+        if *zone_sid == self.default_service_id().await {
+            keys.push(String::new());
         }
         keys
     }
@@ -1389,8 +1458,8 @@ mod lifetime_regressions {
     async fn search_deadline_and_cancellation_own_all_resources() {
         use crate::transport::tcp::TcpTransport;
         use tokio::net::{TcpListener, TcpStream};
-        let local = Keypair::generate_ed25519();
-        let remote = Keypair::generate_ed25519();
+        let local = Keypair::generate();
+        let remote = Keypair::generate();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1429,7 +1498,7 @@ mod lifetime_regressions {
 
     #[tokio::test]
     async fn full_application_queue_does_not_block_watch_protocols() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let kp = Keypair::generate_ed25519();
         let key = DhtId([42; 64]);
         node.local_watches.lock().await.insert(
@@ -1464,7 +1533,7 @@ mod lifetime_regressions {
     }
     #[tokio::test]
     async fn refused_publications_report_failure() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let mut limits = StorageLimits::default();
         limits.max_records = 0;
         *node.dht_store.lock().await = DhtStore::with_limits(&node.peer_id(), limits);
@@ -1474,7 +1543,7 @@ mod lifetime_regressions {
 
     #[tokio::test]
     async fn an_offline_search_does_not_consume_a_walk_round() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let search = node
             .dht_search(DhtId([7; 64]), Instant::now() + Duration::from_secs(10))
             .await;

@@ -156,6 +156,9 @@ record:
 
 ### Link handshake
 
+Wire v10 replaces this handshake (always-hybrid, SIGMA-I, about 6 KB). See
+[identity v2](identity.md).
+
 The v4 handshake (~12 KB: both static keys, static-KEM authentication and a
 signature) is kept unchanged on every connection. Caching certificates to skip
 static keys on reconnect was rejected: it adds a state to get wrong, and a
@@ -649,17 +652,29 @@ stream is refused ends the attempt.
 * **Multi-cell relay messages.** A relay message too large for one cell (a
   post-quantum EXTEND is ~1.3 KB, its EXTENDED ~1.1 KB, INTRODUCE likewise)
   spans several cells. The first cell carries the real command, bit 15 of its
-  length field set ("more follows"), and `total_len(u16) || bytes`. Each
-  further cell is `Continue` with `index(u8) || bytes`, the bit set on all but
-  the last. Every cell keeps its own end-to-end tag, so pieces can be lost
-  but not forged. The receiving hop reassembles one message per stream id;
-  single-cell messages may arrive in between; any gap drops the partial
-  message. Messages are capped at 16 KB.
+  length field set ("more follows"), and `total_len(u16) || msg_id(4) ||
+  bytes`. Each further cell is `Continue` with `index(u8) || msg_id(4) ||
+  bytes`, the bit set on all but the last. Every cell keeps its own
+  end-to-end tag, so pieces can be lost but not forged. `msg_id` hashes the
+  message, so a retransmission has the same id: the receiving hop keeps
+  pieces by (stream id, msg_id) and fills gaps from retransmissions, checks
+  the id on completion, keeps at most 4 partial messages per direction and
+  remembers the last 8 completed ones, delivering a whole retransmission of
+  one again so its handler can repeat a lost answer (wire v10; see
+  [identity v2](identity.md), "Circuits"). Single-cell messages may arrive in
+  between. Messages are capped at 16 KB.
 * **Stream message framing.** A stream's channel packet is `kind(u8) ||
   body`: `0` a whole application message, `1` FIN, `2` a fragment
   `msg_id(u16) || index(u16) || count(u16) || bytes` of a message larger than
   one cell. Fragments are reassembled in any order, so unordered and
   unreliable streams keep message boundaries.
+  A DATA cell carries `seq(u32) || timestamp(u16) || packet`, the timestamp
+  being the sender's own millisecond clock when that copy went out; a
+  StreamAck may end with `echo(u16)`, the timestamp of the last DATA received
+  since the previous ACK (wire v10; see [identity v2](identity.md), "Slow
+  links"). An ACK owed when a DATA packet with room for it goes out rides in
+  the same cell: `StreamDataAck` (relay cell 0x18) is `ack_len(u16) ||
+  StreamAck || DATA`, and the receiver handles the ACK first.
 * A waypoint is `(peer, hints)`. The initiator includes the segment's hints in
   each EXTEND. Relays only ever see hints for the segment they are extending.
 * **Onion layers only at waypoints, and waypoints are authenticated.** See
@@ -734,7 +749,11 @@ against the waypoint's id.
   can't be checked as Ed25519 alone. Peer ids don't change.
 * Relays between waypoints stay unauthenticated by design.
 
-#### Cell crypto (version 1)
+#### Cell crypto (version 2)
+
+Version 2 (wire v10) puts the end-layer keys under the symmetric epoch
+ratchet; see [identity v2](identity.md), "Key lifetime". The rest of this
+section is unchanged from version 1.
 
 ```
 cell   = region(496) || trailer(16)            512 B, as before
@@ -841,6 +860,9 @@ the intro or rendezvous point. Hidden identities should use at least 3.
   hop key and add the end-to-end key as an extra innermost layer. v4 replaced
   all hop keys with the end-to-end key, which is why its hidden-service
   circuits could only be one hop.
+* **Client authentication.** `RendezvousReady` carries the client's SID
+  proof, and the service hands the connection to its listener only after
+  verifying it. See [identity v2](identity.md).
 * **Direct streams refused (fixes A3).** A Hidden identity answers a direct
   `StreamBegin` exactly as a node that doesn't host it would (StreamRefused).
 * **No peer record (fixes A4).** A Hidden identity never publishes the `"peer"`
@@ -1128,9 +1150,18 @@ Introduce (relay cell 0x07)
 RendezvousJoin (relay cell 0x0A)    cookie(32) || join
 RendezvousJoined (relay cell 0x0B)  join
 
+StreamBegin (relay cell 0x03)       service_id(32) || mode(u8) || port_len(u16) || port
+                                    || client_auth
+RendezvousReady (relay cell 0x12)   client_auth
+                     client_auth: the client's mandatory SID proof (wire
+                     v10, see identity.md, "Client authentication")
+
 Continue  (relay cell 0x13)   index(u8) || bytes      piece of a multi-cell message
 TRUNCATE  (relay cell 0x14)   empty payload
 TRUNCATED (relay cell 0x15)   empty payload
+LAYER_REKEY   (relay cell 0x16)  generation(u32) || kem_pk    innermost-layer rekey
+LAYER_REKEYED (relay cell 0x17)  generation(u32) || kem_ct    (identity.md, "Key lifetime")
+StreamDataAck (relay cell 0x18)  ack_len(u16) || StreamAck || DATA
 ```
 
 `hint_count ≤ PATH_MAX + 1`; a message with more is rejected. Forwarders carry

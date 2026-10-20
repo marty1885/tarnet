@@ -35,10 +35,11 @@ const LENGTH_MORE: u16 = 0x8000;
 /// Largest relay message carried across several cells. Bounds reassembly
 /// memory; a post-quantum EXTEND is ~1.3 KB.
 pub const RELAY_MESSAGE_MAX: usize = 16 * 1024;
-/// Payload bytes of the first cell of a multi-cell message (after total_len).
-const FIRST_PIECE_MAX: usize = CELL_PAYLOAD_MAX - 2;
-/// Payload bytes of a continuation cell (after its index).
-const CONTINUE_PIECE_MAX: usize = CELL_PAYLOAD_MAX - 1;
+/// Payload bytes of the first cell of a multi-cell message (after
+/// total_len and msg_id).
+const FIRST_PIECE_MAX: usize = CELL_PAYLOAD_MAX - 2 - 4;
+/// Payload bytes of a continuation cell (after its index and msg_id).
+const CONTINUE_PIECE_MAX: usize = CELL_PAYLOAD_MAX - 1 - 4;
 
 // --- Flow control constants ---
 /// Initial congestion window. Must be > SENDME_INC so the sender can push
@@ -305,6 +306,13 @@ pub enum RelayCellCommand {
     Truncate = 0x14,
     /// Reply to `Truncate`.
     Truncated = 0x15,
+    /// End-to-end rekey of the innermost layer: the initiator's KEM key.
+    LayerRekey = 0x16,
+    /// Reply to `LayerRekey`: the KEM ciphertext.
+    LayerRekeyed = 0x17,
+    /// A stream ACK and a DATA packet in one cell:
+    /// `ack_len(u16) || StreamAck || DATA`.
+    StreamDataAck = 0x18,
 }
 
 impl RelayCellCommand {
@@ -331,6 +339,9 @@ impl RelayCellCommand {
             0x13 => Ok(Self::Continue),
             0x14 => Ok(Self::Truncate),
             0x15 => Ok(Self::Truncated),
+            0x16 => Ok(Self::LayerRekey),
+            0x17 => Ok(Self::LayerRekeyed),
+            0x18 => Ok(Self::StreamDataAck),
             _ => Err(Error::Wire(format!("unknown relay cell command: {:#x}", v))),
         }
     }
@@ -383,9 +394,11 @@ fn write_piece_body(
 ///
 /// A message that fits one cell is a single piece with `more == false`. A
 /// larger one is split: the first piece carries the real command, `more`,
-/// and `total_len(u16) || bytes`; each following piece is a `Continue` with
-/// `index(u8) || bytes`, `more` set on all but the last. Every piece has its
-/// own end-to-end tag, so pieces can be lost but not forged.
+/// and `total_len(u16) || msg_id(4) || bytes`; each following piece is a
+/// `Continue` with `index(u8) || msg_id(4) || bytes`, `more` set on all but
+/// the last. Every piece has its own end-to-end tag, so pieces can be lost
+/// but not forged. `msg_id` is a hash of the message, so a retransmission
+/// has the same id and its pieces fill the gaps a lossy path left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayPiece {
     pub command: RelayCellCommand,
@@ -462,9 +475,11 @@ impl RelayCell {
                 RELAY_MESSAGE_MAX
             )));
         }
+        let id = message_id(self.command, self.stream_id, &self.data);
         let (first, rest) = self.data.split_at(FIRST_PIECE_MAX);
         let mut first_data = Vec::with_capacity(CELL_PAYLOAD_MAX);
         first_data.extend_from_slice(&(self.data.len() as u16).to_be_bytes());
+        first_data.extend_from_slice(&id);
         first_data.extend_from_slice(first);
         let mut pieces = vec![RelayPiece {
             command: self.command,
@@ -475,8 +490,9 @@ impl RelayCell {
         let chunks: Vec<&[u8]> = rest.chunks(CONTINUE_PIECE_MAX).collect();
         let last = chunks.len() - 1;
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let mut data = Vec::with_capacity(1 + chunk.len());
+            let mut data = Vec::with_capacity(5 + chunk.len());
             data.push((i + 1) as u8);
+            data.extend_from_slice(&id);
             data.extend_from_slice(chunk);
             pieces.push(RelayPiece {
                 command: RelayCellCommand::Continue,
@@ -489,27 +505,78 @@ impl RelayCell {
     }
 }
 
-#[derive(Clone)]
+/// A multi-cell message's id: a hash of what it carries. Retransmissions
+/// of one message share it; the receiver checks it on completion.
+fn message_id(command: RelayCellCommand, stream_id: u16, data: &[u8]) -> [u8; 4] {
+    let h = blake3::Hasher::new_derive_key("tarnet relay message id v1")
+        .update(&[command as u8])
+        .update(&stream_id.to_be_bytes())
+        .update(data)
+        .finalize();
+    h.as_bytes()[..4].try_into().unwrap()
+}
+
+#[derive(Clone, Default)]
 struct PartialRelayMessage {
-    command: RelayCellCommand,
-    total: usize,
-    buf: Vec<u8>,
-    next_index: u8,
+    /// From the first piece, once it arrived.
+    head: Option<(RelayCellCommand, usize, Vec<u8>)>,
+    /// Continuation pieces by index (1-based).
+    rest: std::collections::BTreeMap<u8, Vec<u8>>,
+    /// Index of the piece flagged last, once it arrived.
+    last: Option<u8>,
+}
+
+impl PartialRelayMessage {
+    fn bytes_held(&self) -> usize {
+        self.head.as_ref().map_or(0, |(_, _, b)| b.len()) + self.rest.values().map(Vec::len).sum::<usize>()
+    }
+
+    /// The message, once every piece is here.
+    fn complete(&self) -> Option<(RelayCellCommand, Vec<u8>)> {
+        let (command, total, first) = self.head.as_ref()?;
+        let last = if *total <= first.len() {
+            0
+        } else {
+            (total - first.len()).div_ceil(CONTINUE_PIECE_MAX) as u8
+        };
+        if last > 0 && self.last != Some(last) {
+            return None;
+        }
+        if (1..=last).any(|i| !self.rest.contains_key(&i)) {
+            return None;
+        }
+        let mut buf = first.clone();
+        for i in 1..=last {
+            buf.extend_from_slice(&self.rest[&i]);
+        }
+        (buf.len() == *total).then_some((*command, buf))
+    }
 }
 
 /// Reassembles multi-cell relay messages for one circuit direction.
 ///
-/// Cells of a circuit arrive in order, but may be lost, and single-cell
-/// messages may arrive between the pieces of a larger one. One message is
-/// assembled per stream id; a piece that doesn't continue it exactly drops
-/// the partial message.
+/// Pieces may be lost, and single-cell messages may arrive between the
+/// pieces of a larger one. Pieces are kept by message id, so a sender's
+/// retransmission fills the gaps of an earlier attempt instead of having to
+/// arrive whole: on a 50% lossy path a four-cell message would otherwise get
+/// through one try in sixteen.
 #[derive(Default, Clone)]
 pub struct RelayAssembler {
-    partials: HashMap<u16, PartialRelayMessage>,
+    partials: HashMap<(u16, [u8; 4]), PartialRelayMessage>,
+    /// Insertion order of `partials`, oldest first, for eviction.
+    order: std::collections::VecDeque<(u16, [u8; 4])>,
+    /// Recently completed messages. A retransmission of one is still
+    /// assembled and delivered (its handler answers again: the first answer
+    /// may have been lost), but stray late pieces of one are the first to go
+    /// when room is needed.
+    done: std::collections::VecDeque<(u16, [u8; 4])>,
 }
 
-/// Streams with a message in reassembly at once, per circuit direction.
+/// Messages in reassembly at once, per circuit direction. The oldest goes
+/// when a new one starts.
 const MAX_PARTIAL_RELAY_MESSAGES: usize = 4;
+/// Completed message ids remembered per circuit direction.
+const DONE_RELAY_MESSAGES: usize = 8;
 
 impl std::fmt::Debug for RelayAssembler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -531,63 +598,72 @@ impl RelayAssembler {
             more,
             data,
         } = piece;
-        if command != RelayCellCommand::Continue {
-            if !more {
-                return Some(RelayCell {
-                    command,
-                    stream_id,
-                    data,
-                });
-            }
-            if data.len() < 2 {
-                self.partials.remove(&stream_id);
+        if command != RelayCellCommand::Continue && !more {
+            return Some(RelayCell {
+                command,
+                stream_id,
+                data,
+            });
+        }
+        let (head, index, id, bytes) = if command != RelayCellCommand::Continue {
+            if data.len() < 6 {
                 return None;
             }
             let total = u16::from_be_bytes([data[0], data[1]]) as usize;
-            if total > RELAY_MESSAGE_MAX || total <= data.len() - 2 {
-                self.partials.remove(&stream_id);
+            if total > RELAY_MESSAGE_MAX || total <= data.len() - 6 {
                 return None;
             }
-            if self.partials.len() >= MAX_PARTIAL_RELAY_MESSAGES
-                && !self.partials.contains_key(&stream_id)
-            {
+            (Some((command, total)), 0u8, <[u8; 4]>::try_from(&data[2..6]).unwrap(), &data[6..])
+        } else {
+            if data.len() < 5 || data[0] == 0 {
                 return None;
             }
-            let mut buf = Vec::with_capacity(total);
-            buf.extend_from_slice(&data[2..]);
-            self.partials.insert(
-                stream_id,
-                PartialRelayMessage {
-                    command,
-                    total,
-                    buf,
-                    next_index: 1,
-                },
-            );
-            return None;
-        }
-
-        let Some(partial) = self.partials.get_mut(&stream_id) else {
-            return None;
+            (None, data[0], <[u8; 4]>::try_from(&data[1..5]).unwrap(), &data[5..])
         };
-        let Some((&index, bytes)) = data.split_first() else {
-            self.partials.remove(&stream_id);
-            return None;
-        };
-        if index != partial.next_index || partial.buf.len() + bytes.len() > partial.total {
-            self.partials.remove(&stream_id);
+        let slot = (stream_id, id);
+        if !self.partials.contains_key(&slot) {
+            if self.partials.len() >= MAX_PARTIAL_RELAY_MESSAGES {
+                let victim = self
+                    .order
+                    .iter()
+                    .position(|s| self.done.contains(s))
+                    .unwrap_or(0);
+                if let Some(evicted) = self.order.remove(victim) {
+                    self.partials.remove(&evicted);
+                }
+            }
+            self.partials.insert(slot, PartialRelayMessage::default());
+            self.order.push_back(slot);
+        }
+        let partial = self.partials.get_mut(&slot).expect("inserted above");
+        if partial.bytes_held() + bytes.len() > RELAY_MESSAGE_MAX {
             return None;
         }
-        partial.buf.extend_from_slice(bytes);
-        partial.next_index = partial.next_index.wrapping_add(1);
-        if more {
+        match head {
+            Some((command, total)) => partial.head = Some((command, total, bytes.to_vec())),
+            None => {
+                partial.rest.insert(index, bytes.to_vec());
+                if !more {
+                    partial.last = Some(index);
+                }
+            }
+        }
+        let (command, buf) = partial.complete()?;
+        self.partials.remove(&slot);
+        self.order.retain(|s| *s != slot);
+        if message_id(command, stream_id, &buf) != id {
             return None;
         }
-        let partial = self.partials.remove(&stream_id).unwrap();
-        (partial.buf.len() == partial.total).then(|| RelayCell {
-            command: partial.command,
+        if !self.done.contains(&slot) {
+            if self.done.len() >= DONE_RELAY_MESSAGES {
+                self.done.pop_front();
+            }
+            self.done.push_back(slot);
+        }
+        Some(RelayCell {
+            command,
             stream_id,
-            data: partial.buf,
+            data: buf,
         })
     }
 }
@@ -628,8 +704,12 @@ pub struct OutboundCircuit {
     pub waypoints: Vec<PeerId>,
     /// Last time we received any relay cell on this circuit.
     pub last_activity: Instant,
+    /// When the circuit was set up.
+    pub created_at: Instant,
     /// Multi-cell messages arriving from the circuit's hops.
     pub assembler: RelayAssembler,
+    /// End-to-end rekeys of the innermost layer.
+    pub rekey: LayerRekeyState,
 }
 
 impl OutboundCircuit {
@@ -648,8 +728,16 @@ impl OutboundCircuit {
             state,
             waypoints,
             last_activity: Instant::now(),
+            created_at: Instant::now(),
             assembler: Default::default(),
+            rekey: LayerRekeyState::default(),
         }
+    }
+
+    /// The hash the next end-to-end rekey chains from: the last rekey's, or
+    /// the innermost layer's handshake.
+    pub fn rekey_chain(&self) -> Option<[u8; 32]> {
+        self.rekey.chain.or_else(|| self.transcripts.last().copied())
     }
 
     fn last(&self) -> usize {
@@ -992,6 +1080,9 @@ impl CreatedReply {
     /// transcript hash for key derivation.
     pub fn verify(&self, request: &CreateRequest) -> Result<[u8; 32]> {
         let transcript = request.transcript(&self.kem_ct);
+        if !crate::identity::is_hybrid(&self.signing_pk) {
+            return Err(Error::Crypto("CREATED from a non-hybrid node".into()));
+        }
         if !crate::identity::verify_signed(
             crate::identity::SignedBy::Peer(&request.destination),
             None,
@@ -1010,49 +1101,125 @@ impl CreatedReply {
 // ---------------------------------------------------------------------------
 
 /// Build a STREAM_BEGIN relay cell payload.
-/// Format: service_id(32) || mode(1) || port_len(2) || port(bytes)
+/// Format: `service_id(32) || mode(1) || port_len(2) || port || client_auth`.
 pub fn build_stream_begin_payload(
     service_id: &tarnet_api::types::ServiceId,
     mode: tarnet_api::service::PortMode,
     port: &str,
+    client_auth: &[u8],
 ) -> Vec<u8> {
     let port_bytes = port.as_bytes();
     let port_len = u16::try_from(port_bytes.len()).expect("port name too long");
-    let mut payload = Vec::with_capacity(35 + port_bytes.len());
+    let mut payload = Vec::with_capacity(35 + port_bytes.len() + client_auth.len());
     payload.extend_from_slice(service_id.as_bytes());
     payload.push(mode as u8);
     payload.extend_from_slice(&port_len.to_be_bytes());
     payload.extend_from_slice(port_bytes);
+    payload.extend_from_slice(client_auth);
     payload
 }
 
 /// Parse a STREAM_BEGIN relay cell payload.
-/// Returns (service_id, mode, port).
+/// Returns (service_id, mode, port, client_auth).
 pub fn parse_stream_begin_payload(
     data: &[u8],
 ) -> Result<(
     tarnet_api::types::ServiceId,
     tarnet_api::service::PortMode,
     String,
+    Vec<u8>,
 )> {
     if data.len() < 35 {
         return Err(Error::Wire("STREAM_BEGIN payload too short".into()));
     }
     let mut sid = [0u8; 32];
     sid.copy_from_slice(&data[..32]);
-    let mode = match data[32] {
-        0 => tarnet_api::service::PortMode::ReliableOrdered,
-        1 => tarnet_api::service::PortMode::ReliableUnordered,
-        2 => tarnet_api::service::PortMode::UnreliableUnordered,
-        other => return Err(Error::Wire(format!("unknown port mode {}", other))),
-    };
+    let mode = port_mode_from_u8(data[32])?;
     let port_len = u16::from_be_bytes([data[33], data[34]]) as usize;
     if data.len() < 35 + port_len {
         return Err(Error::Wire("STREAM_BEGIN port truncated".into()));
     }
     let port = String::from_utf8(data[35..35 + port_len].to_vec())
         .map_err(|_| Error::Wire("STREAM_BEGIN port is not valid UTF-8".into()))?;
-    Ok((tarnet_api::types::ServiceId(sid), mode, port))
+    let client_auth = data[35 + port_len..].to_vec();
+    Ok((tarnet_api::types::ServiceId(sid), mode, port, client_auth))
+}
+
+fn port_mode_from_u8(byte: u8) -> Result<tarnet_api::service::PortMode> {
+    match byte {
+        0 => Ok(tarnet_api::service::PortMode::ReliableOrdered),
+        1 => Ok(tarnet_api::service::PortMode::ReliableUnordered),
+        2 => Ok(tarnet_api::service::PortMode::UnreliableUnordered),
+        other => Err(Error::Wire(format!("unknown port mode {}", other))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client authentication (`docs/spec/identity.md`, "Client authentication")
+// ---------------------------------------------------------------------------
+
+fn client_auth_signed(
+    binding: &[u8; 32],
+    target: &tarnet_api::types::ServiceId,
+    mode: tarnet_api::service::PortMode,
+    port: &str,
+) -> Vec<u8> {
+    let mut msg = b"tarnet client auth v2".to_vec();
+    msg.extend_from_slice(binding);
+    msg.extend_from_slice(target.as_bytes());
+    msg.push(mode as u8);
+    msg.extend_from_slice(&crate::wire::hash_port_name(port));
+    msg
+}
+
+/// The client's proof of its SID for one connection:
+/// `bundle_len(u16) || bundle || sig_len(u16) || sig`, the signature over the
+/// circuit binding, the target SID, the mode and the port. `binding` is the
+/// destination's CREATED transcript (direct circuits) or the rendezvous
+/// transcript (hidden services), so the proof is good for this circuit only.
+pub fn build_client_auth(
+    source: &crate::identity::Keypair,
+    binding: &[u8; 32],
+    target: &tarnet_api::types::ServiceId,
+    mode: tarnet_api::service::PortMode,
+    port: &str,
+) -> Vec<u8> {
+    let bundle = source.identity.signing.signing_pubkey_bytes();
+    let sig = source.sign(&client_auth_signed(binding, target, mode, port));
+    let mut out = Vec::with_capacity(4 + bundle.len() + sig.len());
+    out.extend_from_slice(&(bundle.len() as u16).to_be_bytes());
+    out.extend_from_slice(&bundle);
+    out.extend_from_slice(&(sig.len() as u16).to_be_bytes());
+    out.extend_from_slice(&sig);
+    out
+}
+
+/// Check a client's proof; returns the client's verified SID. A missing,
+/// malformed or wrong proof is an error: there is no anonymous connection.
+pub fn verify_client_auth(
+    data: &[u8],
+    binding: &[u8; 32],
+    target: &tarnet_api::types::ServiceId,
+    mode: tarnet_api::service::PortMode,
+    port: &str,
+) -> Result<tarnet_api::types::ServiceId> {
+    let mut r = crate::codec::Reader::new(data);
+    let len = r.read_u16()? as usize;
+    let bundle = r.read_bytes(len)?;
+    let len = r.read_u16()? as usize;
+    let sig = r.read_bytes(len)?;
+    r.finish()?;
+    let client = tarnet_api::types::ServiceId::from_signing_pubkey(&bundle);
+    if !crate::identity::verify_signed(
+        crate::identity::SignedBy::Service(&client),
+        None,
+        &bundle,
+        &client_auth_signed(binding, target, mode, port),
+        &sig,
+    ) {
+        return Err(Error::Crypto("client authentication failed".into()));
+    }
+    Ok(client)
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,12 +1292,23 @@ impl Introduction {
     }
 }
 
+/// INTRODUCE's associated data: the service it is meant for and the KEM
+/// ciphertext it is sealed under, so a sealed introduction can't be moved to
+/// another service or ciphertext.
+fn introduce_aad(service_id: &tarnet_api::types::ServiceId, kem_ciphertext: &[u8]) -> Vec<u8> {
+    let mut aad = b"tarnet introduce v2".to_vec();
+    aad.extend_from_slice(service_id.as_bytes());
+    aad.extend_from_slice(kem_ciphertext);
+    aad
+}
+
 /// Seal an [`Introduction`] to the service.
 /// Wire: `ct_len(u16) || kem_ciphertext || nonce(24) || AEAD(plaintext)`.
 pub fn build_introduce_payload(
     intro: &Introduction,
     kem_ciphertext: &[u8],
     shared_secret: &[u8; 32],
+    service_id: &tarnet_api::types::ServiceId,
 ) -> Vec<u8> {
     let enc_key = Zeroizing::new(kdf(shared_secret, "tarnet introduce enc"));
     let mut nonce = [0u8; 24];
@@ -1140,7 +1318,7 @@ pub fn build_introduce_payload(
             (&nonce).into(),
             Payload {
                 msg: &intro.to_plaintext(),
-                aad: b"",
+                aad: &introduce_aad(service_id, kem_ciphertext),
             },
         )
         .expect("AEAD encryption should not fail");
@@ -1157,6 +1335,7 @@ pub fn build_introduce_payload(
 pub fn parse_introduce_payload(
     data: &[u8],
     service_kem: &crate::identity::KemKeypair,
+    service_id: &tarnet_api::types::ServiceId,
 ) -> Result<(Introduction, [u8; 32])> {
     let ct_len = data
         .get(..2)
@@ -1178,7 +1357,7 @@ pub fn parse_introduce_payload(
             nonce.into(),
             Payload {
                 msg: sealed,
-                aad: b"",
+                aad: &introduce_aad(service_id, kem_ct),
             },
         )
         .map_err(|_| Error::Crypto("INTRODUCE AEAD decryption failed".into()))?;
@@ -1223,7 +1402,7 @@ pub fn rendezvous_keys(
     eph_secret: &[u8; 32],
     sealed: &[u8],
     kem_ct: &[u8],
-) -> (HopKey, [u8; 16]) {
+) -> (HopKey, [u8; 16], [u8; 32]) {
     let mut h = blake3::Hasher::new_derive_key("tarnet rendezvous transcript v1");
     h.update(&(sealed.len() as u32).to_be_bytes());
     h.update(sealed);
@@ -1236,7 +1415,204 @@ pub fn rendezvous_keys(
     material.extend_from_slice(&transcript);
     let secret = Zeroizing::new(blake3::derive_key("tarnet rendezvous secret v1", &material));
     let confirm_key = Zeroizing::new(blake3::derive_key("tarnet rendezvous confirm v1", &*secret));
-    (HopKey::derive(&secret, &transcript), mac_16(&confirm_key, &[&transcript]))
+    (
+        HopKey::derive(&secret, &transcript),
+        mac_16(&confirm_key, &[&transcript]),
+        transcript,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end layer rekey
+// ---------------------------------------------------------------------------
+
+/// Payload of `LayerRekey` and `LayerRekeyed`: `generation(u32) || kem`,
+/// the initiator's ephemeral KEM key or the responder's ciphertext. Sent
+/// sealed in the innermost layer, which authenticates both ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerRekeyMsg {
+    pub generation: u32,
+    pub kem: Vec<u8>,
+}
+
+impl LayerRekeyMsg {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = self.generation.to_be_bytes().to_vec();
+        buf.extend_from_slice(&self.kem);
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        let mut r = crate::codec::Reader::new(data);
+        let generation = r.read_u32()?;
+        let kem = r.read_bytes(r.remaining())?;
+        Ok(Self { generation, kem })
+    }
+}
+
+/// New innermost-layer keys (initiator's orientation) and the hash later
+/// rekeys chain from. Chaining binds every generation to the circuit's
+/// original handshake.
+pub fn layer_rekey_keys(
+    secret: &[u8; 32],
+    chain: &[u8; 32],
+    generation: u32,
+    pk: &[u8],
+    ct: &[u8],
+) -> (HopKey, [u8; 32]) {
+    let mut h = blake3::Hasher::new_derive_key("tarnet layer rekey transcript v2");
+    h.update(chain);
+    h.update(&generation.to_be_bytes());
+    h.update(&(pk.len() as u32).to_be_bytes());
+    h.update(pk);
+    h.update(&(ct.len() as u32).to_be_bytes());
+    h.update(ct);
+    let transcript = *h.finalize().as_bytes();
+    (HopKey::derive(secret, &transcript), transcript)
+}
+
+/// A responder's answer to one generation, resent when REKEY is.
+#[derive(Debug, Clone)]
+struct RekeyReply {
+    generation: u32,
+    request: [u8; 32],
+    ct: Vec<u8>,
+}
+
+/// One end's state for end-to-end rekeys of a circuit's innermost layer
+/// (`docs/spec/identity.md`, "Key lifetime"). The initiator retries one
+/// generation with one KEM key until it gets an answer, so the two ends'
+/// chains never diverge.
+#[derive(Default)]
+pub struct LayerRekeyState {
+    /// The other end initiates; we answer.
+    pub responder: bool,
+    /// Last generation installed (initiator) or answered (responder).
+    pub generation: u32,
+    /// Hash of the last rekey; `None` until the first one.
+    pub chain: Option<[u8; 32]>,
+    /// When the current keys were installed; `None` means at circuit setup.
+    pub installed_at: Option<Instant>,
+    /// Initiator: the offer for `generation + 1`, kept across retries.
+    pub offer: Option<std::sync::Arc<crate::key_exchange::KexOffer>>,
+    /// Initiator: a rekey task is running.
+    pub busy: bool,
+    reply: Option<RekeyReply>,
+}
+
+impl std::fmt::Debug for LayerRekeyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LayerRekeyState")
+            .field("responder", &self.responder)
+            .field("generation", &self.generation)
+            .field("busy", &self.busy)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LayerRekeyState {
+    pub fn responder(chain: [u8; 32]) -> Self {
+        Self {
+            responder: true,
+            chain: Some(chain),
+            ..Default::default()
+        }
+    }
+
+    pub fn initiator(chain: [u8; 32]) -> Self {
+        Self {
+            chain: Some(chain),
+            ..Default::default()
+        }
+    }
+
+    /// Whether the keys are older than `max_age`, measuring from `setup`
+    /// before the first rekey.
+    pub fn due(&self, setup: Instant, max_age: Duration) -> bool {
+        !self.responder && !self.busy && self.installed_at.unwrap_or(setup).elapsed() >= max_age
+    }
+
+    /// Responder: answer a REKEY. Returns the reply payload and, the first
+    /// time a generation is seen, the new keys in the initiator's
+    /// orientation, to stage. `chain` is the hash to chain from when no
+    /// rekey happened yet.
+    pub fn respond(&mut self, chain: [u8; 32], msg: &LayerRekeyMsg) -> Result<(Vec<u8>, Option<HopKey>)> {
+        let request = *blake3::hash(&msg.kem).as_bytes();
+        if let Some(reply) = &self.reply {
+            if reply.generation == msg.generation {
+                if reply.request != request {
+                    return Err(Error::Protocol("conflicting layer rekey".into()));
+                }
+                let answer = LayerRekeyMsg {
+                    generation: msg.generation,
+                    kem: reply.ct.clone(),
+                };
+                return Ok((answer.to_bytes(), None));
+            }
+        }
+        if Some(msg.generation) != self.generation.checked_add(1) {
+            return Err(Error::Protocol(format!(
+                "layer rekey generation {} after {}",
+                msg.generation, self.generation
+            )));
+        }
+        let (secret, ct) =
+            crate::key_exchange::kex_accept(tarnet_api::types::KemAlgo::MlkemX25519, &msg.kem)?;
+        let secret = Zeroizing::new(secret);
+        let chain = self.chain.unwrap_or(chain);
+        let (keys, next) = layer_rekey_keys(&secret, &chain, msg.generation, &msg.kem, &ct);
+        self.generation = msg.generation;
+        self.chain = Some(next);
+        self.installed_at = Some(Instant::now());
+        self.reply = Some(RekeyReply {
+            generation: msg.generation,
+            request,
+            ct: ct.clone(),
+        });
+        let answer = LayerRekeyMsg {
+            generation: msg.generation,
+            kem: ct,
+        };
+        Ok((answer.to_bytes(), Some(keys)))
+    }
+
+    /// Initiator: the REKEY payload for the next generation, reusing the
+    /// pending offer.
+    pub fn request(&mut self) -> LayerRekeyMsg {
+        let offer = self
+            .offer
+            .get_or_insert_with(|| {
+                std::sync::Arc::new(crate::key_exchange::KexOffer::new(
+                    tarnet_api::types::KemAlgo::MlkemX25519,
+                ))
+            })
+            .clone();
+        LayerRekeyMsg {
+            generation: self.generation + 1,
+            kem: offer.pubkey_bytes(),
+        }
+    }
+
+    /// Initiator: finish the pending generation with the responder's answer.
+    /// Returns the new keys to install with [`OnionLayers::rekey_last`].
+    pub fn complete(&mut self, chain: [u8; 32], answer: &LayerRekeyMsg) -> Result<HopKey> {
+        let offer = self
+            .offer
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("unexpected layer rekey answer".into()))?;
+        if answer.generation != self.generation + 1 {
+            return Err(Error::Protocol("stale layer rekey answer".into()));
+        }
+        let secret = Zeroizing::new(offer.complete(&answer.kem)?);
+        let pk = offer.pubkey_bytes();
+        let chain = self.chain.unwrap_or(chain);
+        let (keys, next) = layer_rekey_keys(&secret, &chain, answer.generation, &pk, &answer.kem);
+        self.generation = answer.generation;
+        self.chain = Some(next);
+        self.installed_at = Some(Instant::now());
+        self.offer = None;
+        Ok(keys)
+    }
 }
 
 /// The service's answer carried by JOIN and JOINED:
@@ -1366,6 +1742,37 @@ pub fn verify_intro_register(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn client_auth_binds_circuit_target_mode_and_port() {
+        use tarnet_api::service::PortMode::{ReliableOrdered, ReliableUnordered};
+        let target = crate::identity::Keypair::generate().identity.service_id();
+        for client in [crate::identity::Keypair::generate(), crate::identity::Keypair::generate_ed25519()] {
+            let proof = build_client_auth(&client, &[1; 32], &target, ReliableOrdered, "80");
+            assert_eq!(
+                verify_client_auth(&proof, &[1; 32], &target, ReliableOrdered, "80").unwrap(),
+                client.identity.service_id()
+            );
+            let other = crate::identity::Keypair::generate().identity.service_id();
+            assert!(verify_client_auth(&proof, &[2; 32], &target, ReliableOrdered, "80").is_err());
+            assert!(verify_client_auth(&proof, &[1; 32], &other, ReliableOrdered, "80").is_err());
+            assert!(verify_client_auth(&proof, &[1; 32], &target, ReliableUnordered, "80").is_err());
+            assert!(verify_client_auth(&proof, &[1; 32], &target, ReliableOrdered, "81").is_err());
+            assert!(verify_client_auth(&[], &[1; 32], &target, ReliableOrdered, "80").is_err());
+            let mut trailing = proof.clone();
+            trailing.push(0);
+            assert!(verify_client_auth(&trailing, &[1; 32], &target, ReliableOrdered, "80").is_err());
+        }
+    }
+
+    #[test]
+    fn stream_begin_carries_the_proof() {
+        use tarnet_api::service::PortMode::ReliableOrdered;
+        let sid = crate::identity::Keypair::generate().identity.service_id();
+        let payload = build_stream_begin_payload(&sid, ReliableOrdered, "ssh", b"proof");
+        let (s, m, p, auth) = parse_stream_begin_payload(&payload).unwrap();
+        assert_eq!((s, m, p.as_str(), auth.as_slice()), (sid, ReliableOrdered, "ssh", &b"proof"[..]));
+    }
+
     use super::*;
 
     fn pid(b: u8) -> PeerId {
@@ -1571,7 +1978,7 @@ mod tests {
         assert_eq!(CreateRequest::from_bytes(&bytes).unwrap(), req);
         assert!(CreateRequest::from_bytes(&bytes[..bytes.len() - 1]).is_err());
         let mut other_version = bytes;
-        other_version[0] = 2;
+        other_version[0] = CELL_CRYPTO_VERSION - 1;
         assert!(CreateRequest::from_bytes(&other_version).is_err());
     }
 
@@ -1672,19 +2079,92 @@ mod tests {
     }
 
     #[test]
-    fn lost_piece_drops_the_message() {
-        let (_, pieces) = pieces_of(1900, 3);
+    fn retransmission_fills_the_gaps_of_a_lossy_attempt() {
+        let (cell, pieces) = pieces_of(1900, 3);
         assert!(pieces.len() >= 4);
         let mut a = RelayAssembler::default();
+        // First attempt loses pieces 1 and 3; the second loses 0 and 2.
         for (i, p) in pieces.iter().enumerate() {
-            if i == 1 {
-                continue;
+            if i != 1 && i != 3 {
+                assert!(a.push(p.clone()).is_none());
             }
+        }
+        let retry = cell.pieces().unwrap();
+        assert_eq!(retry, pieces, "a retransmission reuses the message id");
+        let mut out = None;
+        for (i, p) in retry.iter().enumerate() {
+            if i == 1 || i == 3 {
+                out = a.push(p.clone()).or(out);
+            }
+        }
+        assert_eq!(out.unwrap().data, cell.data);
+        assert!(a.is_empty());
+        // A whole retransmission of a completed message is delivered again:
+        // the sender retries because our answer was lost, and the handler
+        // must get the chance to answer again.
+        let mut again = None;
+        for p in &pieces {
+            again = a.push(p.clone()).or(again);
+        }
+        assert_eq!(again.unwrap().data, cell.data);
+    }
+
+    #[test]
+    fn stray_pieces_of_completed_messages_are_evicted_first() {
+        let (_, done) = pieces_of(1500, 9);
+        let mut a = RelayAssembler::default();
+        let mut out = None;
+        for p in &done {
+            out = a.push(p.clone()).or(out);
+        }
+        assert!(out.is_some());
+        // A late piece of it, then messages in progress filling the rest.
+        assert!(a.push(done[1].clone()).is_none());
+        let live: Vec<_> = (0..MAX_PARTIAL_RELAY_MESSAGES).map(|n| pieces_of(1000 + n, 0)).collect();
+        for (_, pieces) in &live {
+            assert!(a.push(pieces[0].clone()).is_none());
+        }
+        // The stray went, not the oldest live message.
+        let (cell, pieces) = &live[0];
+        let mut out = None;
+        for p in &pieces[1..] {
+            out = a.push(p.clone()).or(out);
+        }
+        assert_eq!(out.unwrap().data, cell.data);
+    }
+
+    #[test]
+    fn pieces_of_different_messages_never_mix() {
+        let (one, p1) = pieces_of(1200, 0);
+        let mut other = one.clone();
+        other.data[700] ^= 1;
+        let p2 = other.pieces().unwrap();
+        assert_eq!(p1.len(), p2.len());
+        let mut a = RelayAssembler::default();
+        // Head of one, continuations of the other: nothing completes.
+        assert!(a.push(p1[0].clone()).is_none());
+        for p in &p2[1..] {
             assert!(a.push(p.clone()).is_none());
         }
-        assert!(a.is_empty());
-        // A stray continuation with no message in progress is ignored.
-        assert!(a.push(pieces[2].clone()).is_none());
+        // Each completes from its own pieces.
+        let mut out = None;
+        for p in &p1[1..] {
+            out = a.push(p.clone()).or(out);
+        }
+        assert_eq!(out.unwrap().data, one.data);
+        assert!(a.push(p2[0].clone()).unwrap().data == other.data);
+    }
+
+    #[test]
+    fn partial_messages_are_bounded() {
+        let mut a = RelayAssembler::default();
+        for n in 0..(MAX_PARTIAL_RELAY_MESSAGES + 3) {
+            let (_, pieces) = pieces_of(1000 + n, 0);
+            assert!(a.push(pieces[0].clone()).is_none());
+        }
+        assert_eq!(a.partials.len(), MAX_PARTIAL_RELAY_MESSAGES);
+        // A stray continuation alone starts a bounded partial too.
+        assert!(a.order.len() == a.partials.len());
     }
 
     #[test]

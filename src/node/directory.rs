@@ -1235,7 +1235,7 @@ mod cache_regressions {
 
     #[tokio::test]
     async fn an_expired_cache_version_cannot_be_replayed() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let kp = Keypair::generate_ed25519();
         let entries = vec![AddressEntry {
             landmark: PeerId([7; 32]),
@@ -1256,7 +1256,7 @@ mod cache_regressions {
     }
     #[tokio::test]
     async fn a_directory_token_cannot_be_reused_for_a_different_target() {
-        let node = Node::new(Keypair::generate_ed25519());
+        let node = Node::new(Keypair::generate());
         let from = PeerId([1; 32]);
         let target = PeerId([2; 32]);
         assert!(node.remember_lookup([3; 32], from, target, false).await);

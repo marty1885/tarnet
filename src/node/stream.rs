@@ -16,6 +16,8 @@ pub(super) struct StreamState {
     delivery_cancel: tokio::sync::Notify,
     /// ACKs may move retry deadlines or reveal a fast-retransmit hole.
     retry_changed: std::sync::atomic::AtomicBool,
+    /// Origin of our DATA timestamps.
+    epoch: Instant,
 }
 
 /// Initial and maximum undelivered packet credit (about 464 KiB). This
@@ -23,7 +25,11 @@ pub(super) struct StreamState {
 /// Released packets extend an absolute boundary, so reordered ACKs cannot reopen a
 /// stale window or spend the same credit twice.
 const RECEIVE_WINDOW: u32 = 1024;
-const ACK_DELAY: Duration = Duration::from_millis(5);
+/// Long enough for an application that reads at once (an echo, a shell)
+/// to return the credit within it: the receipt ACK and the window update
+/// then travel as one cell instead of two. On a slow link a cell is
+/// hundreds of milliseconds of airtime.
+const ACK_DELAY: Duration = Duration::from_millis(25);
 const ACK_EVERY: u32 = 8;
 const PERSIST_INITIAL: Duration = Duration::from_secs(1);
 const PERSIST_MAX: Duration = Duration::from_secs(8);
@@ -37,6 +43,8 @@ struct FlowControl {
     receive_limit: u32,
     ack_at: Option<tokio::time::Instant>,
     ack_events: u32,
+    /// Timestamp of the last DATA packet received, for the next ACK.
+    echo: Option<u16>,
 }
 
 impl Default for FlowControl {
@@ -46,6 +54,7 @@ impl Default for FlowControl {
             receive_limit: RECEIVE_WINDOW,
             ack_at: None,
             ack_events: 0,
+            echo: None,
         }
     }
 }
@@ -87,10 +96,25 @@ const KIND_PROBE: u8 = 3;
 /// A fragment's fields after its kind byte: msg_id, index, count.
 const FRAGMENT_FIELDS: usize = 6;
 const FRAGMENT_HEADER: usize = 1 + FRAGMENT_FIELDS;
-/// A DATA cell: `seq(u32) || kind(u8) || body`.
+/// A DATA cell: `seq(u32) || timestamp(u16) || kind(u8) || body`. The
+/// timestamp is the sender's own millisecond clock when it sent this copy;
+/// the receiver echoes it in its next ACK.
 const SEQ_LEN: usize = 4;
-/// Channel packet bytes that fit one DATA cell after the channel sequence.
-const PACKET_MAX: usize = CELL_PAYLOAD_MAX - SEQ_LEN;
+const HEADER_LEN: usize = SEQ_LEN + 2;
+/// Channel packet bytes that fit one DATA cell after the header.
+const PACKET_MAX: usize = CELL_PAYLOAD_MAX - HEADER_LEN;
+
+/// Header of a DATA cell sent now.
+fn data_header(epoch: Instant, sequence: u32) -> Vec<u8> {
+    let mut data = sequence.to_be_bytes().to_vec();
+    data.extend_from_slice(&stamp(epoch).to_be_bytes());
+    data
+}
+
+/// Our millisecond clock, wrapping: only ever compared with itself.
+fn stamp(epoch: Instant) -> u16 {
+    epoch.elapsed().as_millis() as u16
+}
 /// Bounds on partially received application messages per stream. On a
 /// reliable stream every missing fragment is still on its way (it holds a
 /// channel window slot until acknowledged), so these only trip for a
@@ -214,6 +238,85 @@ impl EndpointState {
 
 /// Encrypt a fresh cell for every transmission, including retransmissions.
 /// Sequence numbers belong to the end-to-end channel; crypto nonces never repeat.
+/// The last ACK sent and when: an identical one within a round trip tells
+/// the sender nothing it can have learned yet.
+type LastAck = Option<((u32, u32, Vec<u32>), Instant)>;
+
+/// The ACK we owe, encoded, clearing what it reports. Without `early` only
+/// once it is due; with `early` any ACK owed at all, to ride on a DATA cell
+/// going out now (it then costs a few bytes rather than a cell).
+async fn take_ack(stream: &StreamState, early: bool, last_ack: &mut LastAck) -> Option<Vec<u8>> {
+    let (receive_limit, echo) = {
+        let mut flow = stream.flow.lock().unwrap();
+        let owed = flow.ack_at?;
+        if !early && owed > tokio::time::Instant::now() {
+            return None;
+        }
+        flow.ack_at = None;
+        flow.ack_events = 0;
+        (flow.receive_limit, flow.echo.take())
+    };
+    let (ack, srtt) = {
+        let channel = stream.channel.lock().await;
+        (channel.generate_ack(), channel.srtt())
+    };
+    let (ack_seq, selective_acks) = ack?;
+    let id = (ack_seq, receive_limit, selective_acks.clone());
+    // A repeat of the ACK sent less than a round trip ago is redundant: the
+    // sender can't have seen the first yet. On a slow link each one costs a
+    // whole cell, and they queue up ahead of the data they would be
+    // acknowledging. Riding on DATA it costs nothing, so it goes anyway.
+    let repeat = srtt
+        .zip(last_ack.as_ref())
+        .is_some_and(|(rtt, (last, at))| *last == id && at.elapsed() < rtt);
+    if repeat && !early {
+        return None;
+    }
+    *last_ack = Some((id, Instant::now()));
+    Some(
+        StreamAckMsg {
+            receive_limit,
+            ack_seq,
+            selective_acks,
+            echo,
+        }
+        .to_bytes(),
+    )
+}
+
+/// Send a DATA packet, carrying the ACK we owe in the same cell when both
+/// fit. An interactive reply then acknowledges what it answers: on a slow
+/// link that halves the cells per keystroke.
+async fn send_data(
+    circuits: &CircuitState,
+    sender: &super::sender::Sender,
+    key: CircuitKey,
+    outbound: bool,
+    stream: &StreamState,
+    last_ack: &mut LastAck,
+    data: &[u8],
+) -> Result<()> {
+    let ack = if data.len() + 2 + StreamAckMsg::MIN_LEN <= CELL_PAYLOAD_MAX {
+        take_ack(stream, true, last_ack).await
+    } else {
+        None
+    };
+    match ack {
+        Some(ack) if 2 + ack.len() + data.len() <= CELL_PAYLOAD_MAX => {
+            let mut cell = (ack.len() as u16).to_be_bytes().to_vec();
+            cell.extend_from_slice(&ack);
+            cell.extend_from_slice(data);
+            send_cell(circuits, sender, key, outbound, RelayCellCommand::StreamDataAck, &cell).await
+        }
+        ack => {
+            if let Some(ack) = ack {
+                send_cell(circuits, sender, key, outbound, RelayCellCommand::StreamAck, &ack).await?;
+            }
+            send_cell(circuits, sender, key, outbound, RelayCellCommand::Data, data).await
+        }
+    }
+}
+
 async fn send_cell(
     circuits: &CircuitState,
     sender: &super::sender::Sender,
@@ -244,7 +347,7 @@ async fn send_cell(
         hop.counter = n
             .checked_add(1)
             .ok_or_else(|| Error::Crypto("backward counter exhausted".into()))?;
-        super::circuit::seal_backward_cell(&hop.keys, n, key.circuit_id, &body)
+        super::circuit::seal_backward_cell(&mut hop.keys, n, key.circuit_id, &body)
     };
     // Loss here is safe: reliable channels retain the plaintext until its ACK.
     sender
@@ -284,6 +387,7 @@ impl Node {
             closed: std::sync::atomic::AtomicBool::new(false),
             delivery_cancel: tokio::sync::Notify::new(),
             retry_changed: std::sync::atomic::AtomicBool::new(false),
+            epoch: Instant::now(),
         });
         // Our link on this circuit is the slowest hop we know of: size
         // retransmission timeouts so packets queued on it aren't resent early.
@@ -396,6 +500,7 @@ impl Node {
             let mut retry_at: Option<Instant> = None;
             let mut persist_at = None;
             let mut persist_interval = PERSIST_INITIAL;
+            let mut last_ack: LastAck = None;
             'send: loop {
                 #[cfg(test)]
                 stream.sender_passes.fetch_add(1, Ordering::Relaxed);
@@ -425,28 +530,18 @@ impl Node {
                 {
                     break;
                 }
-                let ack_limit = {
-                    let mut flow = stream.flow.lock().unwrap();
-                    if flow
-                        .ack_at
-                        .is_some_and(|at| at <= tokio::time::Instant::now())
-                    {
-                        flow.ack_at = None;
-                        flow.ack_events = 0;
-                        Some(flow.receive_limit)
-                    } else {
-                        None
-                    }
+                // A due ACK waits for a DATA packet that can go in this pass
+                // with room for it, and rides on it.
+                let fits = pending
+                    .front()
+                    .is_some_and(|p| HEADER_LEN + p.len() + 2 + StreamAckMsg::MIN_LEN <= CELL_PAYLOAD_MAX);
+                let data_ready = fits && {
+                    let peer_limit = stream.flow.lock().unwrap().peer_limit;
+                    let channel = stream.channel.lock().await;
+                    channel.can_send() && !(reliable && !before(channel.next_send_sequence(), peer_limit))
                 };
-                if let Some(receive_limit) = ack_limit {
-                    let ack = stream.channel.lock().await.generate_ack();
-                    if let Some((ack_seq, selective_acks)) = ack {
-                        let data = StreamAckMsg {
-                            receive_limit,
-                            ack_seq,
-                            selective_acks,
-                        }
-                        .to_bytes();
+                if !data_ready {
+                    if let Some(data) = take_ack(&stream, false, &mut last_ack).await {
                         if send_cell(
                             &circuits,
                             &sender,
@@ -477,18 +572,11 @@ impl Node {
                     };
                     for (sequence, payload) in due {
                         log::trace!("stream {:?}: retransmit seq {}", key.circuit_id, sequence);
-                        let mut data = sequence.to_be_bytes().to_vec();
+                        let mut data = data_header(stream.epoch, sequence);
                         data.extend_from_slice(&payload);
-                        if send_cell(
-                            &circuits,
-                            &sender,
-                            key,
-                            outbound,
-                            RelayCellCommand::Data,
-                            &data,
-                        )
-                        .await
-                        .is_err()
+                        if send_data(&circuits, &sender, key, outbound, &stream, &mut last_ack, &data)
+                            .await
+                            .is_err()
                         {
                             break 'send;
                         }
@@ -540,18 +628,11 @@ impl Node {
                     persist_at = None;
                     persist_interval = PERSIST_INITIAL;
                     log::trace!("stream {:?}: send seq {}", key.circuit_id, sequence);
-                    let mut data = sequence.to_be_bytes().to_vec();
+                    let mut data = data_header(stream.epoch, sequence);
                     data.extend_from_slice(&payload);
-                    if send_cell(
-                        &circuits,
-                        &sender,
-                        key,
-                        outbound,
-                        RelayCellCommand::Data,
-                        &data,
-                    )
-                    .await
-                    .is_err()
+                    if send_data(&circuits, &sender, key, outbound, &stream, &mut last_ack, &data)
+                        .await
+                        .is_err()
                     {
                         break;
                     }
@@ -561,7 +642,7 @@ impl Node {
                     let at = persist_at
                         .get_or_insert_with(|| tokio::time::Instant::now() + persist_interval);
                     if *at <= tokio::time::Instant::now() {
-                        let mut data = next_sequence.to_be_bytes().to_vec();
+                        let mut data = data_header(stream.epoch, next_sequence);
                         data.push(KIND_PROBE);
                         if send_cell(
                             &circuits,
@@ -635,11 +716,11 @@ impl Node {
     }
 
     pub(super) async fn handle_stream_data(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
-        let kind = SEQ_LEN;
-        if data.len() < SEQ_LEN + 1
+        let kind = HEADER_LEN;
+        if data.len() < HEADER_LEN + 1
             || data[kind] > KIND_PROBE
-            || (matches!(data[kind], KIND_FIN | KIND_PROBE) && data.len() != SEQ_LEN + 1)
-            || (data[kind] == KIND_FRAGMENT && data.len() < SEQ_LEN + FRAGMENT_HEADER)
+            || (matches!(data[kind], KIND_FIN | KIND_PROBE) && data.len() != HEADER_LEN + 1)
+            || (data[kind] == KIND_FRAGMENT && data.len() < HEADER_LEN + FRAGMENT_HEADER)
         {
             return Err(Error::Wire("invalid stream DATA".into()));
         }
@@ -649,6 +730,10 @@ impl Node {
         };
         let sequence = u32::from_be_bytes(data[..SEQ_LEN].try_into().unwrap());
         let reliable = stream.channel.lock().await.reliable;
+        if reliable {
+            stream.flow.lock().unwrap().echo =
+                Some(u16::from_be_bytes([data[SEQ_LEN], data[SEQ_LEN + 1]]));
+        }
         if data[kind] == KIND_PROBE {
             if reliable {
                 stream.flow.lock().unwrap().schedule_ack(true);
@@ -666,7 +751,7 @@ impl Node {
         let (ready, immediate) = {
             let mut channel = stream.channel.lock().await;
             let expected = channel.generate_ack().map(|(seq, _)| seq);
-            let ready = channel.receive_data(sequence, data[SEQ_LEN..].to_vec());
+            let ready = channel.receive_data(sequence, data[HEADER_LEN..].to_vec());
             let immediate = expected.is_some_and(|seq| seq != sequence) || data[kind] == KIND_FIN;
             (ready, immediate)
         };
@@ -689,6 +774,18 @@ impl Node {
         Ok(())
     }
 
+    /// A cell carrying an ACK and a DATA packet: the ACK first, so the
+    /// window it opens is there for whatever the packet triggers.
+    pub(super) async fn handle_stream_data_ack(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
+        let len = data
+            .get(..2)
+            .map(|l| u16::from_be_bytes([l[0], l[1]]) as usize)
+            .filter(|&len| data.len() >= 2 + len)
+            .ok_or_else(|| Error::Wire("truncated stream DATA+ACK".into()))?;
+        self.handle_stream_ack(key, &data[2..2 + len]).await?;
+        self.handle_stream_data(key, &data[2 + len..]).await
+    }
+
     pub(super) async fn handle_stream_ack(&self, key: CircuitKey, data: &[u8]) -> Result<()> {
         // The decoder bounds the selective acks.
         let ack = StreamAckMsg::from_bytes(data)?;
@@ -700,11 +797,14 @@ impl Node {
                 ack.ack_seq,
                 ack.selective_acks
             );
+            let echo_rtt = ack
+                .echo
+                .map(|sent| Duration::from_millis(stamp(stream.epoch).wrapping_sub(sent) as u64));
             stream
                 .channel
                 .lock()
                 .await
-                .process_ack(ack.ack_seq, &ack.selective_acks);
+                .process_ack_timed(ack.ack_seq, &ack.selective_acks, echo_rtt);
             stream.retry_changed.store(true, Ordering::Release);
             stream
                 .flow
@@ -841,7 +941,7 @@ mod tests {
         // Inject a burst larger than the bounded application queue. Raw
         // datagrams have no channel sequence state, ACKs, or credit returns.
         for i in 0..400u32 {
-            let mut data = vec![0; SEQ_LEN];
+            let mut data = vec![0; HEADER_LEN];
             data.push(KIND_DATA);
             data.extend_from_slice(&i.to_be_bytes());
             server.handle_stream_data(key, &data).await.unwrap();
@@ -858,7 +958,7 @@ mod tests {
         for i in 0..256u32 {
             assert_eq!(rx.recv().await.unwrap(), i.to_be_bytes());
         }
-        let mut fresh = vec![0; SEQ_LEN];
+        let mut fresh = vec![0; HEADER_LEN];
         fresh.push(KIND_DATA);
         fresh.extend_from_slice(b"fresh");
         server.handle_stream_data(key, &fresh).await.unwrap();
@@ -981,7 +1081,7 @@ mod tests {
             (2, vec![KIND_FIN]),
             (1, packets[1].clone()),
         ] {
-            let mut data = sequence.to_be_bytes().to_vec();
+            let mut data = data_header(Instant::now(), sequence);
             data.extend(packet);
             server.handle_stream_data(key, &data).await.unwrap();
         }
@@ -1149,6 +1249,90 @@ mod tests {
             "server retained an idle retry timer"
         );
         eprintln!("tickless stream soak: 2768896 verified bytes, 10% DATA/ACK loss each way, 8 rekeys, {:?}, 0 idle passes in 650 ms", started.elapsed());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn circuit_rekeys_under_loss_keep_the_stream_intact() {
+        use crate::firewall::{Action, Firewall, Match};
+        let (client, server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let circuit_id = *client.circuits.outbound.lock().await.keys().next().unwrap();
+        for node in [&client, &server] {
+            let mut firewall = Firewall::default();
+            firewall.add_rule(
+                Match::All(vec![
+                    Match::MsgType(MessageType::CircuitRelay),
+                    Match::Probability(0.10),
+                ]),
+                Action::Drop,
+            );
+            node.set_firewall(firewall).await;
+        }
+        const REKEYS: u32 = 6;
+        let rekey_node = client.clone();
+        let rekeys = tokio::spawn(async move {
+            for _ in 0..REKEYS {
+                // A failed try leaves the generation pending; retrying it
+                // must keep both ends' chains in step.
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    while rekey_node.rekey_circuit_now(circuit_id).await.is_err() {}
+                })
+                .await
+                .expect("circuit rekey never completed");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        let payload = |round: u32, index: u32, direction: u8| {
+            let mut data = vec![direction; [64, 512, 2048, 8192][round as usize % 4]];
+            data[..4].copy_from_slice(&round.to_be_bytes());
+            data[4..8].copy_from_slice(&index.to_be_bytes());
+            data
+        };
+        tokio::time::timeout(Duration::from_secs(120), async {
+            for round in 0..8 {
+                tokio::join!(
+                    async {
+                        for index in 0..32 {
+                            outgoing.send(&payload(round, index, 1)).await.unwrap();
+                        }
+                    },
+                    async {
+                        for index in 0..32 {
+                            incoming.send(&payload(round, index, 2)).await.unwrap();
+                        }
+                    },
+                    async {
+                        for index in 0..32 {
+                            assert_eq!(incoming.recv().await.unwrap(), payload(round, index, 1));
+                        }
+                    },
+                    async {
+                        for index in 0..32 {
+                            assert_eq!(outgoing.recv().await.unwrap(), payload(round, index, 2));
+                        }
+                    },
+                );
+            }
+            rekeys.await.unwrap();
+        })
+        .await
+        .expect("stream stalled across circuit rekeys");
+        client.clear_firewall().await;
+        server.clear_firewall().await;
+
+        // Traffic after the last rekey switches the server's sending side.
+        outgoing.send(b"after").await.unwrap();
+        assert_eq!(incoming.recv().await.unwrap(), b"after");
+        incoming.send(b"reply").await.unwrap();
+        assert_eq!(outgoing.recv().await.unwrap(), b"reply");
+        assert_eq!(
+            client.circuits.outbound.lock().await[&circuit_id].rekey.generation,
+            REKEYS
+        );
+        let map = server.circuits.hop_backward_keys.lock().await;
+        let hop = map.values().next().unwrap();
+        assert_eq!(hop.rekey.generation, REKEYS);
+        assert!(hop.pending.is_none(), "server never switched to the new keys");
     }
 
     #[tokio::test]

@@ -30,7 +30,6 @@ use crate::key_exchange::{kex_accept, KexOffer};
 use crate::link::PeerLink;
 use crate::peer_transport::LinkTable;
 use crate::pool::PoolStore;
-use crate::pubkey_cache::PubkeyCache;
 use crate::routing::RoutingTable;
 use crate::state::{PersistedIdentity, StateDb, StorageLimits};
 use crate::transport::webrtc::WebRtcConnector;
@@ -43,6 +42,7 @@ use crate::wire::*;
 use tarnet_api::service::{Connection, Listener, ListenerOptions};
 
 mod circuit;
+mod circuit_rekey;
 mod dht;
 mod directory;
 mod hidden_service;
@@ -57,6 +57,7 @@ mod tunnel;
 mod webrtc;
 
 pub use directory::{LandmarkConfig, LandmarkMode};
+pub use identity_mgmt::{app_signed_message, verify_app_signature};
 
 /// Create an interval that starts after a random jitter of `0..period/2`,
 /// then ticks at `period`.  Desynchronizes periodic timers across nodes.
@@ -266,7 +267,7 @@ pub struct CircuitState {
     pub create_keys: Arc<Mutex<crate::bounded::BoundedMap<[u8; 32], CircuitKey>>>,
     /// CircuitCreated replies we sent, with a hash of the CREATE they answer,
     /// so a resent CREATE (the first reply was lost) gets the same reply.
-    pub created_replies: Arc<Mutex<crate::bounded::BoundedMap<CircuitKey, ([u8; 32], Vec<u8>)>>>,
+    pub created_replies: Arc<Mutex<crate::bounded::BoundedMap<CircuitKey, CachedCreated>>>,
     /// Our backward layer keys for circuits we are a hop of, with the next
     /// counter for cells we seal ourselves.
     /// Key: (circuit_id, from_peer). Stored at CREATE time.
@@ -279,6 +280,17 @@ pub struct CircuitState {
     pub groups: Arc<Mutex<crate::multipath::CircuitGroupTable>>,
     /// Initiator: circuits waiting for TRUNCATED from their last built hop.
     pub pending_truncates: Arc<Mutex<HashMap<u32, oneshot::Sender<()>>>>,
+    /// Initiator: circuits waiting for the answer to an end-to-end rekey.
+    pub pending_layer_rekeys: Arc<Mutex<HashMap<u32, oneshot::Sender<Vec<u8>>>>>,
+}
+
+/// A CREATED we sent, replayed when its CREATE is resent.
+pub struct CachedCreated {
+    /// Hash of the CREATE it answers.
+    pub create_hash: [u8; 32],
+    pub reply: Vec<u8>,
+    /// When the last copy went to the link queue.
+    pub sent_at: Instant,
 }
 
 /// Our backward layer of a circuit we are a hop of.
@@ -288,6 +300,10 @@ pub struct HopBackward {
     pub counter: u64,
     /// Hash of the CREATE handshake that made this hop.
     pub transcript: [u8; 32],
+    /// End-to-end rekeys the initiator runs with us as its endpoint.
+    pub rekey: crate::circuit::LayerRekeyState,
+    /// Sealing keys from a rekey, used once the initiator has switched.
+    pub pending: Option<LayerKeys>,
 }
 
 /// A routed CREATE a relay passed on.
@@ -327,6 +343,7 @@ impl CircuitState {
             relay_queues: Arc::new(Mutex::new(HashMap::new())),
             groups: Arc::new(Mutex::new(crate::multipath::CircuitGroupTable::new())),
             pending_truncates: Arc::new(Mutex::new(HashMap::new())),
+            pending_layer_rekeys: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -548,7 +565,6 @@ pub struct Node {
     /// our hello can derive the WebRTC signaling channel port name.
     signaling_secret: [u8; 16],
     /// Cache of peer signing/KEM public keys (populated during link handshake).
-    pubkey_cache: Arc<Mutex<PubkeyCache>>,
     /// Persistent write-through database (None for ephemeral/test nodes).
     db: Option<Arc<StateDb>>,
     /// Whether to announce on mainline DHT (set via enable_mainline).
@@ -584,6 +600,16 @@ pub struct Node {
         >,
     >,
     pub(crate) zone_publication: Arc<Mutex<()>>,
+    /// DHT records (key, signer) published for throwaway identities, so
+    /// dropping one forgets them. They are never persisted.
+    ephemeral_records:
+        Arc<Mutex<HashMap<tarnet_api::types::ServiceId, Vec<([u8; 64], [u8; 32])>>>>,
+    /// Publication sequences of throwaway identities, kept in memory: the
+    /// node-wide counter is persisted, and a throwaway leaves no trace on
+    /// disk. Its keys are fresh, so its sequences may start over.
+    ephemeral_sequences: Arc<std::sync::Mutex<HashMap<tarnet_api::types::ServiceId, u64>>>,
+    /// Hybrid key pairs generated ahead for throwaway identities.
+    ephemeral_key_pool: Arc<std::sync::Mutex<Vec<Keypair>>>,
     /// When we last sent each neighbour a full route dump on request.
     route_dumps_sent: Arc<Mutex<HashMap<PeerId, Instant>>>,
     /// Discovery handle for reconnection. Set by `run()`.
@@ -668,43 +694,19 @@ impl Drop for PeerLanes {
     }
 }
 
-/// Restore a Keypair from persisted identity data.
-/// Handles both v2 (full key material) and v1 (Ed25519 seed only) formats.
+/// Restore a Keypair from persisted identity data. Anything but valid v2
+/// key material is fatal: an identity never comes back weaker or as someone
+/// else.
 fn restore_keypair_from_persisted(entry: &crate::state::PersistedIdentity) -> Keypair {
-    // Try full key material first (v2 format stored by IdentityKeypair::to_bytes)
-    if let Ok(kp) = Keypair::from_full_bytes(&entry.signing_key_material) {
-        return kp;
+    match Keypair::from_full_bytes(&entry.signing_key_material) {
+        Ok(kp) => kp,
+        Err(e) => panic!(
+            "identity '{}' can't be loaded: {e}. Identities from before wire v10 \
+             must be recreated: remove the daemon's state.db (its identities and \
+             TNS labels are lost).",
+            entry.label
+        ),
     }
-    // Current persisted state stores signing/KEM material in separate columns.
-    // Reassemble the full serialized identity before falling back to legacy v1 seeds.
-    if !entry.kem_key_material.is_empty() {
-        let signing_len = match u16::try_from(entry.signing_key_material.len()) {
-            Ok(len) => len,
-            Err(_) => panic!("persisted signing key material too large"),
-        };
-        let kem_len = match u16::try_from(entry.kem_key_material.len()) {
-            Ok(len) => len,
-            Err(_) => panic!("persisted KEM key material too large"),
-        };
-        let mut full =
-            Vec::with_capacity(4 + entry.signing_key_material.len() + entry.kem_key_material.len());
-        full.extend_from_slice(&signing_len.to_be_bytes());
-        full.extend_from_slice(&entry.signing_key_material);
-        full.extend_from_slice(&kem_len.to_be_bytes());
-        full.extend_from_slice(&entry.kem_key_material);
-        if let Ok(kp) = Keypair::from_full_bytes(&full) {
-            return kp;
-        }
-    }
-    // Fall back to extracting Ed25519 seed (v1 migration: algo byte + 32-byte seed)
-    let mut seed = [0u8; 32];
-    if entry.signing_key_material.len() >= 33 {
-        seed.copy_from_slice(&entry.signing_key_material[1..33]);
-    } else if entry.signing_key_material.len() == 32 {
-        seed.copy_from_slice(&entry.signing_key_material);
-    }
-    #[allow(deprecated)] // Intentional: v1 migration from bare Ed25519 seed
-    Keypair::from_bytes(seed)
 }
 
 impl Node {
@@ -755,17 +757,13 @@ impl Node {
             let default_kp = Keypair::generate_with_scheme(identity.scheme());
             // Persist default identity on first run
             if let Some(ref db) = db {
-                let pi = PersistedIdentity {
-                    label: "default".to_string(),
-                    scheme: default_kp.scheme() as u8,
-                    signing_key_material: default_kp.identity.signing.to_bytes(),
-                    kem_key_material: default_kp.identity.kem.to_bytes(),
-                    signing_algo: default_kp.identity.signing_algo() as u8,
-                    kem_algo: default_kp.identity.kem_algo() as u8,
-                    privacy: tarnet_api::types::PrivacyLevel::Public,
-                    outbound_hops: 1,
-                    is_default: true,
-                };
+                let pi = PersistedIdentity::from_keypair(
+                    "default",
+                    &default_kp,
+                    tarnet_api::types::PrivacyLevel::Public,
+                    1,
+                    true,
+                );
                 let _ = db.save_identity(&pi);
             }
             IdentityStore::with_default(default_kp, tarnet_api::types::PrivacyLevel::Public, 1)
@@ -821,6 +819,19 @@ impl Node {
         let (dht_watch_tx, dht_watch_rx) = mpsc::channel(256);
         let (channel_event_tx, channel_event_rx) = mpsc::channel(256);
         let (circuit_drop_tx, circuit_drop_rx) = mpsc::unbounded_channel();
+        // Startup sweep (`docs/spec/identity.md`, "Persistence invariants"):
+        // rows bound to identities that no longer exist go before anything
+        // loads them.
+        if let Some(db) = &db {
+            let live: Vec<_> = identity_store.list().into_iter().map(|e| e.1).collect();
+            let mut own_signers = vec![peer_id];
+            own_signers.extend(live.iter().filter_map(|sid| identity_store.keypair_for(sid).map(|k| k.peer_id())));
+            match db.sweep_orphans(&live, &own_signers) {
+                Ok(0) => {}
+                Ok(n) => log::warn!("Startup sweep removed {} row(s) of identities that no longer exist", n),
+                Err(e) => log::error!("Startup sweep failed: {}", e),
+            }
+        }
         let dht_store = match &db {
             Some(db) => DhtStore::open(&peer_id, storage_limits, db.clone()),
             None => DhtStore::with_limits(&peer_id, storage_limits),
@@ -902,7 +913,6 @@ impl Node {
             pool_claims: Arc::new(Mutex::new(HashMap::new())),
             webrtc_connector: None,
             signaling_secret: rand::random(),
-            pubkey_cache: Arc::new(Mutex::new(PubkeyCache::new(1024))),
             db,
             #[cfg(feature = "mainline-bootstrap")]
             mainline_enabled: false,
@@ -915,6 +925,9 @@ impl Node {
             tns_cache: Arc::new(Mutex::new(crate::tns::TnsCache::new())),
             zone_published: Arc::new(Mutex::new(HashMap::new())),
             zone_publication: Arc::new(Mutex::new(())),
+            ephemeral_records: Arc::new(Mutex::new(HashMap::new())),
+            ephemeral_key_pool: Arc::new(std::sync::Mutex::new(Vec::new())),
+            ephemeral_sequences: Arc::new(std::sync::Mutex::new(HashMap::new())),
             route_dumps_sent: Arc::new(Mutex::new(HashMap::new())),
             discovery: Arc::new(Mutex::new(None)),
             bootstrap_addrs: Arc::new(Mutex::new(Vec::new())),
@@ -999,7 +1012,7 @@ impl Node {
             .lock()
             .await
             .keypair_for(sid)
-            .map(|kp| Keypair::from_full_bytes(&kp.to_full_bytes()).unwrap())
+            .map(|kp| kp.clone())
     }
 
     /// The node's default ServiceId as raw bytes (52 bytes: pubkey + hash).
@@ -1152,6 +1165,20 @@ impl Node {
                 loop {
                     interval.tick().await;
                     node.try_fill_outbound_links(&disc).await;
+                }
+            });
+        }
+
+        // Tunnel key lifetime: rekey tunnels we initiated once they are an
+        // hour old or have carried 65536 messages.
+        {
+            let node = self.clone();
+            tokio::spawn(async move {
+                let mut interval = jittered_interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    node.rekey_tunnels().await;
+                    node.rekey_circuits().await;
                 }
             });
         }
@@ -2011,21 +2038,6 @@ impl Node {
         let (link_id, is_first) = self.links.lock().await.insert(peer_id, link.clone());
         log::info!("Link up: {:?} (link_id={})", peer_id, link_id);
 
-        // Populate pubkey cache from handshake-authenticated pubkeys.
-        {
-            use crate::pubkey_cache::CachedPubkey;
-            self.pubkey_cache.lock().await.insert(
-                peer_id,
-                CachedPubkey {
-                    signing_algo: link.remote_signing_algo(),
-                    signing_pk: link.remote_signing_pubkey().to_vec(),
-                    // KEM pubkey not yet available from link — populated from DHT later.
-                    kem_algo: tarnet_api::types::KemAlgo::X25519,
-                    kem_pk: Vec::new(),
-                },
-            );
-        }
-
         if is_first {
             self.governor.lock().await.peer_connected(peer_id);
             if let Some(node) = self.weak_self.get().and_then(|w| w.upgrade()) {
@@ -2854,12 +2866,15 @@ async fn discovery_single_peer(
 
     let mut backoff = INITIAL_BACKOFF;
 
+    // A mainline address names the peer: the link must reach that peer and
+    // no other (whoever answers at the looked-up address).
+    let expected = expected_peer_of(&addr);
     loop {
         let resolved = resolve_discovery_addr(&addr);
 
         if let Some(connect_addr) = resolved {
             match discovery.connect(&connect_addr).await {
-                Ok(transport) => match PeerLink::initiator(transport, &identity, None).await {
+                Ok(transport) => match PeerLink::initiator(transport, &identity, expected).await {
                     Ok(link) => {
                         let link = Arc::new(link);
                         let remote = link.remote_peer();
@@ -2912,6 +2927,16 @@ async fn discovery_single_peer(
 
 /// Resolve a discovery URI to a connectable transport address.
 /// Currently supports `mainline:<hex>`.
+/// The peer a discovery address names, when it names one.
+fn expected_peer_of(addr: &str) -> Option<PeerId> {
+    #[cfg(feature = "mainline-bootstrap")]
+    if addr.starts_with(bootstrap::MAINLINE_PREFIX) {
+        return bootstrap::parse_mainline_addr(addr).ok();
+    }
+    let _ = addr;
+    None
+}
+
 fn resolve_discovery_addr(addr: &str) -> Option<String> {
     if addr.starts_with(bootstrap::MAINLINE_PREFIX) {
         resolve_mainline_addr(addr)
@@ -3232,7 +3257,7 @@ mod tests {
     async fn a_restarted_node_republishes_only_its_own_records() {
         let (db, path) = temp_db("dht-origin");
         let identity = Keypair::generate();
-        let node = Node::with_db(Keypair::from_full_bytes(&identity.to_full_bytes()).unwrap(), db.clone(), StorageLimits::default());
+        let node = Node::with_db(identity.clone(), db.clone(), StorageLimits::default());
         node.dht_put_signed_content(b"mine", 600).await.unwrap();
         let replica = signed(&Keypair::generate(), DhtId([0x41; 64]), 1, b"theirs".to_vec());
         node.dht_store
@@ -3387,7 +3412,7 @@ mod tests {
 
         let db = Arc::new(StateDb::open(&path).unwrap());
         let _original = Node::with_db(
-            Keypair::from_full_bytes(&original_identity.to_full_bytes()).unwrap(),
+            original_identity.clone(),
             db.clone(),
             StorageLimits::default(),
         );

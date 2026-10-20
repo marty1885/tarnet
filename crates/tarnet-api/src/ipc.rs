@@ -98,6 +98,28 @@ pub const METHOD_POOL_WITHDRAW: u16 = 0x002B;
 pub const METHOD_POOL_RESOLVE: u16 = 0x002C;
 pub const METHOD_POOL_CATALOG: u16 = 0x002D;
 
+// ── Identity-bound crypto, scoping (IPC v6) ──
+/// Connect as a named source identity (its SID is what the host sees).
+pub const METHOD_CONNECT_AS: u16 = 0x0030;
+/// Sign as an identity under the application domain.
+pub const METHOD_IDENTITY_SIGN: u16 = 0x0031;
+/// Check an application signature (no secret involved).
+pub const METHOD_IDENTITY_VERIFY: u16 = 0x0032;
+/// Decapsulate to an identity's static KEM key, context-bound.
+pub const METHOD_IDENTITY_KEM_DECAP: u16 = 0x0033;
+/// An identity's static KEM public key.
+pub const METHOD_IDENTITY_KEM_PUBKEY: u16 = 0x0034;
+/// Signed DHT put as a chosen identity.
+pub const METHOD_DHT_PUT_SIGNED_AS: u16 = 0x0035;
+/// Opt in to raw overlay events (`Data`, `Tunnel`) on this connection.
+pub const METHOD_SUBSCRIBE_RAW: u16 = 0x0036;
+/// Create a throwaway identity owned by this connection.
+pub const METHOD_CREATE_EPHEMERAL: u16 = 0x0037;
+/// Drop a throwaway identity this connection owns.
+pub const METHOD_DROP_EPHEMERAL: u16 = 0x0038;
+/// Resolve a target like `connect_to` and connect as a source identity.
+pub const METHOD_CONNECT_TO_AS: u16 = 0x0039;
+
 // ── Response status codes ──
 
 pub const STATUS_OK: u8 = 0x00;
@@ -275,9 +297,9 @@ pub async fn recv_frame<R: AsyncReadExt + Unpin>(reader: &mut R) -> ApiResult<Ip
 // ── Version handshake ──
 
 /// IPC protocol version. Increment when making breaking changes.
-pub const IPC_VERSION: u16 = 5;
+pub const IPC_VERSION: u16 = 6;
 /// Minimum IPC version we can talk to.
-pub const IPC_MIN_VERSION: u16 = 5;
+pub const IPC_MIN_VERSION: u16 = 6;
 /// Magic bytes for version handshake.
 pub const IPC_MAGIC: &[u8; 4] = b"TNET";
 
@@ -379,6 +401,64 @@ pub struct DhtPutSignedReq {
     pub ttl_secs: u32,
     #[serde(with = "serde_bytes")]
     pub value: Vec<u8>,
+}
+
+/// Request to put signed content as a chosen identity.
+#[derive(Serialize, Deserialize)]
+pub struct DhtPutSignedAsReq {
+    pub identity: ServiceId,
+    pub ttl_secs: u32,
+    #[serde(with = "serde_bytes")]
+    pub value: Vec<u8>,
+}
+
+/// Connect as `source`.
+#[derive(Serialize, Deserialize)]
+pub struct ConnectAsReq {
+    pub service_id: ServiceId,
+    pub mode: PortMode,
+    pub port: String,
+    pub source: ServiceId,
+}
+
+/// `connect_to` as a source identity.
+#[derive(Serialize, Deserialize)]
+pub struct ConnectToAsReq {
+    pub target: String,
+    pub mode: PortMode,
+    pub port: String,
+    pub source: ServiceId,
+}
+
+/// Sign `msg` as `identity` under `context`.
+#[derive(Serialize, Deserialize)]
+pub struct IdentitySignReq {
+    pub identity: ServiceId,
+    #[serde(with = "serde_bytes")]
+    pub context: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub msg: Vec<u8>,
+}
+
+/// Check an application signature by `identity`.
+#[derive(Serialize, Deserialize)]
+pub struct IdentityVerifyReq {
+    pub identity: ServiceId,
+    #[serde(with = "serde_bytes")]
+    pub context: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub msg: Vec<u8>,
+    pub signature: crate::service::AppSignature,
+}
+
+/// Decapsulate `ciphertext` to `identity`'s static KEM key.
+#[derive(Serialize, Deserialize)]
+pub struct IdentityKemDecapReq {
+    pub identity: ServiceId,
+    #[serde(with = "serde_bytes")]
+    pub context: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub ciphertext: Vec<u8>,
 }
 
 /// A signed content entry returned from DHT.

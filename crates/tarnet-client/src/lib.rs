@@ -445,6 +445,107 @@ impl ServiceApi for IpcServiceApi {
         decode_payload(&resp)
     }
 
+    async fn dht_put_signed_as(&self, identity: ServiceId, value: &[u8], ttl_secs: u32) -> ApiResult<ContentHandle> {
+        let req = DhtPutSignedAsReq {
+            identity,
+            ttl_secs,
+            value: value.to_vec(),
+        };
+        let (status, resp) = self.request(METHOD_DHT_PUT_SIGNED_AS, &encode_payload(&req)).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn connect_as(
+        &self,
+        service_id: ServiceId,
+        mode: PortMode,
+        port: &str,
+        source_identity: Option<ServiceId>,
+    ) -> ApiResult<Connection> {
+        let Some(source) = source_identity else {
+            return self.connect(service_id, mode, port).await;
+        };
+        let req = ConnectAsReq {
+            service_id,
+            mode,
+            port: port.to_string(),
+            source,
+        };
+        let (status, resp) = self
+            .request_with_timeout(METHOD_CONNECT_AS, &encode_payload(&req), std::time::Duration::from_secs(120))
+            .await?;
+        Self::check_status(status, &resp)?;
+        let r: ConnectResp = decode_payload(&resp)?;
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.mode, r.port)
+            .await
+    }
+
+    async fn identity_sign(
+        &self,
+        identity: ServiceId,
+        context: &[u8],
+        msg: &[u8],
+    ) -> ApiResult<tarnet_api::service::AppSignature> {
+        let req = IdentitySignReq {
+            identity,
+            context: context.to_vec(),
+            msg: msg.to_vec(),
+        };
+        let (status, resp) = self.request(METHOD_IDENTITY_SIGN, &encode_payload(&req)).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn identity_verify(
+        &self,
+        identity: ServiceId,
+        context: &[u8],
+        msg: &[u8],
+        signature: &tarnet_api::service::AppSignature,
+    ) -> ApiResult<bool> {
+        let req = IdentityVerifyReq {
+            identity,
+            context: context.to_vec(),
+            msg: msg.to_vec(),
+            signature: signature.clone(),
+        };
+        let (status, resp) = self.request(METHOD_IDENTITY_VERIFY, &encode_payload(&req)).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn identity_kem_decap(&self, identity: ServiceId, context: &[u8], ciphertext: &[u8]) -> ApiResult<[u8; 32]> {
+        let req = IdentityKemDecapReq {
+            identity,
+            context: context.to_vec(),
+            ciphertext: ciphertext.to_vec(),
+        };
+        let (status, resp) = self.request(METHOD_IDENTITY_KEM_DECAP, &encode_payload(&req)).await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn identity_kem_pubkey(&self, identity: ServiceId) -> ApiResult<Vec<u8>> {
+        let (status, resp) = self.request(METHOD_IDENTITY_KEM_PUBKEY, &encode_payload(&identity)).await?;
+        Self::check_status(status, &resp)?;
+        let pk: serde_bytes::ByteBuf = decode_payload(&resp)?;
+        Ok(pk.into_vec())
+    }
+
+    async fn create_ephemeral_identity(&self, options: tarnet_api::service::EphemeralOptions) -> ApiResult<ServiceId> {
+        let (status, resp) = self
+            .request_with_timeout(METHOD_CREATE_EPHEMERAL, &encode_payload(&options), std::time::Duration::from_secs(30))
+            .await?;
+        Self::check_status(status, &resp)?;
+        decode_payload(&resp)
+    }
+
+    async fn drop_ephemeral_identity(&self, identity: ServiceId) -> ApiResult<()> {
+        let (status, resp) = self.request(METHOD_DROP_EPHEMERAL, &encode_payload(&identity)).await?;
+        Self::check_status(status, &resp)
+    }
+
     async fn dht_get_signed(&self, key: &ContentHandle, timeout_secs: u32) -> Vec<DhtEntry> {
         let payload = encode_payload(&(*key, timeout_secs));
         let timeout = std::time::Duration::from_secs(timeout_secs as u64 + 5);
@@ -536,6 +637,9 @@ impl ServiceApi for IpcServiceApi {
     // ── Event stream ──
 
     async fn subscribe_events(&self) -> ApiResult<mpsc::Receiver<NodeEvent>> {
+        // The daemon sends raw overlay events only to clients that ask.
+        let (status, resp) = self.request(METHOD_SUBSCRIBE_RAW, &[]).await?;
+        Self::check_status(status, &resp)?;
         let mut rx = self.event_tx.subscribe();
         let (tx, out_rx) = mpsc::channel(256);
         tokio::spawn(async move {
@@ -704,6 +808,31 @@ impl ServiceApi for IpcServiceApi {
     }
 
     // ── Unified connect ──
+
+    async fn connect_to_as(
+        &self,
+        target: &str,
+        mode: PortMode,
+        port: &str,
+        source: Option<ServiceId>,
+    ) -> ApiResult<Connection> {
+        let Some(source) = source else {
+            return self.connect_to(target, mode, port).await;
+        };
+        let req = ConnectToAsReq {
+            target: target.to_string(),
+            mode,
+            port: port.to_string(),
+            source,
+        };
+        let (status, resp) = self
+            .request_with_timeout(METHOD_CONNECT_TO_AS, &encode_payload(&req), std::time::Duration::from_secs(120))
+            .await?;
+        Self::check_status(status, &resp)?;
+        let r: ConnectResp = decode_payload(&resp)?;
+        self.make_ipc_connection(r.conn_id, r.remote_service_id, r.mode, r.port)
+            .await
+    }
 
     async fn connect_to(&self, target: &str, mode: PortMode, port: &str) -> ApiResult<Connection> {
         let payload = encode_payload(&(target.to_string(), mode, port.to_string()));

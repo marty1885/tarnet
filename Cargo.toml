@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/tarnet-api", "crates/tarnetd", "crates/tarnet-client", "crates/tarnet-cli", "crates/tarnet-socks", "crates/tarnet-expose", "crates/tarnet-topsim"]
+members = [".", "crates/tarnet-api", "crates/tarnetd", "crates/tarnet-client", "crates/tarnet-cli", "crates/tarnet-socks", "crates/tarnet-expose", "crates/tarnet-topsim", "crates/tarnet-pq"]
 default-members = ["crates/tarnetd", "crates/tarnet-cli", "crates/tarnet-socks", "crates/tarnet-expose"]
 
 [package]
@@ -32,7 +32,7 @@ bytes = "1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 pqcrypto-falcon = "0.3"
-pqcrypto-kyber = "0.8"
+tarnet-pq = { path = "crates/tarnet-pq" }
 pqcrypto-traits = "0.3"
 lru = "0.12"
 dashmap = "6"
@@ -47,3 +47,26 @@ tarnet-client = { path = "crates/tarnet-client" }
 [features]
 default = ["mainline-bootstrap"]
 mainline-bootstrap = ["mainline", "sha1_smol"]
+
+# The post-quantum primitives are unusably slow unoptimised; tests generate
+# many identities.
+[profile.dev.package.pqcrypto-falcon]
+opt-level = 3
+[profile.dev.package.tarnet-pq]
+opt-level = 3
+[profile.dev.package.ml-kem]
+opt-level = 3
+[profile.dev.package.ml-dsa]
+opt-level = 3
+[profile.dev.package.slh-dsa]
+opt-level = 3
+[profile.dev.package.module-lattice]
+opt-level = 3
+[profile.dev.package.hmac]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.sha3]
+opt-level = 3
+[profile.dev.package.keccak]
+opt-level = 3

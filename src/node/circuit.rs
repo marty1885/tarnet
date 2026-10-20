@@ -75,7 +75,8 @@ mod audit_tests {
                 .try_into()
                 .unwrap()
         };
-        let seal = |keys: &LayerKeys, counter, text: &[u8]| {
+        let seal = |mut keys: LayerKeys, counter, text: &[u8]| {
+            let keys = &mut keys;
             decode(seal_backward_cell(
                 keys,
                 counter,
@@ -83,14 +84,14 @@ mod audit_tests {
                 &write_cell_body(RelayCellCommand::Extended, 0, text),
             ))
         };
-        let first_reply = seal(&first.backward, 0, b"first hop");
+        let first_reply = seal(first.backward.clone(), 0, b"first hop");
         let mut corrupted = first_reply;
         corrupted[3] ^= 1;
         assert!(outbound.recv_from_hop(&corrupted, 0).is_err());
         assert_eq!(outbound.recv_from_hop(&first_reply, 0).unwrap().data, b"first hop");
 
         // The last hop's cell gains the first hop's layer on the way.
-        let mut last_reply = seal(&last.backward, 0, b"last hop");
+        let mut last_reply = seal(last.backward.clone(), 0, b"last hop");
         let mut relay = HopCrypto::new(first.backward.clone(), CryptoOp::Encrypt);
         assert!(relay.wrap(&mut last_reply));
         assert!(outbound.recv_from_hop(&last_reply, 0).is_err());
@@ -388,7 +389,8 @@ mod audit_tests {
                 node.default_service_id().await,
                 tarnet_api::service::PortMode::ReliableOrdered,
                 "80",
-                7
+                7,
+                &Keypair::generate(),
             )
             .await
             .is_err());
@@ -462,7 +464,7 @@ impl Drop for CircuitAttemptGuard {
 /// Seal a relay cell at this hop for the circuit initiator. Returns the
 /// encoded wire message.
 pub(super) fn seal_backward_cell(
-    keys: &LayerKeys,
+    keys: &mut LayerKeys,
     counter: u64,
     circuit_id: u32,
     body: &[u8; CELL_BODY_SIZE],
@@ -553,7 +555,11 @@ impl Node {
                 let Peeled::Mine(body) = hop.peel(&mut cell) else {
                     return Ok(());
                 };
+                let promoted = hop.take_promoted();
                 drop(table);
+                if promoted {
+                    self.adopt_rekeyed_backward(circuit_id, from).await;
+                }
                 self.handle_endpoint_relay_cell(from, circuit_id, &body)
                     .await
             }
@@ -592,30 +598,40 @@ impl Node {
                                 }
                                 return Ok(());
                             }
+                            if relay_cell.command == RelayCellCommand::LayerRekey {
+                                return self.handle_layer_rekey_on_circuit(circuit_id, &relay_cell.data).await;
+                            }
+                            if relay_cell.command == RelayCellCommand::LayerRekeyed {
+                                let waiting = self.circuits.pending_layer_rekeys.lock().await.remove(&circuit_id);
+                                if let Some(tx) = waiting {
+                                    let _ = tx.send(relay_cell.data);
+                                }
+                                return Ok(());
+                            }
                             if relay_cell.command == RelayCellCommand::Data {
                                 return self.handle_stream_data(key, &relay_cell.data).await;
                             }
                             if relay_cell.command == RelayCellCommand::StreamAck {
                                 return self.handle_stream_ack(key, &relay_cell.data).await;
                             }
+                            if relay_cell.command == RelayCellCommand::StreamDataAck {
+                                return self.handle_stream_data_ack(key, &relay_cell.data).await;
+                            }
                             if relay_cell.command == RelayCellCommand::RendezvousReady {
-                                let ready = self.endpoints.streams.lock().await.contains_key(&key);
-                                if ready {
+                                // The first READY carries the client's proof to
+                                // the service task, which verifies it and then
+                                // answers; a retransmitted READY after that
+                                // only needs the answer again.
+                                let waiting = self.circuits.pending_extends.lock().await.remove(&circuit_id);
+                                if let Some(tx) = waiting {
+                                    let _ = tx.send(relay_cell.data);
+                                } else if self.endpoints.streams.lock().await.contains_key(&key) {
                                     self.send_circuit_data_cmd(
                                         circuit_id,
                                         RelayCellCommand::StreamConnected,
                                         &[],
                                     )
                                     .await?;
-                                    if let Some(tx) = self
-                                        .circuits
-                                        .pending_extends
-                                        .lock()
-                                        .await
-                                        .remove(&circuit_id)
-                                    {
-                                        let _ = tx.send(Vec::new());
-                                    }
                                 }
                                 return Ok(());
                             }
@@ -746,6 +762,9 @@ impl Node {
             }
             RelayCellCommand::Data => self.handle_stream_data(key, &relay_cell.data).await,
             RelayCellCommand::StreamAck => self.handle_stream_ack(key, &relay_cell.data).await,
+            RelayCellCommand::StreamDataAck => {
+                self.handle_stream_data_ack(key, &relay_cell.data).await
+            }
             RelayCellCommand::StreamBegin => {
                 self.handle_stream_begin(from, circuit_id, &relay_cell.data)
                     .await
@@ -770,6 +789,10 @@ impl Node {
                 self.handle_rendezvous_join(from, circuit_id, &relay_cell.data)
                     .await
             }
+            RelayCellCommand::LayerRekey => {
+                self.handle_layer_rekey_at_endpoint(from, circuit_id, &relay_cell.data)
+                    .await
+            }
             RelayCellCommand::Padding => {
                 // Echo padding back to the initiator for circuit keepalive.
                 self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::Padding, &[])
@@ -786,7 +809,7 @@ impl Node {
     }
 
     /// Send a relay cell back from a circuit endpoint to the initiator.
-    async fn send_endpoint_relay_cell(
+    pub(super) async fn send_endpoint_relay_cell(
         &self,
         from: PeerId,
         circuit_id: u32,
@@ -852,7 +875,7 @@ impl Node {
             circuit_id,
             from_peer: from,
         };
-        let (service_id, mode, port) = parse_stream_begin_payload(payload)?;
+        let (service_id, mode, port, client_auth) = parse_stream_begin_payload(payload)?;
 
         // Idempotent: if we already set up a stream on this circuit,
         // just re-send StreamConnected (the first one may have been dropped).
@@ -884,6 +907,27 @@ impl Node {
             .await
             .get_by_service_id(&service_id)
             .is_some_and(|id| matches!(id.privacy, tarnet_api::types::PrivacyLevel::Hidden { .. }));
+        // Every connection names its client: a proof bound to our handshake
+        // with this circuit, or the stream is refused.
+        let binding = self
+            .circuits
+            .hop_backward_keys
+            .lock()
+            .await
+            .get(&(circuit_id, from))
+            .map(|hop| hop.transcript);
+        let client = binding
+            .ok_or_else(|| Error::Crypto("no handshake for this circuit".into()))
+            .and_then(|b| crate::circuit::verify_client_auth(&client_auth, &b, &service_id, mode, &port));
+        let client = match client {
+            Ok(c) => c,
+            Err(e) => {
+                log::debug!("STREAM_BEGIN rejected: {}", e);
+                self.send_endpoint_relay_cell(from, circuit_id, RelayCellCommand::StreamRefused, &[])
+                    .await?;
+                return Ok(());
+            }
+        };
         if hidden || !self.has_matching_listener(service_id, mode, &port).await {
             log::debug!(
                 "STREAM_BEGIN rejected: not listening on {:?} mode {:?} port {}",
@@ -932,9 +976,10 @@ impl Node {
             circuit_id
         );
 
-        let conn = self
+        let mut conn = self
             .stream_connection(service_id, mode, &port, key, false)
             .await;
+        conn.remote_service_id = client;
 
         let port_name = conn.port.clone();
         let dispatch = self
@@ -1175,11 +1220,24 @@ impl Node {
             .lock()
             .await
             .get(&key)
-            .filter(|(hash, _)| *hash == create_hash)
-            .map(|(_, reply)| reply.clone());
-        if let Some(reply) = cached {
+            .filter(|c| c.create_hash == create_hash)
+            .map(|c| (c.reply.clone(), c.sent_at));
+        if let Some((reply, sent_at)) = cached {
             if self.circuits.table.lock().await.lookup(&key).is_some() {
+                // The sender times its resends by its own link. On a slow
+                // uplink of ours the last copy may still be on air: a ~3 KB
+                // post-quantum CREATED takes seconds on an HC-12-class line,
+                // and copies queued behind each other hold it for all of
+                // them. Replay only once the last copy had time to arrive.
+                let airtime = self.links.lock().await.get(&from).map(|l| l.message_airtime(reply.len()));
+                if airtime.is_some_and(|a| sent_at.elapsed() < a * 2) {
+                    log::debug!("CircuitCreate {} resent by {:?}, last reply still in flight", msg.circuit_id, from);
+                    return Ok(());
+                }
                 log::debug!("CircuitCreate {} resent by {:?}, replaying reply", msg.circuit_id, from);
+                if let Some(c) = self.circuits.created_replies.lock().await.get_mut(&key) {
+                    c.sent_at = Instant::now();
+                }
                 return self.send_to_peer_critical(&from, &reply).await;
             }
         }
@@ -1388,7 +1446,14 @@ impl Node {
             .created_replies
             .lock()
             .await
-            .upsert(key, (create_hash, reply));
+            .upsert(
+                key,
+                super::CachedCreated {
+                    create_hash,
+                    reply,
+                    sent_at: Instant::now(),
+                },
+            );
     }
 
     /// Handle CircuitCreated: pass it back along a routed CREATE, turn it
@@ -1835,6 +1900,8 @@ impl Node {
                 keys,
                 counter: 0,
                 transcript,
+                rekey: crate::circuit::LayerRekeyState::responder(transcript),
+                pending: None,
             },
         );
     }
@@ -1851,14 +1918,14 @@ impl Node {
         let hop = map.get_mut(&(circuit_id, from_peer))?;
         let n = hop.counter;
         hop.counter = n.checked_add(1)?;
-        Some(seal_backward_cell(&hop.keys, n, circuit_id, body))
+        Some(seal_backward_cell(&mut hop.keys, n, circuit_id, body))
     }
 
     /// How long to wait for one EXTEND step: a floor, plus per built hop an
     /// allowance and the airtime of the step's cells on our first link. The
     /// first link is the only one whose speed we know; on a slow chain it is
     /// usually the slow part.
-    async fn extend_step_timeout(&self, first_hop: PeerId, hops_built: usize, bytes: usize) -> Duration {
+    pub(super) async fn extend_step_timeout(&self, first_hop: PeerId, hops_built: usize, bytes: usize) -> Duration {
         let airtime = self
             .links
             .lock()
@@ -2381,8 +2448,12 @@ impl Node {
                         .alloc_id(true, |id| oc.contains_key(&id))
                 };
 
+                let source_sid = match source_identity {
+                    Some(sid) => sid,
+                    None => self.default_service_id().await,
+                };
                 let server_conn = tarnet_api::service::Connection::new(
-                    service_id,
+                    source_sid,
                     mode,
                     port.to_string(),
                     conn_id,
@@ -2423,21 +2494,26 @@ impl Node {
             connected.len()
         );
 
-        // Look up outbound_hops for the source identity.
-        let min_hops = if let Some(src_sid) = &source_identity {
+        // The identity the connection comes from (the default unless one is
+        // named), and its hop count.
+        let (source, min_hops) = {
             let is = self.identity_store.lock().await;
-            is.get_by_service_id(src_sid)
-                .map(|id| id.outbound_hops as usize)
-                .unwrap_or(1)
-        } else {
-            1
+            match &source_identity {
+                Some(src_sid) => {
+                    let id = is
+                        .get_by_service_id(src_sid)
+                        .ok_or_else(|| Error::Protocol("unknown source identity".into()))?;
+                    (id.keypair.clone(), id.outbound_hops as usize)
+                }
+                None => (is.default_identity().keypair.clone(), 1),
+            }
         };
 
         // 1. Explicit peer hint — build circuit via DV routing.
         if let Some(dest_peer) = dest_peer {
             log::info!("circuit_connect: trying explicit peer hint {:?}", dest_peer);
             if let Some(conn) = self
-                .try_connect_to_peer(service_id, mode, port, &dest_peer, min_hops, &connected)
+                .try_connect_to_peer(service_id, mode, port, &dest_peer, min_hops, &connected, &source)
                 .await
             {
                 return Ok(conn);
@@ -2463,7 +2539,7 @@ impl Node {
                     );
                     if let Some(conn) = self
                         .try_connect_to_peer(
-                            service_id, mode, port, &dest_peer, min_hops, &connected,
+                            service_id, mode, port, &dest_peer, min_hops, &connected, &source,
                         )
                         .await
                     {
@@ -2503,7 +2579,7 @@ impl Node {
                 break;
             }
             match self
-                .connect_via_rendezvous(service_id, mode, port, &intro_points, min_hops)
+                .connect_via_rendezvous_as(service_id, mode, port, &intro_points, min_hops, &source)
                 .await
             {
                 Ok(conn) => return Ok(conn),
@@ -2532,6 +2608,7 @@ impl Node {
         dest_peer: &PeerId,
         min_hops: usize,
         connected: &[PeerId],
+        source: &Keypair,
     ) -> Option<tarnet_api::service::Connection> {
         let deadline = tokio::time::Instant::now() + CONNECT_PERSIST;
         let mut gap = CONNECT_ROUND_GAP;
@@ -2556,7 +2633,7 @@ impl Node {
             }
 
             let built = match self
-                .try_build_with_hops(service_id, mode, port, dest_peer, &waypoints, &first_hops)
+                .try_build_with_hops(service_id, mode, port, dest_peer, &waypoints, &first_hops, source)
                 .await
             {
                 Ok(conn) => return Some(conn),
@@ -2596,6 +2673,7 @@ impl Node {
         dest_peer: &PeerId,
         waypoints: &[PeerId],
         first_hops: &[PeerId],
+        source: &Keypair,
     ) -> std::result::Result<tarnet_api::service::Connection, bool> {
         const BUILD_ATTEMPTS: u32 = 3;
         let mut built = false;
@@ -2608,7 +2686,7 @@ impl Node {
                     Ok(circuit_id) => {
                         built = true;
                         match self
-                            .setup_circuit_connection(service_id, mode, port, circuit_id)
+                            .setup_circuit_connection(service_id, mode, port, circuit_id, source)
                             .await
                         {
                             Ok(conn) => return Ok(conn),
@@ -2730,13 +2808,25 @@ impl Node {
         mode: tarnet_api::service::PortMode,
         port: &str,
         circuit_id: u32,
+        source: &Keypair,
     ) -> Result<tarnet_api::service::Connection> {
         // A backend may send a greeting as soon as it accepts. Register the
         // receive channel before STREAM_BEGIN so that first DATA is buffered.
         let conn = self
             .circuit_connection(service_id, mode, port, circuit_id)
             .await;
-        let stream_begin_payload = build_stream_begin_payload(&service_id, mode, port);
+        // Our proof is bound to the destination's handshake: the last hop
+        // the circuit reached.
+        let binding = self
+            .circuits
+            .outbound
+            .lock()
+            .await
+            .get(&circuit_id)
+            .and_then(|c| c.transcripts.last().copied())
+            .ok_or_else(|| Error::Protocol("circuit gone during stream setup".into()))?;
+        let client_auth = crate::circuit::build_client_auth(source, &binding, &service_id, mode, port);
+        let stream_begin_payload = build_stream_begin_payload(&service_id, mode, port, &client_auth);
         self.wait_stream_connected(
             circuit_id,
             RelayCellCommand::StreamBegin,
@@ -2752,9 +2842,31 @@ impl Node {
         command: RelayCellCommand,
         payload: Vec<u8>,
     ) -> Result<()> {
-        const MAX_STREAM_RETRIES: u32 = 5;
+        // With the client's proof this message spans several cells, each of
+        // which a lossy path drops on its own. The far end keeps the pieces of
+        // every attempt (see `RelayAssembler`), so each retry fills gaps rather
+        // than starting over: retry often, with a capped backoff, instead of
+        // a few long waits. A four-cell message on a path losing half of
+        // everything is complete after k tries with probability
+        // (1 - 2^-k)^4: 87% after five, 99.8% after eleven.
+        const MAX_STREAM_RETRIES: u32 = 10;
         const INITIAL_TIMEOUT_MS: u64 = 1000;
-        let mut timeout_ms = INITIAL_TIMEOUT_MS;
+        const MAX_TIMEOUT_MS: u64 = 4000;
+        // Never retry before the message has had time to go out.
+        let airtime_ms = {
+            let first_hop = self.circuits.outbound.lock().await.get(&circuit_id).map(|c| c.first_hop);
+            let link = match first_hop {
+                Some(p) => self.links.lock().await.get(&p).cloned(),
+                None => None,
+            };
+            link.map_or(0, |l| {
+                let cells = payload.len().div_ceil(crate::circuit::CELL_PAYLOAD_MAX - 6).max(1);
+                l.message_airtime(crate::onion::CELL_SIZE + 4).as_millis() as u64 * cells as u64
+            })
+        };
+        let initial_ms = INITIAL_TIMEOUT_MS.max(airtime_ms * 2);
+        let max_ms = MAX_TIMEOUT_MS.max(airtime_ms * 4);
+        let mut timeout_ms = initial_ms;
 
         for attempt in 0..=MAX_STREAM_RETRIES {
             // Register a fresh pending connect each attempt.
@@ -2777,11 +2889,15 @@ impl Node {
                     Some(c) => c,
                     None => return Err(Error::Protocol("circuit gone during stream setup".into())),
                 };
-                let (fh, cid, cell) = circuit.send_relay_cell(&stream_begin);
+                // With the client's proof, STREAM_BEGIN and READY span
+                // several cells.
+                let (fh, cid, cells) = circuit.send_relay_message(&stream_begin)?;
                 drop(circuits);
 
-                let encoded = encode_circuit_relay_cell(cid, &cell);
-                self.send_to_peer_critical(&fh, &encoded).await?;
+                for cell in &cells {
+                    self.send_to_peer_critical(&fh, &encode_circuit_relay_cell(cid, cell))
+                        .await?;
+                }
             }
 
             // Wait for StreamConnected or StreamRefused.
@@ -2813,8 +2929,8 @@ impl Node {
                         attempt + 1,
                         MAX_STREAM_RETRIES,
                     );
-                    // Exponential backoff: 1s, 2s, 4s, 8s, 16s
-                    timeout_ms *= 2;
+                    // Exponential backoff, capped: 1s, 2s, 4s, 4s, ...
+                    timeout_ms = (timeout_ms * 2).min(max_ms);
                     // Add jitter: ±25% of current timeout
                     let jitter = (timeout_ms / 4) as i64;
                     let jitter_val =

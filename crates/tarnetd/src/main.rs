@@ -762,31 +762,21 @@ fn load_or_generate_identity(path: &PathBuf) -> Keypair {
             eprintln!("Identity file is empty");
             std::process::exit(1);
         }
-        // Try full format first (PQ keys), fall back to legacy 32-byte Ed25519 seed.
-        //
-        // The full format starts with an algo byte (0x01, 0x02, ...).
-        // A bare 32-byte file is a v1 Ed25519 seed — but only if the first byte
-        // isn't a known algo byte (otherwise it's a truncated v2 file).
+        // Only identity v2 key material loads; anything else is fatal rather
+        // than silently becoming a weaker or different node.
         let kp = match Keypair::from_full_bytes(&bytes) {
-            Ok(k) => k,
+            Ok(k) if k.scheme() == tarnet_api::types::IdentityScheme::FalconEd25519 => k,
+            Ok(_) => {
+                eprintln!("Identity file {} holds an Ed25519-only key; nodes must be hybrid.", path.display());
+                std::process::exit(1);
+            }
             Err(e) => {
-                if bytes.len() == 32 && tarnet_api::types::SigningAlgo::from_u8(bytes[0]).is_err() {
-                    // Legacy v1: bare 32-byte Ed25519 seed (first byte is random,
-                    // not a valid algo discriminant)
-                    let mut key = [0u8; 32];
-                    key.copy_from_slice(&bytes);
-                    #[allow(deprecated)]
-                    let k = Keypair::from_bytes(key);
-                    std::fs::write(path, k.to_full_bytes())
-                        .expect("Failed to upgrade identity file");
-                    log::info!("Upgraded v1 identity file to v2 format");
-                    k
-                } else {
-                    eprintln!("Failed to load identity: {}", e);
-                    eprintln!("If this is a v1 identity file, it may be corrupted.");
-                    eprintln!("If the signing algorithm is unsupported, upgrade tarnetd.");
-                    std::process::exit(1);
-                }
+                eprintln!("Failed to load identity {}: {}", path.display(), e);
+                eprintln!(
+                    "Identities from before wire v10 can't be used. Move the data directory \
+                     aside to start as a new node (a new PeerId, identities and TNS labels)."
+                );
+                std::process::exit(1);
             }
         };
         log::info!("Loaded identity from {}", path.display());

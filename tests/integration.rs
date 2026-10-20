@@ -293,8 +293,8 @@ async fn tunnel_stateless_e2e() {
 
     // A and C share a key — tunnels are now peer-keyed, no relay state
     let shared = [99u8; 32];
-    let mut tunnel_a = Tunnel::new(PeerId([3; 32]), &shared, true);
-    let mut tunnel_c = Tunnel::new(PeerId([1; 32]), &shared, false);
+    let mut tunnel_a = Tunnel::new(PeerId([3; 32]), &shared, &[0x5a; 32], true);
+    let mut tunnel_c = Tunnel::new(PeerId([1; 32]), &shared, &[0x5a; 32], false);
 
     // A encrypts
     let plaintext = b"end to end stateless";
@@ -758,32 +758,41 @@ fn handshake_confirm_roundtrip() {
     assert_eq!(decoded.confirm_hash, [0xAB; 32]);
 }
 
-/// Test RekeyMsg roundtrip.
+/// Test RekeyMsg roundtrip; the signature binds the link transcript.
 #[test]
 fn rekey_msg_roundtrip() {
     let kp = Keypair::generate();
     let pubkey = kp.identity.signing.signing_pubkey_bytes();
+    let transcript = [7u8; 32];
     let mut rekey = RekeyMsg {
+        epoch: 3,
         kem_algo: kp.identity.kem_algo() as u8,
         kem_pubkey: vec![0xDD; 8],
         kem_ciphertext: vec![0xEE; 16],
         signature: vec![0u8; 64],
     };
-    rekey.signature = kp.sign(&rekey.signable_bytes());
+    rekey.signature = kp.sign(&rekey.signable_bytes(&transcript));
 
     let bytes = rekey.to_bytes();
     let decoded = RekeyMsg::from_bytes(&bytes).unwrap();
     assert_eq!(decoded.kem_algo, kp.identity.kem_algo() as u8);
+    assert_eq!(decoded.epoch, 3);
 
-    // Verify the signature
-    let valid = identity::verify_signed(
-        identity::SignedBy::AnyPeer,
-        Some(kp.identity.signing_algo() as u8),
-        &pubkey,
-        &decoded.signable_bytes(),
-        &decoded.signature,
-    );
-    assert!(valid);
+    let check = |t: &[u8; 32], m: &RekeyMsg| {
+        identity::verify_signed(
+            identity::SignedBy::AnyPeer,
+            Some(kp.identity.signing_algo() as u8),
+            &pubkey,
+            &m.signable_bytes(t),
+            &m.signature,
+        )
+    };
+    assert!(check(&transcript, &decoded));
+    // Another link's transcript, or another epoch, doesn't verify.
+    assert!(!check(&[8u8; 32], &decoded));
+    let mut other_epoch = decoded.clone();
+    other_epoch.epoch = 4;
+    assert!(!check(&transcript, &other_epoch));
 }
 
 /// Integration test: signed content DHT with two publishers at the same key.
@@ -797,8 +806,9 @@ async fn signed_content_multi_publisher() {
     let provider_b = Arc::new(Node::new(Keypair::generate()));
     let client = Arc::new(Node::new(Keypair::generate()));
 
-    let pid_a = provider_a.peer_id();
-    let pid_b = provider_b.peer_id();
+    // Signed content is signed by each provider's default identity.
+    let pid_a = default_signer(&provider_a).await;
+    let pid_b = default_signer(&provider_b).await;
 
     // Start provider A
     let disc_a = TcpDiscovery::bind(&["127.0.0.1:0".into()]).await.unwrap();
@@ -902,7 +912,7 @@ async fn signed_content_garbage_rejected() {
     // Retrieve with correct inner hash — should find the record
     let results = node.dht_get_signed_content(&inner_hash, Duration::ZERO).await;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].0, node.peer_id());
+    assert_eq!(results[0].0, default_signer(&node).await);
     assert_eq!(results[0].1, topic);
 
     // Retrieve with wrong inner hash — should find nothing (self-authentication)
@@ -920,13 +930,16 @@ async fn node_db_restores_sequences_and_records() {
     let path = std::env::temp_dir().join(format!("tarnet-integ-restore-{}.sqlite3", nanos));
     let db = Arc::new(StateDb::open(&path).unwrap());
 
-    let original = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
+    let node_key = Keypair::generate();
+    let original = Node::with_db(node_key.clone(), db.clone(), StorageLimits::default());
 
     original.publish_hello().await;
     let signed_hash = original.dht_put_signed_content(b"payload", 300).await.unwrap();
 
-    // Read back persisted state through new Node
-    let restored = Node::with_db(Keypair::generate(), db.clone(), StorageLimits::default());
+    // Read back persisted state through a new Node with the same key (a
+    // different key would be another node: the startup sweep drops the old
+    // node's own records).
+    let restored = Node::with_db(node_key, db.clone(), StorageLimits::default());
 
     assert!(restored.lookup_hello(&original.peer_id()).await.is_some());
     let restored_signed = restored.dht_get_signed_content(&signed_hash, Duration::ZERO).await;
@@ -1489,7 +1502,7 @@ async fn hidden_service_multi_non_default_reachable() {
             "svc2",
             tarnet_api::types::PrivacyLevel::Hidden { intro_points: 1 },
             1,
-            tarnet_api::types::IdentityScheme::Ed25519,
+            tarnet_api::types::IdentityScheme::DEFAULT,
         )
         .await
         .expect("create svc2");
@@ -1876,4 +1889,10 @@ async fn pool_register_resolve_roundtrip() {
 async fn pool_resolve_unknown_pool_errors() {
     let node = Arc::new(Node::new(Keypair::generate()));
     assert!(node.pool_resolve("nope", "svc", 1).await.is_err());
+}
+
+/// The DHT signer of a node's default identity (who signs its signed content).
+async fn default_signer(node: &Node) -> PeerId {
+    let sid = node.default_service_id().await;
+    node.keypair_for_service(&sid).await.unwrap().peer_id()
 }
