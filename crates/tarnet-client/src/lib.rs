@@ -249,6 +249,9 @@ impl IpcServiceApi {
         let next_id = self.next_id.clone();
         tokio::spawn(async move {
             while let Some(data) = app_rx.recv().await {
+                if data.len() > tarnet_api::service::MAX_CONNECTION_MESSAGE_BYTES {
+                    break;
+                }
                 let payload = encode_payload(&ConnSendReq { conn_id, data });
                 let request_id = next_id.fetch_add(1, Ordering::Relaxed);
                 let frame = IpcFrame::Request {

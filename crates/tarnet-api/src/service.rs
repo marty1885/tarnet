@@ -207,6 +207,20 @@ pub enum PortMode {
     UnreliableUnordered,
 }
 
+/// Maximum payload of one connection message (4 MiB), including application envelopes.
+/// Larger objects must be transferred as application-defined chunks.
+pub const MAX_CONNECTION_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+fn validate_connection_message(data: &[u8]) -> ApiResult<()> {
+    if data.len() > MAX_CONNECTION_MESSAGE_BYTES {
+        return Err(ApiError::Protocol(format!(
+            "connection message too large: {} bytes (maximum {})",
+            data.len(), MAX_CONNECTION_MESSAGE_BYTES
+        )));
+    }
+    Ok(())
+}
+
 /// A bidirectional connection established via `connect()` or `accept()`.
 /// Data is exchanged as whole messages with mode-defined delivery guarantees.
 pub struct Connection {
@@ -258,8 +272,11 @@ impl Connection {
         }
     }
 
-    /// Send data to the remote end.
+    /// Accept one message into the local sending queue.
+    /// Success does not acknowledge remote delivery or durable storage.
+    /// Rejects payloads larger than [`MAX_CONNECTION_MESSAGE_BYTES`].
     pub async fn send(&self, data: &[u8]) -> ApiResult<()> {
+        validate_connection_message(data)?;
         self.tx
             .send(data.to_vec())
             .await
@@ -274,6 +291,9 @@ impl Connection {
 
     /// Split the application endpoints. Dropping the sender half closes the
     /// sending direction after queued data; the receiver can still drain replies.
+    /// The raw sender bypasses `send` validation: callers must respect
+    /// [`MAX_CONNECTION_MESSAGE_BYTES`]. An oversized raw send closes the
+    /// sending task rather than splitting or transmitting the message.
     /// This does not expose circuit, crypto, or transport state.
     pub fn into_split(self) -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
         (self.tx, self.rx.into_inner())
@@ -304,10 +324,7 @@ pub trait MessageStream: Send + Sync {
 #[async_trait]
 impl MessageStream for Connection {
     async fn send(&self, data: &[u8]) -> ApiResult<()> {
-        self.tx
-            .send(data.to_vec())
-            .await
-            .map_err(|_| ApiError::NotConnected)
+        Connection::send(self, data).await
     }
 
     async fn recv(&self) -> ApiResult<Vec<u8>> {
@@ -386,6 +403,8 @@ pub trait ServiceApi: Send + Sync {
 
     /// Connect as a specific source identity. Uses that identity's outbound hop
     /// count for circuit building. If `source_identity` is None, behaves like `connect()`.
+    /// Implementations that cannot honor an explicit identity must return an
+    /// error; the default implementation refuses it rather than substituting one.
     async fn connect_as(
         &self,
         service_id: ServiceId,
@@ -393,8 +412,11 @@ pub trait ServiceApi: Send + Sync {
         port: &str,
         source_identity: Option<ServiceId>,
     ) -> ApiResult<Connection> {
-        // Default implementation ignores source_identity.
-        let _ = source_identity;
+        if source_identity.is_some() {
+            return Err(ApiError::Protocol(
+                "source identity selection not supported".into(),
+            ));
+        }
         self.connect(service_id, mode, port).await
     }
 
@@ -735,3 +757,34 @@ pub trait ServiceApi: Send + Sync {
 }
 
 pub use MessageStream as DataStream;
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn oversized_messages_are_rejected_without_queueing_or_closing() {
+        let (tx, mut queued) = mpsc::channel(2);
+        let (_incoming, rx) = mpsc::channel(1);
+        let conn = Connection::new(
+            ServiceId([1; 32]),
+            PortMode::ReliableOrdered,
+            "test".into(),
+            1,
+            tx,
+            rx,
+        );
+        let oversized = vec![0; MAX_CONNECTION_MESSAGE_BYTES + 1];
+        assert!(conn.send(&oversized).await.is_err());
+        assert!(MessageStream::send(&conn, &oversized).await.is_err());
+        assert!(matches!(
+            queued.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let maximum = vec![7; MAX_CONNECTION_MESSAGE_BYTES];
+        conn.send(&maximum).await.unwrap();
+        assert_eq!(queued.recv().await.unwrap(), maximum);
+        MessageStream::send(&conn, &[]).await.unwrap();
+        assert!(queued.recv().await.unwrap().is_empty());
+    }
+}

@@ -121,7 +121,7 @@ fn stamp(epoch: Instant) -> u16 {
 /// misbehaving peer; on an unreliable stream they also shed messages whose
 /// fragments were lost. The oldest partial message is dropped first.
 const MAX_PARTIAL_MESSAGES: usize = 256;
-const MAX_PARTIAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PARTIAL_BYTES: usize = tarnet_api::service::MAX_CONNECTION_MESSAGE_BYTES;
 
 /// Split an application message into channel packets.
 fn packetize(data: &[u8], next_msg_id: &mut u16) -> Vec<Vec<u8>> {
@@ -133,13 +133,7 @@ fn packetize(data: &[u8], next_msg_id: &mut u16) -> Vec<Vec<u8>> {
     }
     let chunk = PACKET_MAX - FRAGMENT_HEADER;
     let count = data.len().div_ceil(chunk);
-    // A message too large to number in 16 bits is sent as several messages.
-    if count > u16::MAX as usize {
-        let (head, tail) = data.split_at(chunk * u16::MAX as usize);
-        let mut packets = packetize(head, next_msg_id);
-        packets.extend(packetize(tail, next_msg_id));
-        return packets;
-    }
+    debug_assert!(data.len() <= tarnet_api::service::MAX_CONNECTION_MESSAGE_BYTES);
     let msg_id = *next_msg_id;
     *next_msg_id = next_msg_id.wrapping_add(1);
     data.chunks(chunk)
@@ -674,6 +668,10 @@ impl Node {
                     data = outgoing.recv(), if pending.is_empty() && !closing => {
                         match data {
                             Some(data) => {
+                                if data.len() > tarnet_api::service::MAX_CONNECTION_MESSAGE_BYTES {
+                                    log::warn!("closing stream after oversized raw connection send");
+                                    break;
+                                }
                                 pending.extend(packetize(&data, &mut next_msg_id));
                             }
                             None => {
@@ -1101,6 +1099,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_raw_send_closes_without_delivering_a_partial_message() {
+        let (_client, _server, outgoing, incoming) =
+            connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
+        let (tx, _rx) = outgoing.into_split();
+        tx.send(vec![0; tarnet_api::service::MAX_CONNECTION_MESSAGE_BYTES + 1])
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), incoming.recv())
+            .await
+            .unwrap()
+            .is_err());
+        assert!(tx.is_closed());
+    }
+
+    #[tokio::test]
     async fn fragmented_message_larger_than_credit_makes_progress() {
         let (_client, _server, outgoing, incoming) =
             connected_pair(tarnet_api::service::PortMode::ReliableOrdered).await;
@@ -1402,6 +1415,7 @@ mod tests {
         roundtrip(PACKET_MAX, false);
         roundtrip(1000, false);
         roundtrip(64 * 1024, false);
+        roundtrip(tarnet_api::service::MAX_CONNECTION_MESSAGE_BYTES, false);
     }
 
     #[test]

@@ -53,3 +53,16 @@ Both sides must use the same mode. If they differ, the connection is rejected.
 ## Port Names
 
 Port names are arbitrary strings. There are no reserved or well-known ports. By convention, use the service name (e.g., `ssh`, `http`, `myapp`).
+
+## Message size and send completion
+
+Connection messages have a maximum payload of 4 MiB, including any application
+headers or encryption envelope. `Connection::send` and its `MessageStream`
+implementation reject larger messages before queueing them. Large objects must
+be transferred in application-defined chunks; a send is never automatically
+split into several application messages. Raw senders from `into_split` must
+observe the same limit; an oversized raw send closes the sending task.
+
+A successful send means acceptance into the local sending queue. It does not
+confirm remote delivery, durable storage, or application processing. Applications
+that need these guarantees must define their own acknowledgements and retries.
