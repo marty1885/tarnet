@@ -1772,8 +1772,12 @@ impl PeerLink {
                 retry_at = Some(retry_at.map_or(at, |old| old.min(at)));
             }
             // Quiet links still rekey when their keys turn an hour old.
-            let aged = self.crypto.lock().await.installed_at + REKEY_MAX_AGE;
-            retry_at = Some(retry_at.map_or(aged, |old| old.min(aged)));
+            // Once rotation is in flight (or initiation failed), its retry
+            // deadline takes over: the old key's age deadline may already
+            // be in the past and would otherwise make this loop spin.
+            if retry_at.is_none() {
+                retry_at = Some(self.crypto.lock().await.installed_at + REKEY_MAX_AGE);
+            }
             tokio::select! {
                 _ = self.rekey_notify.notified() => {}
                 _ = async {
@@ -1936,7 +1940,9 @@ impl PeerLink {
                 return Err(Error::Crypto("rekey reply for another epoch".into()));
             }
             let pending = pending_slot.take().expect("checked above");
-            drop(pending_slot);
+            // Keep initiation blocked until the new epoch and force flag are
+            // committed. Otherwise the driver can start a fresh request for
+            // the same epoch while we are still installing this reply.
             let kem_ss = pending
                 .eph_kem
                 .decapsulate(&peer_rekey.kem_ciphertext)
@@ -1953,6 +1959,7 @@ impl PeerLink {
             drop(crypto);
             self.force_rekey
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            drop(pending_slot);
             self.rekey_notify.notify_one();
             log::debug!("Re-keyed link with {:?} (initiated)", self.remote_peer);
             Ok(())
@@ -2433,13 +2440,34 @@ mod tests {
         }
         let (a, b) = lossy_pair(&[], &[]);
         let (a, b) = handshake_over(a, b).await;
+        // An aged key with an unanswered request must wait for the retry,
+        // rather than repeatedly waking on the expired key-age deadline.
+        a.crypto.lock().await.installed_at = std::time::Instant::now() - REKEY_MAX_AGE;
         let polls = Arc::new(AtomicUsize::new(0));
         let driven = a.clone();
         let task = tokio::spawn(Counted {
             future: Box::pin(async move { driven.drive_rekey().await }),
             polls: polls.clone(),
         });
-        for epoch in 1..=32 {
+        let first = WireMessage::decode(&recv_good(&b).await).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = polls.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let idle_polls = polls.load(Ordering::Relaxed) - before;
+        task.abort();
+        assert!(idle_polls <= 2, "aged keys caused {idle_polls} driver polls while awaiting a reply");
+        task.await.ok();
+        b.handle_rekey_msg(&RekeyMsg::from_bytes(&first.payload).unwrap()).await.unwrap();
+        let reply = WireMessage::decode(&recv_good(&a).await).unwrap();
+        a.handle_rekey_msg(&RekeyMsg::from_bytes(&reply.payload).unwrap()).await.unwrap();
+        a.send_message(&ping()).await.unwrap();
+        assert_eq!(recv_good(&b).await, ping());
+        let driven = a.clone();
+        let task = tokio::spawn(Counted {
+            future: Box::pin(async move { driven.drive_rekey().await }),
+            polls: polls.clone(),
+        });
+        for epoch in 2..=33 {
             a.request_rekey();
             let request = WireMessage::decode(&recv_good(&b).await).unwrap();
             b.handle_rekey_msg(&RekeyMsg::from_bytes(&request.payload).unwrap()).await.unwrap();
@@ -2459,10 +2487,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rekey_driver_wakes_for_force_and_both_traffic_thresholds() {
-        for trigger in 0..3 {
+    async fn rekey_reply_blocks_new_initiation_until_epoch_is_installed() {
+        let (a, b) = lossy_pair(&[], &[]);
+        let (a, b) = handshake_over(a, b).await;
+        a.request_rekey();
+        a.rekey_initiate().await.unwrap();
+        let request = WireMessage::decode(&recv_good(&b).await).unwrap();
+        b.handle_rekey_msg(&RekeyMsg::from_bytes(&request.payload).unwrap()).await.unwrap();
+        let reply = WireMessage::decode(&recv_good(&a).await).unwrap();
+        let reply = RekeyMsg::from_bytes(&reply.payload).unwrap();
+
+        // Let signature verification finish, then hold key installation up
+        // while a concurrent driver attempts to initiate another rotation.
+        let pending = a.pending_rekey.lock().await;
+        let handler_link = a.clone();
+        let handler = tokio::spawn(async move { handler_link.handle_rekey_msg(&reply).await });
+        tokio::task::yield_now().await;
+        let crypto = a.crypto.lock().await;
+        drop(pending);
+        tokio::task::yield_now().await;
+        assert!(a.pending_rekey.try_lock().is_err(), "reply released pending state before installation");
+        let driver_link = a.clone();
+        let driver = tokio::spawn(async move { driver_link.rekey_initiate().await });
+        tokio::task::yield_now().await;
+        drop(crypto);
+        handler.await.unwrap().unwrap();
+        driver.await.unwrap().unwrap();
+        // A concurrent explicit initiation is allowed, but must target epoch 2.
+        assert_eq!(a.key_epoch().await, 1);
+        assert_eq!(a.pending_rekey.lock().await.as_ref().unwrap().epoch, 2);
+        let request = WireMessage::decode(&recv_good(&b).await).unwrap();
+        let request = RekeyMsg::from_bytes(&request.payload).unwrap();
+        assert_eq!(request.epoch, 2);
+        b.handle_rekey_msg(&request).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rekey_driver_wakes_for_force_traffic_and_age() {
+        for trigger in 0..4 {
             let (a, b) = lossy_pair(&[], &[]);
             let (a, b) = handshake_over(a, b).await;
+            if trigger == 3 {
+                a.crypto.lock().await.installed_at = std::time::Instant::now() - REKEY_MAX_AGE;
+            }
             let driver_link = a.clone();
             let driver = tokio::spawn(async move { driver_link.drive_rekey().await; });
             match trigger {
@@ -2472,11 +2539,12 @@ mod tests {
                     a.send_message(&ping()).await.unwrap();
                     assert_eq!(recv_good(&b).await, ping());
                 }
-                _ => {
+                2 => {
                     b.crypto.lock().await.send_seq = REKEY_INTERVAL;
                     b.send_message(&ping()).await.unwrap();
                     assert_eq!(recv_good(&a).await, ping());
                 }
+                _ => {} // The age deadline itself starts the rotation.
             }
             let request = recv_good(&b).await;
             let decoded = WireMessage::decode(&request).unwrap();
