@@ -1,10 +1,9 @@
 use crate::types::{Error, PeerId, RecordType, Result, ScopedAddress, TransportType};
 
-/// Minimum wire protocol version this node supports. Version 10 is identity
-/// and cryptography v2 (`docs/spec/identity.md`), a hard break.
-pub const WIRE_VERSION_MIN: u8 = 10;
+/// Minimum supported version. Version 11 adds full route dump chunk indices.
+pub const WIRE_VERSION_MIN: u8 = 11;
 /// Maximum (current) wire protocol version this node supports.
-pub const WIRE_VERSION_MAX: u8 = 10;
+pub const WIRE_VERSION_MAX: u8 = 11;
 /// Current wire version used in outgoing messages.
 pub const WIRE_VERSION: u8 = WIRE_VERSION_MAX;
 pub const HEADER_SIZE: usize = 5;
@@ -471,25 +470,27 @@ impl RouteEntry {
     }
 }
 
-/// RouteUpdate: flags(u8) || degree(u8) || dump_id(u16) || count(u16) || count × entry.
+/// RouteUpdate: flags(u8) || degree(u8) || dump_id(u16) || chunk_index(u16) || count(u16) || count × entry.
 /// Entry: dest(32) || seqno(u16) || metric(u16) || eflags(u8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteUpdateMsg {
     pub flags: u8,
     pub degree: u8,
     pub dump_id: u16,
+    pub chunk_index: u16,
     pub entries: Vec<RouteEntry>,
 }
 
 impl RouteUpdateMsg {
     /// Entries that fit one wire message.
-    pub const MAX_ENTRIES: usize = (MAX_PAYLOAD - 6) / ROUTE_ENTRY_SIZE;
+    pub const MAX_ENTRIES: usize = (MAX_PAYLOAD - 8) / ROUTE_ENTRY_SIZE;
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(6 + self.entries.len() * ROUTE_ENTRY_SIZE);
+        let mut buf = Vec::with_capacity(8 + self.entries.len() * ROUTE_ENTRY_SIZE);
         buf.push(self.flags);
         buf.push(self.degree);
         buf.extend_from_slice(&self.dump_id.to_be_bytes());
+        buf.extend_from_slice(&self.chunk_index.to_be_bytes());
         buf.extend_from_slice(&(self.entries.len() as u16).to_be_bytes());
         for e in &self.entries {
             e.write(&mut buf);
@@ -502,6 +503,7 @@ impl RouteUpdateMsg {
         let flags = r.read_u8()?;
         let degree = r.read_u8()?;
         let dump_id = r.read_u16()?;
+        let chunk_index = r.read_u16()?;
         let count = r.read_u16()? as usize;
         if r.remaining() < count * ROUTE_ENTRY_SIZE {
             return Err(Error::Wire("RouteUpdate truncated".into()));
@@ -520,6 +522,7 @@ impl RouteUpdateMsg {
             flags,
             degree,
             dump_id,
+            chunk_index,
             entries,
         })
     }
