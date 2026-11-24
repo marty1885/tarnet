@@ -842,41 +842,42 @@ async fn fetch_records(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRec
         .versions
         .get(&(*zone, label.to_string()))
         .map_or(0, |(sequence, _)| *sequence);
-    // Independent lanes are searched concurrently within ONE step budget.
+    // Yield each candidate immediately and keep every lane open through the
+    // shared grace period, even if its receive queue is temporarily empty.
     let searches = (0..publication::LANES).map(|lane| {
+        use futures_util::stream;
         let pk = &pk;
-        async move {
+        stream::once(async move {
             let (_, key) = publication::label_key(pk, label, lane).ok()?;
-            let mut search = node.dht_search_tns(key, deadline).await;
-            let mut best = None;
-            while let Some(rec) = search.next().await {
-                if let Some((records, sequence)) =
-                    publication::open(zone, pk, label, lane, rec.record())
-                {
-                    let expires = rec.record().expires;
-                    if sequence >= floor
-                        && expires > Instant::now()
-                        && best.as_ref().map_or(true, |(_, old, _)| sequence > *old)
+            Some(node.dht_search_tns(key, deadline).await)
+        })
+        .flat_map(move |search| {
+            stream::unfold(search, move |search| async move {
+                let mut search = search?;
+                while let Some(rec) = search.next().await {
+                    if let Some((records, sequence)) =
+                        publication::open(zone, pk, label, lane, rec.record())
                     {
-                        best = Some((records, sequence, expires));
+                        let expires = rec.record().expires;
+                        if sequence >= floor && expires > Instant::now() {
+                            return Some(((records, sequence, expires), Some(search)));
+                        }
                     }
                 }
-                if best.is_some() && search.is_idle() {
-                    break;
-                }
-            }
-            best
-        }
+                None
+            })
+        })
+        .boxed()
     });
-    let mut searches: futures_util::stream::FuturesUnordered<_> = searches.collect();
+    let mut searches = futures_util::stream::select_all(searches);
     let mut best = None;
     let mut finish = deadline;
-    while !searches.is_empty() {
+    while !searches.is_empty() && Instant::now() < finish {
         match tokio::time::timeout_at(finish.into(), searches.next()).await {
-            Ok(Some(Some(candidate))) => {
+            Ok(Some(candidate)) => {
                 if best.is_none() {
                     // A missing lane cannot impose its entire timeout after
-                    // another lane has supplied an authenticated answer.
+                    // any lane has supplied an authenticated answer.
                     finish = deadline.min(Instant::now() + Duration::from_millis(150));
                 }
                 if best
@@ -886,7 +887,6 @@ async fn fetch_records(node: &Node, zone: &ServiceId, label: &str) -> Vec<TnsRec
                     best = Some(candidate);
                 }
             }
-            Ok(Some(None)) => {}
             _ => break,
         }
     }
@@ -1179,19 +1179,20 @@ pub async fn refresh_zone(node: &Node, zone_keypair: &Keypair) -> Result<()> {
     let _guard = node.zone_publication.lock().await;
     let sid = zone_keypair.identity.service_id();
     let (map, sequence) = node.zone_signing_snapshot(&sid).await;
-    if map.is_empty() {
-        return node
-            .dht_publish_tns_batch(&sid, vec![crate::dht::VerifiedRecord::new_zone_key(
-                zone_keypair,
-                sequence,
-                Duration::from_secs(publication::TTL as u64),
-            )])
-            .await;
+    let descriptor = crate::dht::VerifiedRecord::new_zone_key(
+        zone_keypair,
+        sequence,
+        Duration::from_secs(publication::TTL as u64),
+    );
+    let mut result = node.dht_publish_tns_batch(&sid, vec![descriptor]).await;
+    for (label, set) in map {
+        if let Err(error) = publish_label_snapshot(node, zone_keypair, &label, set, sequence, false).await {
+            if result.is_ok() {
+                result = Err(error);
+            }
+        }
     }
-    for (index, (label, set)) in map.into_iter().enumerate() {
-        publish_label_snapshot(node, zone_keypair, &label, set, sequence, index == 0).await?;
-    }
-    Ok(())
+    result
 }
 
 pub async fn publish(
@@ -1328,6 +1329,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(answer, vec![TnsRecord::Text("reachable".into())]);
+    }
+
+    #[tokio::test]
+    async fn refresh_continues_after_a_label_fails() {
+        let node = Node::new(Keypair::generate());
+        let owner = Keypair::generate_ed25519();
+        let sid = owner.identity.service_id();
+        let oversized = vec![0; publication::MAX_VALUE_BYTES + 1];
+        node.zone_published_update(&sid, "a", Some(oversized)).await;
+        let expected = vec![TnsRecord::Text("still reachable".into())];
+        node.zone_published_update(&sid, "b", Some(serialize_record_set(&expected))).await;
+
+        assert!(refresh_zone(&node, &owner).await.is_err());
+        assert!(!node.dht_held(&crate::dht::zone_key(&sid)).await.is_empty());
+        assert_eq!(held_label(&node, &owner, "b").await, expected);
     }
 
     #[tokio::test]

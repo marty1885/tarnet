@@ -123,6 +123,7 @@ struct Neighbour {
 /// second precedence rule for the initial dump.
 struct RouteSnapshot {
     id: u16,
+    next_chunk: usize,
     routes: BTreeMap<PeerId, RouteEntry>,
     changes: BTreeMap<PeerId, RouteEntry>,
 }
@@ -131,6 +132,7 @@ impl RouteSnapshot {
     fn new(id: u16) -> Self {
         Self {
             id,
+            next_chunk: 0,
             routes: BTreeMap::new(),
             changes: BTreeMap::new(),
         }
@@ -518,7 +520,10 @@ impl RoutingTable {
             // Malformed: dump brackets only appear on dump messages.
             return Vec::new();
         }
-        if (!full && msg.dump_id != 0) || (full && msg.dump_id == 0) {
+        if (!full && (msg.dump_id != 0 || msg.chunk_index != 0))
+            || (full && msg.dump_id == 0)
+            || (start && msg.chunk_index != 0)
+        {
             return Vec::new();
         }
         if start {
@@ -537,6 +542,11 @@ impl RoutingTable {
             // next digest asks again.
             return Vec::new();
         }
+        if full && nb.staging.as_ref().is_some_and(|snapshot| {
+            usize::from(msg.chunk_index) < snapshot.next_chunk
+        }) {
+            return Vec::new();
+        }
         // All authoritative sets enter through the same admission boundary.
         // The replay log is different: it retains withdrawals as tombstones.
         let accepted = (|| -> Option<()> {
@@ -544,6 +554,13 @@ impl RoutingTable {
                 nb.rib = admit_routes(&nb.rib, msg.entries.iter().copied(), cap)?;
             }
             if let Some(snapshot) = nb.staging.as_mut() {
+                if full {
+                    let chunk = usize::from(msg.chunk_index);
+                    if chunk != snapshot.next_chunk {
+                        return None;
+                    }
+                    snapshot.next_chunk += 1;
+                }
                 snapshot.apply(full, &msg.entries, cap)?;
             }
             if full && nb.first_dump {
@@ -647,7 +664,7 @@ impl RoutingTable {
         let entries: Vec<RouteEntry> = std::mem::take(&mut nb.pending).into_values().collect();
         let degree_dirty = std::mem::take(&mut nb.degree_dirty);
         if entries.is_empty() && degree_dirty {
-            return vec![RouteUpdateMsg { flags: 0, degree, dump_id: 0, entries }];
+            return vec![RouteUpdateMsg { flags: 0, degree, dump_id: 0, chunk_index: 0, entries }];
         }
         entries
             .chunks(RouteUpdateMsg::MAX_ENTRIES)
@@ -655,6 +672,7 @@ impl RoutingTable {
                 flags: 0,
                 degree,
                 dump_id: 0,
+                chunk_index: 0,
                 entries: c.to_vec(),
             })
             .collect()
@@ -707,6 +725,7 @@ impl RoutingTable {
                     flags,
                     degree,
                     dump_id,
+                    chunk_index: i as u16,
                     entries: c.to_vec(),
                 }
             })
@@ -1118,6 +1137,7 @@ mod tests {
             flags: 0,
             degree: 1,
             dump_id: 0,
+            chunk_index: 0,
             entries,
         }
     }
@@ -1215,18 +1235,19 @@ mod tests {
         assert!(a.lookup(&pid(9)).is_none());
     }
 
-    fn dump(id: u16, flags: u8, entries: Vec<RouteEntry>) -> RouteUpdateMsg {
+    fn dump(id: u16, chunk_index: u16, flags: u8, entries: Vec<RouteEntry>) -> RouteUpdateMsg {
         RouteUpdateMsg {
             flags: ROUTE_FULL | flags,
             degree: 1,
             dump_id: id,
+            chunk_index,
             entries,
         }
     }
 
     #[test]
     fn route_update_dump_generation_round_trips() {
-        let msg = dump(17, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 3, 4)]);
+        let msg = dump(17, 0, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 3, 4)]);
         assert_eq!(RouteUpdateMsg::from_bytes(&msg.to_bytes()).unwrap(), msg);
     }
 
@@ -1234,11 +1255,11 @@ mod tests {
     fn a_dump_takes_effect_when_it_ends_and_keeps_newer_updates() {
         let mut a = RoutingTable::new(pid(1));
         a.neighbour_up(pid(2), COST_FAST);
-        a.apply_update(&pid(2), &dump(1, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
+        a.apply_update(&pid(2), &dump(1, 0, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
         assert!(a.lookup(&pid(9)).is_some());
 
         // A second dump: nothing changes while it is in progress.
-        a.apply_update(&pid(2), &dump(2, ROUTE_FULL_START, vec![entry(8, 1, 1)]));
+        a.apply_update(&pid(2), &dump(2, 0, ROUTE_FULL_START, vec![entry(8, 1, 1)]));
         assert!(a.lookup(&pid(8)).is_none(), "dump applied before its end");
         assert!(a.lookup(&pid(9)).is_some());
         // An ordinary update during the dump applies now and survives the end.
@@ -1246,15 +1267,15 @@ mod tests {
         assert!(a.lookup(&pid(7)).is_some());
         // A delayed snapshot chunk may complete after that delta; commit must
         // still replay the newer ordinary update over the snapshot.
-        a.apply_update(&pid(2), &dump(2, 0, vec![entry(7, 1, 9)]));
-        a.apply_update(&pid(2), &dump(2, ROUTE_FULL_END, vec![]));
+        a.apply_update(&pid(2), &dump(2, 1, 0, vec![entry(7, 1, 9)]));
+        a.apply_update(&pid(2), &dump(2, 2, ROUTE_FULL_END, vec![]));
         assert!(a.lookup(&pid(8)).is_some());
         assert_eq!(a.lookup(&pid(7)).unwrap().cost, 2, "update during the dump was lost");
         assert!(a.lookup(&pid(9)).is_none(), "entry missing from the dump kept");
 
         // A repaired chunk from the previous generation cannot open or alter
         // a newer snapshot.
-        a.apply_update(&pid(2), &dump(1, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
+        a.apply_update(&pid(2), &dump(1, 0, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
         assert!(a.lookup(&pid(9)).is_none());
     }
 
@@ -1262,15 +1283,15 @@ mod tests {
     fn a_dump_whose_end_is_lost_changes_nothing() {
         let mut a = RoutingTable::new(pid(1));
         a.neighbour_up(pid(2), COST_FAST);
-        a.apply_update(&pid(2), &dump(1, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
-        a.apply_update(&pid(2), &dump(2, ROUTE_FULL_START, vec![entry(8, 1, 1)]));
+        a.apply_update(&pid(2), &dump(1, 0, ROUTE_FULL_START | ROUTE_FULL_END, vec![entry(9, 1, 1)]));
+        a.apply_update(&pid(2), &dump(2, 0, ROUTE_FULL_START, vec![entry(8, 1, 1)]));
         assert!(a.lookup(&pid(8)).is_none());
         assert!(a.lookup(&pid(9)).is_some());
         // Dump parts without a start, and brackets on ordinary updates, are
         // ignored.
         let mut b = RoutingTable::new(pid(1));
         b.neighbour_up(pid(2), COST_FAST);
-        b.apply_update(&pid(2), &dump(1, 0, vec![entry(6, 1, 1)]));
+        b.apply_update(&pid(2), &dump(1, 0, 0, vec![entry(6, 1, 1)]));
         assert!(b.lookup(&pid(6)).is_none());
         b.apply_update(
             &pid(2),
@@ -1278,10 +1299,33 @@ mod tests {
                 flags: ROUTE_FULL_START,
                 degree: 1,
                 dump_id: 1,
+                chunk_index: 0,
                 entries: vec![entry(5, 1, 1)],
             },
         );
         assert!(b.lookup(&pid(5)).is_none());
+    }
+
+    #[test]
+    fn a_dump_missing_a_middle_chunk_keeps_committed_routes() {
+        let mut table = RoutingTable::new(pid(1));
+        let neighbor = pid(2);
+        let committed = vec![entry(9, 1, 1)];
+        table.neighbour_up(neighbor, COST_FAST);
+        table.apply_update(
+            &neighbor,
+            &dump(1, 0, ROUTE_FULL_START | ROUTE_FULL_END, committed.clone()),
+        );
+        table.apply_update(&neighbor, &dump(2, 0, ROUTE_FULL_START, vec![entry(8, 1, 1)]));
+        table.apply_update(&neighbor, &dump(2, 2, ROUTE_FULL_END, vec![]));
+
+        assert!(table.lookup(&pid(9)).is_some());
+        assert!(table.lookup(&pid(8)).is_none());
+        let digest = RouteDigestMsg::of_with_degree(committed.iter(), 1);
+        assert!(!table.digest_matches(&neighbor, &digest));
+
+        table.apply_update(&neighbor, &dump(3, 0, ROUTE_FULL_START | ROUTE_FULL_END, committed));
+        assert!(table.digest_matches(&neighbor, &digest));
     }
 
     #[test]
@@ -1290,7 +1334,7 @@ mod tests {
         // its dump takes a while.
         let mut a = RoutingTable::new(pid(1));
         a.neighbour_up(pid(2), COST_FAST);
-        a.apply_update(&pid(2), &dump(1, ROUTE_FULL_START, vec![entry(9, 1, 1)]));
+        a.apply_update(&pid(2), &dump(1, 0, ROUTE_FULL_START, vec![entry(9, 1, 1)]));
         assert!(a.lookup(&pid(9)).is_some());
     }
 

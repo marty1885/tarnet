@@ -1,23 +1,27 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 use super::{Discovery, Transport};
 use crate::types::{Error, Result};
 
+const MAX_PENDING_UPGRADES: usize = 64;
+const UPGRADE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// WebSocket transport — uses binary WebSocket frames for message delivery.
 /// WebSocket handles framing natively, so no length-prefix is needed.
 pub struct WsTransport {
     tx: mpsc::Sender<Vec<u8>>,
     rx: Mutex<mpsc::Receiver<Vec<u8>>>,
-    // Keep task handles alive so the reader/writer loops don't get cancelled.
-    _reader: tokio::task::JoinHandle<()>,
-    _writer: tokio::task::JoinHandle<()>,
+    reader: tokio::task::JoinHandle<()>,
+    writer: tokio::task::JoinHandle<()>,
 }
 
 impl WsTransport {
@@ -55,9 +59,16 @@ impl WsTransport {
         Self {
             tx: write_tx,
             rx: Mutex::new(read_rx),
-            _reader: reader,
-            _writer: writer,
+            reader,
+            writer,
         }
+    }
+}
+
+impl Drop for WsTransport {
+    fn drop(&mut self) {
+        self.reader.abort();
+        self.writer.abort();
     }
 }
 
@@ -120,27 +131,35 @@ impl WsDiscovery {
         let accept_path = path.clone();
 
         tokio::spawn(async move {
+            let upgrades = Arc::new(Semaphore::new(MAX_PENDING_UPGRADES));
             loop {
-                match listener.accept().await {
+                let accepted = tokio::select! {
+                    _ = tx.closed() => break,
+                    accepted = listener.accept() => accepted,
+                };
+                match accepted {
                     Ok((stream, peer_addr)) => {
+                        let Ok(upgrade) = upgrades.clone().try_acquire_owned() else {
+                            continue;
+                        };
                         let _ = super::tcp::apply_keepalive(&stream);
                         let tx = tx.clone();
                         let path = accept_path.clone();
                         tokio::spawn(async move {
-                            match ws_accept(stream, &path).await {
-                                Ok(ws) => {
-                                    log::debug!("WebSocket accepted from {}", peer_addr);
-                                    let transport: Box<dyn Transport> =
-                                        Box::new(WsTransport::wrap(ws));
-                                    let _ = tx.send(transport).await;
+                            let _upgrade = upgrade;
+                            let result = tokio::time::timeout(UPGRADE_TIMEOUT, async {
+                                let ws = ws_accept(stream, &path).await?;
+                                if let Ok(slot) = tx.reserve().await {
+                                    let transport: Box<dyn Transport> = Box::new(WsTransport::wrap(ws));
+                                    slot.send(transport);
                                 }
-                                Err(e) => {
-                                    log::debug!(
-                                        "WebSocket upgrade failed from {}: {}",
-                                        peer_addr,
-                                        e
-                                    );
-                                }
+                                Ok::<(), Error>(())
+                            })
+                            .await;
+                            match result {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => log::debug!("WebSocket upgrade failed from {}: {}", peer_addr, e),
+                                Err(_) => log::debug!("WebSocket upgrade timed out from {}", peer_addr),
                             }
                         });
                     }
@@ -255,4 +274,38 @@ async fn ws_connect(addr: &str) -> Result<Box<dyn Transport>> {
     }
     log::debug!("WebSocket connected to {}", addr);
     Ok(Box::new(WsTransport::wrap(ws)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn stalled_upgrade_expires_without_blocking_valid_connections() {
+        let discovery = WsDiscovery::bind("127.0.0.1:0", "/tarnet".into()).await.unwrap();
+        let mut stalled = TcpStream::connect(discovery.local_addr()).await.unwrap();
+        let url = format!("ws://{}/tarnet", discovery.local_addr());
+        let (client, server) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(discovery.connect(&url), discovery.accept())
+        })
+        .await
+        .expect("stalled upgrade blocked another connection");
+        let client = client.unwrap();
+        let server = server.unwrap();
+        client.send(b"hello").await.unwrap();
+        let mut received = [0; 5];
+        assert_eq!(server.recv(&mut received).await.unwrap(), 5);
+        assert_eq!(&received, b"hello");
+
+        let mut byte = [0];
+        let bytes_read = tokio::time::timeout(
+            UPGRADE_TIMEOUT + Duration::from_secs(2),
+            stalled.read(&mut byte),
+        )
+        .await
+        .expect("stalled upgrade stayed open")
+        .unwrap();
+        assert_eq!(bytes_read, 0);
+    }
 }

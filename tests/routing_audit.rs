@@ -13,10 +13,11 @@ fn entry(n: u8, metric: u16) -> RouteEntry {
         eflags: 0,
     }
 }
-fn update(flags: u8, dump_id: u16, entries: Vec<RouteEntry>) -> RouteUpdateMsg {
+fn update(flags: u8, dump_id: u16, chunk_index: u16, entries: Vec<RouteEntry>) -> RouteUpdateMsg {
     RouteUpdateMsg {
         flags,
         dump_id,
+        chunk_index,
         entries,
         degree: 1,
     }
@@ -31,16 +32,17 @@ fn audit_dump_preserves_interleaved_withdrawal() {
         &update(
             ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END,
             1,
+            0,
             vec![entry(3, 1)],
         ),
     );
     rt.apply_update(
         &peer(2),
-        &update(ROUTE_FULL | ROUTE_FULL_START, 2, vec![entry(3, 1)]),
+        &update(ROUTE_FULL | ROUTE_FULL_START, 2, 0, vec![entry(3, 1)]),
     );
-    rt.apply_update(&peer(2), &update(0, 0, vec![entry(3, ROUTE_INFINITY)]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, vec![entry(3, ROUTE_INFINITY)]));
     assert!(rt.lookup(&peer(3)).is_none());
-    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_END, 2, vec![]));
+    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_END, 2, 1, vec![]));
     assert!(
         rt.lookup(&peer(3)).is_none(),
         "dump resurrected a withdrawn route"
@@ -57,17 +59,17 @@ fn audit_dump_commit_preserves_rib_capacity() {
     rt.neighbour_up(peer(2), COST_FAST);
     rt.apply_update(
         &peer(2),
-        &update(ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END, 1, vec![]),
+        &update(ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END, 1, 0, vec![]),
     );
     // With these limits advertised_capacity = 2 and RIB capacity = 4.
     let snapshot: Vec<_> = (10..14).map(|n| entry(n, 1)).collect();
     let changes: Vec<_> = (20..24).map(|n| entry(n, 1)).collect();
     rt.apply_update(
         &peer(2),
-        &update(ROUTE_FULL | ROUTE_FULL_START, 2, snapshot.clone()),
+        &update(ROUTE_FULL | ROUTE_FULL_START, 2, 0, snapshot.clone()),
     );
-    rt.apply_update(&peer(2), &update(0, 0, changes.clone()));
-    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_END, 2, vec![]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, changes.clone()));
+    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_END, 2, 1, vec![]));
     let union: Vec<_> = snapshot.into_iter().chain(changes).collect();
     assert!(
         !rt.digest_matches(&peer(2), &RouteDigestMsg::of_with_degree(union.iter(), 1)),
@@ -80,7 +82,7 @@ fn audit_dump_commit_preserves_rib_capacity() {
     assert!(!rt.digest_matches(&peer(2), &digest));
     rt.apply_update(
         &peer(2),
-        &update(ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END, 3, retained),
+        &update(ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END, 3, 0, retained),
     );
     assert!(rt.digest_matches(&peer(2), &digest));
 }
@@ -126,12 +128,12 @@ fn audit_admission_checks_final_batch_not_entry_order() {
     rt.neighbour_up(peer(2), COST_FAST);
     rt.apply_update(
         &peer(2),
-        &update(0, 0, (10..14).map(|n| entry(n, 1)).collect()),
+        &update(0, 0, 0, (10..14).map(|n| entry(n, 1)).collect()),
     );
     // Addition comes before the withdrawal which makes room for it.
     rt.apply_update(
         &peer(2),
-        &update(0, 0, vec![entry(20, 1), entry(10, ROUTE_INFINITY)]),
+        &update(0, 0, 0, vec![entry(20, 1), entry(10, ROUTE_INFINITY)]),
     );
     let expected: Vec<_> = [11, 12, 13, 20].into_iter().map(|n| entry(n, 1)).collect();
     assert!(rt.digest_matches(
@@ -139,12 +141,13 @@ fn audit_admission_checks_final_batch_not_entry_order() {
         &RouteDigestMsg::of_with_degree(expected.iter(), 1)
     ));
     // An oversized ordinary batch must not partially change the live set.
-    rt.apply_update(&peer(2), &update(0, 0, vec![entry(21, 1)]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, vec![entry(21, 1)]));
     rt.apply_update(
         &peer(2),
         &update(
             ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END,
             1,
+            0,
             expected.clone(),
         ),
     );
@@ -167,12 +170,13 @@ fn audit_overflowing_first_dump_can_be_replaced() {
         &update(
             ROUTE_FULL | ROUTE_FULL_START,
             1,
+            0,
             (10..14).map(|n| entry(n, 1)).collect(),
         ),
     );
     rt.apply_update(
         &peer(2),
-        &update(ROUTE_FULL | ROUTE_FULL_END, 1, vec![entry(14, 1)]),
+        &update(ROUTE_FULL | ROUTE_FULL_END, 1, 1, vec![entry(14, 1)]),
     );
     let repaired: Vec<_> = (20..24).map(|n| entry(n, 1)).collect();
     rt.apply_update(
@@ -180,6 +184,7 @@ fn audit_overflowing_first_dump_can_be_replaced() {
         &update(
             ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END,
             2,
+            0,
             repaired.clone(),
         ),
     );
@@ -193,10 +198,10 @@ fn audit_overflowing_first_dump_can_be_replaced() {
 fn audit_first_dump_must_not_resurrect_an_interleaved_withdrawal() {
     let mut rt = RoutingTable::new(peer(1));
     rt.neighbour_up(peer(2), COST_FAST);
-    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_START, 1, vec![]));
-    rt.apply_update(&peer(2), &update(0, 0, vec![entry(9, ROUTE_INFINITY)]));
+    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_START, 1, 0, vec![]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, vec![entry(9, ROUTE_INFINITY)]));
     // A later chunk still carries the snapshot taken before the withdrawal.
-    rt.apply_update(&peer(2), &update(ROUTE_FULL, 1, vec![entry(9, 1)]));
+    rt.apply_update(&peer(2), &update(ROUTE_FULL, 1, 1, vec![entry(9, 1)]));
     assert!(rt.lookup(&peer(9)).is_none(), "stale first-dump chunk resurrected a withdrawn route before END");
 }
 
@@ -211,9 +216,9 @@ fn audit_landmark_penalty_expiry_must_restore_selection() {
     rt.neighbour_up(peer(2), COST_FAST);
     let mut landmark = entry(9, 10);
     landmark.eflags = ROUTE_LANDMARK;
-    rt.apply_update(&peer(2), &update(0, 0, vec![entry(2, 0), landmark]));
-    rt.apply_update(&peer(2), &update(0, 0, vec![entry(9, 10)]));
-    rt.apply_update(&peer(2), &update(0, 0, vec![landmark]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, vec![entry(2, 0), landmark]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, vec![entry(9, 10)]));
+    rt.apply_update(&peer(2), &update(0, 0, 0, vec![landmark]));
     assert!(rt.landmarks().is_empty());
     rt.advance_time(std::time::Instant::now() + Duration::from_secs(61));
     assert_eq!(rt.landmarks().len(), 1, "expired landmark penalty remains effective without unrelated route changes");
@@ -234,22 +239,24 @@ fn audit_snapshot_delta_precedence_for_every_interleaving() {
                 if !initial {
                     let old = entry(7, 3);
                     committed.insert(old.dest, old);
-                    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END, 1, vec![old]));
+                    rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_START | ROUTE_FULL_END, 1, 0, vec![old]));
                 }
-                rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_START, 2, vec![]));
+                rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_START, 2, 0, vec![]));
                 let mut snapshot = BTreeMap::new();
                 let mut delta = None;
+                let mut chunk_index = 1;
                 for event in schedule {
                     if event < 2 {
                         let e = entry(8 + event, 5);
                         snapshot.insert(e.dest, e);
-                        rt.apply_update(&peer(2), &update(ROUTE_FULL, 2, vec![e]));
+                        rt.apply_update(&peer(2), &update(ROUTE_FULL, 2, chunk_index, vec![e]));
+                        chunk_index += 1;
                     } else {
                         let e = entry(9, if withdrawal { ROUTE_INFINITY } else { 1 });
                         delta = Some(e);
                         if withdrawal { committed.remove(&e.dest); }
                         else { committed.insert(e.dest, e); }
-                        rt.apply_update(&peer(2), &update(0, 0, vec![e]));
+                        rt.apply_update(&peer(2), &update(0, 0, 0, vec![e]));
                     }
                     let mut expected = if initial { snapshot.clone() } else { committed.clone() };
                     if let Some(e) = delta {
@@ -262,7 +269,7 @@ fn audit_snapshot_delta_precedence_for_every_interleaving() {
                 let e = delta.unwrap();
                 if withdrawal { snapshot.remove(&e.dest); }
                 else { snapshot.insert(e.dest, e); }
-                rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_END, 2, vec![]));
+                rt.apply_update(&peer(2), &update(ROUTE_FULL | ROUTE_FULL_END, 2, chunk_index, vec![]));
                 assert!(rt.digest_matches(&peer(2), &RouteDigestMsg::of_with_degree(snapshot.values(), 1)));
             }
         }

@@ -1048,6 +1048,10 @@ header `VER(u8) | TYPE(u16) | LEN(u16)` is unchanged, with `VER = 7`.
 Retired: `RouteAdvertisement (0x0100)`, `RouteProbe (0x0101)`,
 `RouteProbeFound (0x0102)`.
 
+Wire version 11 adds a chunk index to route updates. A receiver commits a
+full dump only when its chunks through FULL_END arrived in order without
+gaps. A gap leaves the committed routes in place and triggers digest repair.
+
 ```
 RouteUpdate        (0x0110)
   flags(u8)          bit0 FULL (part of a full dump), bit1 FULL_START (first
@@ -1056,6 +1060,7 @@ RouteUpdate        (0x0110)
   degree(u8)         sender's number of links, saturating at 255
   dump_id(u16)       nonzero generation shared by all chunks of a full dump;
                      zero on ordinary updates
+  chunk_index(u16)   zero-based position in a full dump; zero on ordinary updates
   count(u16)
   count × ( dest(32) || seqno(u16) || metric(u16) || eflags(u8) )
                      metric 0xFFFF = retraction; eflags bit0 LANDMARK, others reserved
